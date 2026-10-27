@@ -12,9 +12,20 @@ new path reads as wholly added. `--find-copies-harder` also catches a copy
 whose source is untouched in the range.
 """
 
+import os
 import re
 
 from typing import NamedTuple, Optional
+
+
+#: The base a branch diffs against when nobody names one.
+DEFAULT_BASE = "origin/master"
+
+
+def default_base(given=None, env=None):
+    """The base ref: `given` (a --base flag), else $BASE_REF, else origin/master."""
+    env = os.environ if env is None else env
+    return given or env.get("BASE_REF") or DEFAULT_BASE
 
 
 # Vendored and generated paths no first-party gate lints. One pattern lives

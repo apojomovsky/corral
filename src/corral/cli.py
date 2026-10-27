@@ -60,15 +60,11 @@ def cmd_paths(args: argparse.Namespace) -> int:
     return OK
 
 
-def default_base(args: argparse.Namespace) -> str:
-    return args.base or os.environ.get("BASE_REF", "origin/master")
-
-
 def cmd_prose(args: argparse.Namespace) -> int:
     from corral import diffscope, prose
 
     cwd = os.getcwd()
-    base = default_base(args)
+    base = diffscope.default_base(args.base)
     try:
         if args.verify:
             found = prose.verify(base, cwd=cwd)
@@ -91,7 +87,9 @@ def cmd_push(args: argparse.Namespace) -> int:
 def cmd_budget(args: argparse.Namespace) -> int:
     from corral import budget
 
-    print(budget.dispatch_block(default_base(args)))
+    from corral import diffscope
+
+    print(budget.dispatch_block(diffscope.default_base(args.base)))
     return OK
 
 

@@ -317,5 +317,25 @@ class UnderAHookTest(RealRepoTest):
         )
 
 
+class DefaultBaseTest(unittest.TestCase):
+    def test_flag_then_env_then_the_default(self):
+        self.assertEqual(diffscope.default_base("main", {"BASE_REF": "x"}), "main")
+        self.assertEqual(diffscope.default_base(None, {"BASE_REF": "x"}), "x")
+        self.assertEqual(diffscope.default_base(None, {"BASE_REF": ""}), "origin/master")
+        self.assertEqual(diffscope.default_base(None, {}), "origin/master")
+
+    def test_no_other_module_reads_base_ref(self):
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+        readers = []
+        for here, _, names in os.walk(src):
+            for name in names:
+                if name.endswith(".py"):
+                    path = os.path.join(here, name)
+                    with open(path, encoding="utf-8") as handle:
+                        if 'get("BASE_REF"' in handle.read():
+                            readers.append(os.path.relpath(path, src))
+        self.assertEqual(readers, [os.path.join("corral", "diffscope.py")])
+
+
 if __name__ == "__main__":
     unittest.main()

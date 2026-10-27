@@ -94,7 +94,7 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 def cmd_show(args: argparse.Namespace) -> int:
     from corral import mergeup, reviewrecord
-    from corral.cli import default_base
+    from corral.diffscope import default_base
 
     cwd = os.getcwd()
     commit = _commit(args.commit, cwd)
@@ -104,7 +104,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     record, found = mergeup.find_record(
         lambda c: reviewrecord.read_record(args.repo, args.number, c),
         commit,
-        default_base(args),
+        default_base(args.base),
         cwd,
     )
     if record is None:
