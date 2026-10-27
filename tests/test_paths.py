@@ -136,6 +136,54 @@ class Cli(unittest.TestCase):
             self.assertEqual(cli.main(["deps"]), 4)
         self.assertIn("must be an absolute path", err.getvalue())
 
+    def _run(self, argv):
+        import io
+        from contextlib import redirect_stdout
+
+        from corral import cli
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(argv)
+        return code, out.getvalue()
+
+    def test_paths_prints_each_resolver(self):
+        code, out = self._run(["paths"])
+        self.assertEqual(code, 0)
+        want = "".join(
+            f"{name} = {getattr(paths, name + '_dir')()}\n"
+            for name in ("state", "config", "cache", "sessions")
+        )
+        self.assertEqual(out, want)
+
+    def test_paths_one_name_honours_the_override(self):
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = os.path.join(tmp.name, "nested", "cache")
+        with mock.patch.dict(os.environ, {"CORRAL_CACHE": target}):
+            code, out = self._run(["paths", "cache"])
+            self.assertEqual((code, out), (0, target + "\n"))
+            self.assertFalse(os.path.exists(target))
+            code, out = self._run(["paths", "cache", "--mkdir"])
+        self.assertEqual((code, out), (0, target + "\n"))
+        self.assertTrue(os.path.isdir(target))
+
+    def test_an_unknown_name_is_a_usage_error(self):
+        import io
+        from contextlib import redirect_stderr
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self._run(["paths", "bogus"])[0], 4)
+
+    def test_agents_md_drafts_pr_bodies_through_the_resolver(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "AGENTS.md"), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn('mktemp "$(uv run corral paths cache --mkdir)/pr-', text)
+        self.assertNotIn("XDG_CACHE_HOME", text)
+
 
 if __name__ == "__main__":
     unittest.main()
