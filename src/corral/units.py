@@ -6,13 +6,13 @@ comes from `agents.unit_prefix`, so several fleets can share a host. A unit
 without the prefix is never listed, counted or stopped here.
 
 Each start is appended to `units.log` in the ticket's session dir. That file
-decides the next generation, so a unit name is not reused while the log
-keeps it.
+decides the next generation, and it is the proof of ownership: a live unit
+is stopped only when its name is in the log, because a prefix can parse
+another fleet's unit as one of ours.
 
 Every subprocess goes through one seam. `list_units` and `start` take `run`.
 `stop` takes `list_fn` and `stop_fn`, both required, and never falls back to
-`systemctl_stop`, the one production stop (AGENTS.md, "Destructive seams
-have no default").
+the production stop (AGENTS.md, "Destructive seams have no default").
 
 Errors map to the public exit codes: UnitExists 2, Unreachable 3, UnitsError 4.
 """
@@ -45,6 +45,7 @@ _TAIL = re.compile(
     rf"(?P<repo>{paths.REPO_NAME.pattern})-(?P<number>[1-9][0-9]*)"
     r"(?:-r(?P<gen>[1-9][0-9]*))?"
 )
+_WELL_FORMED = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*-[1-9][0-9]*(?:-r[1-9][0-9]*)?")
 _GEN = re.compile(r"-r([1-9][0-9]*)$")
 
 
@@ -61,7 +62,7 @@ class UnitExists(UnitsError):
 
 
 class Unreachable(UnitsError):
-    """systemctl cannot be asked: fail closed, never read as "no units" (exit 3)."""
+    """The service manager cannot be asked: fail closed, never "no units" (exit 3)."""
 
     exit_code = 3
 
@@ -81,7 +82,7 @@ def _check_prefix(prefix):
 
 
 def _check_repo(repo):
-    if not isinstance(repo, str) or not paths.REPO_NAME.fullmatch(repo):
+    if not paths.plain_repo_name(repo):
         raise UnitsError(f"repo name {repo!r} is not a plain repository name")
 
 
@@ -119,7 +120,7 @@ def parse_unit(prefix, name):
     if not name.startswith(prefix):
         return None
     match = _TAIL.fullmatch(name[len(prefix) :])
-    if not match:
+    if not match or not paths.plain_repo_name(match.group("repo")):
         return None
     return match.group("repo"), int(match.group("number")), int(match.group("gen") or 0)
 
@@ -134,9 +135,10 @@ def _gen_of(unit):
 
 
 def list_units(prefix, run=default_run):
-    """[(unit, active state, sub state)] for this prefix's units, from systemctl.
+    """[(unit, active state, sub state)] for this prefix's units, from the service manager.
 
-    Raises Unreachable when systemctl cannot run or fails.
+    Raises Unreachable when the query cannot run, fails, or prints a line in a
+    shape it does not know: a format change is never read as "no units".
     """
     _check_prefix(prefix)
     argv = [
@@ -157,16 +159,24 @@ def list_units(prefix, run=default_run):
         raise Unreachable(f"cannot list units: {(proc.stderr or '').strip()}")
     out = []
     for line in (proc.stdout or "").splitlines():
+        if not line.strip():
+            continue
         fields = line.split()
-        if len(fields) >= 4:
-            unit = fields[0].removesuffix(".service")
-            if parse_unit(prefix, unit):
-                out.append((unit, fields[2], fields[3]))
+        if len(fields) < 4:
+            raise Unreachable(f"cannot read the unit list, unexpected line: {line!r}")
+        unit = fields[0].removesuffix(".service")
+        if parse_unit(prefix, unit):
+            out.append((unit, fields[2], fields[3]))
     return out
 
 
 def live_tickets(prefix, units):
-    """{(repo, number)} for every unit in one of LIVE_STATES."""
+    """{(repo, number)} for every unit in one of LIVE_STATES.
+
+    With overlapping prefixes this can over-count, since another fleet's unit
+    may parse as one of ours. Over-counting only makes admission more
+    conservative, never less.
+    """
     out = set()
     for name, active, _ in units:
         parsed = parse_unit(prefix, name)
@@ -202,9 +212,13 @@ def unit_argv(unit, workdir, session_dir, command, env, runtime_max_s):
 
     stdout and stderr append to the session's out.log and err.log. `env` is
     `K=V` strings, or a mapping; each item becomes one `--setenv`. PATH and
-    HOME are passed through explicitly.
+    HOME are passed through explicitly. The command is a program and its
+    arguments; a first element that is an option is refused.
     """
     _check_int(runtime_max_s, "runtime_max_s", 1)
+    command = list(command)
+    if not command or not isinstance(command[0], str) or command[0].startswith("-"):
+        raise UnitsError(f"command {command[:1]!r} must start with a program name")
     if isinstance(env, Mapping):
         items = [f"{key}={value}" for key, value in env.items()]
     else:
@@ -222,23 +236,29 @@ def unit_argv(unit, workdir, session_dir, command, env, runtime_max_s):
         f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
         f"--setenv=HOME={os.path.expanduser('~')}",
         *[f"--setenv={item}" for item in items],
-        *list(command),
+        *command,
     ]
 
 
 def start(argv, session_dir, unit, run=default_run):
-    """Run systemd-run, then record the unit in the session's units.log.
+    """Run the start argv, then record the unit in the session's units.log.
 
-    "already exists" raises UnitExists (exit 2); any other failure raises
-    UnitsError (exit 4).
+    The argv must carry `--unit=<unit>`, and the unit must be well formed.
+    "already exists" or "already loaded" (any case) raises UnitExists (exit
+    2); any other failure raises UnitsError (exit 4).
     """
+    if not isinstance(unit, str) or not _WELL_FORMED.fullmatch(unit):
+        raise UnitsError(f"unit name {unit!r} is not a well-formed agent unit name")
+    if f"--unit={unit}" not in argv:
+        raise UnitsError(f"the start argv does not name {unit}")
     try:
         proc = run(argv, timeout=START_TIMEOUT_S)
     except OSError as err:
         raise UnitsError(f"cannot start {unit}: {err}") from err
     if proc.returncode != 0:
         tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
-        if "already" in tail or "exists" in tail:
+        low = tail.lower()
+        if "already exists" in low or "already loaded" in low:
             raise UnitExists(f"{unit}: {tail}")
         raise UnitsError(f"cannot start {unit}: {tail}")
     try:
@@ -269,24 +289,58 @@ def next_gen(session_dir):
 
 
 def systemctl_stop(unit):
-    """The one production stop: `systemctl --user stop <unit>`. Never call it from a test."""
+    """The one production stop of a unit. Never call it from a test."""
     proc = default_run(["systemctl", "--user", "stop", unit], timeout=STOP_TIMEOUT_S)
     if proc.returncode != 0:
         raise UnitsError(f"cannot stop {unit}: {(proc.stderr or '').strip()}")
 
 
-def stop(prefix, repo, number, *, list_fn, stop_fn):
-    """Stop every live unit of one ticket. Returns the names stopped.
-
-    `list_fn(prefix)` returns the units; `stop_fn(unit)` stops one. Both are
-    required, so a caller that forgets one fails with TypeError rather than
-    reaching systemctl.
-    """
-    _check_prefix(prefix)
-    stopped = []
+def _owned_live(prefix, repo, number, session_dir, list_fn):
+    """(owned, unproven): live units that parse to the ticket, split by the log."""
+    logged = set(started_units(session_dir))
+    owned, unproven = [], []
     for name, active, _ in list_fn(prefix):
         parsed = parse_unit(prefix, name)
-        if parsed and parsed[0] == repo and parsed[1] == number and active in LIVE_STATES:
+        if not parsed or parsed[:2] != (repo, number) or active not in LIVE_STATES:
+            continue
+        (owned if name in logged else unproven).append(name)
+    return owned, unproven
+
+
+def unproven(prefix, repo, number, *, session_dir, list_fn):
+    """Live units that parse to this ticket but are not in its units.log.
+
+    `stop` never touches these. They are reported here so a caller can warn
+    about a unit that another fleet, or a stale prefix, may own.
+    """
+    _check_prefix(prefix)
+    _check_repo(repo)
+    _check_int(number, "ticket number", 1)
+    return _owned_live(prefix, repo, number, session_dir, list_fn)[1]
+
+
+def stop(prefix, repo, number, *, session_dir, list_fn, stop_fn):
+    """Stop every live unit of one ticket that this ticket's log proves it started.
+
+    A unit is stopped only when it is live, parses to exactly (repo, number),
+    and its name is in `units.log` under `session_dir`. Live units that parse
+    but are not logged are left alone (see `unproven`). Returns the names
+    stopped. When `stop_fn` fails partway, the raised error names the units
+    already stopped.
+
+    `list_fn(prefix)` returns the units; `stop_fn(unit)` stops one. Every
+    argument is required, so a caller that forgets one fails with TypeError.
+    """
+    _check_prefix(prefix)
+    _check_repo(repo)
+    _check_int(number, "ticket number", 1)
+    owned, _ = _owned_live(prefix, repo, number, session_dir, list_fn)
+    stopped = []
+    for name in owned:
+        try:
             stop_fn(name)
-            stopped.append(name)
+        except UnitsError as err:
+            done = ", ".join(stopped) or "none"
+            raise type(err)(f"stopped {done}; {name} failed: {err}") from err
+        stopped.append(name)
     return stopped

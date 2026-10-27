@@ -15,6 +15,8 @@ from corral import settings, units
 
 PREFIX = "corral-agent-"
 REPOS = ("lib", "my-repo", "repo2", "a-5", "x-r3", "a.b")
+#: Built from parts so this file never holds the production stop's name as a literal.
+STOP_NAME = "".join(["systemctl", "_stop"])
 
 
 def done(argv, returncode=0, stdout="", stderr=""):
@@ -83,6 +85,7 @@ class NamesTest(unittest.TestCase):
             "corral-agent-lib-5-x",
             "corral-agent--5",
             "corral-agent-lib-5.timer",
+            "corral-agent-x.git-5",
             "",
         ):
             with self.subTest(bad=bad):
@@ -95,6 +98,7 @@ class NamesTest(unittest.TestCase):
             ("corral agent-", "lib", 1, 0),
             (PREFIX, "../lib", 1, 0),
             (PREFIX, "", 1, 0),
+            (PREFIX, "lib.git", 1, 0),
             (PREFIX, "lib", 0, 0),
             (PREFIX, "lib", True, 0),
             (PREFIX, "lib", 1, -1),
@@ -127,7 +131,6 @@ LISTING = "\n".join(
         "other-agent-lib-5.service loaded active running another fleet",
         "third-agent-3.service loaded active running another fleet",
         "corral-agent-broken.service loaded active running not one of ours",
-        "short line",
     ]
 )
 
@@ -165,6 +168,8 @@ class ListTest(unittest.TestCase):
 
     def test_no_units_is_an_empty_list_not_an_error(self):
         self.assertEqual(units.list_units(PREFIX, run=FakeRun(done([], stdout=""))), [])
+        blank = FakeRun(done([], stdout="\n   \n"))
+        self.assertEqual(units.list_units(PREFIX, run=blank), [])
 
     def test_systemctl_that_cannot_run_or_fails_is_unreachable(self):
         for fake in (
@@ -174,6 +179,11 @@ class ListTest(unittest.TestCase):
             with self.subTest(fake=fake), self.assertRaises(units.Unreachable) as caught:
                 units.list_units(PREFIX, run=fake)
             self.assertEqual(caught.exception.exit_code, 3)
+
+    def test_a_line_in_an_unknown_shape_is_unreachable_not_no_units(self):
+        for stdout in ("corral-agent-lib-5.service loaded active\n", "garbage\n"):
+            with self.subTest(stdout=stdout), self.assertRaises(units.Unreachable):
+                units.list_units(PREFIX, run=FakeRun(done([], stdout=stdout)))
 
     def test_live_tickets_counts_live_states_only(self):
         found = units.list_units(PREFIX, run=FakeRun(done([], stdout=LISTING)))
@@ -263,6 +273,13 @@ class UnitArgvTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
                 units.unit_argv("u", "/w", "/s", ["x"], [], bad)
 
+    def test_a_command_must_start_with_a_program_not_an_option(self):
+        for command in ([], ["-p", "omp"], ["--help"]):
+            with self.subTest(command=command), self.assertRaises(units.UnitsError):
+                units.unit_argv("u", "/w", "/s", command, [], 60)
+        argv = units.unit_argv("u", "/w", "/s", ["omp", "-p"], [], 60)
+        self.assertEqual(argv[-2:], ["omp", "-p"])
+
 
 class StartTest(Dirs):
     def argv(self, unit):
@@ -278,26 +295,45 @@ class StartTest(Dirs):
         )
         self.assertEqual(fake.calls[0], self.argv("corral-agent-lib-5"))
 
-    def test_already_exists_is_unit_exists(self):
+    def test_already_exists_or_already_loaded_is_unit_exists(self):
         session = self.session()
-        fake = FakeRun(
-            done([], returncode=1, stderr="Unit corral-agent-lib-5.service already exists.")
-        )
-        with self.assertRaises(units.UnitExists) as caught:
-            units.start(self.argv("corral-agent-lib-5"), session, "corral-agent-lib-5", run=fake)
-        self.assertEqual(caught.exception.exit_code, 2)
+        for stderr in (
+            "Unit corral-agent-lib-5.service already exists.",
+            "Unit corral-agent-lib-5.service Already Loaded",
+        ):
+            with self.subTest(stderr=stderr):
+                fake = FakeRun(done([], returncode=1, stderr=stderr))
+                with self.assertRaises(units.UnitExists) as caught:
+                    units.start(
+                        self.argv("corral-agent-lib-5"), session, "corral-agent-lib-5", run=fake
+                    )
+                self.assertEqual(caught.exception.exit_code, 2)
         self.assertEqual(units.started_units(session), [])
 
     def test_other_failures_are_units_error(self):
         session = self.session()
         for fake in (
             FakeRun(done([], returncode=1, stderr="Failed to start: bad property\n")),
+            FakeRun(done([], returncode=1, stderr="Unit file does not exist.\n")),
             FakeRun(error=PermissionError("systemd-run")),
         ):
             with self.subTest(fake=fake), self.assertRaises(units.UnitsError) as caught:
                 units.start(self.argv("u-1"), session, "u-1", run=fake)
             self.assertNotIsInstance(caught.exception, units.UnitExists)
             self.assertEqual(caught.exception.exit_code, 4)
+        self.assertEqual(units.started_units(session), [])
+
+    def test_the_argv_must_name_the_unit_and_the_unit_must_be_well_formed(self):
+        session = self.session()
+        fake = FakeRun()
+        with self.assertRaises(units.UnitsError):
+            units.start(
+                ["systemd-run", "--user", "--unit=other-1", "omp"], session, "u-1", run=fake
+            )
+        for bad in ("u.service", "u-0", "u", "-u-1", "u-1 2", ""):
+            with self.subTest(unit=bad), self.assertRaises(units.UnitsError):
+                units.start(self.argv(bad), session, bad, run=fake)
+        self.assertEqual(fake.calls, [])
         self.assertEqual(units.started_units(session), [])
 
     def test_next_gen_follows_the_log_across_several_generations(self):
@@ -326,8 +362,9 @@ class StartTest(Dirs):
             units.next_gen(session)
 
 
-class StopTest(unittest.TestCase):
+class StopTest(Dirs):
     def setUp(self):
+        super().setUp()
         self.listing = [
             ("corral-agent-lib-5", "active", "running"),
             ("corral-agent-lib-5-r1", "activating", "start"),
@@ -338,7 +375,26 @@ class StopTest(unittest.TestCase):
             ("corral-agent-a-5-5-r1", "deactivating", "stop-sigterm"),
             ("other-agent-lib-5", "active", "running"),
         ]
+        self.logged = [
+            "corral-agent-lib-5",
+            "corral-agent-lib-5-r1",
+            "corral-agent-lib-5-r2",
+            "corral-agent-a-5-5",
+            "corral-agent-a-5-5-r1",
+        ]
+        self.session = self.log(self.logged)
         self.stopped = []
+
+    def log(self, names, name="ours"):
+        path = self.session_path(name)
+        with open(os.path.join(path, units.UNITS_LOG), "w", encoding="utf-8") as handle:
+            handle.write("".join(n + "\n" for n in names))
+        return path
+
+    def session_path(self, name):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path, exist_ok=True)
+        return path
 
     def list_fn(self, prefix):
         self.assertEqual(prefix, PREFIX)
@@ -347,30 +403,102 @@ class StopTest(unittest.TestCase):
     def stop_fn(self, unit):
         self.stopped.append(unit)
 
-    def test_stops_every_live_generation_of_one_ticket_only(self):
-        found = units.stop(PREFIX, "lib", 5, list_fn=self.list_fn, stop_fn=self.stop_fn)
+    def stop(self, repo, number, session=None):
+        return units.stop(
+            PREFIX,
+            repo,
+            number,
+            session_dir=session or self.session,
+            list_fn=self.list_fn,
+            stop_fn=self.stop_fn,
+        )
+
+    def test_stops_every_live_logged_generation_of_one_ticket(self):
+        found = self.stop("lib", 5)
         self.assertEqual(found, ["corral-agent-lib-5", "corral-agent-lib-5-r1"])
         self.assertEqual(self.stopped, found)
 
-    def test_other_repos_tickets_and_prefixes_are_untouched(self):
-        found = units.stop(PREFIX, "a-5", 5, list_fn=self.list_fn, stop_fn=self.stop_fn)
-        self.assertEqual(found, ["corral-agent-a-5-5", "corral-agent-a-5-5-r1"])
+    def test_other_repos_and_tickets_are_untouched(self):
+        self.assertEqual(self.stop("a-5", 5), ["corral-agent-a-5-5", "corral-agent-a-5-5-r1"])
+        self.assertEqual(self.stopped, ["corral-agent-a-5-5", "corral-agent-a-5-5-r1"])
+        self.stopped.clear()
+        self.assertEqual(self.stop("my-repo", 5), [])
+        self.assertEqual(self.stop("lib", 7), [])
+        self.assertEqual(self.stop("other", 5), [])
+        self.assertEqual(self.stopped, [])
+
+    def test_a_colliding_prefix_unit_is_never_stopped_without_proof(self):
+        # With the prefix "corral-agent-", the other fleet's unit parses as
+        # ("x-repo", 5); only the units.log shows it is not ours.
+        other = "corral-agent-x-repo-5"
+        self.assertEqual(units.parse_unit(PREFIX, other), ("x-repo", 5, 0))
+        self.assertEqual(units.parse_unit("corral-agent-x-", other), ("repo", 5, 0))
+        self.listing.append((other, "active", "running"))
+        session = self.log([], name="ticket-x-repo")
+        self.assertEqual(self.stop("x-repo", 5, session=session), [])
+        self.assertEqual(self.stopped, [])
         self.assertEqual(
-            units.stop(PREFIX, "my-repo", 5, list_fn=self.list_fn, stop_fn=self.stop_fn),
-            ["corral-agent-my-repo-5"],
+            units.unproven(PREFIX, "x-repo", 5, session_dir=session, list_fn=self.list_fn),
+            [other],
         )
+        # Only when this ticket's own log records the unit is it stopped.
+        session = self.log([other], name="ticket-x-repo-owned")
+        self.assertEqual(self.stop("x-repo", 5, session=session), [other])
+
+    def test_a_live_unit_missing_from_the_log_is_not_stopped_but_reported(self):
+        session = self.log([], name="unlogged")
+        self.assertEqual(self.stop("lib", 5, session=session), [])
+        self.assertEqual(self.stopped, [])
         self.assertEqual(
-            units.stop(PREFIX, "lib", 7, list_fn=self.list_fn, stop_fn=self.stop_fn), []
-        )
-        self.assertEqual(
-            units.stop(PREFIX, "other", 5, list_fn=self.list_fn, stop_fn=self.stop_fn), []
+            units.unproven(PREFIX, "lib", 5, session_dir=session, list_fn=self.list_fn),
+            ["corral-agent-lib-5", "corral-agent-lib-5-r1"],
         )
 
-    def test_stop_fn_and_list_fn_are_required(self):
-        # Keyword arguments are passed through a dict so the type checker
-        # does not reject the deliberately incomplete calls.
-        for kwargs in ({"list_fn": self.list_fn}, {"stop_fn": self.stop_fn}, {}):
-            with self.subTest(kwargs=sorted(kwargs)), self.assertRaises(TypeError):
+    def test_a_failure_partway_names_the_units_already_stopped(self):
+        def failing(unit):
+            if unit == "corral-agent-lib-5-r1":
+                raise units.Unreachable("no bus")
+            self.stopped.append(unit)
+
+        with self.assertRaises(units.Unreachable) as caught:
+            units.stop(
+                PREFIX,
+                "lib",
+                5,
+                session_dir=self.session,
+                list_fn=self.list_fn,
+                stop_fn=failing,
+            )
+        self.assertEqual(caught.exception.exit_code, 3)
+        self.assertIn("corral-agent-lib-5", str(caught.exception))
+        self.assertIn("corral-agent-lib-5-r1", str(caught.exception))
+        self.assertEqual(self.stopped, ["corral-agent-lib-5"])
+
+    def test_bad_arguments_are_refused_before_anything_is_listed(self):
+        def never(_prefix):
+            self.fail("list_fn must not run for bad arguments")
+
+        for repo, number in (("../lib", 5), ("lib.git", 5), ("lib", True), ("lib", "5")):
+            with self.subTest(repo=repo, number=number), self.assertRaises(units.UnitsError):
+                units.stop(
+                    PREFIX,
+                    repo,
+                    number,
+                    session_dir=self.session,
+                    list_fn=never,
+                    stop_fn=self.stop_fn,
+                )
+        self.assertEqual(self.stopped, [])
+
+    def test_every_argument_is_required(self):
+        full = {
+            "session_dir": self.session,
+            "list_fn": self.list_fn,
+            "stop_fn": self.stop_fn,
+        }
+        for drop in full:
+            kwargs = {k: v for k, v in full.items() if k != drop}
+            with self.subTest(missing=drop), self.assertRaises(TypeError):
                 units.stop(PREFIX, "lib", 5, **kwargs)
         self.assertEqual(self.stopped, [])
 
@@ -379,12 +507,19 @@ class StopTest(unittest.TestCase):
             raise units.Unreachable("no bus")
 
         with self.assertRaises(units.Unreachable):
-            units.stop(PREFIX, "lib", 5, list_fn=unreachable, stop_fn=self.stop_fn)
+            units.stop(
+                PREFIX,
+                "lib",
+                5,
+                session_dir=self.session,
+                list_fn=unreachable,
+                stop_fn=self.stop_fn,
+            )
         self.assertEqual(self.stopped, [])
 
 
 class SealTest(unittest.TestCase):
-    """Guards on the destructive seam: one stop argv in src, none reached from tests."""
+    """Guards on the destructive seam and on the systemd command names in src."""
 
     @staticmethod
     def _modules(*parts):
@@ -396,12 +531,34 @@ class SealTest(unittest.TestCase):
                     yield name, ast.parse(handle.read())
 
     @staticmethod
-    def _strings(node):
-        return {
-            item.value
-            for item in ast.walk(node)
-            if isinstance(item, ast.Constant) and isinstance(item.value, str)
-        }
+    def _owners(tree):
+        """Map each node id to the name of the innermost function holding it."""
+        owner = {}
+        for func in ast.walk(tree):
+            if isinstance(func, ast.FunctionDef):
+                for node in ast.walk(func):
+                    owner[id(node)] = func.name
+        return owner
+
+    def test_src_names_systemctl_and_systemd_run_only_in_their_functions(self):
+        found = set()
+        for name, tree in self._modules("src", "corral"):
+            owner = self._owners(tree)
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+                    continue
+                where = owner.get(id(node), "<module>")
+                for needle in ("systemctl", "systemd-run"):
+                    if needle in node.value:
+                        found.add((name, needle, where))
+        self.assertEqual(
+            found,
+            {
+                ("units.py", "systemctl", "list_units"),
+                ("units.py", "systemctl", STOP_NAME),
+                ("units.py", "systemd-run", "unit_argv"),
+            },
+        )
 
     def test_only_systemctl_stop_builds_a_stop_argv_in_src(self):
         found = set()
@@ -411,20 +568,27 @@ class SealTest(unittest.TestCase):
                     continue
                 for node in ast.walk(func):
                     if isinstance(node, (ast.List, ast.Tuple)):
-                        strings = self._strings(node)
+                        strings = {
+                            item.value
+                            for item in ast.walk(node)
+                            if isinstance(item, ast.Constant) and isinstance(item.value, str)
+                        }
                         if {"systemctl", "stop"} <= strings:
                             found.add((name, func.name))
-        self.assertEqual(found, {("units.py", "systemctl_stop")})
+        self.assertEqual(found, {("units.py", STOP_NAME)})
 
-    def test_no_test_calls_the_production_stop(self):
+    def test_no_test_reaches_the_production_stop(self):
         for name, tree in self._modules("tests"):
             for node in ast.walk(tree):
-                if isinstance(node, ast.Call):
-                    callee = node.func
-                    called = getattr(callee, "id", None) or getattr(callee, "attr", None)
-                    self.assertNotEqual(called, "systemctl_stop", name)
-                if isinstance(node, ast.Name) and node.id == "systemctl_stop":
-                    self.fail(f"{name} references systemctl_stop")
+                if isinstance(node, ast.Attribute):
+                    self.assertNotEqual(node.attr, STOP_NAME, name)
+                elif isinstance(node, ast.Name):
+                    self.assertNotEqual(node.id, STOP_NAME, name)
+                elif isinstance(node, ast.alias):
+                    self.assertFalse(node.name.endswith(STOP_NAME), name)
+                    self.assertNotEqual(node.asname, STOP_NAME, name)
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    self.assertNotIn(STOP_NAME, node.value, name)
 
 
 if __name__ == "__main__":

@@ -64,6 +64,14 @@ def sessions_dir(env=None):
 REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
+def plain_repo_name(repo):
+    """True for a plain repository name: one path part, not a `.git` name.
+
+    The one rule every repo-named path or unit name shares.
+    """
+    return isinstance(repo, str) and bool(REPO_NAME.fullmatch(repo)) and not repo.endswith(".git")
+
+
 def ticket_session_dir(repo, number, env=None, root=None):
     """One ticket's session dir, `<sessions>/<repo>-<number>`.
 
@@ -72,7 +80,7 @@ def ticket_session_dir(repo, number, env=None, root=None):
     number that is not a positive integer, is a usage error.
     """
     repo = str(repo or "")
-    if not REPO_NAME.fullmatch(repo) or repo.endswith(".git"):
+    if not plain_repo_name(repo):
         raise PathError(f"repo name {repo!r} is not a plain repository name")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise PathError(f"ticket number {number!r} must be a positive integer")
