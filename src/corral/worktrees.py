@@ -1,22 +1,24 @@
 """One worktree per ticket: the checkout a ticket's agent works in.
 
-The branch name comes from the ``git.branch`` setting and the directory
-from ``git.worktrees``, both read from the registry (`corral.settings`),
-never restated here. Every git call goes through the one seam `git`,
-which runs with `gitenv.clean_env()`.
+The caller resolves the `git.branch` and `git.worktrees` settings once,
+through `corral.settings`, and passes the values in. This module never
+reads the registry, so it cannot disagree with the caller about a default.
+Every git call goes through the one seam `git`, which runs with
+`gitenv.clean_env()`.
 
-`ensure_worktree` reuses, in order: a worktree already on the ticket's
-branch, a local ticket branch, the ticket branch on origin (an open PR's
-head). Otherwise it creates the branch from ``origin/<default_branch>``.
-A leftover directory that git does not have on that branch is refused,
-never reused. Removal belongs to host hygiene, not here.
+`ensure_worktree` picks a ticket's branch: the one that already has a
+worktree, else the one ticket branch that exists (local or on origin), else
+a branch rendered from the title. Several candidates with no clear winner
+are refused, never picked by name. A stale local branch is fast-forwarded to
+origin's when it is an ancestor and checked out nowhere; diverged branches
+are refused. The worktree lives under the root, which must sit inside the
+main clone. Removal belongs to host hygiene, not here.
 """
 
 import os
 import re
 import subprocess
 
-from corral import settings
 from corral.gitenv import clean_env
 
 TYPES = ("feat", "fix", "docs", "test", "ci", "build", "chore", "refactor", "perf", "revert")
@@ -33,7 +35,11 @@ FALLBACK_SLUG = "ticket"
 GIT_TIMEOUT_S = 300
 
 TITLE_TYPE_RE = re.compile(r"^([A-Za-z][\w.-]*)(?:\([^)]*\))?!?:")
-TICKET_BRANCH_RE = re.compile(r"^(?P<type>[A-Za-z][\w.-]*)/(?P<number>\d+)-(?P<slug>[\w.-]+)$")
+
+#: A ticket branch: `<type>/<n>-<slug>`. The type grammar is the one
+#: scripts/pre_pr_check.py enforces (lowercase letters); the number has no
+#: leading zero, so `feat/5-x` and `feat/50-x` never alias one ticket.
+TICKET_BRANCH_RE = re.compile(r"^(?P<type>[a-z]+)/(?P<number>[1-9][0-9]*)-(?P<slug>[\w.-]+)$")
 
 
 class WorktreeError(RuntimeError):
@@ -72,6 +78,31 @@ def _ok(run, args, cwd):
     return run(args, cwd).returncode == 0
 
 
+def _check_number(number):
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise WorktreeError(f"ticket number {number!r} must be a positive integer")
+
+
+def _check_branch(branch, number):
+    """The TICKET_BRANCH_RE match for `branch`, which must be ticket `number`'s."""
+    match = TICKET_BRANCH_RE.match(branch or "")
+    if not match:
+        raise WorktreeError(
+            f"branch {branch!r} is not <type>/<n>-<slug> (lowercase type, "
+            "number without a leading zero)"
+        )
+    if int(match.group("number")) != number:
+        raise WorktreeError(f"branch {branch!r} is not ticket #{number}")
+    return match
+
+
+def _inside(path, parent):
+    """True when `path` is strictly below `parent`; both are real paths."""
+    if path == parent:
+        return False
+    return os.path.commonpath([path, parent]) == parent
+
+
 def slugify(title):
     """The title without its Conventional prefix, as lowercase hyphenated words.
 
@@ -89,24 +120,25 @@ def slugify(title):
     return slug.rstrip("-") or FALLBACK_SLUG
 
 
-def branch_for(number, title, template=None):
-    """The ticket's branch, rendered from the `git.branch` template.
+def branch_for(number, title, *, template):
+    """The ticket's branch, rendered from `template` (the resolved `git.branch`).
 
-    `template` defaults to the registry's default for `git.branch`. Its
     `{type}` comes from a Conventional title prefix when it is one of
     `TYPES`, else `DEFAULT_TYPE`; `{issue}` is the number and `{slug}` is
-    `slugify(title)`.
+    `slugify(title)`. The rendered name must match TICKET_BRANCH_RE for
+    this number, else WorktreeError.
     """
-    if template is None:
-        template = str(settings.REGISTRY["git.branch"].default)
+    _check_number(number)
     match = TITLE_TYPE_RE.match((title or "").strip())
     kind = match.group(1).lower() if match else ""
     if kind not in TYPES:
         kind = DEFAULT_TYPE
     try:
-        return template.format(type=kind, issue=number, slug=slugify(title))
+        branch = template.format(type=kind, issue=number, slug=slugify(title))
     except (KeyError, IndexError, ValueError) as err:
         raise WorktreeError(f"git.branch {template!r} is not a valid template: {err}") from None
+    _check_branch(branch, number)
+    return branch
 
 
 def parse_worktree_list(text):
@@ -134,9 +166,53 @@ def ticket_branches(number, names):
     return sorted(out)
 
 
-def _check_number(number):
-    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-        raise WorktreeError(f"ticket number {number!r} must be a positive integer")
+def _resolve_root(main, root):
+    """The real path of the worktree root; it must sit strictly inside the clone."""
+    absolute = root if os.path.isabs(root) else os.path.join(main, root)
+    real = os.path.realpath(absolute)
+    if not _inside(real, main):
+        raise WorktreeError(
+            f"worktree root {root!r} resolves to {real}, outside the main clone {main}"
+        )
+    return real
+
+
+def _ticket_names(number, run, main):
+    """Ticket `number`'s branches, local or on origin, sorted and unique."""
+    local = _out(run, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"], main)
+    remote = _out(
+        run,
+        ["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/"],
+        main,
+    )
+    return sorted(set(ticket_branches(number, local.splitlines() + remote.splitlines())))
+
+
+def _sync_local(branch, checked_out, main, run):
+    """Bring a stale local `branch` up to origin's, when that is safe.
+
+    A branch checked out anywhere is never moved. A local branch that is an
+    ancestor of origin's is fast-forwarded; one ahead of origin is kept; one
+    that has diverged is refused.
+    """
+    if branch in checked_out:
+        return
+    if not _ok(run, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], main):
+        return
+    if not _ok(run, ["show-ref", "--verify", "--quiet", f"refs/remotes/origin/{branch}"], main):
+        return
+    local = _out(run, ["rev-parse", f"refs/heads/{branch}"], main).strip()
+    remote = _out(run, ["rev-parse", f"refs/remotes/origin/{branch}"], main).strip()
+    if local == remote:
+        return
+    if _ok(run, ["merge-base", "--is-ancestor", local, remote], main):
+        _out(run, ["branch", "-f", branch, remote], main)
+        return
+    if _ok(run, ["merge-base", "--is-ancestor", remote, local], main):
+        return
+    raise WorktreeError(
+        f"local {branch} and origin/{branch} have diverged in {main}: reconcile them, then retry"
+    )
 
 
 def ensure_worktree(
@@ -144,50 +220,69 @@ def ensure_worktree(
     number,
     *,
     default_branch,
+    branch_template,
+    root,
     title=None,
     branch=None,
-    root=None,
     git=git,
 ):
     """``(workdir, branch)`` for ticket `number`, created if it does not exist.
 
-    `root` is the worktree directory, relative to `main_clone` or absolute;
-    it defaults to the registry's `git.worktrees`. `branch` pins the branch;
-    when absent it is the ticket's existing branch, else `branch_for(number,
-    title)`, so a caller that wants the `git.branch` setting honoured passes
-    the branch it rendered with `branch_for(..., template=...)`.
+    The caller resolves `branch_template` (`git.branch`) and `root`
+    (`git.worktrees`) through `corral.settings` and passes them in. `root`
+    is relative to `main_clone` or absolute, and must resolve inside it.
+    `branch` pins the branch and must be ticket `number`'s. Without it, the
+    ticket's branch is the one that already has a worktree; failing that the
+    only ticket branch (local or on origin); failing that a branch rendered
+    from `title`. Several candidates with no worktree are refused, never
+    picked by name.
 
-    Refused with `WorktreeError` when the main clone sits on the ticket's
-    branch, a registered worktree for it is missing on disk, a leftover
-    directory is not a worktree on it, origin cannot be fetched, or there is
-    no branch and no title to derive one.
+    Callers run this under `corral.units.spawn_lock()`, so two launches never
+    race on a ticket.
+
+    Refused with `WorktreeError` when the root escapes the clone, the main
+    clone sits on the ticket's branch, a registered worktree for it is
+    missing, outside the root or has no `.git` file, a leftover directory is
+    not a worktree on it, local and origin have diverged, origin cannot be
+    fetched, or there is no branch and no title to derive one.
     """
     _check_number(number)
     if not os.path.isdir(main_clone):
         raise WorktreeError(f"no main clone at {main_clone}")
     main = os.path.realpath(main_clone)
-    if root is None:
-        root = str(settings.REGISTRY["git.worktrees"].default)
+    real_root = _resolve_root(main, root)
     fetched = git(["fetch", "--quiet", "origin"], main)
     if fetched.returncode != 0:
         raise WorktreeError(f"cannot fetch origin in {main}: {_tail(fetched)}")
 
     trees = parse_worktree_list(_out(git, ["worktree", "list", "--porcelain"], main))
-    if branch is None:
-        local = _out(git, ["for-each-ref", "--format=%(refname:short)", "refs/heads/"], main)
-        found = ticket_branches(number, local.splitlines())
-        if not found:
-            remote = _out(
-                git,
-                ["for-each-ref", "--format=%(refname:lstrip=3)", "refs/remotes/origin/"],
-                main,
+    checked_out = set(trees.values())
+    if branch is not None:
+        _check_branch(branch, number)
+    else:
+        names = _ticket_names(number, git, main)
+        with_tree = [name for name in names if name in checked_out]
+        if len(with_tree) > 1:
+            raise WorktreeError(
+                f"#{number} has worktrees on several ticket branches: "
+                f"{', '.join(with_tree)}; pass branch= to choose one"
             )
-            found = ticket_branches(number, remote.splitlines())
-        branch = found[0] if found else None
-    if branch is None:
-        if not title:
+        if with_tree:
+            branch = with_tree[0]
+        elif len(names) > 1:
+            raise WorktreeError(
+                f"#{number} has several ticket branches and no worktree: "
+                f"{', '.join(names)}; pass branch= to choose one"
+            )
+        elif names:
+            branch = names[0]
+        elif title:
+            branch = branch_for(number, title, template=branch_template)
+        else:
             raise WorktreeError(f"#{number}: no ticket branch and no title to derive one")
-        branch = branch_for(number, title)
+    match = _check_branch(branch, number)
+
+    _sync_local(branch, checked_out, main, git)
 
     for path, current in trees.items():
         if current != branch:
@@ -201,11 +296,15 @@ def ensure_worktree(
             raise WorktreeError(
                 f"{path} is registered for {branch} but missing: run `git -C {main} worktree prune`"
             )
+        if not _inside(os.path.realpath(path), real_root):
+            raise WorktreeError(
+                f"{path} is registered for {branch} but outside the worktree root {real_root}"
+            )
+        if not os.path.exists(os.path.join(path, ".git")):
+            raise WorktreeError(f"{path} is registered for {branch} but has no .git file")
         return path, branch
 
-    match = TICKET_BRANCH_RE.match(branch)
-    slug = match.group("slug") if match else slugify(branch)
-    dest = os.path.join(main, root, f"{number}-{slug}")
+    dest = os.path.join(real_root, f"{number}-{match.group('slug')}")
     if os.path.lexists(dest):
         raise WorktreeError(
             f"{dest} exists but is not a worktree on {branch}: remove it or pass the right branch"

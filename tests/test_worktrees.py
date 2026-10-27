@@ -4,15 +4,21 @@ Real git in temp dirs. The bare repository in a temp dir is `origin`, so
 nothing leaves the machine.
 """
 
+import inspect
 import os
+import re
 import shutil
 import tempfile
 import unittest
 
-from corral import worktrees
+from corral import settings, worktrees
 from corral.worktrees import WorktreeError
 
 from tests.test_reviewrecord import git_in
+
+TEMPLATE = "{type}/{issue}-{slug}"
+ROOT = ".worktrees"
+PRE_PR_CHECK = os.path.join(os.path.dirname(__file__), "..", "scripts", "pre_pr_check.py")
 
 
 class SlugifyTest(unittest.TestCase):
@@ -24,12 +30,12 @@ class SlugifyTest(unittest.TestCase):
 
     def test_punctuation_and_runs_of_separators_become_one_hyphen(self):
         self.assertEqual(
-            worktrees.slugify("Add a parser,  with   punctuation!"), "add-a-parser-with-punctuation"
+            worktrees.slugify("Add a parser,  with   punctuation!"),
+            "add-a-parser-with-punctuation",
         )
 
     def test_cuts_at_the_last_whole_word_within_forty_characters(self):
-        title = "aaaa " * 12
-        slug = worktrees.slugify(title)
+        slug = worktrees.slugify("aaaa " * 12)
         self.assertEqual(slug, "-".join(["aaaa"] * 8)[:39])
         self.assertLessEqual(len(slug), worktrees.MAX_SLUG)
 
@@ -44,29 +50,35 @@ class SlugifyTest(unittest.TestCase):
 
 class BranchForTest(unittest.TestCase):
     def test_the_type_comes_from_a_known_conventional_prefix(self):
-        self.assertEqual(worktrees.branch_for(7, "fix(api)!: handle it"), "fix/7-handle-it")
-        self.assertEqual(worktrees.branch_for(7, "Docs: Write it"), "docs/7-write-it")
-        self.assertEqual(worktrees.branch_for(7, "revert: undo"), "revert/7-undo")
+        render = lambda title: worktrees.branch_for(7, title, template=TEMPLATE)
+        self.assertEqual(render("fix(api)!: handle it"), "fix/7-handle-it")
+        self.assertEqual(render("Docs: Write it"), "docs/7-write-it")
+        self.assertEqual(render("revert: undo"), "revert/7-undo")
 
     def test_an_unknown_or_missing_prefix_means_feat(self):
-        self.assertEqual(worktrees.branch_for(7, "wip: half done"), "feat/7-half-done")
-        self.assertEqual(worktrees.branch_for(7, "No prefix here"), "feat/7-no-prefix-here")
-        self.assertEqual(worktrees.branch_for(7, None), "feat/7-ticket")
+        render = lambda title: worktrees.branch_for(7, title, template=TEMPLATE)
+        self.assertEqual(render("wip: half done"), "feat/7-half-done")
+        self.assertEqual(render("No prefix here"), "feat/7-no-prefix-here")
+        self.assertEqual(render(None), "feat/7-ticket")
 
-    def test_the_default_template_is_the_git_branch_setting(self):
-        default = worktrees.settings.REGISTRY["git.branch"].default
-        self.assertEqual(default, "{type}/{issue}-{slug}")
-        self.assertEqual(worktrees.branch_for(3, "fix: x", template=default), "fix/3-x")
-
-    def test_an_explicit_template_is_rendered(self):
+    def test_the_template_is_the_caller_s_and_is_required(self):
         self.assertEqual(
-            worktrees.branch_for(3, "fix: x", template="wip/{issue}/{type}-{slug}"),
-            "wip/3/fix-x",
+            worktrees.branch_for(3, "fix: x", template="task/{issue}-{slug}"), "task/3-x"
         )
+        for name in ("branch_for", "ensure_worktree"):
+            params = inspect.signature(getattr(worktrees, name)).parameters
+            for key in ("template", "branch_template", "root", "default_branch"):
+                if key in params:
+                    self.assertIs(params[key].default, inspect.Parameter.empty, f"{name}.{key}")
+                    self.assertIs(params[key].kind, inspect.Parameter.KEYWORD_ONLY)
 
-    def test_a_template_with_an_unknown_field_is_refused(self):
-        with self.assertRaises(WorktreeError):
-            worktrees.branch_for(3, "fix: x", template="{nope}/{issue}")
+    def test_a_template_that_does_not_render_the_grammar_is_refused(self):
+        for template in ("feature/{issue}", "{type}/{issue}", "{nope}/{issue}-{slug}"):
+            with self.subTest(template=template), self.assertRaises(WorktreeError):
+                worktrees.branch_for(3, "fix: x", template=template)
+
+    def test_the_registry_default_is_the_documented_template(self):
+        self.assertEqual(settings.REGISTRY["git.branch"].default, TEMPLATE)
 
 
 class ParseWorktreeListTest(unittest.TestCase):
@@ -117,6 +129,51 @@ class TicketBranchesTest(unittest.TestCase):
         self.assertEqual(worktrees.ticket_branches(2, ["fix/22-x", "fix/2-x"]), ["fix/2-x"])
 
 
+class BranchGrammarTest(unittest.TestCase):
+    """TICKET_BRANCH_RE and the branch check in scripts/pre_pr_check.py agree on the type."""
+
+    @staticmethod
+    def _pre_pr_check_regex():
+        with open(PRE_PR_CHECK, encoding="utf-8") as handle:
+            source = handle.read()
+        match = re.search(r'^BRANCH_RE = re\.compile\(r"(.*)"\)$', source, re.MULTILINE)
+        if match is None:
+            raise AssertionError("BRANCH_RE not found in scripts/pre_pr_check.py")
+        return re.compile(match.group(1))
+
+    def test_both_accept_and_reject_the_same_sample_names(self):
+        pre = self._pre_pr_check_regex()
+        samples = [
+            "feat/7-x",
+            "fix/12-a.b",
+            "docs/3-x_y",
+            "chore/9-Mixed",
+            "x/1-y",
+            "Feat/7-x",
+            "FEAT/7-x",
+            "a1/7-x",
+            "feat7-x",
+            "feat/-x",
+            "feat/7",
+            "feat/7-",
+            "feat/7-x y",
+            "feat/7-x/y",
+            "feat-x/7-y",
+        ]
+        for name in samples:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    bool(pre.match(name)),
+                    bool(worktrees.TICKET_BRANCH_RE.match(name)),
+                )
+
+    def test_a_zero_padded_number_is_refused(self):
+        for name in ("feat/07-x", "feat/0-x", "feat/00-x"):
+            with self.subTest(name=name):
+                self.assertIsNone(worktrees.TICKET_BRANCH_RE.match(name))
+        self.assertIsNotNone(worktrees.TICKET_BRANCH_RE.match("feat/10-x"))
+
+
 class EnsureWorktreeTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -135,6 +192,8 @@ class EnsureWorktreeTest(unittest.TestCase):
 
     def ensure(self, number, **kwargs):
         kwargs.setdefault("default_branch", "master")
+        kwargs.setdefault("branch_template", TEMPLATE)
+        kwargs.setdefault("root", ROOT)
         return worktrees.ensure_worktree(self.main, number, **kwargs)
 
     def worktree_count(self):
@@ -142,12 +201,22 @@ class EnsureWorktreeTest(unittest.TestCase):
             worktrees.parse_worktree_list(git_in(self.main, "worktree", "list", "--porcelain"))
         )
 
+    def real_main(self):
+        return os.path.realpath(self.main)
+
+    def push_seed_branch(self, name, commit=True):
+        git_in(self.seed, "checkout", "-q", "-B", name, "master")
+        if commit:
+            git_in(self.seed, "commit", "-q", "--allow-empty", "-m", name)
+        head = git_in(self.seed, "rev-parse", "HEAD")
+        git_in(self.seed, "push", "-q", "origin", name)
+        git_in(self.seed, "checkout", "-q", "master")
+        return head
+
     def test_a_new_ticket_gets_a_worktree_on_a_branch_from_origin_default(self):
         workdir, branch = self.ensure(7, title="feat(api): add the widget")
         self.assertEqual(branch, "feat/7-add-the-widget")
-        self.assertEqual(
-            workdir, os.path.join(os.path.realpath(self.main), ".worktrees", "7-add-the-widget")
-        )
+        self.assertEqual(workdir, os.path.join(self.real_main(), ROOT, "7-add-the-widget"))
         self.assertTrue(os.path.isdir(workdir))
         self.assertEqual(git_in(workdir, "rev-parse", "--abbrev-ref", "HEAD"), branch)
         self.assertEqual(
@@ -162,10 +231,20 @@ class EnsureWorktreeTest(unittest.TestCase):
         self.assertEqual(os.path.basename(second), "22-second")
         self.assertEqual(self.worktree_count(), 3)
 
+    def test_ticket_five_and_ticket_fifty_get_separate_worktrees(self):
+        five, five_branch = self.ensure(5, title="feat: five")
+        fifty, fifty_branch = self.ensure(50, title="feat: fifty")
+        self.assertEqual(five_branch, "feat/5-five")
+        self.assertEqual(fifty_branch, "feat/50-fifty")
+        self.assertEqual(os.path.basename(five), "5-five")
+        self.assertEqual(os.path.basename(fifty), "50-fifty")
+        self.assertNotEqual(five, fifty)
+        self.assertEqual(self.ensure(5)[0], five)
+        self.assertEqual(self.ensure(50)[0], fifty)
+
     def test_an_existing_worktree_on_the_ticket_branch_is_reused(self):
         first = self.ensure(7, title="feat: x")
-        again = self.ensure(7, title="feat: x")
-        self.assertEqual(first, again)
+        self.assertEqual(first, self.ensure(7, title="feat: x"))
         self.assertEqual(self.worktree_count(), 2)
 
     def test_a_local_ticket_branch_without_a_worktree_is_reused(self):
@@ -175,10 +254,7 @@ class EnsureWorktreeTest(unittest.TestCase):
         self.assertEqual(os.path.basename(workdir), "7-old-name")
 
     def test_a_branch_on_origin_only_is_reused_at_its_head(self):
-        git_in(self.seed, "checkout", "-q", "-b", "fix/7-pr-head")
-        git_in(self.seed, "commit", "-q", "--allow-empty", "-m", "pr work")
-        git_in(self.seed, "push", "-q", "origin", "fix/7-pr-head")
-        head = git_in(self.seed, "rev-parse", "HEAD")
+        head = self.push_seed_branch("fix/7-pr-head")
         workdir, branch = self.ensure(7)
         self.assertEqual(branch, "fix/7-pr-head")
         self.assertEqual(git_in(workdir, "rev-parse", "HEAD"), head)
@@ -188,12 +264,102 @@ class EnsureWorktreeTest(unittest.TestCase):
         self.assertEqual(branch, "feat/7-custom")
         self.assertEqual(os.path.basename(workdir), "7-custom")
 
-    def test_a_custom_root_is_honoured_relative_and_absolute(self):
+    def test_an_explicit_branch_for_another_ticket_is_refused(self):
+        with self.assertRaisesRegex(WorktreeError, "not ticket #7"):
+            self.ensure(7, branch="feat/8-x")
+
+    def test_an_explicit_branch_outside_the_grammar_is_refused(self):
+        for name in ("Feat/7-x", "feat/07-x", "feat/7", "feat-x/7-y"):
+            with self.subTest(name=name), self.assertRaises(WorktreeError):
+                self.ensure(7, branch=name)
+
+    def test_several_ticket_branches_without_a_worktree_are_refused_and_listed(self):
+        git_in(self.main, "branch", "feat/7-a", "origin/master")
+        self.push_seed_branch("fix/7-b")
+        with self.assertRaisesRegex(WorktreeError, "feat/7-a, fix/7-b"):
+            self.ensure(7, title="feat: ignored")
+        self.assertEqual(self.worktree_count(), 1)
+
+    def test_the_one_ticket_branch_with_a_worktree_wins_over_the_others(self):
+        git_in(self.main, "branch", "feat/7-a", "origin/master")
+        self.ensure(7, branch="feat/7-a")
+        self.push_seed_branch("fix/7-b")
+        workdir, branch = self.ensure(7)
+        self.assertEqual(branch, "feat/7-a")
+        self.assertEqual(os.path.basename(workdir), "7-a")
+
+    def test_several_ticket_branches_with_worktrees_are_refused_and_listed(self):
+        git_in(self.main, "branch", "feat/7-a", "origin/master")
+        self.ensure(7, branch="feat/7-a")
+        self.push_seed_branch("fix/7-b")
+        self.ensure(7, branch="fix/7-b")
+        with self.assertRaisesRegex(WorktreeError, "feat/7-a, fix/7-b"):
+            self.ensure(7)
+
+    def test_a_stale_local_branch_is_fast_forwarded_to_origin(self):
+        git_in(self.main, "branch", "feat/7-x", "origin/master")
+        head = self.push_seed_branch("feat/7-x")
+        workdir, branch = self.ensure(7)
+        self.assertEqual(branch, "feat/7-x")
+        self.assertEqual(git_in(self.main, "rev-parse", "refs/heads/feat/7-x"), head)
+        self.assertEqual(git_in(workdir, "rev-parse", "HEAD"), head)
+
+    def test_a_local_branch_ahead_of_origin_is_kept(self):
+        self.push_seed_branch("feat/7-x", commit=False)
+        git_in(self.main, "fetch", "-q", "origin")
+        git_in(self.main, "checkout", "-q", "-b", "feat/7-x", "origin/feat/7-x")
+        git_in(self.main, "commit", "-q", "--allow-empty", "-m", "local work")
+        local = git_in(self.main, "rev-parse", "HEAD")
+        git_in(self.main, "checkout", "-q", "master")
+        workdir, _ = self.ensure(7)
+        self.assertEqual(git_in(self.main, "rev-parse", "refs/heads/feat/7-x"), local)
+        self.assertEqual(git_in(workdir, "rev-parse", "HEAD"), local)
+
+    def test_diverged_local_and_origin_branches_are_refused_and_left_alone(self):
+        git_in(self.main, "checkout", "-q", "-b", "feat/7-x", "origin/master")
+        git_in(self.main, "commit", "-q", "--allow-empty", "-m", "local")
+        local = git_in(self.main, "rev-parse", "HEAD")
+        git_in(self.main, "checkout", "-q", "master")
+        self.push_seed_branch("feat/7-x")
+        with self.assertRaisesRegex(WorktreeError, "diverged"):
+            self.ensure(7)
+        self.assertEqual(git_in(self.main, "rev-parse", "refs/heads/feat/7-x"), local)
+
+    def test_a_stale_branch_checked_out_in_a_worktree_is_not_moved(self):
+        git_in(self.main, "branch", "feat/7-x", "origin/master")
+        workdir, _ = self.ensure(7, branch="feat/7-x")
+        old = git_in(self.main, "rev-parse", "refs/heads/feat/7-x")
+        self.push_seed_branch("feat/7-x")
+        self.assertEqual(self.ensure(7)[0], workdir)
+        self.assertEqual(git_in(self.main, "rev-parse", "refs/heads/feat/7-x"), old)
+
+    def test_a_custom_relative_root_is_honoured(self):
         rel, _ = self.ensure(7, title="feat: rel", root="custom/trees")
-        self.assertEqual(rel, os.path.join(os.path.realpath(self.main), "custom", "trees", "7-rel"))
-        absolute = os.path.join(self.tmp, "elsewhere")
-        abs_dir, _ = self.ensure(22, title="feat: abs", root=absolute)
-        self.assertEqual(abs_dir, os.path.join(absolute, "22-abs"))
+        self.assertEqual(rel, os.path.join(self.real_main(), "custom", "trees", "7-rel"))
+
+    def test_an_absolute_root_inside_the_clone_is_honoured(self):
+        inside = os.path.join(self.main, "trees")
+        workdir, _ = self.ensure(22, title="feat: abs", root=inside)
+        self.assertEqual(workdir, os.path.join(os.path.realpath(inside), "22-abs"))
+
+    def test_a_root_outside_the_clone_is_refused(self):
+        outside = os.path.join(self.tmp, "elsewhere")
+        for root in (outside, "../escape", "..", "."):
+            with self.subTest(root=root), self.assertRaisesRegex(WorktreeError, "outside"):
+                self.ensure(7, title="feat: x", root=root)
+        self.assertFalse(os.path.exists(outside))
+
+    def test_a_registered_worktree_outside_the_root_is_refused(self):
+        outside = os.path.join(self.tmp, "outside")
+        git_in(self.main, "worktree", "add", "-q", "-b", "feat/7-out", outside, "origin/master")
+        with self.assertRaisesRegex(WorktreeError, "outside the worktree root"):
+            self.ensure(7)
+
+    def test_a_registered_worktree_without_a_git_file_is_refused(self):
+        workdir, _ = self.ensure(7, title="feat: broken")
+        os.remove(os.path.join(workdir, ".git"))
+        with self.assertRaisesRegex(WorktreeError, "no .git file"):
+            self.ensure(7, title="feat: broken")
 
     def test_the_git_seam_is_the_only_way_git_runs(self):
         calls = []
@@ -205,7 +371,7 @@ class EnsureWorktreeTest(unittest.TestCase):
         self.ensure(7, title="feat: seam", git=recording)
         self.assertTrue(calls)
         self.assertEqual(calls[0][0], "fetch")
-        self.assertTrue(all(cwd == os.path.realpath(self.main) for _, cwd in calls))
+        self.assertTrue(all(cwd == self.real_main() for _, cwd in calls))
 
     def test_refused_when_the_main_clone_sits_on_the_ticket_branch(self):
         git_in(self.main, "checkout", "-q", "-b", "feat/7-here")
@@ -219,7 +385,7 @@ class EnsureWorktreeTest(unittest.TestCase):
             self.ensure(7, title="feat: gone")
 
     def test_refused_when_a_leftover_directory_is_not_a_worktree_on_the_branch(self):
-        os.makedirs(os.path.join(self.main, ".worktrees", "7-leftover"))
+        os.makedirs(os.path.join(self.main, ROOT, "7-leftover"))
         with self.assertRaisesRegex(WorktreeError, "not a worktree"):
             self.ensure(7, title="feat: leftover")
 
@@ -230,7 +396,12 @@ class EnsureWorktreeTest(unittest.TestCase):
     def test_refused_without_a_main_clone(self):
         with self.assertRaisesRegex(WorktreeError, "no main clone"):
             worktrees.ensure_worktree(
-                os.path.join(self.tmp, "absent"), 7, default_branch="master", title="feat: x"
+                os.path.join(self.tmp, "absent"),
+                7,
+                default_branch="master",
+                branch_template=TEMPLATE,
+                root=ROOT,
+                title="feat: x",
             )
 
     def test_refused_when_origin_cannot_be_fetched(self):

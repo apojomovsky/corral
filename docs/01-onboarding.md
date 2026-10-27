@@ -76,7 +76,7 @@ Everything a project might reasonably do differently is a named setting with a d
 | `project.name` | the repository name | also the default unit prefix |
 | `project.units.prefix` | `<name>-agent` | |
 | `git.default_branch` | detected from the remote | |
-| `git.branch` | `{type}/{issue}-{slug}` | a template, so `feature/{issue}` works too |
+| `git.branch` | `{type}/{issue}-{slug}` | a template that must render `<type>/<n>-<slug>` (lowercase type, no leading zero in `<n>`); `feature/{issue}` alone does not |
 | `git.worktrees` | `.worktrees/` | relative to the clone |
 | `git.commits.conventional` | `true` | the commit-msg hook can be turned off |
 | `board.ready` | label `ready` | which issues an agent may take |
