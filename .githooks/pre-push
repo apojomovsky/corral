@@ -22,7 +22,25 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   fi
 done
 
+# Suite stamp: a verified push (`corral push`) retries a dropped connection,
+# and the retry must not pay for the suite twice. Stamp the tree the suite
+# passed, keyed on the tree hash plus this hook's own content hash, so any
+# tree or hook change runs the suite again. src/corral/push.py computes the
+# same stamp with `git hash-object`.
+stamp_file="$(git rev-parse --absolute-git-dir 2>/dev/null)/corral-pre-push-stamp"
+tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
+hook_sum="$(git hash-object "${0}" 2>/dev/null)"
+if [ -n "$tree" ] && [ -n "$hook_sum" ] && [ -f "$stamp_file" ] \
+    && grep -qx "$tree $hook_sum" "$stamp_file" 2>/dev/null; then
+    echo "pre-push: suite already passed for this tree, skipping"
+    exit 0
+fi
+
 uv run --locked --quiet python -m unittest discover -t . -s tests >/dev/null 2>&1 || {
     echo "pre-push: test suite failed (make test)" >&2
     exit 2
 }
+
+if [ -n "$tree" ] && [ -n "$hook_sum" ]; then
+    printf '%s %s\n' "$tree" "$hook_sum" > "$stamp_file" 2>/dev/null || true
+fi
