@@ -25,11 +25,11 @@ def _ticket(args):
 def _ticket_text(entry):
     from corral import registry
 
-    held = registry.ticket_of(entry)
-    if held is None:
+    if registry.ticket_of(entry) is None:
         return "-"
-    project, repo, number = held
-    return f"{project + '/' if project else ''}{repo} {number}"
+    ticket = entry["ticket"]
+    project = ticket.get("project")
+    return f"{project + '/' if project else ''}{ticket['repo']} {ticket['number']}"
 
 
 def cmd_agent(args: argparse.Namespace) -> int:

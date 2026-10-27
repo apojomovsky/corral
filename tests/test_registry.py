@@ -112,6 +112,40 @@ class LifecycleTest(RegistryCase):
         self.register("." * 3)
         self.assertEqual(len(reg.load_all(self.path)), 3)
 
+    def test_a_second_done_is_refused_and_keeps_the_first_outcome(self):
+        self.register()
+        reg.done("a1", outcome="ok", now=T0 + 1, path=self.path)
+        with self.assertRaises(reg.RegistryError):
+            reg.done("a1", outcome="failed", now=T0 + 2, path=self.path)
+        self.assertEqual(self.entry()["outcome"], "ok")
+
+    def test_a_pid_below_one_is_refused(self):
+        for pid in (0, -1, True):
+            with self.subTest(pid=pid), self.assertRaises(reg.RegistryError):
+                self.register(pid=pid)
+
+    def test_entries_with_wrong_types_are_skipped(self):
+        self.register()
+        for name, bad in (
+            ("num.json", {"id": 5, "ended_at": 1.0}),
+            ("when.json", {"id": "w", "started_at": "yesterday"}),
+            ("pid.json", {"id": "p", "pid": "12"}),
+        ):
+            with open(os.path.join(self.path, name), "w", encoding="utf-8") as handle:
+                json.dump(bad, handle)
+        self.assertEqual([e["id"] for e in reg.load_all(self.path)], ["a1"])
+        self.register("b1", now=T0 + 1)
+        self.assertEqual(sorted(e["id"] for e in reg.load_all(self.path)), ["a1", "b1"])
+
+    def test_gc_removes_the_file_it_read_not_the_one_its_id_names(self):
+        self.register("live", now=T0)
+        old = dict(self.entry("live"), ended_at=T0 - 3 * reg.RETAIN_S)
+        with open(os.path.join(self.path, "copy.json"), "w", encoding="utf-8") as handle:
+            json.dump(old, handle)
+        self.register("other", now=T0 + 1)
+        names = sorted(os.listdir(self.path))
+        self.assertEqual(names, [".lock", "live.json", "other.json"])
+
     def test_corrupt_files_are_skipped(self):
         self.register()
         with open(os.path.join(self.path, "junk.json"), "w", encoding="utf-8") as handle:
@@ -200,26 +234,37 @@ class CapTest(RegistryCase):
     """Only live ticket workers count; one ticket is one slot."""
 
     def counted(self, now=T0 + 1, cfg=CFG):
-        return reg.counted_tickets(now, cfg, self.path, alive)
+        return reg.counted_tickets(now, cfg, self.path, alive, HOST)
 
     def test_a_ticket_counts_and_no_ticket_never_does(self):
         self.register("worker", ticket=ticket())
         self.register("reviewer")
         self.register("coordinator", runtime="human")
-        self.assertEqual(self.counted(), {("", "lib", 5)})
+        self.assertEqual(self.counted(), {("lib", 5)})
 
     def test_two_agents_on_one_ticket_are_one_slot(self):
         self.register("w1", ticket=ticket())
         self.register("w2", runtime="omp", ticket=ticket())
         self.register("w3", ticket=ticket(number=6))
         self.register("w4", ticket=ticket(project="other"))
-        self.assertEqual(self.counted(), {("", "lib", 5), ("", "lib", 6), ("other", "lib", 5)})
+        self.register("w5", ticket=ticket(repo="app"))
+        self.assertEqual(self.counted(), {("lib", 5), ("lib", 6), ("app", 5)})
+
+    def test_an_explicit_and_an_inferred_ticket_are_one_slot(self):
+        self.register("w1", ticket=ticket(project="proj"))
+        self.register("w2")
+        reg.heartbeat("w2", ticket=ticket(), now=T0, path=self.path)
+        self.assertEqual(self.counted(), {("lib", 5)})
+
+    def test_another_hosts_agents_never_count(self):
+        self.register("w1", ticket=ticket(), host="host-2")
+        self.assertEqual(self.counted(), set())
 
     def test_stale_finished_and_disabled_do_not_count(self):
         self.register("w1", ticket=ticket(number=1))
         self.register("w2", ticket=ticket(number=2))
         reg.done("w2", now=T0 + 1, path=self.path)
-        self.assertEqual(self.counted(), {("", "lib", 1)})
+        self.assertEqual(self.counted(), {("lib", 1)})
         self.assertEqual(self.counted(now=T0 + 601), set())
         self.assertEqual(self.counted(cfg=dict(CFG, count_toward_cap=False)), set())
 
@@ -231,7 +276,7 @@ class TicketSourceTest(RegistryCase):
         self.assertEqual(
             (self.entry()["ticket"], self.entry()["ticket_source"]), (ticket(), reg.INFERRED)
         )
-        self.assertEqual(reg.counted_tickets(T0 + 2, CFG, self.path, alive), {("", "lib", 5)})
+        self.assertEqual(reg.counted_tickets(T0 + 2, CFG, self.path, alive, HOST), {("lib", 5)})
 
     def test_a_heartbeat_ticket_corrects_an_older_inference(self):
         self.register()

@@ -14,9 +14,11 @@ once; no heartbeat for ``registry.stale_s`` reads ``stale``, for
 write). A ``done`` entry is ``finished`` for ``RETAIN_S``.
 
 A ticket is plain data (``project``, ``repo``, ``number``), never a
-tracker's reference syntax. Cap accounting: a live agent holding a
-ticket counts toward the host's cap when ``registry.count_toward_cap``
-is on; one ticket is one slot however many agents hold it. Agents with
+tracker's reference syntax. Cap accounting: a live agent on this host
+holding a ticket counts toward the host's cap when
+``registry.count_toward_cap`` is on; one ticket is one slot however many
+agents hold it. A heartbeat or done for an agent already dropped is an
+unknown id (exit 4): the agent registers again. Agents with
 no ticket (reviewers, scouts, a coordinator) show but never count.
 """
 
@@ -127,28 +129,42 @@ def _read(path):
             entry = json.load(handle)
     except (OSError, ValueError):
         return None
-    return entry if isinstance(entry, dict) and entry.get("id") else None
+    if not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or not entry["id"]:
+        return None
+    for key in ("started_at", "last_seen", "ended_at"):
+        value = entry.get(key)
+        if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
+            return None
+    pid = entry.get("pid")
+    if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int)):
+        return None
+    return entry
 
 
 def _write(path, entry):
     paths.atomic_write_text(path, json.dumps(entry, sort_keys=True))
 
 
-def load_all(path=None):
-    """Every readable entry, oldest start first. Corrupt files are skipped."""
-    directory = agents_dir(path)
+def _load_files(directory):
+    """``[(file, entry)]`` for every readable entry, oldest start first."""
     try:
         names = sorted(os.listdir(directory))
     except OSError:
         return []
-    entries = []
+    found = []
     for name in names:
         if name.endswith(".json"):
-            entry = _read(os.path.join(directory, name))
+            target = os.path.join(directory, name)
+            entry = _read(target)
             if entry is not None:
-                entries.append(entry)
-    entries.sort(key=lambda e: (e.get("started_at") or 0, e["id"]))
-    return entries
+                found.append((target, entry))
+    found.sort(key=lambda pair: (pair[1].get("started_at") or 0, pair[1]["id"]))
+    return found
+
+
+def load_all(path=None):
+    """Every readable entry, oldest start first. Corrupt files are skipped."""
+    return [entry for _, entry in _load_files(agents_dir(path))]
 
 
 def pid_alive(pid):
@@ -189,11 +205,16 @@ def status(entry, now, cfg=None, alive=pid_alive, host=None):
 
 
 def ticket_of(entry):
-    """``(project, repo, number)`` an entry holds, or None."""
+    """``(repo, number)`` an entry holds, or None.
+
+    The cap key leaves the project out: an explicit ticket names it and a
+    hook's inference may not, and one ticket must stay one slot. Two
+    projects on one host sharing a repository name share its slots.
+    """
     ticket = entry.get("ticket")
     if not isinstance(ticket, dict) or not ticket.get("repo") or not ticket.get("number"):
         return None
-    return (ticket.get("project") or "", ticket["repo"], ticket["number"])
+    return (ticket["repo"], ticket["number"])
 
 
 def make_ticket(repo=None, number=None, project=None):
@@ -224,10 +245,13 @@ def _check_ticket(ticket):
 
 
 def _gc(directory, now, cfg, alive):
-    for entry in load_all(directory):
+    # The file that was read is the one removed, never a name derived
+    # from its contents: a copied or hand-edited file must not take a
+    # live agent's file with it.
+    for target, entry in _load_files(directory):
         if status(entry, now, cfg, alive) == GONE:
             try:
-                os.unlink(_file_for(directory, entry["id"]))
+                os.unlink(target)
             except OSError:
                 pass
 
@@ -260,6 +284,8 @@ def register(
     if runtime not in RUNTIMES:
         raise RegistryError(f"unknown runtime {runtime!r}: want one of {', '.join(RUNTIMES)}")
     ticket = _check_ticket(ticket)
+    if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid < 1):
+        raise RegistryError(f"bad pid {pid!r}: want a positive integer")
     moment = _as_epoch(time.time() if now is None else now)
     directory = agents_dir(path)
     with _locked(directory):
@@ -337,6 +363,8 @@ def done(agent_id, *, outcome="ok", pr=None, now=None, path=None):
     moment = _as_epoch(time.time() if now is None else now)
 
     def change(entry):
+        if entry.get("ended_at") is not None:
+            raise RegistryError(f"agent {agent_id!r} already done ({entry.get('outcome')})")
         entry["last_seen"] = moment
         entry["ended_at"] = moment
         entry["outcome"] = outcome
@@ -357,19 +385,21 @@ def visible(now, cfg=None, path=None, alive=pid_alive, host=None):
     return out
 
 
-def counted_tickets(now=None, cfg=None, path=None, alive=pid_alive):
-    """Tickets of live registered workers that count toward the cap.
+def counted_tickets(now=None, cfg=None, path=None, alive=pid_alive, host=None):
+    """``{(repo, number)}`` of live registered workers that count toward the cap.
 
     Only a live entry holding a ticket counts: stale, finished and gone
-    ones free the slot, and agents without a ticket never take one.
+    ones free the slot, and agents without a ticket never take one. Only
+    this host's entries count: the cap is a host's.
     """
+    host = host or socket.gethostname()
     cfg = cfg or config()
     if not cfg["count_toward_cap"]:
         return set()
     moment = time.time() if now is None else now
     out = set()
-    for entry, state in visible(moment, cfg, path, alive):
+    for entry, state in visible(moment, cfg, path, alive, host):
         held = ticket_of(entry)
-        if state == LIVE and held:
+        if state == LIVE and held and entry.get("host") == host:
             out.add(held)
     return out
