@@ -334,6 +334,20 @@ class GraphqlPacer:
             self.sleep(nap)
             waited += nap
 
+    def charge(self, cost: float) -> None:
+        """Deduct `cost` without waiting, for a call that goes through anyway.
+
+        A call whose wait exceeded the cap still hit the API, so it must still
+        draw on the bucket. The balance may go negative, down to -capacity, so
+        the debt stays bounded and later callers wait it off.
+        """
+
+        def take(state, now):
+            state["tokens"] = max(-self.capacity, state["tokens"] - cost)
+            return 0.0
+
+        self._update(take)
+
     def cooldown(self, seconds: float) -> None:
         seconds = min(seconds, GRAPHQL_MAX_COOLDOWN_S)
 

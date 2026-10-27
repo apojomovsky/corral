@@ -625,3 +625,17 @@ class ReadmeNaNoteTest(unittest.TestCase):
     def test_tilde_fenced_note_is_ignored(self):
         body = "Fix.\n\n~~~\nREADME: n/a\n~~~\n"
         self.assertFalse(gh.has_readme_na_note(body))
+
+
+class PacerChargeTest(unittest.TestCase):
+    def test_charge_deducts_past_the_cap_and_later_callers_wait(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pacer = gh.GraphqlPacer(
+                os.path.join(tmp, "pacing.json"), capacity=2.0, max_wait_s=0.0, now=lambda: 1000.0
+            )
+            pacer.charge(5.0)
+            # The debt is floored at -capacity: 2 - 5 becomes -2, not -3.
+            with open(os.path.join(tmp, "pacing.json")) as handle:
+                self.assertEqual(json.load(handle)["tokens"], -2.0)
+            with self.assertRaises(gh.GhError):
+                pacer.acquire(cost=1.0)

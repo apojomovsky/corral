@@ -49,6 +49,7 @@ make install      # uv tool install
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |
 | `corral prose [--verify]` | list the comment blocks a branch adds; `--verify` fails on ones that break the prose rules |
 | `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
+| `corral gh-calls [--since D] [--by-shape] [--json]` | summary of the paced `gh` calls agents make: per caller and minute, throttled totals, GraphQL query shapes; `--since` takes `30m`, `1h`, `7d`; exit 4 on a bad `--since` |
 | `corral review record REPO N --commit SHA --verdict V --author ID` | a reviewer states its verdict on one commit of a ticket, once; a self-review is refused. The record is the review gate's proof |
 | `corral review show REPO N [--commit SHA] [--base REF]` | the record a commit has, or inherits across a clean merge-up of the base; exit 0 only for `approve` or `approve-with-findings`, 1 for none or a `block` |
 | `corral agent register\|heartbeat\|done\|list` | the host's agent registry: any agent, from any runtime, reports itself; a ticket is `--repo` and `--number` (optional `--project`); exit 4 on a heartbeat means the agent was dropped and registers again |

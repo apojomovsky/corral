@@ -6,6 +6,7 @@ import sys
 from collections.abc import Sequence
 
 from corral import agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
+from corral.github import ghcli
 
 # Exit codes are a public interface (AGENTS.md).
 OK, NO, RACE, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 2, 3, 4, 75
@@ -142,6 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
     coordcli.add_parser(sub)
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
+    ghcli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
     return parser
 
