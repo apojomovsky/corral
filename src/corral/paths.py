@@ -10,6 +10,7 @@ paths built by joining onto it.
 """
 
 import os
+import re
 
 
 class PathError(ValueError):
@@ -58,6 +59,24 @@ def sessions_dir(env=None):
     """One directory per agent session: `CORRAL_SESSIONS`, else `<state>/sessions`."""
     env = os.environ if env is None else env
     return _override("CORRAL_SESSIONS", env) or os.path.join(state_dir(env), "sessions")
+
+
+_REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
+def ticket_session_dir(repo, number, env=None, root=None):
+    """One ticket's session dir, `<sessions>/<repo>-<number>`.
+
+    `root` replaces the sessions dir (tests, a reviewer outside the
+    host's session tree). A repo name that could leave the root, or a
+    number that is not a positive integer, is a usage error.
+    """
+    repo = str(repo or "")
+    if not _REPO_NAME.fullmatch(repo) or repo.endswith(".git"):
+        raise PathError(f"repo name {repo!r} is not a plain repository name")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise PathError(f"ticket number {number!r} must be a positive integer")
+    return os.path.join(root or sessions_dir(env), f"{repo}-{number}")
 
 
 def atomic_write_text(target, text):
