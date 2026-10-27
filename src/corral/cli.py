@@ -4,10 +4,10 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from corral import deps, paths
+from corral import coordcli, deps, paths
 
 # Exit codes are a public interface (AGENTS.md).
-OK, NO, USAGE = 0, 1, 4
+OK, NO, RACE, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 2, 3, 4, 75
 
 
 def cmd_deps(args: argparse.Namespace) -> int:
@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="check the host programs corral needs; print how to install what is missing",
     )
     p.set_defaults(func=cmd_deps)
+    coordcli.add_parser(sub)
     return parser
 
 

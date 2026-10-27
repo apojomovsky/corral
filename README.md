@@ -39,6 +39,15 @@ To put `corral` on your PATH from a checkout:
 make install      # uv tool install
 ```
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `corral deps` | check the host programs corral needs; print how to install what is missing |
+| `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
+
+Exit codes: `0` success, `1` nothing to do or a gate said no, `2` race lost (the lease is held, or a generation is stale), `4` usage error.
+
 ## Develop
 
 ```bash
