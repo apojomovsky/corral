@@ -39,6 +39,15 @@ To put `corral` on your PATH from a checkout:
 make install      # uv tool install
 ```
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `corral deps` | check the host programs corral needs; print how to install what is missing |
+| `corral config show [--origin] [--repo NAME] [--root PATH]` | every setting with its resolved value; `--origin` names the layer it came from and marks values clamped by a host limit |
+
+Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project.
+
 ## Develop
 
 ```bash
