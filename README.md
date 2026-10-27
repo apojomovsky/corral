@@ -1,0 +1,56 @@
+# corral
+
+An opinionated core for running fleets of headless coding agents on Linux hosts.
+
+You bring the projects: a board, the rules for which ticket is ready, the prompts. corral keeps the agents in one pen. It launches them as systemd user units, keeps their sessions, routes their models, watches the provider quota every project shares, caps how many run at once, and cleans up after them without losing work.
+
+Status: early. The host check (`corral deps`) works; the rest is being built.
+
+## Opinions
+
+corral makes these choices for you, and does not try to support the alternatives:
+
+- **Linux only.** Every agent is a transient `systemd --user` unit. macOS, Windows, containers-as-agents and other init systems are not supported as agent hosts.
+- **GitHub, behind two interfaces.** Tickets and claims (the tracker) and pull requests (the forge) each go through one interface. Today each has exactly one implementation: GitHub, through `gh`. Other providers are not supported, but adding one means writing an adapter, not redesigning corral.
+- **One ticket, one worktree, one branch.** Agents never share a checkout.
+- **Headless runtimes.** omp and opencode, one major version of each at a time.
+- **Your home config is yours.** Every launch gets its own config overlay. corral reads `~/.omp/` and `~/.config/opencode/` and never writes them.
+- **One pool per host.** All projects on a host share one cap, one quota ledger and one GitHub rate budget, so one project cannot starve another without the others noticing.
+- **Proof before removal.** corral deletes a branch, worktree, cache or session only once it can show nothing is lost.
+- **Network-agnostic.** Across hosts, corral sees `host:port` and a token. LAN, Tailscale or anything else that gives each host an address will do.
+- **uv and the standard library.** No runtime dependencies.
+
+Why, and how the pieces fit: [`docs/00-design.md`](docs/00-design.md). Bringing a project in, new or existing: [`docs/01-onboarding.md`](docs/01-onboarding.md).
+
+## Install
+
+You need [uv](https://docs.astral.sh/uv/). Everything else is listed, with how to get it, in [`system-deps.toml`](system-deps.toml).
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh   # if you don't have uv
+make bootstrap    # Python, the locked venv, git hooks; then checks the host
+```
+
+`make bootstrap` never uses sudo. For anything missing, it prints the commands to run yourself, then exits 1. Run `make deps` (or `corral deps`) at any time to check again.
+
+To put `corral` on your PATH from a checkout:
+
+```bash
+make install      # uv tool install
+```
+
+## Develop
+
+```bash
+make test         # the unittest suite
+make check        # format check, type check, suite on Python 3.11 and 3.14
+make format       # ruff, through uv
+make pre-pr-check PR_BODY=<file> [TEST=1]   # takeoff before a PR
+make help
+```
+
+Rules for contributors and agents: [`AGENTS.md`](AGENTS.md).
+
+## License
+
+MIT, see [`LICENSE`](LICENSE).

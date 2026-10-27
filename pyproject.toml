@@ -1,0 +1,23 @@
+[project]
+name = "corral"
+version = "0.1.0"
+description = "An opinionated core for running fleets of headless coding agents on Linux hosts"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+corral = "corral.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = ">=0.13.5"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

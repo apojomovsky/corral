@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# pre-commit: run the test suite, fast enough to gate every commit. Install with: make setup-hooks
+set -uo pipefail
+
+# Git exports GIT_DIR, GIT_INDEX_FILE and friends for the repo being
+# committed; a fixture git call inheriting them would act on this repo
+# instead of its own scratch repo. Drop them first.
+unset "${!GIT_@}" 2>/dev/null || true
+
+uv run --locked --quiet python -m unittest discover -t . -s tests >/dev/null 2>&1 || {
+    echo "pre-commit: test suite failed (make test)" >&2
+    exit 1
+}

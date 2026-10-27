@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.worktrees/
+.cache/
+.venv/
+dist/
+AGENTS.local.md

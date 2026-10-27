@@ -1,0 +1,92 @@
+# The host programs corral needs, and how to get each one.
+#
+# `make bootstrap` (or `corral deps`) checks every entry and prints the
+# commands for what is missing. It never runs them: most need sudo, and the
+# host is yours. Python is not listed, because uv provides it.
+#
+# Fields:
+#   name      what the report calls it
+#   why       one line: what corral uses it for
+#   probe     argv run to check it; it must exit 0 ($VARS are expanded)
+#   pattern   regex the probe output must match; a `version` group, if any,
+#             is compared with `min` and `below`
+#   min       lowest accepted version (inclusive)
+#   below     first rejected version (exclusive), for a major we do not run
+#   paths     where to look when the program is not on PATH
+#   apt       Debian/Ubuntu package; missing ones are merged into one
+#             `sudo apt install` line
+#   install   the command to print otherwise
+#   optional  only reported; does not fail the check
+
+[[dep]]
+name = "uv"
+why = "runs corral, its Python and its tools"
+probe = ["uv", "--version"]
+min = "0.13.5"
+paths = ["~/.local/bin/uv"]
+install = "curl -LsSf https://astral.sh/uv/install.sh | sh"
+
+[[dep]]
+name = "git"
+why = "clones, worktrees and branches, one worktree per ticket"
+probe = ["git", "--version"]
+apt = "git"
+
+[[dep]]
+name = "make"
+why = "the repository's entry points"
+probe = ["make", "--version"]
+apt = "make"
+
+[[dep]]
+name = "curl"
+why = "the installers below"
+probe = ["curl", "--version"]
+apt = "curl"
+
+[[dep]]
+name = "gh"
+why = "GitHub: issues, pull requests, boards"
+probe = ["gh", "--version"]
+install = "see https://github.com/cli/cli/blob/trunk/docs/install_linux.md"
+
+[[dep]]
+name = "docker"
+why = "agent toolchains, and image pruning by the host keeper"
+probe = ["docker", "version", "--format", "{{.Server.Version}}"]
+install = 'curl -fsSL https://get.docker.com | sh && sudo usermod -aG docker "$USER"  # then log in again'
+
+[[dep]]
+name = "systemd"
+why = "agents run as transient systemd --user units"
+probe = ["systemd-run", "--version"]
+pattern = 'systemd (?P<version>\d+)'
+
+[[dep]]
+name = "linger"
+why = "user units keep running after you log out"
+probe = ["loginctl", "show-user", "$USER", "--property=Linger"]
+pattern = 'Linger=yes'
+install = 'loginctl enable-linger "$USER"'
+
+[[dep]]
+name = "omp"
+why = "agent runtime"
+probe = ["omp", "--version"]
+paths = ["~/.local/bin/omp"]
+install = "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.12.6"
+
+[[dep]]
+name = "opencode"
+why = "agent runtime (major 1 until the cutover to 2)"
+probe = ["opencode", "--version"]
+below = "2"
+paths = ["~/.opencode/bin/opencode"]
+install = "curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.32"
+
+[[dep]]
+name = "tailscale"
+why = "multi-host only: any network that gives each host an address works"
+probe = ["tailscale", "version"]
+optional = true
+install = "curl -fsSL https://tailscale.com/install.sh | sh"
