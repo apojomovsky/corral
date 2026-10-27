@@ -3,17 +3,18 @@
 `omp -p` prints nothing until the session ends, so the activity is read from
 the session `.jsonl` files in the session directory, not from the unit's
 out.log. The per-launch config is `overlay.yml`, written by hand (stdlib
-only, no YAML library) from a dict shaped like omp's own setting ids.
+only, no YAML library) from a nested dict shaped like omp's own setting ids.
 """
 
 import functools
 import json
+import math
 import os
 import re
 import shutil
 
 from corral import paths
-from corral.runtimes import DEFAULT_MAX_TIME
+from corral.runtimes import DEFAULT_MAX_TIME, check_prompt
 
 NAME = "omp"
 #: Where omp installs for a user, when PATH does not have it.
@@ -28,6 +29,8 @@ SESSION_SUFFIX = ".jsonl"
 FORCED = {"bash": {"autoBackground": {"enabled": False}}, "async": {"enabled": False}}
 
 _PLAIN_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
+#: Plain scalars YAML 1.1 reads as a boolean or null (any case). Quoted, they stay strings.
+_YAML_WORDS = frozenset({"y", "yes", "n", "no", "on", "off", "true", "false", "null", "~"})
 
 
 @functools.cache
@@ -52,6 +55,8 @@ def _scalar(value):
         return "true" if value else "false"
     if value is None:
         return "null"
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"cannot write {value!r} to the overlay: not a finite number")
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, str):
@@ -61,8 +66,13 @@ def _scalar(value):
 
 
 def _key(key):
-    key = str(key)
-    return key if _PLAIN_KEY.fullmatch(key) else json.dumps(key)
+    text = str(key)
+    if "." in text:
+        # A dotted key would be read as a literal name, beside the nested
+        # block, and could slip past the forced keys. Callers nest instead.
+        raise ValueError(f"overlay key {text!r} has a dot: nest it as a mapping")
+    plain = _PLAIN_KEY.fullmatch(text) is not None and text.lower() not in _YAML_WORDS
+    return text if plain else json.dumps(text)
 
 
 def _yaml_lines(mapping, depth=0):
@@ -99,6 +109,7 @@ def write_config(session_dir, config):
 
 
 def argv(session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME):
+    check_prompt(prompt)
     command = [
         binary(),
         "-p",
@@ -122,19 +133,25 @@ def env(session_dir):
 
 
 def _sessions(session_dir: str) -> list[str]:
+    """The session files in the dir: regular files ending in `.jsonl`."""
     try:
-        names: list[str] = [n for n in os.listdir(session_dir) if n.endswith(SESSION_SUFFIX)]
+        names: list[str] = os.listdir(session_dir)
     except OSError:
         return []
-    return [os.path.join(session_dir, n) for n in names]
+    found = [os.path.join(session_dir, n) for n in names if n.endswith(SESSION_SUFFIX)]
+    return [p for p in found if os.path.isfile(p)]
 
 
 def resume_handle(session_dir):
-    """Absolute path of the newest session `.jsonl`, or None."""
+    """Absolute path of the newest session `.jsonl`, or None.
+
+    Equal mtimes go to the name that sorts last, so the pick never depends on
+    directory order.
+    """
     found = _sessions(session_dir)
     if not found:
         return None
-    newest: str = max(found, key=os.path.getmtime)
+    newest: str = max(found, key=lambda p: (os.path.getmtime(p), os.path.basename(p)))
     return os.path.abspath(newest)
 
 

@@ -141,5 +141,22 @@ class Show(unittest.TestCase):
         self.assertEqual(out.getvalue(), "   omp says\n   opencode says\n")
 
 
+class NonStringText(unittest.TestCase):
+    """A text field that is not a string is no text: it renders as nothing, never a crash."""
+
+    VALUES = (5, 0.5, True, ["x"], {"a": 1})
+
+    def test_omp_shape(self):
+        for value in self.VALUES:
+            with self.subTest(value=value):
+                line = entry("assistant", {"type": "text", "text": value})
+                self.assertEqual(tail.render(line), [])
+
+    def test_opencode_shape(self):
+        for value in self.VALUES:
+            with self.subTest(value=value):
+                self.assertEqual(tail.render(event("text", {"text": value})), [])
+
+
 if __name__ == "__main__":
     unittest.main()

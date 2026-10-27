@@ -21,6 +21,11 @@ def _dict(value):
     return value if isinstance(value, dict) else {}
 
 
+def _text(value):
+    """`value` when it is a non-blank string, else None: any other type is no text."""
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def render(line):
     """Display lines for one session entry; [] for anything else."""
     try:
@@ -42,7 +47,7 @@ def render(line):
             args = json.dumps(item.get("arguments") or {})
             label = item.get("intent") or item.get("name") or "tool"
             out.append(_one_line(f"-> {label} | {args}"))
-        elif kind == "text" and (item.get("text") or "").strip():
+        elif kind == "text" and _text(item.get("text")):
             out.append("   " + _one_line(item["text"]))
     return out
 
@@ -54,7 +59,7 @@ def _render_event(entry):
         args = _dict(_dict(part.get("state")).get("input"))
         label = args.get("description") or part.get("tool") or "tool"
         return [_one_line(f"-> {label} | {json.dumps(args)}")]
-    if entry.get("type") == "text" and (part.get("text") or "").strip():
+    if entry.get("type") == "text" and _text(part.get("text")):
         return ["   " + _one_line(part["text"])]
     return []
 

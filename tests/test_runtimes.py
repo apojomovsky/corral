@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 from corral import runtimes as rt
+from corral import settings
 from corral.runtimes import omp, opencode
 
 PROMPT = "do the thing"
@@ -291,6 +292,112 @@ class Adapters(unittest.TestCase):
 
     def test_an_unrecorded_session_defaults_to_omp(self):
         self.assertEqual(rt.DEFAULT_RUNTIME, "omp")
+
+
+class PromptAsFlag(unittest.TestCase):
+    """The prompt is the last argument; one that starts with `-` would be read as a flag."""
+
+    def setUp(self):
+        patch = mock.patch.object(omp, "binary", return_value="/fake/omp")
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(opencode, "binary", return_value="/fake/opencode")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_both_runtimes_refuse_a_prompt_that_starts_with_a_dash(self):
+        for runtime in (omp.RUNTIME, opencode.RUNTIME):
+            for prompt in ("--help", "-p", "-"):
+                with self.subTest(runtime=runtime.name, prompt=prompt):
+                    with self.assertRaises(ValueError):
+                        runtime.argv("/s", prompt)
+
+    def test_a_prompt_that_only_contains_a_dash_is_fine(self):
+        self.assertEqual(omp.RUNTIME.argv("/s", "fix -x")[-1], "fix -x")
+        self.assertEqual(opencode.RUNTIME.argv("/s", "fix -x")[-1], "fix -x")
+
+
+class DottedAndReservedKeys(SessionCase):
+    def test_a_dotted_key_is_refused_and_nothing_is_written(self):
+        with self.assertRaises(ValueError):
+            omp.RUNTIME.write_config(self.sdir, {"bash.autoBackground.enabled": True})
+        self.assertFalse(os.path.exists(os.path.join(self.sdir, "overlay.yml")))
+
+    def test_a_dotted_key_deeper_in_the_mapping_is_refused_too(self):
+        with self.assertRaises(ValueError):
+            omp.overlay_text({"bash": {"autoBackground.enabled": False}})
+
+    def test_keys_that_yaml_reads_as_booleans_or_null_are_quoted(self):
+        text = omp.overlay_text({"modelRoles": {"yes": "x", "Off": "x", "NULL": "x", "n": "x"}})
+        for key in ("yes", "Off", "NULL", "n"):
+            self.assertIn(f'  "{key}": "x"\n', text)
+
+    def test_string_values_that_yaml_reads_as_booleans_or_null_stay_quoted(self):
+        text = omp.overlay_text({"modelRoles": {"default": "off", "judge": "null"}})
+        self.assertIn('  default: "off"\n', text)
+        self.assertIn('  judge: "null"\n', text)
+
+    def test_a_non_finite_float_is_refused(self):
+        for value in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    omp.overlay_text({"retry": {"limit": value}})
+
+    def test_a_finite_number_is_written_as_a_number(self):
+        self.assertIn("  limit: 2.5\n", omp.overlay_text({"retry": {"limit": 2.5}}))
+
+
+class OmpSessionFiles(SessionCase):
+    def test_a_directory_named_like_a_session_is_not_a_session(self):
+        os.makedirs(os.path.join(self.sdir, "dir.jsonl"))
+        self.assertIsNone(omp.RUNTIME.resume_handle(self.sdir))
+        real = self.write("real.jsonl", "{}\n")
+        self.assertEqual(omp.RUNTIME.resume_handle(self.sdir), os.path.abspath(real))
+
+    def test_equal_mtimes_go_to_the_name_that_sorts_last(self):
+        for name in ("b.jsonl", "a.jsonl"):
+            os.utime(self.write(name, "{}\n"), (1000, 1000))
+        self.assertEqual(
+            omp.RUNTIME.resume_handle(self.sdir),
+            os.path.join(os.path.abspath(self.sdir), "b.jsonl"),
+        )
+
+
+class OpencodeSessionIds(SessionCase):
+    def test_a_non_string_session_id_on_the_last_line_is_skipped(self):
+        self.write(
+            "out.log",
+            "\n".join(
+                [
+                    json.dumps({"sessionID": "ses_1"}),
+                    json.dumps({"sessionID": ["ses_2"]}),
+                ]
+            )
+            + "\n",
+        )
+        self.assertEqual(opencode.RUNTIME.resume_handle(self.sdir), "ses_1")
+
+    def test_numeric_and_empty_session_ids_are_skipped(self):
+        self.write(
+            "out.log",
+            "\n".join(
+                [
+                    json.dumps({"sessionID": "ses_1"}),
+                    json.dumps({"sessionID": 7}),
+                    json.dumps({"sessionID": ""}),
+                ]
+            )
+            + "\n",
+        )
+        self.assertEqual(opencode.RUNTIME.resume_handle(self.sdir), "ses_1")
+
+
+class RuntimeSetting(unittest.TestCase):
+    def test_the_agents_runtime_setting_is_registered_by_the_runtimes_package(self):
+        setting = settings.REGISTRY["agents.runtime"]
+        self.assertEqual(setting.default, rt.DEFAULT_RUNTIME)
+        self.assertIn("omp or opencode", setting.help)
+        self.assertIn("corral.runtimes", settings.PROVIDERS)
 
 
 if __name__ == "__main__":

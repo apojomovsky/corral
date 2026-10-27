@@ -17,7 +17,7 @@ has none.
 import os
 from typing import Protocol
 
-from corral import paths
+from corral import paths, settings
 
 #: The session file that names the runtime a session was launched on.
 RUNTIME_FILE = "runtime"
@@ -30,6 +30,17 @@ DEFAULT_MAX_TIME = "3h"
 
 class UnknownRuntime(ValueError):
     """A runtime name corral does not support (exit 4, usage error)."""
+
+
+#: The runtime a project's agents use; `get` is where the name is checked.
+settings.register("agents.runtime", str, DEFAULT_RUNTIME, f"agent runtime: {' or '.join(NAMES)}")
+
+
+def check_prompt(prompt):
+    """Refuse a prompt a runtime would read as a flag: it is the last argument."""
+    if isinstance(prompt, str) and prompt.startswith("-"):
+        raise ValueError("a prompt must not start with '-': a runtime reads it as a flag")
+    return prompt
 
 
 class Runtime(Protocol):

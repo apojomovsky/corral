@@ -3,6 +3,10 @@
 Under opencode the unit's out.log is the `--format json` event stream, so the
 activity is read from out.log and the session id comes from its `sessionID`
 fields. The per-launch config is `opencode.json`, pointed at by OPENCODE_CONFIG.
+
+OPENCODE_CONFIG adds this file on top of the user's global config, which
+opencode still merges, so a setting in the home config can still apply to a
+headless run. corral never writes that home config.
 """
 
 import functools
@@ -11,7 +15,7 @@ import os
 import shutil
 
 from corral import paths
-from corral.runtimes import DEFAULT_MAX_TIME
+from corral.runtimes import DEFAULT_MAX_TIME, check_prompt
 
 NAME = "opencode"
 #: Where opencode installs for a user, when PATH does not have it.
@@ -31,6 +35,7 @@ def binary():
 
 def argv(session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME):
     """`max_time` is accepted for the protocol; opencode has no run limit flag."""
+    check_prompt(prompt)
     command = [binary(), "run", "--format", "json", "--auto", "--pure"]
     if resume:
         command += ["--session", resume]
@@ -63,9 +68,11 @@ def resume_handle(session_dir):
         with open(os.path.join(session_dir, OUT_LOG), encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 try:
-                    found = json.loads(line).get("sessionID") or found
+                    session = json.loads(line).get("sessionID")
                 except (ValueError, AttributeError):
                     continue
+                if isinstance(session, str) and session:
+                    found = session
     except OSError:
         return None
     return found
