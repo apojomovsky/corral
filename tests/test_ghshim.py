@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -25,6 +26,41 @@ from corral.github import gh, gh_shim, ghshim
 
 #: Directory holding the `corral` package, for the child interpreter.
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(corral.__file__)))
+
+
+def _kill_quietly(pid):
+    """Kill a stray process a test started, if it is still there."""
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+def _gone(pid, within=10.0):
+    """Whether `pid` ends within `within` seconds. A zombie counts as ended."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        if not _alive(pid):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def _alive(pid):
+    """Whether `pid` is running: not missing, and not a zombie."""
+    try:
+        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+            state = handle.read().rsplit(")", 1)[1].split()[0]
+        return state != "Z"
+    except FileNotFoundError:
+        return False
+    except OSError:
+        pass
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
 
 
 class FakePacer:
@@ -386,6 +422,17 @@ class PayloadTest(unittest.TestCase):
         hit, _ = self._cooldown_after(body, 1)
         self.assertTrue(hit)
 
+    def test_structured_rate_limit_on_exit_zero_still_cools_down(self):
+        body = json.dumps({"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]})
+        hit, cooldowns = self._cooldown_after(body, 0)
+        self.assertTrue(hit)
+        self.assertEqual(cooldowns, [gh.GRAPHQL_COOLDOWN_S])
+
+    def test_plain_message_on_exit_zero_sets_nothing(self):
+        hit, cooldowns = self._cooldown_after('{"message": "API rate limit exceeded"}', 0)
+        self.assertFalse(hit)
+        self.assertEqual(cooldowns, [])
+
     def test_non_json_or_unrelated_payload_sets_nothing(self):
         self.assertFalse(self._cooldown_after("rate limit exceeded", 1)[0])
         self.assertFalse(self._cooldown_after('{"message": "Not Found"}', 1)[0])
@@ -410,6 +457,18 @@ class PacingCapTest(unittest.TestCase):
         self.assertTrue(capped)
         self.assertEqual(pacer.charged, [5.0])
         self.assertGreaterEqual(waited, 0.0)
+
+    def test_capped_call_stays_capped_when_the_charge_cannot_be_written(self):
+        # The state dir is a regular file, so acquire and charge both fail.
+        # The call is still capped, not unthrottled.
+        with tempfile.TemporaryDirectory() as tmp:
+            block = os.path.join(tmp, "blocked")
+            with open(block, "w", encoding="utf-8") as handle:
+                handle.write("not a dir\n")
+            pacer = gh.GraphqlPacer(os.path.join(block, "pacing.json"))
+            with mock.patch.object(gh, "_pacer", return_value=pacer):
+                _, capped = ghshim.pace_before(5.0)
+        self.assertTrue(capped)
 
     def test_after_cools_down_on_a_secondary_limit(self):
         pacer = FakePacer()
@@ -835,6 +894,24 @@ class ShimScriptTest(unittest.TestCase):
         self.assertIn(ghshim.WRAPPER_MARKER, body)
         self.assertIn("-m corral.github.gh_shim", body)
         self.assertIn(os.path.realpath(self.tmp.name), body)
+
+    def test_a_grandchild_holding_stdout_does_not_hang_the_shim(self):
+        # The leader exits at once, but a backgrounded sleep inherits stdout
+        # and keeps the pipe open. The shim must return without waiting for it,
+        # and the sleep must be gone afterwards.
+        sleep_bin = shutil.which("sleep")
+        self.assertIsNotNone(sleep_bin)
+        pidfile = os.path.join(self.tmp.name, "grandchild.pid")
+        self._stub(f"#!/bin/sh\n{sleep_bin} 60 &\necho $! > {pidfile}\necho started\nexit 0\n")
+        started = time.monotonic()
+        proc = self._shim("pr", "list")
+        self.assertLess(time.monotonic() - started, 60)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"started\n")
+        with open(pidfile, encoding="utf-8") as handle:
+            grandchild = int(handle.read().strip())
+        self.addCleanup(_kill_quietly, grandchild)
+        self.assertTrue(_gone(grandchild), "the backgrounded sleep survived the shim")
 
     def test_concurrent_calls_log_every_line_and_keep_the_pacer_valid(self):
         self._stub("#!/bin/sh\necho ok\nexit 0\n")

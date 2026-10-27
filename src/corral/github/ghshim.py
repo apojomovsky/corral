@@ -23,6 +23,9 @@ the wrong file, and the pacer state is never touched by rotation.
 own paced runner sets it on its children, which already paid the bucket. An
 agent that sets it by hand only skips its own accounting; it gains no
 other access.
+
+The stderr scan runs on every exit code, so a stderr warning that mentions a
+rate limit can still start a cooldown. That false positive is accepted.
 """
 
 import json
@@ -436,7 +439,8 @@ def pace_before(cost):
     Waits rather than fails, like `GraphqlPacer.acquire`. When the wait
     would exceed the pacer's cap the call goes through anyway, `capped` is
     true, and the cost is still charged (the balance may go negative), so
-    later callers wait for it and the shim never blocks forever.
+    later callers wait for it and the shim never blocks forever. A charge
+    that cannot be written (an unwritable state file) still counts as capped.
     """
     pacer = gh._pacer()
     start = time.monotonic()
@@ -444,37 +448,48 @@ def pace_before(cost):
         pacer.acquire(cost=cost)
         return time.monotonic() - start, False
     except gh.GhError:
-        pacer.charge(cost)
+        try:
+            pacer.charge(cost)
+        except gh.GhError:
+            pass
         return time.monotonic() - start, True
 
 
 def pace_after(stderr_text):
-    """Start the shared cooldown on a rate-limit answer in stderr; whether one was set."""
+    """Start the shared cooldown on a rate-limit answer in stderr; whether one was set.
+
+    stderr is scanned whatever the exit code, so a warning on stderr that
+    mentions a rate limit can start a cooldown. That false positive is accepted.
+    """
     if not gh.is_rate_limited(stderr_text or ""):
         return False
     gh._pacer().cooldown(gh.retry_after_s(stderr_text))
     return True
 
 
-def _payload_limit_text(stdout_text):
-    """The rate-limit message in a JSON error payload on stdout, else None.
-
-    Only a parsed payload counts: a top-level `errors` list with an item typed
-    RATE_LIMITED, or a top-level `message` that `gh.is_rate_limited` matches.
-    Free text that merely mentions a rate limit does not.
-    """
+def _parse_object(text):
+    """The JSON object in `text`, else None."""
     try:
-        payload = json.loads(stdout_text or "")
+        payload = json.loads(text or "")
     except (ValueError, TypeError):
         return None
-    if not isinstance(payload, dict):
-        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _structured_limit(payload):
+    """The message of a RATE_LIMITED item in a top-level `errors` list, else None."""
     errors = payload.get("errors")
-    if isinstance(errors, list):
-        for item in errors:
-            if isinstance(item, dict) and item.get("type") == "RATE_LIMITED":
-                message = item.get("message")
-                return message if isinstance(message, str) and message else "rate limit exceeded"
+    if not isinstance(errors, list):
+        return None
+    for item in errors:
+        if isinstance(item, dict) and item.get("type") == "RATE_LIMITED":
+            message = item.get("message")
+            return message if isinstance(message, str) and message else "rate limit exceeded"
+    return None
+
+
+def _plain_limit(payload):
+    """A top-level `message` that `gh.is_rate_limited` matches, else None."""
     message = payload.get("message")
     if isinstance(message, str) and gh.is_rate_limited(message):
         return message
@@ -482,14 +497,19 @@ def _payload_limit_text(stdout_text):
 
 
 def pace_after_payload(stdout_text, exit_code):
-    """Start the shared cooldown on a rate-limit JSON payload from a failed call.
+    """Start the shared cooldown on a rate-limit JSON payload on stdout.
 
-    Inspected only when gh exits non-zero, so a successful answer whose
+    A structured payload counts on any exit code: an `errors` item typed
+    RATE_LIMITED is a rate limit even when gh exits 0. A plain top-level
+    `message` counts only on a non-zero exit, so a successful answer whose
     content mentions a rate limit never cools the host down. Whether one was set.
     """
-    if exit_code == 0:
+    payload = _parse_object(stdout_text)
+    if payload is None:
         return False
-    limit = _payload_limit_text(stdout_text)
+    limit = _structured_limit(payload)
+    if limit is None and exit_code != 0:
+        limit = _plain_limit(payload)
     if limit is None:
         return False
     gh._pacer().cooldown(gh.retry_after_s(limit))

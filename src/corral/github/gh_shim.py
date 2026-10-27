@@ -36,6 +36,8 @@ NOT_FOUND = 127
 _MARKER_PROBE = 512
 #: Largest single read from a child's pipe.
 _CHUNK = 64 * 1024
+#: Seconds a reader may keep running after the child exits before the group is killed.
+_READER_JOIN_S = 5.0
 
 
 def _is_wrapper(path):
@@ -100,16 +102,23 @@ def _pump(pipe, sink, tail):
             sink.flush()
             tail.extend(chunk)
             del tail[: -ghshim.TAIL_BYTES]
+    except OSError:
+        # The pipe was closed under us after the shim gave up on it.
+        pass
     finally:
-        pipe.close()
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
 
 def _wait(proc, timeout):
     """True when the child ran past `timeout` and was stopped.
 
-    Escalates like `gh.run`: SIGTERM to the child's process group, then
-    SIGKILL after a grace period. The child is a session leader, so its
-    grandchildren go with it and close the pipes the readers drain.
+    Escalates like `gh.run`: SIGTERM to the child's process group, then a
+    grace period. The group is SIGKILLed whenever the child ran past the
+    timeout, even if the leader exited during the grace period, because a
+    grandchild may still hold the pipes.
     """
     try:
         proc.wait(timeout=timeout)
@@ -119,9 +128,30 @@ def _wait(proc, timeout):
         try:
             proc.wait(timeout=gh._KILL_AFTER_S)
         except subprocess.TimeoutExpired:
-            gh._signal_group(proc, signal.SIGKILL)
-            proc.wait()
+            pass
+        gh._signal_group(proc, signal.SIGKILL)
+        proc.wait()
         return True
+
+
+def _drain(proc, readers):
+    """Join the readers, stopping the group if a grandchild keeps a pipe open.
+
+    A daemonised helper that inherited stdout or stderr keeps the pipe open
+    after the leader exits, so the readers never see EOF. Each join is bounded.
+    If a reader is still alive, the group is SIGKILLed and the readers are
+    joined once more. A reader still alive then is a daemon thread on a pipe
+    that a process outside the group holds; the shim does not wait for it, and
+    the pipe closes when the shim exits. (Closing a pipe another thread is
+    reading is not safe, so the shim does not close it early.)
+    """
+    for reader in readers:
+        reader.join(timeout=_READER_JOIN_S)
+    if not any(reader.is_alive() for reader in readers):
+        return
+    gh._signal_group(proc, signal.SIGKILL)
+    for reader in readers:
+        reader.join(timeout=_READER_JOIN_S)
 
 
 def _depth():
@@ -188,8 +218,7 @@ def main(argv=None):
     for reader in readers:
         reader.start()
     timed_out = _wait(proc, ghshim.TIMEOUT_S)
-    for reader in readers:
-        reader.join()
+    _drain(proc, readers)
     duration = time.monotonic() - start
     code = ghshim.TIMED_OUT_EXIT if timed_out else proc.returncode
     if timed_out:
