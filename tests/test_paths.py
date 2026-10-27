@@ -136,6 +136,109 @@ class Cli(unittest.TestCase):
             self.assertEqual(cli.main(["deps"]), 4)
         self.assertIn("must be an absolute path", err.getvalue())
 
+    def _run(self, argv):
+        import io
+        from contextlib import redirect_stdout
+
+        from corral import cli
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = cli.main(argv)
+        return code, out.getvalue()
+
+    def test_paths_prints_each_resolver(self):
+        code, out = self._run(["paths"])
+        self.assertEqual(code, 0)
+        want = "".join(
+            f"{name} = {getattr(paths, name + '_dir')()}\n"
+            for name in ("state", "config", "cache", "sessions")
+        )
+        self.assertEqual(out, want)
+
+    def test_paths_one_name_honours_the_override(self):
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        target = os.path.join(tmp.name, "nested", "cache")
+        with mock.patch.dict(os.environ, {"CORRAL_CACHE": target}):
+            code, out = self._run(["paths", "cache"])
+            self.assertEqual((code, out), (0, target + "\n"))
+            self.assertFalse(os.path.exists(target))
+            code, out = self._run(["paths", "cache", "--mkdir"])
+        self.assertEqual((code, out), (0, target + "\n"))
+        self.assertTrue(os.path.isdir(target))
+
+    def test_each_name_prints_its_own_resolver(self):
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = {
+            "CORRAL_STATE": os.path.join(tmp.name, "s"),
+            "CORRAL_CONFIG": os.path.join(tmp.name, "c"),
+            "CORRAL_CACHE": os.path.join(tmp.name, "k"),
+            "CORRAL_SESSIONS": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            for name, want in (
+                ("state", env["CORRAL_STATE"]),
+                ("config", env["CORRAL_CONFIG"]),
+                ("cache", env["CORRAL_CACHE"]),
+                ("sessions", os.path.join(env["CORRAL_STATE"], "sessions")),
+            ):
+                self.assertEqual(self._run(["paths", name]), (0, want + "\n"), name)
+            own = os.path.join(tmp.name, "own")
+            with mock.patch.dict(os.environ, {"CORRAL_SESSIONS": own}):
+                self.assertEqual(self._run(["paths", "sessions"]), (0, own + "\n"))
+            code, _ = self._run(["paths", "--mkdir"])
+        self.assertEqual(code, 0)
+        for name in ("s", "c", "k", os.path.join("s", "sessions")):
+            self.assertTrue(os.path.isdir(os.path.join(tmp.name, name)), name)
+
+    def test_a_relative_override_through_paths_exits_4(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CORRAL_CACHE": "rel/cache"}), redirect_stderr(err):
+            self.assertEqual(self._run(["paths", "cache"]), (4, ""))
+        self.assertIn("CORRAL_CACHE", err.getvalue())
+
+    def test_a_directory_that_cannot_be_made_exits_4(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        blocker = os.path.join(tmp.name, "file")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        err = io.StringIO()
+        target = os.path.join(blocker, "cache")
+        with mock.patch.dict(os.environ, {"CORRAL_CACHE": target}), redirect_stderr(err):
+            self.assertEqual(self._run(["paths", "cache", "--mkdir"]), (4, ""))
+        self.assertIn("cannot create", err.getvalue())
+
+    def test_an_unknown_name_is_a_usage_error(self):
+        import io
+        from contextlib import redirect_stderr
+
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self._run(["paths", "bogus"])[0], 4)
+
+    def test_agents_md_drafts_pr_bodies_through_the_resolver(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "AGENTS.md"), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertIn(
+            'dir=$(uv run --locked corral paths cache --mkdir) && body=$(mktemp "$dir/pr-', text
+        )
+        self.assertNotIn("XDG_CACHE_HOME", text)
+
 
 if __name__ == "__main__":
     unittest.main()

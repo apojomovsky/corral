@@ -86,7 +86,7 @@ The rules the design rests on:
    - each finding, with its severity and how it was resolved;
    - a `Fixed in place:` list, or `No findings`.
 
-   Write the body to a unique file (`mktemp "${XDG_CACHE_HOME:-$HOME/.cache}/corral/pr-<n>-XXXXXX.md"`) with real newlines, then pass it with `gh pr create --body-file`. Never use `--body "a\nb"`.
+   Write the body to a unique file (`dir=$(uv run --locked corral paths cache --mkdir) && body=$(mktemp "$dir/pr-<n>-XXXXXX.md")`) with real newlines, then pass it with `gh pr create --body-file`. Never use `--body "a\nb"`.
 
 **Severity labels:**
 - `priority:high`: a correctness bug, a broken gate, a privacy leak, a flaky test.

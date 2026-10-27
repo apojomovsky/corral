@@ -34,6 +34,32 @@ def cmd_config(args: argparse.Namespace) -> int:
     return OK
 
 
+PATHS = {
+    "state": paths.state_dir,
+    "config": paths.config_dir,
+    "cache": paths.cache_dir,
+    "sessions": paths.sessions_dir,
+}
+
+
+def cmd_paths(args: argparse.Namespace) -> int:
+    names = [args.name] if args.name else list(PATHS)
+    resolved = {name: PATHS[name]() for name in names}
+    if args.mkdir:
+        for path in resolved.values():
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as err:
+                print(f"corral: cannot create {path}: {err.strerror}", file=sys.stderr)
+                return USAGE
+    if args.name:
+        print(resolved[args.name])
+    else:
+        for name, path in resolved.items():
+            print(f"{name} = {path}")
+    return OK
+
+
 def default_base(args: argparse.Namespace) -> str:
     return args.base or os.environ.get("BASE_REF", "origin/master")
 
@@ -86,6 +112,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--root", default=None, help="the ops root (default: nearest corral.toml upward)"
     )
     p.set_defaults(func=cmd_config)
+    p = sub.add_parser("paths", help="the directories corral keeps on this host")
+    p.add_argument("name", nargs="?", choices=list(PATHS), help="print only this one")
+    p.add_argument("--mkdir", action="store_true", help="create the directories first")
+    p.set_defaults(func=cmd_paths)
     base_help = "base ref to diff against (default origin/master or $BASE_REF)"
     p = sub.add_parser("prose", help="list and verify added comment blocks")
     p.add_argument(
