@@ -18,6 +18,7 @@ their own stores. Nothing in the registry holds one.
 """
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -87,14 +88,22 @@ class Resolved:
         return self.values[key].value
 
 
-def _flatten(table, prefix=""):
+def _flatten(table, where, prefix=""):
+    """Dotted keys to scalars. A key reached twice (a quoted `"a.b"` beside a
+    `[a] b`) and an empty table are errors, never silently dropped."""
     out = {}
     for key, value in table.items():
         dotted = f"{prefix}{key}"
         if isinstance(value, dict):
-            out.update(_flatten(value, dotted + "."))
+            if not value:
+                raise SettingsError(f"{where}: {dotted} is an empty table")
+            items = _flatten(value, where, dotted + ".").items()
         else:
-            out[dotted] = value
+            items = [(dotted, value)]
+        for k, v in items:
+            if k in out:
+                raise SettingsError(f"{where}: {k} is set twice")
+            out[k] = v
     return out
 
 
@@ -110,6 +119,9 @@ def _check(key, value, where):
     return value
 
 
+_INT = re.compile(r"-?[0-9]+")
+
+
 def _parse_env(setting, raw):
     if setting.type is bool:
         low = raw.strip().lower()
@@ -119,10 +131,9 @@ def _parse_env(setting, raw):
             return False
         raise SettingsError(f"{setting.env}={raw!r}: expected true or false")
     if setting.type is int:
-        try:
-            return int(raw)
-        except ValueError:
-            raise SettingsError(f"{setting.env}={raw!r}: expected an integer") from None
+        if not _INT.fullmatch(raw.strip()):
+            raise SettingsError(f"{setting.env}={raw!r}: expected an integer")
+        return int(raw)
     return raw
 
 
@@ -133,7 +144,7 @@ def _load(path):
             return tomllib.load(handle)
     except FileNotFoundError:
         return {}
-    except (OSError, tomllib.TOMLDecodeError) as err:
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as err:
         raise SettingsError(f"{path}: {err}") from None
 
 
@@ -167,27 +178,29 @@ def resolve(
     limits = host.pop("limits", {})
     if not isinstance(limits, dict):
         raise SettingsError(f"{host_name}: [limits] must be a table")
-    for key, value in _flatten(host).items():
+    for key, value in _flatten(host, host_name).items():
         result[key] = Value(_check(key, value, host_name), HOST)
 
     repos = project.pop("repo", [])
     if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
         raise SettingsError(f"{project_name}: [[repo]] must be an array of tables")
-    for key, value in _flatten(project).items():
+    for key, value in _flatten(project, project_name).items():
         result[key] = Value(_check(key, value, project_name), PROJECT)
-    names = [r.get("name") for r in repos]
-    if any(not isinstance(n, str) or not n for n in names):
-        raise SettingsError(f"{project_name}: every [[repo]] needs a name")
-    if len(set(names)) != len(names):
-        raise SettingsError(f"{project_name}: a [[repo]] name appears twice")
+    entries = {}
+    for index, raw in enumerate(repos, 1):
+        entry = dict(raw)
+        name = entry.pop("name", None)
+        if not isinstance(name, str) or not name:
+            raise SettingsError(f"{project_name}: [[repo]] number {index} needs a name")
+        if name in entries:
+            raise SettingsError(f"{project_name}: [[repo]] {name!r} appears twice")
+        where = f"{project_name} [[repo]] {name}"
+        entries[name] = {k: _check(k, v, where) for k, v in _flatten(entry, where).items()}
     if repo is not None:
-        if repo not in names:
+        if repo not in entries:
             raise SettingsError(f"{project_name}: no [[repo]] named {repo!r}")
-        entry = dict(repos[names.index(repo)])
-        entry.pop("name")
-        where = f"{project_name} [[repo]] {repo}"
-        for key, value in _flatten(entry).items():
-            result[key] = Value(_check(key, value, where), REPO)
+        for key, value in entries[repo].items():
+            result[key] = Value(value, REPO)
 
     for key, setting in REGISTRY.items():
         raw = env.get(setting.env)
@@ -197,12 +210,12 @@ def resolve(
         if value is not None:
             result[key] = Value(_check(key, value, "flag"), FLAG)
 
-    for key, ceiling in _flatten(limits).items():
+    for key, ceiling in _flatten(limits, f"{host_name} [limits]").items():
         setting = REGISTRY.get(key)
         if setting is None or setting.type is not int:
             raise SettingsError(f"{host_name}: [limits] {key!r} is not a numeric setting")
-        if isinstance(ceiling, bool) or not isinstance(ceiling, int):
-            raise SettingsError(f"{host_name}: [limits] {key} must be int")
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+            raise SettingsError(f"{host_name}: [limits] {key} must be an int of 0 or more")
         current = result[key]
         if isinstance(current.value, int) and current.value > ceiling:
             result[key] = Value(ceiling, current.origin, clamped_from=current.value)

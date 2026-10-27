@@ -123,6 +123,37 @@ class Errors(unittest.TestCase):
         self.assertNotIn("x.y", S.REGISTRY)
 
 
+class Strictness(unittest.TestCase):
+    def test_every_repo_entry_is_checked_not_only_the_selected_one(self):
+        for entry in ({"name": "a", "bogus": 1}, {"name": "a", "agents": {"cap": "x"}}):
+            with self.subTest(entry=entry), self.assertRaisesRegex(S.SettingsError, "repo"):
+                resolve(project={"repo": [entry, {"name": "b"}]}, repo="b")
+
+    def test_repo_errors_name_the_entry(self):
+        with self.assertRaisesRegex(S.SettingsError, "number 2 needs a name"):
+            resolve(project={"repo": [{"name": "a"}, {}]})
+        with self.assertRaisesRegex(S.SettingsError, "'a' appears twice"):
+            resolve(project={"repo": [{"name": "a"}, {"name": "a"}]})
+
+    def test_a_key_set_twice_is_an_error(self):
+        with self.assertRaisesRegex(S.SettingsError, "agents.cap is set twice"):
+            resolve(project={"agents.cap": 3, "agents": {"cap": 5}})
+
+    def test_an_empty_table_is_an_error(self):
+        with self.assertRaisesRegex(S.SettingsError, "empty table"):
+            resolve(project={"agents": {"cap": {}}})
+
+    def test_env_ints_are_plain_digits(self):
+        for raw in ("1_0", "\u0663", "+3", "0x3"):
+            with self.subTest(raw=raw), self.assertRaises(S.SettingsError):
+                resolve(env={"CORRAL_AGENTS_CAP": raw})
+        self.assertEqual(resolve(env={"CORRAL_AGENTS_CAP": " 3 "})["agents.cap"], 3)
+
+    def test_a_ceiling_must_not_be_negative(self):
+        with self.assertRaisesRegex(S.SettingsError, "0 or more"):
+            resolve(host={"limits": {"agents": {"cap": -1}}})
+
+
 class Files(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -153,6 +184,12 @@ class Files(unittest.TestCase):
         with self.assertRaisesRegex(S.SettingsError, "corral.toml"):
             S.load(root=self.root, env={"CORRAL_CONFIG": self.config})
 
+    def test_a_file_that_is_not_utf8_is_a_settings_error(self):
+        with open(os.path.join(self.root, "corral.toml"), "wb") as handle:
+            handle.write(b"[agents]\ncap = 2 # \xff\n")
+        with self.assertRaisesRegex(S.SettingsError, "corral.toml"):
+            S.load(root=self.root, env={"CORRAL_CONFIG": self.config})
+
     def test_find_root_walks_up_to_the_nearest_corral_toml(self):
         self.write(os.path.join(self.root, "corral.toml"), "")
         self.assertEqual(S.find_root(os.path.join(self.root, "sub", "deeper")), self.root)
@@ -169,6 +206,8 @@ class ConfigShow(unittest.TestCase):
         env = mock.patch.dict(os.environ, {"CORRAL_CONFIG": os.path.join(tmp.name, "none")})
         env.start()
         self.addCleanup(env.stop)
+        for setting in S.REGISTRY.values():
+            os.environ.pop(setting.env, None)
 
     def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -192,6 +231,13 @@ class ConfigShow(unittest.TestCase):
         code, _, err = self.run_cli("--repo", "nope")
         self.assertEqual(code, 4)
         self.assertIn("no [[repo]] named 'nope'", err)
+
+    def test_a_root_without_corral_toml_exits_4(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["config", "show", "--root", os.path.join(self.root, "typo")])
+        self.assertEqual(code, 4)
+        self.assertIn("no corral.toml", err.getvalue())
 
     def test_repo_without_a_root_exits_4(self):
         out, err = io.StringIO(), io.StringIO()

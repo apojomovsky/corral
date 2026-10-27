@@ -19,6 +19,9 @@ def cmd_deps(args: argparse.Namespace) -> int:
 def cmd_config(args: argparse.Namespace) -> int:
     import os
 
+    if args.root and not os.path.isfile(os.path.join(args.root, settings.PROJECT_FILE)):
+        print(f"corral: no {settings.PROJECT_FILE} in --root {args.root}", file=sys.stderr)
+        return USAGE
     root = args.root or settings.find_root(os.getcwd())
     if args.repo and not root:
         print("corral: --repo needs an ops root (corral.toml)", file=sys.stderr)
