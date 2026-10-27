@@ -5,10 +5,10 @@ import os
 import sys
 from collections.abc import Sequence
 
-from corral import deps, paths, settings
+from corral import coordcli, deps, paths, settings
 
 # Exit codes are a public interface (AGENTS.md).
-OK, NO, USAGE = 0, 1, 4
+OK, NO, RACE, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 2, 3, 4, 75
 
 
 def cmd_deps(args: argparse.Namespace) -> int:
@@ -109,6 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--base", default=None, help=base_help)
     p.set_defaults(func=cmd_budget)
+    coordcli.add_parser(sub)
     return parser
 
 

@@ -48,10 +48,11 @@ make install      # uv tool install
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |
 | `corral prose [--verify]` | list the comment blocks a branch adds; `--verify` fails on ones that break the prose rules |
 | `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
+| `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
 
 Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project.
 
-Exit codes: `0` success, `1` a gate said no, `3` a remote or service unreachable, `4` usage error.
+Exit codes: `0` success, `1` nothing to do or a gate said no, `2` race lost (the lease is held, or a generation is stale), `3` a remote or service unreachable, `4` usage error.
 
 ## Develop
 
