@@ -30,7 +30,7 @@ settings.register("board.hold_label", str, HOLD_LABEL, "label that holds a ticke
 
 def labels_held(labels, hold_label=HOLD_LABEL):
     """Whether a label collection carries the hold. Pure."""
-    return hold_label in (labels or ())
+    return any(name == hold_label for name in labels or ())
 
 
 def reason(read_labels, ref, linked=(), *, hold_label=HOLD_LABEL):
@@ -53,9 +53,16 @@ def reason(read_labels, ref, linked=(), *, hold_label=HOLD_LABEL):
         )
     ticket = f"{ticket_repo}#{ticket_number}"
     targets = [(ticket_repo, ticket_number, "issue", True)]
-    seen = set()
+    seen = {(ticket_repo, ticket_number)}
     for pair in linked or ():
-        repo, number = pair
+        try:
+            repo, number = pair
+        except (TypeError, ValueError):
+            return (
+                f"{ticket}: {hold_label} unreadable "
+                f"(unparseable linked ref {pair!r}): no resume "
+                "until the labels read again"
+            )
         if (repo, number) in seen:
             continue
         seen.add((repo, number))

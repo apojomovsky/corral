@@ -108,6 +108,26 @@ class ReasonTest(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["board.hold_label"].default, "hold")
         self.assertIn("corral.hold", settings.PROVIDERS)
 
+    def test_unparseable_ticket_ref_is_a_hold(self):
+        text = hold.reason(reader({}), None)
+        self.assertIn("unparseable ticket ref", text)
+
+    def test_unparseable_linked_ref_is_a_hold(self):
+        mapping = {("issue", "app", 7): []}
+        text = hold.reason(reader(mapping), ("app", 7), [None])
+        self.assertIn("unparseable linked ref", text)
+        self.assertIn("app#7", text)
+
+    def test_ticket_in_linked_is_not_read_twice(self):
+        calls = []
+        mapping = {("issue", "app", 7): []}
+        self.assertIsNone(hold.reason(reader(mapping, calls), ("app", 7), [("app", 7)]))
+        self.assertEqual(calls, [("issue", "app", 7)])
+
+    def test_bare_string_is_not_a_substring_match(self):
+        self.assertFalse(hold.labels_held("holds"))
+        self.assertFalse(hold.labels_held("withhold"))
+
 
 if __name__ == "__main__":
     unittest.main()
