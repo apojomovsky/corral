@@ -10,7 +10,9 @@ floor (hard limit at least three times the expectation) and stay under the
 machine ceiling.
 """
 
+import io
 import subprocess
+from contextlib import redirect_stdout
 import unittest
 from unittest import mock
 
@@ -173,18 +175,21 @@ class CliTest(unittest.TestCase):
         from corral import cli
 
         proc = subprocess.CompletedProcess([], 0, "4\t0\tsrc/a.rs\n", "")
-        argv = ["budget"]
-        with mock.patch.object(bu, "_git", return_value=proc):
-            rc = cli.main(argv)
+        out = io.StringIO()
+        with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
+            rc = cli.main(["budget"])
         self.assertEqual(rc, 0)
+        self.assertIn("expected duration:", out.getvalue())
 
     def test_budget_verb_accepts_an_explicit_base(self):
         from corral import cli
 
         proc = subprocess.CompletedProcess([], 0, "4\t0\tsrc/a.rs\n", "")
-        with mock.patch.object(bu, "_git", return_value=proc):
+        out = io.StringIO()
+        with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
             rc = cli.main(["budget", "--base", "HEAD~3"])
         self.assertEqual(rc, 0)
+        self.assertIn("HEAD~3", out.getvalue())
 
 
 if __name__ == "__main__":
