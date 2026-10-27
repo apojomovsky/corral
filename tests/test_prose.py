@@ -276,7 +276,6 @@ class ChangedFilesTest(unittest.TestCase):
                 "build_output/y.c",
                 "build-debug/y.c",
                 "target/z.rs",
-                "docs/superpowers/plans/p.md",
                 ".worktrees/w/a.c",
                 "third_party/t.c",
             ]
@@ -324,7 +323,7 @@ class IsTestPathTest(unittest.TestCase):
         self.assertTrue(prose.is_test_path("tests/combo/a.c"))
         self.assertTrue(prose.is_test_path("lib-lcd/tests/a.c"))
         self.assertTrue(prose.is_test_path("examples/a.c"))
-        self.assertTrue(prose.is_test_path("pic16f193x-hal/examples/a.c"))
+        self.assertTrue(prose.is_test_path("lib/examples/a.c"))
 
     def test_source_paths(self):
         self.assertFalse(prose.is_test_path("src/a.c"))

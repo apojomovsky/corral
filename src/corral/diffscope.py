@@ -18,12 +18,9 @@ from typing import NamedTuple, Optional
 
 
 # Vendored and generated paths no first-party gate lints. One pattern lives
-# here so the prose and doxygen gates cannot drift; both filter on
-# is_excluded() and name it in their rename context.
-EXCLUDED = re.compile(
-    r"(^|/)(vendor|third_party|target|build(?:[_-][^/]*)?|\.worktrees)/"
-    r"|^docs/superpowers/plans/"
-)
+# here so first-party gates cannot drift; each filters on is_excluded()
+# and names it in its rename context.
+EXCLUDED = re.compile(r"(^|/)(vendor|third_party|target|build(?:[_-][^/]*)?|\.worktrees)/")
 
 
 def is_excluded(path):

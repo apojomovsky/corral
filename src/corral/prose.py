@@ -4,8 +4,7 @@ Every added comment block is extracted from the diff and classified as
 a file header, doc comment, or explanatory block. The rules are all
 stateless: line caps, decoration, narrative prose, and em-dashes. There
 is no adjudication state to maintain, which is what lets the gate run at
-pre-push and in CI. Spec:
-docs/superpowers/specs/2026-08-25-prose-lint-design.md
+pre-push and in CI.
 """
 
 import hashlib
@@ -213,8 +212,8 @@ def classify(first_line, start, span, syntax):
     return EXPLANATORY
 
 
-# Shared vendored pattern lives in diffscope so the prose and doxygen gates
-# cannot drift. Alias kept for backward-compatible imports.
+# The vendored pattern lives in diffscope so every first-party gate shares
+# one rule.
 _EXCLUDED = diffscope.EXCLUDED
 
 

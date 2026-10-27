@@ -44,8 +44,8 @@ UNREACHABLE_MARKERS = (
 )
 
 
-#: `git push` runs the pre-push hook, which runs the full suite (4 to 6
-#: minutes on the coordinator machine); every other git call is quick.
+#: `git push` runs the pre-push hook, which runs the full suite (minutes
+#: on a typical host); every other git call is quick.
 GIT_TIMEOUT_S = 300
 PUSH_TIMEOUT_S = 3600
 

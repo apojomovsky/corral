@@ -14,6 +14,16 @@ def fake_git(stdout):
     return lambda args, cwd=None: mock.Mock(stdout=stdout, returncode=0)
 
 
+def brief_only(path):
+    """A rename context like a C-docs gate's: tests and examples are a lighter tier."""
+    return "/tests/" in path or "/examples/" in path or path.startswith(("tests/", "examples/"))
+
+
+def tier_and_vendored(path):
+    """A rename context that also tracks the vendored rule."""
+    return (brief_only(path), diffscope.is_excluded(path))
+
+
 class ParseTest(unittest.TestCase):
     def test_added_and_modified_are_content_changes(self):
         out = "A\0src/new.c\0M\0src/old.c\0"
@@ -125,7 +135,7 @@ class RealRepoTest(unittest.TestCase):
         self.assertEqual(prose.changed_files("master", cwd=self.repo), [])
         self.assertEqual(prose.extract("master", cwd=self.repo), [])
 
-    def test_a_pure_move_leaves_no_c_files_for_the_doxygen_gate(self):
+    def test_a_pure_move_leaves_no_c_files_for_a_c_file_gate(self):
         self.move()
         self.assertEqual(
             diffscope.content_changes("master", prose._git, cwd=self.repo, pathspec=("*.c", "*.h")),
@@ -159,7 +169,7 @@ class RealRepoTest(unittest.TestCase):
         self.assertEqual([b.normalized for b in blocks], ["reason line 3 edited"])
         self.assertEqual(blocks[0].path, "new/a.c")
 
-    def test_an_edited_move_is_still_a_c_file_for_the_doxygen_gate(self):
+    def test_an_edited_move_is_still_a_c_file_for_a_c_file_gate(self):
         self.move(edit=C_SOURCE + "int other;\n")
         got = diffscope.content_changes(
             "master", prose._git, cwd=self.repo, pathspec=("*.c", "*.h")
@@ -181,6 +191,27 @@ class RealRepoTest(unittest.TestCase):
         self.mv("vendor/v.c", "src/v.c")
         blocks = prose.extract("master", cwd=self.repo)
         self.assertEqual([b.path for b in blocks], ["src/v.c"])
+
+    def test_a_move_out_of_tests_is_held_to_the_full_rules(self):
+        self.mv("tests/t.c", "src/t.c")
+        got = diffscope.content_changes(
+            "master", prose._git, cwd=self.repo, pathspec=("*.c", "*.h"), context=brief_only
+        )
+        self.assertEqual([c.path for c in got], ["src/t.c"])
+
+    def test_a_move_within_tests_stays_dropped(self):
+        self.mv("tests/t.c", "tests/sub/t.c")
+        got = diffscope.content_changes(
+            "master", prose._git, cwd=self.repo, pathspec=("*.c", "*.h"), context=brief_only
+        )
+        self.assertEqual(got, [])
+
+    def test_a_move_out_of_vendor_is_charged_whole_by_a_c_file_gate(self):
+        self.mv("vendor/v.c", "src/v.c")
+        got = diffscope.content_changes(
+            "master", prose._git, cwd=self.repo, pathspec=("*.c", "*.h"), context=tier_and_vendored
+        )
+        self.assertEqual([c.path for c in got], ["src/v.c"])
 
     def test_an_unknown_base_fails_closed(self):
         with self.assertRaises(diffscope.DiffError):
@@ -216,7 +247,6 @@ class RealRepoTest(unittest.TestCase):
             "target/x.c",
             "build/x.c",
             ".worktrees/w/y.c",
-            "docs/superpowers/plans/p.md",
         ):
             self.assertTrue(diffscope.is_excluded(path), path)
         self.assertFalse(diffscope.is_excluded("src/main.c"))

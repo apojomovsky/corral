@@ -142,6 +142,15 @@ class PrePush(Repo):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("suite already passed", r.stdout + r.stderr)
 
+    def test_the_hook_and_corral_push_share_the_stamp_name(self):
+        from corral import push
+
+        lines = [
+            l for l in (HOOKS / "pre-push").read_text().splitlines() if l.startswith("stamp_file=")
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("/" + push.STAMP_NAME + '"', lines[0])
+
     def test_deleting_a_remote_branch_is_refused(self):
         r = git(self.repo, "push", "-q", "origin", ":master", env=self.env)
         self.assertNotEqual(r.returncode, 0)
