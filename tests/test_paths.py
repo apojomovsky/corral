@@ -170,6 +170,59 @@ class Cli(unittest.TestCase):
         self.assertEqual((code, out), (0, target + "\n"))
         self.assertTrue(os.path.isdir(target))
 
+    def test_each_name_prints_its_own_resolver(self):
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = {
+            "CORRAL_STATE": os.path.join(tmp.name, "s"),
+            "CORRAL_CONFIG": os.path.join(tmp.name, "c"),
+            "CORRAL_CACHE": os.path.join(tmp.name, "k"),
+            "CORRAL_SESSIONS": "",
+        }
+        with mock.patch.dict(os.environ, env):
+            for name, want in (
+                ("state", env["CORRAL_STATE"]),
+                ("config", env["CORRAL_CONFIG"]),
+                ("cache", env["CORRAL_CACHE"]),
+                ("sessions", os.path.join(env["CORRAL_STATE"], "sessions")),
+            ):
+                self.assertEqual(self._run(["paths", name]), (0, want + "\n"), name)
+            own = os.path.join(tmp.name, "own")
+            with mock.patch.dict(os.environ, {"CORRAL_SESSIONS": own}):
+                self.assertEqual(self._run(["paths", "sessions"]), (0, own + "\n"))
+            code, _ = self._run(["paths", "--mkdir"])
+        self.assertEqual(code, 0)
+        for name in ("s", "c", "k", os.path.join("s", "sessions")):
+            self.assertTrue(os.path.isdir(os.path.join(tmp.name, name)), name)
+
+    def test_a_relative_override_through_paths_exits_4(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        err = io.StringIO()
+        with mock.patch.dict(os.environ, {"CORRAL_CACHE": "rel/cache"}), redirect_stderr(err):
+            self.assertEqual(self._run(["paths", "cache"]), (4, ""))
+        self.assertIn("CORRAL_CACHE", err.getvalue())
+
+    def test_a_directory_that_cannot_be_made_exits_4(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        blocker = os.path.join(tmp.name, "file")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        err = io.StringIO()
+        target = os.path.join(blocker, "cache")
+        with mock.patch.dict(os.environ, {"CORRAL_CACHE": target}), redirect_stderr(err):
+            self.assertEqual(self._run(["paths", "cache", "--mkdir"]), (4, ""))
+        self.assertIn("cannot create", err.getvalue())
+
     def test_an_unknown_name_is_a_usage_error(self):
         import io
         from contextlib import redirect_stderr
@@ -181,7 +234,9 @@ class Cli(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(root, "AGENTS.md"), encoding="utf-8") as handle:
             text = handle.read()
-        self.assertIn('mktemp "$(uv run corral paths cache --mkdir)/pr-', text)
+        self.assertIn(
+            'dir=$(uv run --locked corral paths cache --mkdir) && body=$(mktemp "$dir/pr-', text
+        )
         self.assertNotIn("XDG_CACHE_HOME", text)
 
 

@@ -34,15 +34,24 @@ def cmd_config(args: argparse.Namespace) -> int:
     return OK
 
 
-PATH_NAMES = ("state", "config", "cache", "sessions")
+PATHS = {
+    "state": paths.state_dir,
+    "config": paths.config_dir,
+    "cache": paths.cache_dir,
+    "sessions": paths.sessions_dir,
+}
 
 
 def cmd_paths(args: argparse.Namespace) -> int:
-    names = [args.name] if args.name else PATH_NAMES
-    resolved = {name: getattr(paths, f"{name}_dir")() for name in names}
+    names = [args.name] if args.name else list(PATHS)
+    resolved = {name: PATHS[name]() for name in names}
     if args.mkdir:
         for path in resolved.values():
-            os.makedirs(path, exist_ok=True)
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError as err:
+                print(f"corral: cannot create {path}: {err.strerror}", file=sys.stderr)
+                return USAGE
     if args.name:
         print(resolved[args.name])
     else:
@@ -104,7 +113,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.set_defaults(func=cmd_config)
     p = sub.add_parser("paths", help="the directories corral keeps on this host")
-    p.add_argument("name", nargs="?", choices=PATH_NAMES, help="print only this one")
+    p.add_argument("name", nargs="?", choices=list(PATHS), help="print only this one")
     p.add_argument("--mkdir", action="store_true", help="create the directories first")
     p.set_defaults(func=cmd_paths)
     base_help = "base ref to diff against (default origin/master or $BASE_REF)"
