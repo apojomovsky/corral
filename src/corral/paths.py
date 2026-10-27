@@ -61,7 +61,7 @@ def sessions_dir(env=None):
     return _override("CORRAL_SESSIONS", env) or os.path.join(state_dir(env), "sessions")
 
 
-_REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
 def ticket_session_dir(repo, number, env=None, root=None):
@@ -72,7 +72,7 @@ def ticket_session_dir(repo, number, env=None, root=None):
     number that is not a positive integer, is a usage error.
     """
     repo = str(repo or "")
-    if not _REPO_NAME.fullmatch(repo) or repo.endswith(".git"):
+    if not REPO_NAME.fullmatch(repo) or repo.endswith(".git"):
         raise PathError(f"repo name {repo!r} is not a plain repository name")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise PathError(f"ticket number {number!r} must be a positive integer")

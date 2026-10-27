@@ -68,7 +68,7 @@ def register(key, type_, default, help_):
 #: Modules that register settings of their own. `resolve` imports them
 #: first, so a file setting one of their keys never reads as unknown, and
 #: `config show` lists them. A test keeps this list complete.
-PROVIDERS = ("corral.registry",)
+PROVIDERS = ("corral.registry", "corral.units")
 
 
 def _load_providers():
