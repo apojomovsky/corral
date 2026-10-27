@@ -23,7 +23,7 @@ os.environ["TMPDIR"] = SUITE_TMP_ROOT
 tempfile.tempdir = SUITE_TMP_ROOT
 atexit.register(shutil.rmtree, SUITE_TMP_ROOT, True)
 
-for _var in ("CORRAL_STATE", "CORRAL_SESSIONS", "CORRAL_CONFIG"):
+for _var in ("CORRAL_STATE", "CORRAL_SESSIONS", "CORRAL_CONFIG", "CORRAL_CACHE"):
     os.environ[_var] = tempfile.mkdtemp(prefix=_var.lower() + "-")
 
 
