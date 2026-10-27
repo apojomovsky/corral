@@ -310,6 +310,16 @@ class StartTest(Dirs):
                 self.assertEqual(caught.exception.exit_code, 2)
         self.assertEqual(units.started_units(session), [])
 
+    def test_an_unreachable_user_manager_is_unreachable(self):
+        session = self.session()
+        for stderr in ("Failed to connect to bus: No medium found\n", "FAILED TO CONNECT TO BUS"):
+            with self.subTest(stderr=stderr):
+                fake = FakeRun(done([], returncode=1, stderr=stderr))
+                with self.assertRaises(units.Unreachable) as caught:
+                    units.start(self.argv("u-1"), session, "u-1", run=fake)
+                self.assertEqual(caught.exception.exit_code, 3)
+        self.assertEqual(units.started_units(session), [])
+
     def test_other_failures_are_units_error(self):
         session = self.session()
         for fake in (
