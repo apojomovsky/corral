@@ -317,5 +317,69 @@ class UnderAHookTest(RealRepoTest):
         )
 
 
+class DefaultBaseTest(unittest.TestCase):
+    def test_flag_then_env_then_the_default(self):
+        self.assertEqual(diffscope.default_base("main", {"BASE_REF": "x"}), "main")
+        self.assertEqual(diffscope.default_base(None, {"BASE_REF": "x"}), "x")
+        self.assertEqual(diffscope.default_base(None, {"BASE_REF": ""}), "origin/master")
+        self.assertEqual(diffscope.default_base(None, {}), "origin/master")
+
+    def test_no_other_module_reads_base_ref(self):
+        src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
+        readers = []
+        for here, _, names in os.walk(src):
+            for name in names:
+                if name.endswith(".py"):
+                    path = os.path.join(here, name)
+                    with open(path, encoding="utf-8") as handle:
+                        if "BASE_REF" in handle.read():
+                            readers.append(os.path.relpath(path, src))
+        self.assertEqual(readers, [os.path.join("corral", "diffscope.py")])
+
+
+class CallersUseTheResolverTest(unittest.TestCase):
+    """Each --base caller takes $BASE_REF when no flag is given."""
+
+    def setUp(self):
+        patch = mock.patch.dict(os.environ, {"BASE_REF": "origin/elsewhere"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def quiet(self, fn, *args):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return fn(*args)
+
+    def test_prose(self):
+        from corral import cli
+
+        with mock.patch.object(prose, "extract", return_value=[]) as extract:
+            self.quiet(cli.main, ["prose"])
+        self.assertEqual(extract.call_args.args[0], "origin/elsewhere")
+
+    def test_budget_verb_and_module(self):
+        from corral import budget, cli
+
+        with mock.patch.object(budget, "dispatch_block", return_value="") as block:
+            self.quiet(cli.main, ["budget"])
+            self.quiet(budget.main_cli, [])
+            self.quiet(budget.main_cli, ["--base", "x"])
+        self.assertEqual(
+            [c.args[0] for c in block.call_args_list], ["origin/elsewhere", "origin/elsewhere", "x"]
+        )
+
+    def test_review_show(self):
+        from corral import cli, mergeup
+
+        with (
+            mock.patch.object(mergeup, "resolve_commit", return_value="a" * 40),
+            mock.patch.object(mergeup, "find_record", return_value=(None, "")) as find,
+        ):
+            self.quiet(cli.main, ["review", "show", "lib", "1"])
+        self.assertEqual(find.call_args.args[2], "origin/elsewhere")
+
+
 if __name__ == "__main__":
     unittest.main()

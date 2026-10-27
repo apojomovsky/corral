@@ -60,15 +60,11 @@ def cmd_paths(args: argparse.Namespace) -> int:
     return OK
 
 
-def default_base(args: argparse.Namespace) -> str:
-    return args.base or os.environ.get("BASE_REF", "origin/master")
-
-
 def cmd_prose(args: argparse.Namespace) -> int:
     from corral import diffscope, prose
 
     cwd = os.getcwd()
-    base = default_base(args)
+    base = diffscope.default_base(args.base)
     try:
         if args.verify:
             found = prose.verify(base, cwd=cwd)
@@ -91,7 +87,9 @@ def cmd_push(args: argparse.Namespace) -> int:
 def cmd_budget(args: argparse.Namespace) -> int:
     from corral import budget
 
-    print(budget.dispatch_block(default_base(args)))
+    from corral import diffscope
+
+    print(budget.dispatch_block(diffscope.default_base(args.base)))
     return OK
 
 
@@ -116,7 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", choices=list(PATHS), help="print only this one")
     p.add_argument("--mkdir", action="store_true", help="create the directories first")
     p.set_defaults(func=cmd_paths)
-    base_help = "base ref to diff against (default origin/master or $BASE_REF)"
+    from corral.diffscope import BASE_HELP
+
+    base_help = f"base ref to diff against ({BASE_HELP})"
     p = sub.add_parser("prose", help="list and verify added comment blocks")
     p.add_argument(
         "--verify",

@@ -198,7 +198,9 @@ def main_cli(argv):
     Mirrors the `corral budget` verb's flag so the two spellings cannot
     disagree about how the base ref is given.
     """
-    base = os.environ.get("BASE_REF", "origin/master")
+    from corral.diffscope import default_base
+
+    base = default_base()
     rest = list(argv)
     while rest:
         arg = rest.pop(0)
