@@ -39,6 +39,17 @@ To put `corral` on your PATH from a checkout:
 make install      # uv tool install
 ```
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `corral deps` | check the host programs corral needs; print how to install what is missing |
+| `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |
+| `corral prose [--verify]` | list the comment blocks a branch adds; `--verify` fails on ones that break the prose rules |
+| `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
+
+Exit codes: `0` success, `1` a gate said no, `3` a remote or service unreachable, `4` usage error.
+
 ## Develop
 
 ```bash
