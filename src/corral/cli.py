@@ -4,7 +4,7 @@ import argparse
 import sys
 from collections.abc import Sequence
 
-from corral import deps
+from corral import deps, paths
 
 # Exit codes are a public interface (AGENTS.md).
 OK, NO, USAGE = 0, 1, 4
@@ -33,4 +33,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(argv)
     except SystemExit as err:
         return OK if err.code == 0 else USAGE
-    return args.func(args)
+    try:
+        return args.func(args)
+    except paths.PathError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
