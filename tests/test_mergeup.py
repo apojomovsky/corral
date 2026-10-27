@@ -54,6 +54,7 @@ class MergeUpTest(unittest.TestCase):
             TICKET,
             commit,
             reviewer="reviewer-1",
+            author="author-1",
             verdict=verdict,
             sessions_root=self.sessions,
         )

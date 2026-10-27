@@ -1,10 +1,20 @@
 """`corral review`: write and read review records.
 
 `record` is run by the reviewer process, never the author's shell: it
-states the verdict for one commit of a ticket. `show` prints the record a
-commit has, inherited across clean merge-ups. Exit codes: 0 ok, 1 no
-record, 4 usage (a bad verdict, a self-review, a commit that does not
-resolve, a changed verdict on a reviewed commit).
+states the verdict for one commit of a ticket, and names the change's
+author so a self-review is refused. `show` prints the record a commit
+has, inherited across clean merge-ups of `--base`.
+
+`--base` is trusted as given: a gate must pass the base the forge
+reports for the PR, not a local ref the author's clone controls, or a
+merge of unreviewed work could pass as a merge-up. A full sha is also
+taken on trust when it does not resolve here, for a reviewer outside
+the reviewed checkout.
+
+Exit codes: 0 the commit has an approving record (`approve` or
+`approve-with-findings`), 1 no record or a `block`, 4 usage (a bad
+verdict, a missing author, a self-review, a commit that does not
+resolve, a commit already reviewed).
 """
 
 import argparse
@@ -84,6 +94,7 @@ def cmd_record(args: argparse.Namespace) -> int:
 
 def cmd_show(args: argparse.Namespace) -> int:
     from corral import mergeup, reviewrecord
+    from corral.cli import default_base
 
     cwd = os.getcwd()
     commit = _commit(args.commit, cwd)
@@ -93,7 +104,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     record, found = mergeup.find_record(
         lambda c: reviewrecord.read_record(args.repo, args.number, c),
         commit,
-        args.base or os.environ.get("BASE_REF", "origin/master"),
+        default_base(args),
         cwd,
     )
     if record is None:
@@ -107,7 +118,7 @@ def cmd_show(args: argparse.Namespace) -> int:
                 dict(record, inherited_from=found if found != commit else None), sort_keys=True
             )
         )
-        return OK
+        return OK if reviewrecord.approves(record) else NO
     inherited = (
         ""
         if found == commit
@@ -116,7 +127,7 @@ def cmd_show(args: argparse.Namespace) -> int:
     print(f"{record['verdict']} by {record['reviewer']} on {record['commit']}{inherited}")
     for finding in record.get("findings") or []:
         print(f"- {finding.get('severity', 'note')}: {finding.get('text', '')}")
-    return OK
+    return OK if reviewrecord.approves(record) else NO
 
 
 def add_parser(sub) -> None:
@@ -135,7 +146,9 @@ def add_parser(sub) -> None:
     p.add_argument("--verdict", required=True, choices=reviewrecord.VERDICTS, help="the verdict")
     p.add_argument("--finding", action="append", default=[], help="severity:text (repeatable)")
     p.add_argument("--reviewer", default=None, help=f"the reviewer's agent id (or {AGENT_ID_ENV})")
-    p.add_argument("--author", default="", help="the change's author; refused as its own reviewer")
+    p.add_argument(
+        "--author", required=True, help="the change's author; refused as its own reviewer"
+    )
     p.add_argument("--question", default="", help="the one question the review answered")
     p.add_argument("--session", default="", help="the reviewer's own session")
     p.set_defaults(func=cmd_record)

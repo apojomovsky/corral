@@ -52,13 +52,16 @@ class RecordTest(unittest.TestCase):
 
     def write(self, commit="abc123def456", verdict="approve", **kw):
         kw.setdefault("reviewer", "reviewer-1")
+        kw.setdefault("author", "author-1")
         return reviewrecord.write_record(
             REPO, 1, commit, verdict=verdict, sessions_root=self.root, **kw
         )
 
     def test_the_default_root_is_the_sessions_dir(self):
         with mock.patch.dict(os.environ, {"CORRAL_SESSIONS": self.root}):
-            path = reviewrecord.write_record(REPO, 1, "abc123", reviewer="r", verdict="approve")
+            path = reviewrecord.write_record(
+                REPO, 1, "abc123", reviewer="r", verdict="approve", author="a"
+            )
         self.assertEqual(
             os.path.dirname(path),
             os.path.join(paths.ticket_session_dir(REPO, 1, root=self.root), "reviews"),
@@ -84,18 +87,38 @@ class RecordTest(unittest.TestCase):
             reviewrecord.read_record("app", 1, "abc123def456", sessions_root=self.root)
         )
 
-    def test_the_same_verdict_again_is_kept_and_a_changed_one_refused(self):
-        self.write()
-        self.write()
-        with self.assertRaises(ValueError):
-            self.write(verdict="block")
+    def test_a_retry_is_a_no_op_and_any_other_second_write_is_refused(self):
+        self.write(findings=[{"severity": "high", "text": "a real bug"}], now=1.0)
+        self.write(now=2.0)
+        for kw in ({"verdict": "block"}, {"reviewer": "reviewer-2"}):
+            with self.subTest(kw=kw), self.assertRaises(ValueError):
+                self.write(**kw)
         record = reviewrecord.read_record(REPO, 1, "abc123def456", sessions_root=self.root)
-        self.assertEqual(record["verdict"], "approve")
+        self.assertEqual(
+            (record["verdict"], record["reviewer"], record["at"], record["findings"]),
+            ("approve", "reviewer-1", 1.0, [{"severity": "high", "text": "a real bug"}]),
+        )
+        self.assertEqual(
+            os.listdir(reviewrecord.reviews_dir(REPO, 1, self.root)), ["review-abc123def456.json"]
+        )
+
+    def test_a_commit_sharing_the_file_prefix_does_not_share_the_record(self):
+        first, second = "a" * 12 + "1" * 28, "a" * 12 + "2" * 28
+        self.write(first)
+        self.assertIsNotNone(reviewrecord.read_record(REPO, 1, first, sessions_root=self.root))
+        self.assertIsNone(reviewrecord.read_record(REPO, 1, second, sessions_root=self.root))
+
+    def test_approves(self):
+        self.assertTrue(reviewrecord.approves({"verdict": "approve"}))
+        self.assertTrue(reviewrecord.approves({"verdict": "approve-with-findings"}))
+        self.assertFalse(reviewrecord.approves({"verdict": "block"}))
+        self.assertFalse(reviewrecord.approves(None))
 
     def test_bad_inputs_are_refused(self):
         for kw in (
             {"verdict": "looks-fine"},
             {"reviewer": ""},
+            {"author": ""},
             {"reviewer": "agent-1", "author": "agent-1"},
             {"commit": ""},
         ):
@@ -116,17 +139,6 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(reviewrecord.commit_id({"sha": "b" * 40}), "b" * 12)
         self.assertEqual(len(reviewrecord.commit_id("HEAD")), 12)
         self.assertEqual(reviewrecord.commit_id(""), "")
-
-    def test_records_newest_first_and_corrupt_files_skipped(self):
-        self.write("aaa111aaa111", now=100.0)
-        self.write("bbb222bbb222", verdict="block", now=200.0)
-        bad = os.path.join(reviewrecord.reviews_dir(REPO, 1, self.root), "review-zzz.json")
-        with open(bad, "w", encoding="utf-8") as handle:
-            handle.write("{not json")
-        found = reviewrecord.records(REPO, 1, sessions_root=self.root)
-        self.assertEqual([r["commit"] for r in found], ["bbb222bbb222", "aaa111aaa111"])
-        self.assertEqual(reviewrecord.latest_record(REPO, 1, self.root)["verdict"], "block")
-        self.assertIsNone(reviewrecord.latest_record(REPO, 9, self.root))
 
 
 class ResolveCommitTest(unittest.TestCase):
@@ -204,7 +216,17 @@ class VerbTest(unittest.TestCase):
 
     def record(self, commit, *extra):
         return self.run_cli(
-            "review", "record", REPO, "7", "--commit", commit, "--verdict", "approve", *extra
+            "review",
+            "record",
+            REPO,
+            "7",
+            "--commit",
+            commit,
+            "--verdict",
+            "approve",
+            "--author",
+            "author-1",
+            *extra,
         )
 
     def test_record_then_show(self):
@@ -254,9 +276,48 @@ class VerbTest(unittest.TestCase):
             "block",
             "--reviewer",
             "r-1",
+            "--author",
+            "author-1",
         )
         self.assertEqual(code, 4)
         self.assertIn("already reviewed", err)
+
+    def test_no_author_is_a_usage_error(self):
+        code, _, err = self.run_cli(
+            "review",
+            "record",
+            REPO,
+            "7",
+            "--commit",
+            "HEAD",
+            "--verdict",
+            "approve",
+            "--reviewer",
+            "r-1",
+        )
+        self.assertEqual(code, 4)
+        self.assertFalse(os.path.exists(reviewrecord.reviews_dir(REPO, 7)))
+
+    def test_show_of_a_block_exits_1(self):
+        code, _, _ = self.run_cli(
+            "review",
+            "record",
+            REPO,
+            "7",
+            "--commit",
+            "HEAD",
+            "--verdict",
+            "block",
+            "--reviewer",
+            "r-1",
+            "--author",
+            "author-1",
+        )
+        self.assertEqual(code, 0)
+        code, out, _ = self.run_cli("review", "show", REPO, "7")
+        self.assertEqual(code, 1)
+        self.assertIn("block by r-1", out)
+        self.assertEqual(self.run_cli("review", "show", REPO, "7", "--json")[0], 1)
 
     def test_an_unresolvable_id_is_refused_not_hashed(self):
         for commit in ("1234567" if not self.head.startswith("1234567") else "7654321", "a9c992g"):
@@ -280,6 +341,8 @@ class VerbTest(unittest.TestCase):
             "approve",
             "--reviewer",
             "r",
+            "--author",
+            "a",
         )
         self.assertEqual(code, 4)
 

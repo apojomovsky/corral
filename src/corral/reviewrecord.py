@@ -16,11 +16,16 @@ makes the review a machine fact instead of a promise:
 The record is small and boring on purpose: JSON, one file per reviewed
 commit, under the host's session root, written by the reviewer process
 itself. It holds no verdict the reviewer did not state.
+
+Records are plain files, not signatures: the reviewer and author ids are
+what the processes said they were. Separation is as strong as the
+process separation on the host, which is what the review gate asks for.
 """
 
 import hashlib
 import json
 import os
+import tempfile
 import time
 
 from corral import paths
@@ -60,29 +65,38 @@ def record_path(repo, number, commit, sessions_root=None):
     return os.path.join(reviews_dir(repo, number, sessions_root), name)
 
 
+def _full(commit):
+    """The lowercase commit text a record stores and compares against."""
+    if isinstance(commit, dict):
+        commit = commit.get("sha") or commit.get("id") or ""
+    return str(commit or "").strip().lower()
+
+
 def write_record(
     repo,
     number,
     commit,
     reviewer,
     verdict,
+    author,
     findings=None,
     question="",
     session="",
     sessions_root=None,
     now=None,
-    author="",
 ):
-    """Write one review record; returns the path.
+    """Write one review record; returns the path. Raises ValueError.
 
-    ``reviewer`` is the reviewing agent's id, ``verdict`` one of
+    ``reviewer`` is the reviewing agent's id, ``author`` the agent that
+    wrote the change: both are required, and a record naming the author
+    as its own reviewer is refused. ``verdict`` is one of
     :data:`VERDICTS`, ``findings`` the findings it stated (each a dict
-    with at least a severity). ``author`` is the agent that wrote the
-    change; a record naming the author as its own reviewer is refused.
-    Writing the same commit again is allowed only with the same verdict,
-    so a reviewer re-stating itself loses nothing, while a changed
-    verdict on a reviewed commit is refused: that needs a new commit and
-    a new record. Raises ValueError.
+    with at least a severity).
+
+    A commit is reviewed once. The file is created exclusively, so the
+    first record wins even when two reviewers race: a later write is a
+    no-op when it repeats the same reviewer and verdict (a retried
+    reviewer loses nothing), and refused otherwise.
     """
     verdict = str(verdict or "").strip().lower()
     if verdict not in VERDICTS:
@@ -91,23 +105,19 @@ def write_record(
     if not reviewer:
         raise ValueError("a review record needs the reviewer's agent id")
     author = str(author or "").strip()
-    if author and author == reviewer:
+    if not author:
+        raise ValueError("a review record needs the change's author, to refuse a self-review")
+    if author == reviewer:
         raise ValueError(f"{repo} {number}: the author ({author}) cannot be its own reviewer")
     if not commit_id(commit):
         raise ValueError("a review record needs the reviewed commit")
     path = record_path(repo, number, commit, sessions_root)
-    if os.path.exists(path):
-        existing = _load(path) or {}
-        if existing.get("verdict") != verdict:
-            raise ValueError(
-                f"{repo} {number} commit {commit_id(commit)} was already reviewed as "
-                f"{existing.get('verdict')!r}; a changed verdict needs a new commit"
-            )
     payload = {
         "repo": repo,
         "number": int(number),
-        "commit": commit_id(commit),
+        "commit": _full(commit),
         "reviewer": reviewer,
+        "author": author,
         "verdict": verdict,
         "findings": list(findings or []),
         "question": str(question or ""),
@@ -115,7 +125,29 @@ def write_record(
         "at": float(now if now is not None else time.time()),
     }
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    paths.atomic_write_text(path, json.dumps(payload, sort_keys=True) + "\n")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".review.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        # link() fails when the name exists: a create-exclusive publish
+        # of a file that is already complete.
+        os.link(tmp, path)
+    except FileExistsError:
+        existing = _load(path) or {}
+        if existing.get("reviewer") == reviewer and existing.get("verdict") == verdict:
+            return path
+        raise ValueError(
+            f"{repo} {number} commit {commit_id(commit)} was already reviewed "
+            f"({existing.get('verdict')!r} by {existing.get('reviewer')!r}); "
+            "a new review needs a new commit"
+        ) from None
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
     return path
 
 
@@ -134,28 +166,18 @@ def _load(path):
 
 
 def read_record(repo, number, commit, sessions_root=None):
-    """The record for one commit, or None."""
-    return _load(record_path(repo, number, commit, sessions_root))
+    """The record for exactly this commit, or None.
+
+    File names carry a 12-digit prefix; the stored commit must also be
+    the one asked for, so two commits sharing a prefix never share a
+    record.
+    """
+    payload = _load(record_path(repo, number, commit, sessions_root))
+    if payload is None or payload.get("commit") != _full(commit):
+        return None
+    return payload
 
 
-def records(repo, number, sessions_root=None):
-    """Every valid record of a ticket, newest first."""
-    directory = reviews_dir(repo, number, sessions_root)
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError:
-        return []
-    out = []
-    for name in names:
-        if name.startswith(RECORD_PREFIX) and name.endswith(".json"):
-            payload = _load(os.path.join(directory, name))
-            if payload is not None:
-                out.append(payload)
-    out.sort(key=lambda p: p.get("at", 0), reverse=True)
-    return out
-
-
-def latest_record(repo, number, sessions_root=None):
-    """The newest record of a ticket, or None."""
-    found = records(repo, number, sessions_root)
-    return found[0] if found else None
+def approves(record):
+    """Whether a record lets a change through: approve, with or without findings."""
+    return record is not None and record.get("verdict") in ("approve", "approve-with-findings")
