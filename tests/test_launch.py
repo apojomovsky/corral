@@ -539,5 +539,175 @@ class CliTest(OpsCase):
                 self.assertEqual(cli.main([verb, "--help"]), 0, verb)
 
 
+def _read(path):
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+class RaceTest(OpsCase):
+    """The session is written only after the second admission, and generations follow the log."""
+
+    def test_a_launch_that_loses_the_second_admit_leaves_the_live_session_alone(self):
+        launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "first prompt",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+        )
+        self.system.finish("corral-agent-lib-5")
+        session = self.session("lib", 5)
+        before = {
+            name: _read(os.path.join(session, name))
+            for name in ("prompt.md", "runtime", "overlay.yml")
+        }
+        started = len(self.system.started)
+
+        # The first admission sees nothing live; the second sees the ticket live.
+        calls = []
+
+        def flipping(prefix):
+            calls.append(prefix)
+            if len(calls) == 1:
+                return []
+            return [("corral-agent-lib-5", "active", "running")]
+
+        with self.assertRaises(units.UnitExists):
+            launch.launch(
+                self.target("lib", "opencode"),
+                5,
+                "second prompt",
+                title="feat: add the thing",
+                list_fn=flipping,
+                run=self.system.run,
+            )
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(runtimes.recorded(session), "omp")
+        for name, text in before.items():
+            self.assertEqual(_read(os.path.join(session, name)), text, name)
+        self.assertFalse(os.path.exists(os.path.join(session, "opencode.json")))
+        self.assertEqual(len(self.system.started), started)
+
+    def test_two_sequential_resumes_take_generations_one_and_two(self):
+        session = self.session("lib", 5)
+        launch.launch(
+            self.target("lib"),
+            5,
+            "go",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+        )
+        self.system.finish("corral-agent-lib-5")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+
+        first, _ = launch.resume(
+            self.target("lib"), 5, "again", list_fn=self.system.list_fn, run=self.system.run
+        )
+        self.system.finish(first)
+        second, _ = launch.resume(
+            self.target("lib"), 5, "again", list_fn=self.system.list_fn, run=self.system.run
+        )
+        self.assertEqual(first, "corral-agent-lib-5-r1")
+        self.assertEqual(second, "corral-agent-lib-5-r2")
+        self.assertEqual(
+            units.started_units(session),
+            ["corral-agent-lib-5", "corral-agent-lib-5-r1", "corral-agent-lib-5-r2"],
+        )
+
+
+class RegistryCapTest(OpsCase):
+    """Admission counts registered agents under the target's own resolved settings."""
+
+    def holders(self):
+        registry.register("worker-1", "claude-code", ticket=registry.make_ticket("my-repo", 9))
+        registry.register("worker-2", "claude-code", ticket=registry.make_ticket("lib", 9))
+
+    def test_registered_workers_fill_the_cap_by_default(self):
+        self.holders()
+        with self.assertRaises(launch.CapFull):
+            launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+
+    def test_count_toward_cap_false_in_the_ops_root_frees_the_slots(self):
+        with open(os.path.join(self.root, settings.PROJECT_FILE), "a", encoding="utf-8") as handle:
+            handle.write("\n[registry]\ncount_toward_cap = false\n")
+        self.holders()
+        tgt = self.target()
+        self.assertFalse(tgt.resolved["registry.count_toward_cap"])
+        launch.admit(tgt, 5, list_fn=lambda prefix: [])
+
+    def test_a_registered_live_ticket_refuses_with_the_registry_note(self):
+        registry.register("worker-1", "claude-code", ticket=registry.make_ticket("lib", 5))
+        with self.assertRaises(units.UnitExists) as ctx:
+            launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+        self.assertEqual(
+            str(ctx.exception),
+            "#5 of lib already has a live agent (registered agent, counts until its heartbeat goes stale)",
+        )
+
+    def test_a_full_host_held_by_registered_agents_names_them(self):
+        self.holders()
+        with self.assertRaises(launch.CapFull) as ctx:
+            launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+        self.assertEqual(
+            str(ctx.exception),
+            "2 of 2 agent slots are taken (registered agent, counts until its heartbeat goes stale): try later",
+        )
+
+    def test_a_unit_holder_gets_no_registry_note(self):
+        self.system.units["corral-agent-lib-5"] = "active"
+        with self.assertRaises(units.UnitExists) as ctx:
+            launch.admit(self.target(), 5, list_fn=self.system.list_fn)
+        self.assertEqual(str(ctx.exception), "#5 of lib already has a live agent")
+
+        self.system.units.clear()
+        self.system.units["corral-agent-my-repo-6"] = "active"
+        self.system.units["corral-agent-my-repo-7"] = "active"
+        with self.assertRaises(launch.CapFull) as ctx:
+            launch.admit(self.target(), 5, list_fn=self.system.list_fn)
+        self.assertNotIn("registered", str(ctx.exception))
+
+
+class StopUnprovenTest(OpsCase):
+    """stop names a live unit the log does not prove ours, and exits 2 for it."""
+
+    def test_an_unproven_live_unit_is_named_and_left_running(self):
+        launch.launch(
+            self.target(),
+            5,
+            "go",
+            title="feat: go",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+        )
+        self.system.units["corral-agent-lib-5-r7"] = "active"
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = launchcli.run_verb(
+                ["stop", "lib", "5", "--root", self.root], self.system.seams()
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("stopped corral-agent-lib-5", out.getvalue())
+        self.assertIn(
+            "live but not proven ours, not stopped: corral-agent-lib-5-r7", err.getvalue()
+        )
+        self.assertEqual(self.system.stopped, ["corral-agent-lib-5"])
+        self.assertEqual(self.system.units["corral-agent-lib-5-r7"], "active")
+
+    def test_only_an_unproven_unit_live_is_exit_2_with_nothing_stopped(self):
+        self.system.units["corral-agent-lib-5-r7"] = "active"
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = launchcli.run_verb(
+                ["stop", "lib", "5", "--root", self.root], self.system.seams()
+            )
+        self.assertEqual(code, 2)
+        self.assertEqual(self.system.stopped, [])
+        self.assertIn("corral-agent-lib-5-r7", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

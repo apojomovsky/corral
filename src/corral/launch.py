@@ -13,6 +13,15 @@ the production stop (see `corral.launchcli`).
 
 Errors carry the public exit code: LaunchError 4, CapFull 75. The units
 errors (UnitExists 2, Unreachable 3, UnitsError 4) pass through unchanged.
+
+A launch or resume writes nothing into the ticket's session until its
+second admission has passed, under the same spawn lock as the start. A
+launch that loses the race leaves the live agent's session as it was.
+
+Stop ends only the ticket's live units its session log proves it started.
+A live unit the log does not prove ours is left running and named (see
+`unproven`); the CLI exits 2 for it, and 1 when no unit of the ticket
+is live at all.
 """
 
 import os
@@ -25,6 +34,9 @@ from corral.runtimes import tail as runtime_tail
 #: RuntimeMaxSec. It is the same limit as runtimes.DEFAULT_MAX_TIME ("3h");
 #: a test asserts the two agree.
 RUNTIME_MAX_S = 3 * 60 * 60
+
+#: Appended to an admission error when the live agent is a registered one.
+REGISTERED_NOTE = "(registered agent, counts until its heartbeat goes stale)"
 
 #: The unit's environment entry that names the agent, read by the agent's hooks.
 AGENT_ID_VAR = "CORRAL_AGENT_ID"
@@ -58,6 +70,8 @@ class Target:
     cap: int
     branch_template: str
     worktrees_root: str
+    #: The settings this target was resolved from; admission reads the registry's keys here.
+    resolved: settings.Resolved
 
 
 def target(root, repo, env=None, flags=None):
@@ -91,6 +105,7 @@ def target(root, repo, env=None, flags=None):
         cap=resolved["agents.cap"],
         branch_template=resolved["git.branch"],
         worktrees_root=resolved["git.worktrees"],
+        resolved=resolved,
     )
 
 
@@ -127,19 +142,43 @@ def _check_model(model):
     return model
 
 
+def _live(tgt, list_fn):
+    """(from_units, from_registry): the tickets live as units, and as counted registered agents."""
+    from_units = units.live_tickets(tgt.prefix, list_fn(tgt.prefix))
+    from_registry = registry.counted_tickets(cfg=registry.config(tgt.resolved)) - from_units
+    return from_units, from_registry
+
+
 def admit(tgt, number, *, list_fn):
     """Refuse a ticket that is already live, or a host with no free slot.
 
     Live means a live unit of this prefix (`list_fn(prefix)`) or a live
-    registered worker on this host that holds the ticket. Raises
-    units.UnitExists (exit 2) for the ticket, CapFull (exit 75) when the
-    live count has reached the cap.
+    registered worker on this host that holds the ticket, counted under the
+    target's own resolved registry settings. Raises units.UnitExists (exit
+    2) for the ticket, CapFull (exit 75) when the live count has reached
+    the cap. A live agent that is only registered says so in the message.
     """
-    live = units.live_tickets(tgt.prefix, list_fn(tgt.prefix)) | registry.counted_tickets()
-    if (tgt.repo, number) in live:
+    from_units, from_registry = _live(tgt, list_fn)
+    live = from_units | from_registry
+    if (tgt.repo, number) in from_units:
         raise units.UnitExists(f"#{number} of {tgt.repo} already has a live agent")
+    if (tgt.repo, number) in from_registry:
+        raise units.UnitExists(
+            f"#{number} of {tgt.repo} already has a live agent {REGISTERED_NOTE}"
+        )
     if len(live) >= tgt.cap:
-        raise CapFull(f"{len(live)} of {tgt.cap} agent slots are taken: try later")
+        note = f" {REGISTERED_NOTE}" if from_registry else ""
+        raise CapFull(f"{len(live)} of {tgt.cap} agent slots are taken{note}: try later")
+
+
+def unproven(tgt, number, *, list_fn):
+    """Live units that parse to this ticket but that its units.log does not prove ours.
+
+    `stop` leaves these running; the CLI reports them.
+    """
+    return units.unproven(
+        tgt.prefix, tgt.repo, number, session_dir=_session(tgt, number), list_fn=list_fn
+    )
 
 
 def _env(adapter, session, unit):
@@ -187,23 +226,27 @@ def launch(
             git=git,
         )
 
-    os.makedirs(session, exist_ok=True)
+    with units.spawn_lock():
+        admit(tgt, number, list_fn=list_fn)
+        _write_session(session, adapter, tgt.runtime, prompt, runtime_config)
+        unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
+        command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
+        argv = units.unit_argv(
+            unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
+        )
+        units.start(argv, session, unit, run=run)
+    return unit, workdir
+
+
+def _write_session(session, adapter, runtime, prompt, runtime_config):
+    """The prompt, the runtime record and the per-launch config, into the session dir."""
     try:
+        os.makedirs(session, exist_ok=True)
         paths.atomic_write_text(os.path.join(session, "prompt.md"), prompt)
-        runtimes.record(session, tgt.runtime)
+        runtimes.record(session, runtime)
         adapter.write_config(session, runtime_config or {})
     except (ValueError, TypeError, OSError) as err:
         raise LaunchError(f"cannot write the agent's session: {err}") from None
-
-    unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
-    command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
-    argv = units.unit_argv(
-        unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
-    )
-    with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn)
-        units.start(argv, session, unit, run=run)
-    return unit, workdir
 
 
 def resume(
@@ -240,20 +283,19 @@ def resume(
             git=git,
         )
 
-    gen = max(units.next_gen(session), 1)
-    unit = units.unit_name(tgt.prefix, tgt.repo, number, gen)
-    command = adapter.argv(
-        session,
-        message,
-        model=model,
-        resume=handle,
-        max_time=runtimes.DEFAULT_MAX_TIME,
-    )
-    argv = units.unit_argv(
-        unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
-    )
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn)
+        unit = units.unit_name(tgt.prefix, tgt.repo, number, max(units.next_gen(session), 1))
+        command = adapter.argv(
+            session,
+            message,
+            model=model,
+            resume=handle,
+            max_time=runtimes.DEFAULT_MAX_TIME,
+        )
+        argv = units.unit_argv(
+            unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
+        )
         units.start(argv, session, unit, run=run)
     return unit, workdir
 

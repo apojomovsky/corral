@@ -1,7 +1,10 @@
 """`corral launch|resume|stop|tail`: the agent verbs over `corral.launch`.
 
-Exit codes: 0 ok; 1 nothing to stop; 2 already live or race lost; 3 systemd
-or a host unreachable; 4 usage or configuration error; 75 no free slot.
+Exit codes: 0 ok; 1 nothing to stop (no live agent of the ticket at all);
+2 already live or race lost, or, for stop, a live unit this ticket's log
+does not prove ours was left running (it is named on stderr and never
+stopped); 3 systemd or a host unreachable; 4 usage or configuration error;
+75 no free slot.
 
 The production seams are built in one place, `production_seams`, and passed
 to `add_parser` as a required argument. A test passes fakes instead.
@@ -126,11 +129,18 @@ def cmd_resume(args, seams: Seams) -> int:
 def cmd_stop(args, seams: Seams) -> int:
     tgt = _target(args)
     stopped = launch.stop(tgt, args.number, list_fn=seams.list_fn, stop_fn=seams.stop_fn)
+    left = launch.unproven(tgt, args.number, list_fn=seams.list_fn)
+    for unit in stopped:
+        print(f"stopped {unit}")
+    if left:
+        print(
+            f"corral: live but not proven ours, not stopped: {', '.join(left)}",
+            file=sys.stderr,
+        )
+        return RACE
     if not stopped:
         print("nothing to stop")
         return NOTHING
-    for unit in stopped:
-        print(f"stopped {unit}")
     return OK
 
 
