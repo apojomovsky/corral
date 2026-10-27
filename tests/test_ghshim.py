@@ -1,8 +1,8 @@
 """The paced gh shim: costs, redaction, shapes, the log, its summary and passthrough.
 
 No test runs a real `gh`. The in-process tests fake the pacer at
-`gh._pacer`; the end-to-end shim tests put a stub `gh` executable on a
-hermetic PATH and run the shim module in a child interpreter.
+`gh._pacer`; the end-to-end shim tests put stub `gh` executables on a
+hermetic PATH and run the wrapper or the shim module in a child interpreter.
 """
 
 import io
@@ -32,12 +32,16 @@ class FakePacer:
     def __init__(self, error=None):
         self.error = error
         self.acquired = []
+        self.charged = []
         self.cooldowns = []
 
     def acquire(self, cost=gh.GRAPHQL_CALL_COST):
         if self.error is not None:
             raise self.error
         self.acquired.append(cost)
+
+    def charge(self, cost):
+        self.charged.append(cost)
 
     def cooldown(self, seconds):
         self.cooldowns.append(seconds)
@@ -52,14 +56,65 @@ class CostTest(unittest.TestCase):
     def test_writes_cost_five(self):
         self.assertEqual(ghshim.cost_for(["pr", "create"]), 5.0)
         self.assertEqual(ghshim.cost_for(["issue", "close"]), 5.0)
-        self.assertEqual(ghshim.cost_for(["api", "-X", "POST", "repos/x"]), 5.0)
 
-    def test_graphql_costs_match_the_library_split(self):
-        self.assertEqual(ghshim.cost_for(["api", "graphql"]), gh.GRAPHQL_CALL_COST)
+    def test_write_verbs_cost_five(self):
+        for verb in (
+            "item-add",
+            "item-edit",
+            "item-delete",
+            "item-archive",
+            "ready",
+            "update-branch",
+        ):
+            with self.subTest(verb=verb):
+                self.assertEqual(ghshim.cost_for(["pr", verb, "12"]), 5.0)
+
+    def test_inline_graphql_costs_match_the_library_split(self):
+        self.assertEqual(
+            ghshim.cost_for(["api", "graphql", "-f", "query={ viewer { login } }"]),
+            gh.GRAPHQL_CALL_COST,
+        )
         self.assertEqual(
             ghshim.cost_for(["api", "graphql", "-f", "query=mutation { x }"]),
             gh.GRAPHQL_MUTATION_COST,
         )
+
+    def test_graphql_from_file_or_stdin_costs_the_mutation_rate(self):
+        # The query text is unknown, so the higher cost applies.
+        self.assertEqual(
+            ghshim.cost_for(["api", "graphql", "-F", "query=@q.graphql"]), gh.GRAPHQL_MUTATION_COST
+        )
+        self.assertEqual(
+            ghshim.cost_for(["api", "graphql", "--input", "-"]), gh.GRAPHQL_MUTATION_COST
+        )
+        self.assertEqual(ghshim.cost_for(["api", "graphql"]), gh.GRAPHQL_MUTATION_COST)
+
+    def test_body_flags_make_a_rest_call_a_write(self):
+        for argv in (
+            ["api", "repos/x", "-f", "a=b"],
+            ["api", "repos/x", "-F", "n=1"],
+            ["api", "repos/x", "--field", "a=b"],
+            ["api", "repos/x", "--raw-field", "a=b"],
+            ["api", "repos/x", "--input", "-"],
+            ["api", "repos/x", "-fa=b"],
+            ["api", "repos/x", "--field=a=b"],
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(ghshim.cost_for(argv), 5.0)
+
+    def test_explicit_get_with_fields_is_a_read(self):
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "-X", "GET", "-f", "a=b"]), 1.0)
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "--method=get", "-f", "a=b"]), 1.0)
+
+    def test_method_forms_decide(self):
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "--method=POST"]), 5.0)
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "-XPOST"]), 5.0)
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "-X", "put"]), 5.0)
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "-XGET"]), 1.0)
+        self.assertEqual(ghshim.cost_for(["api", "repos/x", "--method", "GET"]), 1.0)
+
+    def test_plain_api_read_costs_one(self):
+        self.assertEqual(ghshim.cost_for(["api", "repos/x"]), 1.0)
 
     def test_local_commands_are_not_paced(self):
         self.assertIsNone(ghshim.cost_for([]))
@@ -70,9 +125,6 @@ class CostTest(unittest.TestCase):
         self.assertEqual(ghshim.cost_for(["auth", "login"]), 1.0)
         self.assertEqual(ghshim.cost_for(["extension", "install"]), 5.0)
 
-    def test_rest_method_flag_decides(self):
-        self.assertEqual(ghshim.cost_for(["api", "repos/x", "--method", "GET"]), 1.0)
-
 
 class RedactionTest(unittest.TestCase):
     def test_only_two_words_survive(self):
@@ -80,6 +132,21 @@ class RedactionTest(unittest.TestCase):
             ghshim.short_argv(["pr", "create", "--body", "secret-body", "--token", "hunter2"]),
             ["pr", "create"],
         )
+
+    def test_token_in_a_url_path_is_not_logged(self):
+        self.assertEqual(ghshim.short_argv(["api", "repos/o/r?access_token=X"]), ["api", "<arg>"])
+
+    def test_token_in_a_query_string_is_not_logged(self):
+        self.assertEqual(ghshim.short_argv(["api", "/user?access_token=SECRET"]), ["api", "<arg>"])
+
+    def test_credentials_in_a_clone_url_are_not_logged(self):
+        self.assertEqual(
+            ghshim.short_argv(["repo", "https://user:TOKEN@example.com/o/r"]),
+            ["repo", "<arg>"],
+        )
+
+    def test_first_word_is_verbatim_and_plain_second_word_kept(self):
+        self.assertEqual(ghshim.short_argv(["pr", "list", "--state", "open"]), ["pr", "list"])
 
     def test_appended_line_carries_no_tokens_or_bodies(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,13 +159,23 @@ class RedactionTest(unittest.TestCase):
                 duration_s=0.1,
                 throttled=False,
             )
+            ghshim.append_call(
+                path,
+                caller="a@h",
+                argv=["api", "/user?access_token=TOKEN123"],
+                exit_code=0,
+                duration_s=0.1,
+                throttled=False,
+            )
             with open(path, encoding="utf-8") as handle:
-                rec = json.loads(handle.read())
-            self.assertEqual(rec["argv"], ["issue", "create"])
-            self.assertNotIn("s3cret", json.dumps(rec))
-            self.assertEqual(rec["caller"], "a@h")
-            self.assertEqual(rec["exit"], 0)
-            self.assertFalse(rec["throttled"])
+                first, second = [json.loads(line) for line in handle]
+            self.assertEqual(first["argv"], ["issue", "create"])
+            self.assertNotIn("s3cret", json.dumps(first))
+            self.assertEqual(first["caller"], "a@h")
+            self.assertEqual(first["exit"], 0)
+            self.assertFalse(first["throttled"])
+            self.assertEqual(second["argv"], ["api", "<arg>"])
+            self.assertNotIn("TOKEN123", json.dumps(second))
 
 
 class RotationTest(unittest.TestCase):
@@ -284,12 +361,71 @@ class ShapeTest(unittest.TestCase):
             self.assertEqual(summary["by_shape"], {"user": 1})
 
 
-class WatchesStdoutTest(unittest.TestCase):
-    def test_only_graphql_watches_stdout(self):
-        self.assertTrue(ghshim.watches_stdout(["api", "graphql"]))
-        self.assertFalse(ghshim.watches_stdout(["pr", "list"]))
-        self.assertFalse(ghshim.watches_stdout(["api", "repos/x"]))
-        self.assertFalse(ghshim.watches_stdout([]))
+class PayloadTest(unittest.TestCase):
+    """Rate limits are read from parsed JSON error payloads, never free text."""
+
+    def _cooldown_after(self, stdout, code):
+        pacer = FakePacer()
+        with mock.patch.object(gh, "_pacer", return_value=pacer):
+            hit = ghshim.pace_after_payload(stdout, code)
+        return hit, pacer.cooldowns
+
+    def test_successful_answer_mentioning_a_rate_limit_sets_nothing(self):
+        hit, cooldowns = self._cooldown_after('{"data": {"note": "rate limit policy"}}', 0)
+        self.assertFalse(hit)
+        self.assertEqual(cooldowns, [])
+
+    def test_failed_call_with_a_json_rate_limit_message_cools_down(self):
+        hit, cooldowns = self._cooldown_after('{"message": "API rate limit exceeded for user"}', 1)
+        self.assertTrue(hit)
+        self.assertEqual(cooldowns, [gh.GRAPHQL_COOLDOWN_S])
+
+    def test_failed_call_with_a_rate_limited_error_item_cools_down(self):
+        body = json.dumps({"errors": [{"type": "RATE_LIMITED", "message": "slow down"}]})
+        hit, _ = self._cooldown_after(body, 1)
+        self.assertTrue(hit)
+
+    def test_non_json_or_unrelated_payload_sets_nothing(self):
+        self.assertFalse(self._cooldown_after("rate limit exceeded", 1)[0])
+        self.assertFalse(self._cooldown_after('{"message": "Not Found"}', 1)[0])
+        self.assertFalse(self._cooldown_after('["rate limit"]', 1)[0])
+
+
+class PacingCapTest(unittest.TestCase):
+    """The pacer's cap path charges the call and reports it as capped."""
+
+    def test_before_charges_the_cost_without_a_cap(self):
+        pacer = FakePacer()
+        with mock.patch.object(gh, "_pacer", return_value=pacer):
+            _, capped = ghshim.pace_before(3.0)
+        self.assertFalse(capped)
+        self.assertEqual(pacer.acquired, [3.0])
+        self.assertEqual(pacer.charged, [])
+
+    def test_before_caps_and_still_charges_the_cost(self):
+        pacer = FakePacer(error=gh.GhError("unavailable", "x"))
+        with mock.patch.object(gh, "_pacer", return_value=pacer):
+            waited, capped = ghshim.pace_before(5.0)
+        self.assertTrue(capped)
+        self.assertEqual(pacer.charged, [5.0])
+        self.assertGreaterEqual(waited, 0.0)
+
+    def test_after_cools_down_on_a_secondary_limit(self):
+        pacer = FakePacer()
+        with mock.patch.object(gh, "_pacer", return_value=pacer):
+            self.assertTrue(
+                ghshim.pace_after(
+                    "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes."
+                )
+            )
+        self.assertEqual(pacer.cooldowns, [gh.GRAPHQL_COOLDOWN_S])
+
+    def test_after_ignores_clean_stderr(self):
+        pacer = FakePacer()
+        with mock.patch.object(gh, "_pacer", return_value=pacer):
+            self.assertFalse(ghshim.pace_after(""))
+            self.assertFalse(ghshim.pace_after("Created the pull request"))
+        self.assertEqual(pacer.cooldowns, [])
 
 
 class CallerTest(unittest.TestCase):
@@ -422,41 +558,8 @@ class LogPathTest(unittest.TestCase):
         )
 
 
-class PacerWiringTest(unittest.TestCase):
-    def test_before_charges_the_cost_without_a_cap(self):
-        pacer = FakePacer()
-        with mock.patch.object(gh, "_pacer", return_value=pacer):
-            _, capped = ghshim.pace_before(3.0)
-        self.assertFalse(capped)
-        self.assertEqual(pacer.acquired, [3.0])
-
-    def test_before_caps_instead_of_raising(self):
-        pacer = FakePacer(error=gh.GhError("unavailable", "x"))
-        with mock.patch.object(gh, "_pacer", return_value=pacer):
-            waited, capped = ghshim.pace_before(1.0)
-        self.assertTrue(capped)
-        self.assertGreaterEqual(waited, 0.0)
-
-    def test_after_cools_down_on_a_secondary_limit(self):
-        pacer = FakePacer()
-        with mock.patch.object(gh, "_pacer", return_value=pacer):
-            self.assertTrue(
-                ghshim.pace_after(
-                    "HTTP 403: You have exceeded a secondary rate limit. Please wait a few minutes."
-                )
-            )
-        self.assertEqual(pacer.cooldowns, [gh.GRAPHQL_COOLDOWN_S])
-
-    def test_after_ignores_clean_stderr(self):
-        pacer = FakePacer()
-        with mock.patch.object(gh, "_pacer", return_value=pacer):
-            self.assertFalse(ghshim.pace_after(""))
-            self.assertFalse(ghshim.pace_after("Created the pull request"))
-        self.assertEqual(pacer.cooldowns, [])
-
-
 class FindOnPathTest(unittest.TestCase):
-    """The shim finds the real gh without finding itself, using fake executables."""
+    """The shim finds the real gh without finding itself or another wrapper."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -469,10 +572,10 @@ class FindOnPathTest(unittest.TestCase):
         self._fake(self.shimdir)
         self._fake(self.bindir)
 
-    def _fake(self, directory):
+    def _fake(self, directory, body="#!/bin/sh\nexit 0\n"):
         path = os.path.join(directory, "gh")
         with open(path, "w", encoding="utf-8") as handle:
-            handle.write("#!/bin/sh\nexit 0\n")
+            handle.write(body)
         os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
         return path
 
@@ -498,6 +601,12 @@ class FindOnPathTest(unittest.TestCase):
         )
         self.assertEqual(found, os.path.join(self.bindir, "gh"))
 
+    def test_skips_another_corral_wrapper_in_a_second_shim_dir(self):
+        other = os.path.join(self.root, "other")
+        ghshim.install_shim(other, state=self.root)
+        found = gh_shim.find_on_path("gh", self.shimdir, path=f"{other}{os.pathsep}{self.bindir}")
+        self.assertEqual(found, os.path.join(self.bindir, "gh"))
+
     def test_none_when_only_the_shim_is_on_path(self):
         self.assertIsNone(gh_shim.find_on_path("gh", self.shimdir, path=self.shimdir))
 
@@ -511,7 +620,7 @@ class ShimScriptTest(unittest.TestCase):
         self.shimdir = os.path.join(self.tmp.name, "shim")
         self.bindir = os.path.join(self.tmp.name, "bin")
         os.makedirs(self.bindir)
-        self.wrapper = ghshim.install_shim(self.shimdir)
+        self.wrapper = ghshim.install_shim(self.shimdir, state=self.tmp.name)
         self.env = dict(
             os.environ,
             PATH=os.pathsep.join([self.shimdir, self.bindir]),
@@ -520,6 +629,7 @@ class ShimScriptTest(unittest.TestCase):
             CORRAL_AGENT_ID="shim-test@h",
         )
         self.env.pop(gh.PACED_MARKER, None)
+        self.env.pop(ghshim.DEPTH_ENV, None)
 
     def _stub(self, body):
         path = os.path.join(self.bindir, "gh")
@@ -558,13 +668,29 @@ class ShimScriptTest(unittest.TestCase):
         self.assertNotIn("top-secret", json.dumps(rec))
         self.assertNotIn("hunter2", json.dumps(rec))
 
-    def test_secondary_limit_cools_down_the_shared_pacer(self):
+    def test_secondary_limit_on_stderr_cools_down_the_shared_pacer(self):
         self._stub(
             "#!/bin/sh\necho 'HTTP 403: You have exceeded a "
             "secondary rate limit. Please wait a few minutes.' >&2\n"
             "exit 1\n"
         )
         proc = self._shim("pr", "list")
+        self.assertEqual(proc.returncode, 1)
+        (rec,) = self._log()
+        self.assertTrue(rec["throttled"])
+        self.assertGreater(self._cooldown(), 0.0)
+
+    def test_successful_answer_mentioning_a_rate_limit_sets_no_cooldown(self):
+        self._stub('#!/bin/sh\necho \'{"data": {"note": "rate limit policy"}}\'\nexit 0\n')
+        proc = self._shim("api", "graphql", "-f", "query={ viewer { login } }")
+        self.assertEqual(proc.returncode, 0)
+        (rec,) = self._log()
+        self.assertFalse(rec["throttled"])
+        self.assertEqual(self._cooldown(), 0.0)
+
+    def test_failing_rest_call_with_a_json_rate_limit_body_cools_down(self):
+        self._stub('#!/bin/sh\necho \'{"message": "API rate limit exceeded for user"}\'\nexit 1\n')
+        proc = self._shim("api", "repos/x")
         self.assertEqual(proc.returncode, 1)
         (rec,) = self._log()
         self.assertTrue(rec["throttled"])
@@ -579,19 +705,6 @@ class ShimScriptTest(unittest.TestCase):
         # No bucket file: the pacer was never opened for a local command.
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "graphql-pacing.json")))
         self.assertEqual(self._cooldown(), 0.0)
-
-    def test_graphql_stdout_errors_cool_down_the_pacer(self):
-        self._stub(
-            '#!/bin/sh\necho \'{"errors": [{"type": '
-            '"RATE_LIMITED", "message": "rate limit exceeded"}]}\'\n'
-            "exit 0\n"
-        )
-        proc = self._shim("api", "graphql", "-f", "query={ x }")
-        self.assertEqual(proc.returncode, 0)
-        self.assertIn(b"RATE_LIMITED", proc.stdout)
-        (rec,) = self._log()
-        self.assertTrue(rec["throttled"])
-        self.assertGreater(self._cooldown(), 0.0)
 
     def test_signal_death_is_not_remapped_to_an_exit_code(self):
         self._stub("#!/bin/sh\nkill -TERM $$\n")
@@ -644,25 +757,110 @@ class ShimScriptTest(unittest.TestCase):
         proc = self._shim("pr", "list", env=env)
         self.assertEqual(proc.returncode, 127)
 
-    def test_missing_shim_dir_is_a_usage_error(self):
-        # The wrapper always sets the variable, so run the module directly.
-        env = {key: value for key, value in self.env.items() if key != ghshim.SHIM_DIR_ENV}
+    def test_two_shim_directories_do_not_loop(self):
+        other = os.path.join(self.tmp.name, "other")
+        other_wrapper = ghshim.install_shim(other, state=self.tmp.name)
+        self._stub("#!/bin/sh\necho reached-real-gh\nexit 0\n")
+        env = dict(self.env, PATH=os.pathsep.join([self.shimdir, other, self.bindir]))
         proc = subprocess.run(
-            [sys.executable, "-P", "-m", "corral.github.gh_shim", "pr", "list"],
-            capture_output=True,
-            env=env,
-            timeout=120,
+            [self.wrapper, "pr", "list"], capture_output=True, env=env, timeout=120
         )
-        self.assertEqual(proc.returncode, 4)
-        self.assertIn(ghshim.SHIM_DIR_ENV.encode(), proc.stderr)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"reached-real-gh\n")
+        self.assertTrue(other_wrapper.startswith(other))
 
-    def test_install_writes_an_executable_wrapper_in_the_shim_dir(self):
+    def test_a_shim_started_with_the_depth_marker_refuses_to_run(self):
+        self._stub("#!/bin/sh\necho ran\nexit 0\n")
+        env = dict(self.env, **{ghshim.DEPTH_ENV: "1"})
+        proc = self._shim("pr", "list", env=env)
+        self.assertEqual(proc.returncode, 4)
+        self.assertNotIn(b"ran", proc.stdout)
+        self.assertIn(ghshim.DEPTH_ENV.encode(), proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "gh-calls.jsonl")))
+
+    def test_real_gh_runs_with_the_depth_marker_set(self):
+        self._stub('#!/bin/sh\necho "depth=$CORRAL_GH_SHIM_DEPTH"\nexit 0\n')
+        proc = self._shim("pr", "list")
+        self.assertEqual(proc.stdout, b"depth=1\n")
+
+    def test_wrapper_exports_the_install_time_state_dir(self):
+        self._stub("#!/bin/sh\nexit 0\n")
+        elsewhere = os.path.join(self.tmp.name, "elsewhere")
+        env = dict(self.env, CORRAL_STATE=elsewhere)
+        proc = self._shim("pr", "list", env=env)
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(len(self._log()), 1)
+        self.assertFalse(os.path.exists(elsewhere))
+
+    def test_install_writes_an_executable_wrapper_with_marker_and_state(self):
         self.assertEqual(self.wrapper, os.path.join(self.shimdir, "gh"))
         self.assertTrue(os.access(self.wrapper, os.X_OK))
         with open(self.wrapper, encoding="utf-8") as handle:
             body = handle.read()
         self.assertTrue(body.startswith("#!/bin/sh\n"))
+        self.assertIn(ghshim.WRAPPER_MARKER, body)
         self.assertIn("-m corral.github.gh_shim", body)
+        self.assertIn(os.path.realpath(self.tmp.name), body)
+
+    def test_concurrent_calls_log_every_line_and_keep_the_pacer_valid(self):
+        self._stub("#!/bin/sh\necho ok\nexit 0\n")
+        count = 8
+        procs = [
+            subprocess.Popen(
+                [self.wrapper, "pr", "list"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=self.env,
+            )
+            for _ in range(count)
+        ]
+        for proc in procs:
+            out, _ = proc.communicate(timeout=120)
+            self.assertEqual(proc.returncode, 0)
+            self.assertEqual(out, b"ok\n")
+        self.assertEqual(len(self._log()), count)
+        with open(os.path.join(self.tmp.name, "graphql-pacing.json"), encoding="utf-8") as handle:
+            json.load(handle)
+
+
+class TimeoutTest(unittest.TestCase):
+    """A gh that runs past the timeout is stopped and the shim exits 124."""
+
+    def test_a_stuck_gh_is_stopped_and_the_shim_exits_124(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shimdir = os.path.join(tmp, "shim")
+            bindir = os.path.join(tmp, "bin")
+            os.makedirs(bindir)
+            sleep_bin = shutil.which("sleep")
+            self.assertIsNotNone(sleep_bin)
+            stub = os.path.join(bindir, "gh")
+            with open(stub, "w", encoding="utf-8") as handle:
+                handle.write(f"#!/bin/sh\nexec {sleep_bin} 60\n")
+            os.chmod(stub, os.stat(stub).st_mode | stat.S_IXUSR)
+            wrapper = ghshim.install_shim(shimdir, state=tmp)
+            env = {
+                "PATH": os.pathsep.join([shimdir, bindir]),
+                "CORRAL_STATE": tmp,
+                "CORRAL_GH_SHIM_DIR": shimdir,
+                "CORRAL_AGENT_ID": "timeout-test",
+            }
+            self.assertTrue(os.path.isfile(wrapper))
+            err = io.TextIOWrapper(io.BytesIO())
+            out = io.TextIOWrapper(io.BytesIO())
+            with (
+                mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(ghshim, "TIMEOUT_S", 0.5),
+                mock.patch.object(gh, "_KILL_AFTER_S", 2.0),
+                mock.patch("sys.stderr", err),
+                mock.patch("sys.stdout", out),
+            ):
+                code = gh_shim.main(["pr", "list"])
+            self.assertEqual(code, ghshim.TIMED_OUT_EXIT)
+            err.flush()
+            self.assertIn(b"timed out", err.buffer.getvalue())
+            with open(os.path.join(tmp, "gh-calls.jsonl"), encoding="utf-8") as handle:
+                (rec,) = [json.loads(line) for line in handle]
+            self.assertEqual(rec["exit"], ghshim.TIMED_OUT_EXIT)
 
 
 class GhCallsCommandTest(unittest.TestCase):
@@ -707,10 +905,7 @@ class GhCallsCommandTest(unittest.TestCase):
 
     def test_by_shape_lists_shapes_without_minute_rows(self):
         self._state()
-        board = (
-            "query($o:String!){ user(login:$o){ projectV2(number:1)"
-            "{ items(first:100){ nodes { id } } } } }"
-        )
+        board = "query($o:String!){ user(login:$o){ projectV2(number:1){ items(first:100){ nodes { id } } } } }"
         item = "query($i:ID!){ node(id:$i){ id } }"
         ghshim.append_call(
             caller="a@h",

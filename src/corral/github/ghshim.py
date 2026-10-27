@@ -8,10 +8,21 @@ the shared bucket, starts the shared cooldown on a rate-limit answer, and
 appends one redacted line to the call log. `corral gh-calls` summarizes
 that log.
 
-The log keeps only the first two argv words per call, so tokens and
+The log keeps the first argv word and, when it looks like a plain word,
+the second. Anything else in the second slot (a URL, a query string, a
+clone address with credentials) is logged as `<arg>`, so tokens and
 `--body` content never reach the disk. GraphQL calls also carry one shape
-token: the root selection names only, never query text or variables. Past
-ROTATE_BYTES the log moves to `<path>.1`, replacing the previous copy.
+token: the root selection names only, never query text or variables.
+
+Past ROTATE_BYTES the log moves to `<path>.1`, replacing the previous copy.
+Writers do not lock the rotation, so under concurrent writers a rotation
+can race and drop at most one generation of log lines. Nothing leaks into
+the wrong file, and the pacer state is never touched by rotation.
+
+`CORRAL_GH_PACED=1` (gh.PACED_MARKER) is a trusted-environment marker. Corral's
+own paced runner sets it on its children, which already paid the bucket. An
+agent that sets it by hand only skips its own accounting; it gains no
+other access.
 """
 
 import json
@@ -33,6 +44,19 @@ SHIM_DIR_NAME = "dispatch"
 #: Names the directory the shim executable sits in. The shim skips that
 #: directory when it searches PATH for the real `gh`, so it never runs itself.
 SHIM_DIR_ENV = "CORRAL_GH_SHIM_DIR"
+#: Set in the real gh's environment by the shim. A shim that starts with it
+#: already set is a shim calling itself through PATH, so it refuses to run.
+DEPTH_ENV = "CORRAL_GH_SHIM_DEPTH"
+#: The state dir the wrapper exports, so every agent shares one bucket and log.
+STATE_ENV = "CORRAL_STATE"
+#: A line the wrapper always contains. PATH candidates carrying it are wrappers
+#: of this shim and are skipped, so two shim directories cannot loop.
+WRAPPER_MARKER = "# corral-gh-shim"
+#: Seconds the real gh may run before the shim kills it. Agents run long
+#: commands such as `pr checks --watch`, so this is generous.
+TIMEOUT_S = 600.0
+#: Exit code when the shim kills a timed-out gh (the timeout(1) convention).
+TIMED_OUT_EXIT = 124
 
 #: `gh` entry points that never reach the API, so the shim logs them but
 #: charges nothing (auth status reads the local keyring, config/alias are
@@ -76,6 +100,12 @@ _WRITE_WORDS = frozenset(
         "unlock",
         "unpin",
         "upload",
+        "item-add",
+        "item-edit",
+        "item-delete",
+        "item-archive",
+        "ready",
+        "update-branch",
     }
 )
 
@@ -97,18 +127,24 @@ def shim_dir(state=None):
     return os.path.join(base, SHIM_DIR_NAME)
 
 
-def install_shim(directory=None):
+def install_shim(directory=None, state=None):
     """Write the `gh` wrapper into `directory` (default `shim_dir()`); return its path.
 
     The wrapper names its own directory in SHIM_DIR_ENV, so the shim can skip
-    it on PATH, and runs the interpreter that installed corral. It is not put
-    on any agent's PATH here.
+    it on PATH, exports CORRAL_STATE as the state dir at install time (`state`,
+    default `paths.state_dir()`), and runs the interpreter that installed
+    corral. The export wins over whatever the agent's environment says, so
+    every unit shares one bucket and one log. It is not put on any agent's
+    PATH here.
     """
     target_dir = shim_dir() if directory is None else directory
+    state_dir = paths.state_dir() if state is None else state
     os.makedirs(target_dir, exist_ok=True)
     target = os.path.join(target_dir, SHIM_NAME)
     body = (
         "#!/bin/sh\n"
+        f"{WRAPPER_MARKER}\n"
+        f"{STATE_ENV}={shlex.quote(os.path.realpath(state_dir))} "
         f"{SHIM_DIR_ENV}={shlex.quote(os.path.realpath(target_dir))} "
         f'exec {shlex.quote(sys.executable)} -P -m corral.github.gh_shim "$@"\n'
     )
@@ -133,16 +169,25 @@ def paced_marker_set(env=None):
     return env.get(gh.PACED_MARKER) == "1"
 
 
+#: A second word that is a plain name (`list`, `create`). Anything else, such as
+#: `repos/o/r`, a URL with a query string or credentials, is logged as <arg>.
+_PLAIN_WORD = re.compile(r"[A-Za-z][\w-]*")
+
+
 def short_argv(argv):
-    """First two argv words; everything identifying the call, nothing secret."""
-    return [str(word) for word in list(argv or [])[:2]]
+    """The first argv word verbatim, and the second only when it is a plain word."""
+    words = [str(word) for word in list(argv or [])[:2]]
+    if len(words) > 1 and not _PLAIN_WORD.fullmatch(words[1]):
+        words[1] = "<arg>"
+    return words
 
 
 def cost_for(argv):
     """Shared-bucket cost of a `gh` call, or None when it never hits the API.
 
     Mirrors the `paced_run`/`graphql` split: GraphQL 3 (5 for a mutation),
-    REST 1 a read and 5 a mutative call.
+    REST 1 a read and 5 a mutative call. When the cost cannot be known (a
+    GraphQL query read from a file or stdin) the higher cost applies.
     """
     words = [str(word) for word in (argv or [])]
     if not words:
@@ -157,19 +202,59 @@ def cost_for(argv):
         # `extension install`) fall through to normal costing below.
         return None
     if first == "api":
-        if _is_graphql(words):
-            if re.search(r"\bmutation\b", " ".join(words)):
-                return gh.GRAPHQL_MUTATION_COST
-            return gh.GRAPHQL_CALL_COST
-        for index, word in enumerate(rest):
-            if word in ("-X", "--method") and index + 1 < len(rest):
-                if rest[index + 1].upper() in _MUTATING_METHODS:
-                    return gh.REST_WRITE_COST
-                return gh.REST_READ_COST
-        return gh.REST_READ_COST
+        return _api_cost(words)
     if rest and rest[0] in _WRITE_WORDS:
         return gh.REST_WRITE_COST
     return gh.REST_READ_COST
+
+
+def _api_cost(words):
+    """Cost of a `gh api` call: GraphQL by its query, REST by its method."""
+    rest = words[1:]
+    if _is_graphql(words):
+        query = _query_text(words)
+        if query is None or query.lstrip().startswith("@"):
+            # Query from a file or stdin: unknown, so assume the mutation cost.
+            return gh.GRAPHQL_MUTATION_COST
+        if re.search(r"\bmutation\b", " ".join(words)):
+            return gh.GRAPHQL_MUTATION_COST
+        return gh.GRAPHQL_CALL_COST
+    method = _api_method(rest)
+    if method is None:
+        # gh sends a request with fields as POST, so fields make a write.
+        return gh.REST_WRITE_COST if _has_body_flag(rest) else gh.REST_READ_COST
+    if method == "GET":
+        return gh.REST_READ_COST
+    return gh.REST_WRITE_COST if method in _MUTATING_METHODS else gh.REST_READ_COST
+
+
+def _api_method(rest):
+    """The explicit HTTP method upper-cased (`-X POST`, `--method=post`, `-XPOST`), or None."""
+    for index, word in enumerate(rest):
+        if word in ("-X", "--method") and index + 1 < len(rest):
+            return rest[index + 1].upper()
+        if word.startswith("--method="):
+            return word[len("--method=") :].upper()
+        if word.startswith("-X") and len(word) > 2:
+            return word[2:].upper()
+    return None
+
+
+#: Flags that send a request body or fields, so the call is a write unless
+#: the method is explicitly GET. Attached forms (`-fkey=v`, `--field=k=v`)
+#: are matched by prefix.
+_BODY_FLAGS = ("-f", "-F", "--field", "--raw-field", "--input")
+
+
+def _has_body_flag(rest):
+    for word in rest:
+        if word in _BODY_FLAGS:
+            return True
+        if any(word.startswith(flag + "=") for flag in _BODY_FLAGS if flag.startswith("--")):
+            return True
+        if word[:2] in ("-f", "-F") and len(word) > 2:
+            return True
+    return False
 
 
 def _is_graphql(words):
@@ -331,17 +416,6 @@ def shape_for(argv):
     return token[:_SHAPE_MAX_LEN] or None
 
 
-def watches_stdout(argv):
-    """Whether this call's errors may ride on stdout with exit 0.
-
-    A GraphQL error payload is data, not a transport failure, so `gh`
-    prints it on stdout and exits 0; the shim buffers stdout for these
-    calls only, so the shared cooldown still sees a rate-limit answer.
-    Every other call streams stdout untouched.
-    """
-    return _is_graphql([str(word) for word in (argv or [])])
-
-
 def _is_local(first, rest):
     """Whether a locally-handled entry point stays off the bucket."""
     allowed = _LOCAL_SECOND.get(first)
@@ -356,8 +430,9 @@ def pace_before(cost):
     """Take `cost` points from the shared bucket; (waited_s, capped).
 
     Waits rather than fails, like `GraphqlPacer.acquire`. When the wait
-    would exceed the pacer's cap the call goes through anyway and `capped`
-    is true, so the shim never blocks forever.
+    would exceed the pacer's cap the call goes through anyway, `capped` is
+    true, and the cost is still charged (the balance may go negative), so
+    later callers wait for it and the shim never blocks forever.
     """
     pacer = gh._pacer()
     start = time.monotonic()
@@ -365,14 +440,55 @@ def pace_before(cost):
         pacer.acquire(cost=cost)
         return time.monotonic() - start, False
     except gh.GhError:
+        pacer.charge(cost)
         return time.monotonic() - start, True
 
 
 def pace_after(stderr_text):
-    """Start the shared cooldown on a rate-limit answer; whether one was set."""
+    """Start the shared cooldown on a rate-limit answer in stderr; whether one was set."""
     if not gh.is_rate_limited(stderr_text or ""):
         return False
     gh._pacer().cooldown(gh.retry_after_s(stderr_text))
+    return True
+
+
+def _payload_limit_text(stdout_text):
+    """The rate-limit message in a JSON error payload on stdout, else None.
+
+    Only a parsed payload counts: a top-level `errors` list with an item typed
+    RATE_LIMITED, or a top-level `message` that `gh.is_rate_limited` matches.
+    Free text that merely mentions a rate limit does not.
+    """
+    try:
+        payload = json.loads(stdout_text or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    errors = payload.get("errors")
+    if isinstance(errors, list):
+        for item in errors:
+            if isinstance(item, dict) and item.get("type") == "RATE_LIMITED":
+                message = item.get("message")
+                return message if isinstance(message, str) and message else "rate limit exceeded"
+    message = payload.get("message")
+    if isinstance(message, str) and gh.is_rate_limited(message):
+        return message
+    return None
+
+
+def pace_after_payload(stdout_text, exit_code):
+    """Start the shared cooldown on a rate-limit JSON payload from a failed call.
+
+    Inspected only when gh exits non-zero, so a successful answer whose
+    content mentions a rate limit never cools the host down. Whether one was set.
+    """
+    if exit_code == 0:
+        return False
+    limit = _payload_limit_text(stdout_text)
+    if limit is None:
+        return False
+    gh._pacer().cooldown(gh.retry_after_s(limit))
     return True
 
 
