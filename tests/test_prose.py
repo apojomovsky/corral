@@ -395,17 +395,17 @@ class ContentChecksTest(unittest.TestCase):
         self.assertEqual(self.messages(["// fixed point Q8.8 scaling"]), "")
 
     def test_em_dash_fails(self):
-        self.assertIn("em-dash", self.messages(["// the reason — and more"]))
+        self.assertIn("em-dash", self.messages(["// the reason \u2014 and more"]))
 
     def test_em_dash_in_ascii_art_passes(self):
-        art = ["// ┌──┐", "// │ a — b │"]
+        art = ["// ┌──┐", "// │ a \u2014 b │"]
         self.assertEqual(self.messages(art), "")
 
     def test_clean_block_has_no_violations(self):
         self.assertEqual(self.messages(["// datasheet 80329B 9.2 needs the read"]), "")
 
     def test_several_violations_are_all_reported(self):
-        got = self.messages(["// verified by sim — and more"])
+        got = self.messages(["// verified by sim \u2014 and more"])
         self.assertIn("narrative", got)
         self.assertIn("em-dash", got)
 

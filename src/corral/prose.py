@@ -351,7 +351,7 @@ def check_line_rules(block):
     return None
 
 
-EM_DASH = "—"
+EM_DASH = "\u2014"
 
 # Narrow on purpose. A bare `fixed` would flag every fixed-point comment
 # in numeric code, so each pattern needs the narrative shape around it.
