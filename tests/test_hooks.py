@@ -131,6 +131,26 @@ class PrePush(Repo):
         r = git(self.repo, "push", "-q", "--force", "origin", "master", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
 
+    def test_a_second_push_of_the_same_tree_skips_the_suite(self):
+        r = git(self.repo, "push", "origin", "master:copy", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("suite already passed for this tree", r.stdout + r.stderr)
+
+    def test_a_new_tree_runs_the_suite_again(self):
+        self.commit("chore: three", name="h")
+        r = git(self.repo, "push", "origin", "master", env=self.env)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("suite already passed", r.stdout + r.stderr)
+
+    def test_the_hook_and_corral_push_share_the_stamp_name(self):
+        from corral import push
+
+        lines = [
+            l for l in (HOOKS / "pre-push").read_text().splitlines() if l.startswith("stamp_file=")
+        ]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("/" + push.STAMP_NAME + '"', lines[0])
+
     def test_deleting_a_remote_branch_is_refused(self):
         r = git(self.repo, "push", "-q", "origin", ":master", env=self.env)
         self.assertNotEqual(r.returncode, 0)
