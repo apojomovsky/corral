@@ -51,6 +51,7 @@ make install      # uv tool install
 | `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
 | `corral review record REPO N --commit SHA --verdict V --author ID` | a reviewer states its verdict on one commit of a ticket, once; a self-review is refused. The record is the review gate's proof |
 | `corral review show REPO N [--commit SHA] [--base REF]` | the record a commit has, or inherits across a clean merge-up of the base; exit 0 only for `approve` or `approve-with-findings`, 1 for none or a `block` |
+| `corral agent register\|heartbeat\|done\|list` | the host's agent registry: any agent, from any runtime, reports itself; a ticket is `--repo` and `--number` (optional `--project`); exit 4 on a heartbeat means the agent was dropped and registers again |
 | `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
 
 Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project.

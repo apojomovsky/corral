@@ -65,6 +65,19 @@ def register(key, type_, default, help_):
     return REGISTRY[key]
 
 
+#: Modules that register settings of their own. `resolve` imports them
+#: first, so a file setting one of their keys never reads as unknown, and
+#: `config show` lists them. A test keeps this list complete.
+PROVIDERS = ("corral.registry",)
+
+
+def _load_providers():
+    import importlib
+
+    for name in PROVIDERS:
+        importlib.import_module(name)
+
+
 register("git.branch", str, "{type}/{issue}-{slug}", "branch name template")
 register("git.worktrees", str, ".worktrees/", "worktree root, relative to the clone")
 register("git.commits.conventional", bool, True, "enforce Conventional Commits")
@@ -170,6 +183,7 @@ def resolve(
     project_name: str = PROJECT_FILE,
 ) -> Resolved:
     """Every registered setting, resolved through the five layers (pure)."""
+    _load_providers()
     host = dict(host or {})
     project = dict(project or {})
     env = os.environ if env is None else env
