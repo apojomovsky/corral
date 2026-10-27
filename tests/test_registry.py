@@ -226,6 +226,8 @@ class ConfigTest(unittest.TestCase):
                 with open(path, encoding="utf-8") as handle:
                     if re.search(r"^settings\.register\(", handle.read(), re.MULTILINE):
                         module = os.path.relpath(path, src)[: -len(".py")].replace(os.sep, ".")
+                        # A package's __init__ is the package itself, as PROVIDERS names it.
+                        module = module.removesuffix(".__init__")
                         found.add(module)
         self.assertEqual(found, set(settings.PROVIDERS))
 
