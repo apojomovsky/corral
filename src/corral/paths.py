@@ -4,7 +4,9 @@ Every reader of a corral directory goes through the function here, so a
 path is decided in exactly one place (AGENTS.md, "One fact, one place").
 Defaults follow the XDG base directory spec. An override names an
 absolute path; a relative one is refused rather than resolved against
-whatever the cwd happens to be.
+whatever the cwd happens to be. An empty override counts as unset.
+Every result is normalized, so containment checks against it agree with
+paths built by joining onto it.
 """
 
 import os
@@ -14,46 +16,48 @@ class PathError(ValueError):
     """A directory override is unusable (exit 4, configuration error)."""
 
 
-def _resolve(override_var, xdg_var, xdg_default, leaf, env):
+def _override(var, env):
+    """The normalized absolute path in `var`, None when unset or empty."""
+    value = env.get(var)
+    if not value:
+        return None
+    path = os.path.expanduser(value)
+    if not os.path.isabs(path):
+        raise PathError(f"{var}={value!r} must be an absolute path")
+    return os.path.normpath(path)
+
+
+def _resolve(override_var, xdg_var, xdg_default, env):
     env = os.environ if env is None else env
-    override = env.get(override_var)
+    override = _override(override_var, env)
     if override:
-        path = os.path.expanduser(override)
-        if not os.path.isabs(path):
-            raise PathError(f"{override_var}={override!r} must be an absolute path")
-        return path
+        return override
     base = env.get(xdg_var)
     if not base or not os.path.isabs(base):
         # The XDG spec says a relative value is invalid and must be ignored.
         base = os.path.expanduser(xdg_default)
-    return os.path.join(base, leaf)
+    return os.path.normpath(os.path.join(base, "corral"))
 
 
 def state_dir(env=None):
     """Ledgers, the board store and logs: `CORRAL_STATE`, else XDG state."""
-    return _resolve("CORRAL_STATE", "XDG_STATE_HOME", "~/.local/state", "corral", env)
+    return _resolve("CORRAL_STATE", "XDG_STATE_HOME", "~/.local/state", env)
 
 
 def config_dir(env=None):
     """Host config, project registrations, the API token: `CORRAL_CONFIG`."""
-    return _resolve("CORRAL_CONFIG", "XDG_CONFIG_HOME", "~/.config", "corral", env)
+    return _resolve("CORRAL_CONFIG", "XDG_CONFIG_HOME", "~/.config", env)
 
 
 def cache_dir(env=None):
     """Scratch files, such as PR body drafts: `CORRAL_CACHE`, else XDG cache."""
-    return _resolve("CORRAL_CACHE", "XDG_CACHE_HOME", "~/.cache", "corral", env)
+    return _resolve("CORRAL_CACHE", "XDG_CACHE_HOME", "~/.cache", env)
 
 
 def sessions_dir(env=None):
     """One directory per agent session: `CORRAL_SESSIONS`, else `<state>/sessions`."""
     env = os.environ if env is None else env
-    override = env.get("CORRAL_SESSIONS")
-    if override:
-        path = os.path.expanduser(override)
-        if not os.path.isabs(path):
-            raise PathError(f"CORRAL_SESSIONS={override!r} must be an absolute path")
-        return path
-    return os.path.join(state_dir(env), "sessions")
+    return _override("CORRAL_SESSIONS", env) or os.path.join(state_dir(env), "sessions")
 
 
 def atomic_write_text(target, text):

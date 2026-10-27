@@ -38,6 +38,8 @@ class Resolvers(unittest.TestCase):
     def test_overrides_win_and_are_used_as_given(self):
         env = {
             "XDG_STATE_HOME": "/x/state",
+            "XDG_CONFIG_HOME": "/x/config",
+            "XDG_CACHE_HOME": "/x/cache",
             "CORRAL_STATE": "/o/state",
             "CORRAL_CONFIG": "/o/config",
             "CORRAL_CACHE": "/o/cache",
@@ -65,6 +67,32 @@ class Resolvers(unittest.TestCase):
         ):
             with self.subTest(name), self.assertRaises(paths.PathError):
                 fn({name: "relative/dir"})
+
+    def test_relative_xdg_config_and_cache_are_ignored(self):
+        env = {"XDG_CONFIG_HOME": "rel/config", "XDG_CACHE_HOME": "rel/cache"}
+        self.assertEqual(paths.config_dir(env), os.path.join(HOME, ".config/corral"))
+        self.assertEqual(paths.cache_dir(env), os.path.join(HOME, ".cache/corral"))
+
+    def test_the_sessions_override_wins_over_xdg_state(self):
+        env = {"XDG_STATE_HOME": "/x/state", "CORRAL_SESSIONS": "/o/sessions"}
+        self.assertEqual(paths.sessions_dir(env), "/o/sessions")
+
+    def test_a_relative_state_override_fails_sessions_too_and_names_it(self):
+        with self.assertRaisesRegex(paths.PathError, "CORRAL_STATE"):
+            paths.sessions_dir({"CORRAL_STATE": "relative/state"})
+
+    def test_an_empty_override_counts_as_unset(self):
+        env = {"CORRAL_STATE": "", "CORRAL_SESSIONS": ""}
+        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/corral"))
+        self.assertEqual(
+            paths.sessions_dir(env), os.path.join(HOME, ".local/state/corral/sessions")
+        )
+
+    def test_results_are_normalized(self):
+        self.assertEqual(paths.state_dir({"CORRAL_STATE": "/o/state/"}), "/o/state")
+        self.assertEqual(paths.state_dir({"CORRAL_STATE": "/o/../o/state"}), "/o/state")
+        self.assertEqual(paths.sessions_dir({"CORRAL_SESSIONS": "/o/s//x/"}), "/o/s/x")
+        self.assertEqual(paths.config_dir({"XDG_CONFIG_HOME": "/x/./config/"}), "/x/config/corral")
 
     def test_the_suite_never_resolves_the_real_dirs(self):
         # tests/__init__.py points these at scratch dirs for the whole run.
