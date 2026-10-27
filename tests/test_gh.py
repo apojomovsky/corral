@@ -279,9 +279,9 @@ class NormalizePrBodyTest(unittest.TestCase):
         self.assertFalse(gh.contains_literal_escapes("a\n b"))
         self.assertFalse(gh.contains_literal_escapes(""))
 
-    def test_a_real_world_body(self):
-        literal = "Split per #109 option B.\\n\\n- common_ram is now PIC14\\n- access_bank is PIC18"
-        expected = "Split per #109 option B.\n\n- common_ram is now PIC14\n- access_bank is PIC18"
+    def test_a_multi_paragraph_body(self):
+        literal = "Split per #9 option B.\\n\\n- a is now x\\n- b is y"
+        expected = "Split per #9 option B.\n\n- a is now x\n- b is y"
         self.assertEqual(gh.normalize_pr_body(literal), expected)
 
 
@@ -364,7 +364,7 @@ class ClosingRefsTest(unittest.TestCase):
     def test_title_only_mention_is_not_a_closing_reference(self):
         # A (#N) title suffix or bare #N mention fills no field: only the
         # references list counts, so a body mention alone yields nothing.
-        self.assertEqual(gh.closing_issue_numbers({"body": "feat thing"}), [])
+        self.assertEqual(gh.closing_issue_numbers({"body": "feat thing (#119)"}), [])
 
 
 class RefsTest(unittest.TestCase):
@@ -561,6 +561,24 @@ class BranchTicketLinkedTest(unittest.TestCase):
             gh.branch_ticket_linked(450, [("Acme/HAL", 450)], "acme/lib", self.SIBLINGS)
         )
         self.assertTrue(gh.branch_ticket_linked(450, [("acme/lib", 450)], "ACME/Lib"))
+
+    def test_sibling_entries_match_case_insensitively(self):
+        self.assertTrue(gh.branch_ticket_linked(450, [("acme/hal", 450)], "acme/lib", {"Acme/HAL"}))
+
+    def test_only_exact_sibling_names_count(self):
+        for repo in ("acme/app-ops-x", "acme/app", "acme/app-op"):
+            with self.subTest(repo=repo):
+                self.assertFalse(
+                    gh.branch_ticket_linked(450, [(repo, 450)], "acme/lib", self.SIBLINGS)
+                )
+
+    def test_a_sibling_under_another_owner_counts(self):
+        self.assertTrue(
+            gh.branch_ticket_linked(450, [("client/app", 450)], "acme/app-ops", {"client/app"})
+        )
+
+    def test_an_empty_default_repo_rejects_qualified_pairs(self):
+        self.assertFalse(gh.branch_ticket_linked(450, [("acme/hal", 450)], "", self.SIBLINGS))
 
     def test_with_no_siblings_only_the_own_repo_counts(self):
         self.assertFalse(gh.branch_ticket_linked(450, [("acme/hal", 450)], "acme/lib"))

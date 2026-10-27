@@ -925,7 +925,7 @@ def branch_ticket_linked(
             continue
         if repo is None:
             return True
-        if default_repo is not None and repo.lower() in allowed:
+        if default_repo and repo.lower() in allowed:
             return True
     return False
 
