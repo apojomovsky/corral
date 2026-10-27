@@ -114,7 +114,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", choices=list(PATHS), help="print only this one")
     p.add_argument("--mkdir", action="store_true", help="create the directories first")
     p.set_defaults(func=cmd_paths)
-    base_help = "base ref to diff against (default origin/master or $BASE_REF)"
+    from corral.diffscope import BASE_HELP
+
+    base_help = f"base ref to diff against ({BASE_HELP})"
     p = sub.add_parser("prose", help="list and verify added comment blocks")
     p.add_argument(
         "--verify",

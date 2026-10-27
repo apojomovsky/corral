@@ -26,6 +26,8 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# corral's own takeoff gates against its own master, whatever base a
+# caller's $BASE_REF names for the diff tools: a PR here always targets it.
 BASE = "origin/master"
 BRANCH_RE = re.compile(r"^[a-z]+/(\d+)-[\w.-]+$")
 LINK_RE = re.compile(r"\b(?:closes|fixes|resolves|refs)\s+#(\d+)\b", re.IGNORECASE)

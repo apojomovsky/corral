@@ -133,6 +133,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 def add_parser(sub) -> None:
     """Register `review` and its verbs on the top-level subparsers."""
     from corral import reviewrecord
+    from corral.diffscope import BASE_HELP
 
     ticket = argparse.ArgumentParser(add_help=False)
     ticket.add_argument("repo", help="the ticket's repository name")
@@ -154,6 +155,6 @@ def add_parser(sub) -> None:
     p.set_defaults(func=cmd_record)
     p = verbs.add_parser("show", parents=[ticket], help="the record a commit has, or inherits")
     p.add_argument("--commit", default="HEAD", help="the commit (default HEAD)")
-    p.add_argument("--base", default=None, help="the PR base (default origin/master or $BASE_REF)")
+    p.add_argument("--base", default=None, help=f"the PR base ({BASE_HELP})")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.set_defaults(func=cmd_show)
