@@ -5,7 +5,7 @@ import os
 import sys
 from collections.abc import Sequence
 
-from corral import deps, paths
+from corral import deps, paths, settings
 
 # Exit codes are a public interface (AGENTS.md).
 OK, NO, USAGE = 0, 1, 4
@@ -15,6 +15,23 @@ def cmd_deps(args: argparse.Namespace) -> int:
     text, ok = deps.report(deps.check_all(deps.load()))
     sys.stdout.write(text)
     return OK if ok else NO
+
+
+def cmd_config(args: argparse.Namespace) -> int:
+    if args.root and not os.path.isfile(os.path.join(args.root, settings.PROJECT_FILE)):
+        print(f"corral: no {settings.PROJECT_FILE} in --root {args.root}", file=sys.stderr)
+        return USAGE
+    root = args.root or settings.find_root(os.getcwd())
+    if args.repo and not root:
+        print("corral: --repo needs an ops root (corral.toml)", file=sys.stderr)
+        return USAGE
+    try:
+        resolved = settings.load(root=root, repo=args.repo)
+    except settings.SettingsError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+    sys.stdout.write(settings.render(resolved, origin=args.origin))
+    return OK
 
 
 def default_base(args: argparse.Namespace) -> str:
@@ -60,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="check the host programs corral needs; print how to install what is missing",
     )
     p.set_defaults(func=cmd_deps)
+    config = sub.add_parser("config", help="resolved settings")
+    verbs = config.add_subparsers(dest="config_verb", required=True)
+    p = verbs.add_parser("show", help="every setting with its resolved value")
+    p.add_argument("--origin", action="store_true", help="name the layer each value came from")
+    p.add_argument("--repo", default=None, help="resolve for this [[repo]] entry")
+    p.add_argument(
+        "--root", default=None, help="the ops root (default: nearest corral.toml upward)"
+    )
+    p.set_defaults(func=cmd_config)
     base_help = "base ref to diff against (default origin/master or $BASE_REF)"
     p = sub.add_parser("prose", help="list and verify added comment blocks")
     p.add_argument(
