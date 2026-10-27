@@ -7,22 +7,25 @@ directory in `CORRAL_GH_SHIM_DIR` and exports the install-time state dir as
 directory and every other corral wrapper, so it never runs itself. For each
 call it takes points from the shared bucket (waiting, with a cap, then
 letting the call through, charged), runs the real `gh` with the same
-arguments, passes stdout, stderr and the exit code through, starts the
-shared cooldown on a rate-limit answer, and appends one redacted line to the
-call log.
+arguments, passes stdout and stderr through as they arrive, starts the shared
+cooldown on a rate-limit answer, and appends one redacted line to the call
+log.
 
-Stdout is buffered, not streamed, so the shim can read a JSON error payload
-from a failed call. Stdin is inherited. A call still running after
-`ghshim.TIMEOUT_S` is terminated (then killed) and exits 124.
+Output streams: reader threads copy the child's stdout and stderr chunk by
+chunk. Only the last `ghshim.TAIL_BYTES` of each stream are kept, for the
+rate-limit check after the call. Stdin is inherited. A call still running
+after `ghshim.TIMEOUT_S` is stopped (SIGTERM, then SIGKILL) and exits 124.
 
-A shim that starts with `CORRAL_GH_SHIM_DEPTH` already set exits 4 instead of
-running: that is a shim calling itself through PATH.
+A gh that calls gh again (an alias or extension) runs one level deeper, with
+`CORRAL_GH_SHIM_DEPTH` set to the new depth. A shim that starts at
+`ghshim.MAX_DEPTH` or deeper exits 4 instead of running.
 """
 
 import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 from corral.github import gh, ghshim
@@ -31,6 +34,8 @@ USAGE = 4
 NOT_FOUND = 127
 #: Bytes read from a candidate to check for the wrapper marker.
 _MARKER_PROBE = 512
+#: Largest single read from a child's pipe.
+_CHUNK = 64 * 1024
 
 
 def _is_wrapper(path):
@@ -80,31 +85,65 @@ def _exit_with(returncode):
     return returncode
 
 
-def _communicate(proc, timeout):
-    """(stdout, stderr, timed_out): wait up to `timeout`, then stop the group.
+def _pump(pipe, sink, tail):
+    """Copy `pipe` to `sink` as bytes arrive, keeping the last TAIL_BYTES in `tail`.
+
+    `read1` returns as soon as any bytes are available, so output reaches the
+    caller while the child is still running.
+    """
+    try:
+        while True:
+            chunk = pipe.read1(_CHUNK)
+            if not chunk:
+                break
+            sink.write(chunk)
+            sink.flush()
+            tail.extend(chunk)
+            del tail[: -ghshim.TAIL_BYTES]
+    finally:
+        pipe.close()
+
+
+def _wait(proc, timeout):
+    """True when the child ran past `timeout` and was stopped.
 
     Escalates like `gh.run`: SIGTERM to the child's process group, then
     SIGKILL after a grace period. The child is a session leader, so its
-    grandchildren go with it.
+    grandchildren go with it and close the pipes the readers drain.
     """
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
-        return stdout, stderr, False
+        proc.wait(timeout=timeout)
+        return False
     except subprocess.TimeoutExpired:
         gh._signal_group(proc, signal.SIGTERM)
         try:
-            stdout, stderr = proc.communicate(timeout=gh._KILL_AFTER_S)
+            proc.wait(timeout=gh._KILL_AFTER_S)
         except subprocess.TimeoutExpired:
             gh._signal_group(proc, signal.SIGKILL)
-            stdout, stderr = proc.communicate()
-        return stdout, stderr, True
+            proc.wait()
+        return True
+
+
+def _depth():
+    """The nesting depth this shim runs at, from DEPTH_ENV (0 when unset)."""
+    raw = os.environ.get(ghshim.DEPTH_ENV, "")
+    if not raw:
+        return 0
+    if not raw.isdigit():
+        raise ValueError(raw)
+    return int(raw)
 
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
-    if os.environ.get(ghshim.DEPTH_ENV):
+    try:
+        depth = _depth()
+    except ValueError:
+        sys.stderr.write(f"gh shim: {ghshim.DEPTH_ENV} is not a depth\n")
+        return USAGE
+    if depth >= ghshim.MAX_DEPTH:
         sys.stderr.write(
-            f"gh shim: refusing to run, {ghshim.DEPTH_ENV} is already set (a shim calling itself)\n"
+            f"gh shim: refusing to run at depth {depth} (a gh calling gh {ghshim.MAX_DEPTH} levels deep)\n"
         )
         return USAGE
     shim_dir = os.environ.get(ghshim.SHIM_DIR_ENV, "")
@@ -128,7 +167,7 @@ def main(argv=None):
         except Exception:
             # Pacing is best-effort: a broken bucket must never break gh.
             capped = False
-    child_env = dict(os.environ, **{ghshim.DEPTH_ENV: "1"})
+    child_env = dict(os.environ, **{ghshim.DEPTH_ENV: str(depth + 1)})
     start = time.monotonic()
     proc = subprocess.Popen(
         [real_gh] + args,
@@ -137,28 +176,35 @@ def main(argv=None):
         start_new_session=True,
         env=child_env,
     )
-    stdout, stderr, timed_out = _communicate(proc, ghshim.TIMEOUT_S)
+    out_tail, err_tail = bytearray(), bytearray()
+    readers = [
+        threading.Thread(
+            target=_pump, args=(proc.stdout, sys.stdout.buffer, out_tail), daemon=True
+        ),
+        threading.Thread(
+            target=_pump, args=(proc.stderr, sys.stderr.buffer, err_tail), daemon=True
+        ),
+    ]
+    for reader in readers:
+        reader.start()
+    timed_out = _wait(proc, ghshim.TIMEOUT_S)
+    for reader in readers:
+        reader.join()
     duration = time.monotonic() - start
     code = ghshim.TIMED_OUT_EXIT if timed_out else proc.returncode
-    # Byte-identical, delivered at exit: the output is buffered so a failed
-    # call's JSON error payload can be read.
-    sys.stdout.buffer.write(stdout)
-    sys.stdout.buffer.flush()
-    # stderr is buffered rather than teed on purpose: agent units are headless
-    # and stdin still inherits, so a prompt reading EOF behaves exactly as
-    # without the shim.
-    sys.stderr.buffer.write(stderr)
     if timed_out:
-        sys.stderr.write(f"gh shim: gh timed out after {ghshim.TIMEOUT_S:g}s and was stopped\n")
-    sys.stderr.buffer.flush()
+        sys.stderr.buffer.write(
+            f"gh shim: gh timed out after {ghshim.TIMEOUT_S:g}s and was stopped\n".encode()
+        )
+        sys.stderr.buffer.flush()
     # A library-paced call already cooled down upstream; setting it here
     # would double the backoff for the same event.
     hit = False
     if not library_paced:
         try:
-            hit = ghshim.pace_after(stderr.decode("utf-8", "replace"))
+            hit = ghshim.pace_after(bytes(err_tail).decode("utf-8", "replace"))
             if not hit:
-                hit = ghshim.pace_after_payload(stdout.decode("utf-8", "replace"), code)
+                hit = ghshim.pace_after_payload(bytes(out_tail).decode("utf-8", "replace"), code)
         except Exception:
             hit = False
     try:

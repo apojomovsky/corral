@@ -44,19 +44,23 @@ SHIM_DIR_NAME = "dispatch"
 #: Names the directory the shim executable sits in. The shim skips that
 #: directory when it searches PATH for the real `gh`, so it never runs itself.
 SHIM_DIR_ENV = "CORRAL_GH_SHIM_DIR"
-#: Set in the real gh's environment by the shim. A shim that starts with it
-#: already set is a shim calling itself through PATH, so it refuses to run.
+#: Nesting depth the shim stamps into its child's environment. A gh that calls
+#: gh again (an alias or extension) runs one level deeper; a shim that starts
+#: at MAX_DEPTH or deeper refuses, so runaway nesting stops.
 DEPTH_ENV = "CORRAL_GH_SHIM_DEPTH"
+MAX_DEPTH = 3
 #: The state dir the wrapper exports, so every agent shares one bucket and log.
 STATE_ENV = "CORRAL_STATE"
 #: A line the wrapper always contains. PATH candidates carrying it are wrappers
 #: of this shim and are skipped, so two shim directories cannot loop.
 WRAPPER_MARKER = "# corral-gh-shim"
-#: Seconds the real gh may run before the shim kills it. Agents run long
-#: commands such as `pr checks --watch`, so this is generous.
-TIMEOUT_S = 600.0
-#: Exit code when the shim kills a timed-out gh (the timeout(1) convention).
+#: Seconds the real gh may run before the shim stops it. Agents run long
+#: commands such as `pr checks --watch` and `gh run watch`, so this is generous.
+TIMEOUT_S = 3600.0
+#: Exit code when the shim stops a timed-out gh (the timeout(1) convention).
 TIMED_OUT_EXIT = 124
+#: Bytes of stdout and stderr kept (the last ones) for the rate-limit check.
+TAIL_BYTES = 64 * 1024
 
 #: `gh` entry points that never reach the API, so the shim logs them but
 #: charges nothing (auth status reads the local keyring, config/alias are

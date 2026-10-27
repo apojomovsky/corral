@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -769,19 +770,52 @@ class ShimScriptTest(unittest.TestCase):
         self.assertEqual(proc.stdout, b"reached-real-gh\n")
         self.assertTrue(other_wrapper.startswith(other))
 
-    def test_a_shim_started_with_the_depth_marker_refuses_to_run(self):
+    def test_a_shim_at_max_depth_refuses_to_run(self):
         self._stub("#!/bin/sh\necho ran\nexit 0\n")
-        env = dict(self.env, **{ghshim.DEPTH_ENV: "1"})
+        env = dict(self.env, **{ghshim.DEPTH_ENV: str(ghshim.MAX_DEPTH)})
         proc = self._shim("pr", "list", env=env)
         self.assertEqual(proc.returncode, 4)
         self.assertNotIn(b"ran", proc.stdout)
-        self.assertIn(ghshim.DEPTH_ENV.encode(), proc.stderr)
+        self.assertIn(b"refusing", proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "gh-calls.jsonl")))
 
-    def test_real_gh_runs_with_the_depth_marker_set(self):
+    def test_a_non_numeric_depth_is_a_usage_error(self):
+        self._stub("#!/bin/sh\necho ran\nexit 0\n")
+        env = dict(self.env, **{ghshim.DEPTH_ENV: "deep"})
+        proc = self._shim("pr", "list", env=env)
+        self.assertEqual(proc.returncode, 4)
+        self.assertNotIn(b"ran", proc.stdout)
+
+    def test_nested_runs_below_max_depth_pass_through_paced_and_logged(self):
+        self._stub('#!/bin/sh\necho "depth=$CORRAL_GH_SHIM_DEPTH"\nexit 0\n')
+        for depth in range(ghshim.MAX_DEPTH):
+            with self.subTest(depth=depth):
+                env = dict(self.env, **{ghshim.DEPTH_ENV: str(depth)})
+                proc = self._shim("pr", "list", env=env)
+                self.assertEqual(proc.returncode, 0)
+                self.assertEqual(proc.stdout, f"depth={depth + 1}\n".encode())
+        # Every nested call was logged like a top-level one.
+        self.assertEqual(len(self._log()), ghshim.MAX_DEPTH)
+
+    def test_real_gh_runs_one_level_deeper(self):
         self._stub('#!/bin/sh\necho "depth=$CORRAL_GH_SHIM_DEPTH"\nexit 0\n')
         proc = self._shim("pr", "list")
         self.assertEqual(proc.stdout, b"depth=1\n")
+
+    def test_output_streams_before_the_child_exits(self):
+        # A line printed before a pause reaches the caller while gh still runs.
+        sleep_bin = shutil.which("sleep")
+        self.assertIsNotNone(sleep_bin)
+        self._stub(f"#!/bin/sh\necho first\n{sleep_bin} 3\necho second\n")
+        proc = subprocess.Popen([self.wrapper, "pr", "list"], stdout=subprocess.PIPE, env=self.env)
+        stdout = proc.stdout
+        assert stdout is not None
+        self.addCleanup(stdout.close)
+        self.addCleanup(proc.kill)
+        self.assertEqual(stdout.readline(), b"first\n")
+        self.assertIsNone(proc.poll(), "the shim exited before the child printed its second line")
+        self.assertEqual(stdout.read(), b"second\n")
+        self.assertEqual(proc.wait(timeout=60), 0)
 
     def test_wrapper_exports_the_install_time_state_dir(self):
         self._stub("#!/bin/sh\nexit 0\n")
@@ -821,6 +855,30 @@ class ShimScriptTest(unittest.TestCase):
         self.assertEqual(len(self._log()), count)
         with open(os.path.join(self.tmp.name, "graphql-pacing.json"), encoding="utf-8") as handle:
             json.load(handle)
+
+
+class PumpTest(unittest.TestCase):
+    """Output is forwarded whole, and only a bounded tail is kept for the checks."""
+
+    def test_forwards_everything_and_keeps_only_the_last_tail(self):
+        data = b"a" * 1000 + b"END"
+        read_fd, write_fd = os.pipe()
+        with mock.patch.object(ghshim, "TAIL_BYTES", 100), mock.patch.object(gh_shim, "_CHUNK", 64):
+            sink = io.BytesIO()
+            tail = bytearray()
+
+            def feed():
+                with os.fdopen(write_fd, "wb") as writer:
+                    writer.write(data)
+
+            writer = threading.Thread(target=feed)
+            writer.start()
+            with os.fdopen(read_fd, "rb") as reader:
+                gh_shim._pump(reader, sink, tail)
+            writer.join()
+        self.assertEqual(sink.getvalue(), data)
+        self.assertEqual(len(tail), 100)
+        self.assertTrue(bytes(tail).endswith(b"END"))
 
 
 class TimeoutTest(unittest.TestCase):
