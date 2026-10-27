@@ -243,7 +243,7 @@ class StateDedupeTest(unittest.TestCase):
     def test_same_state_is_one_event_across_passes(self):
         item = {
             "kind": "coordinator-review",
-            "ref": "app#170",
+            "ref": "app#2",
             "evidence": "needs-human: publish the registry",
             "state": "publish the registry",
         }
@@ -472,10 +472,10 @@ class SyncQuestionsHoldsDedupeTest(unittest.TestCase):
         return [row for row in rows if not row.get("resolved_at")]
 
     def _pr(self, head_sha="deadbeef"):
-        return {"repo": "app", "number": 170, "head_sha": head_sha, "closes": [], "refs": []}
+        return {"repo": "app", "number": 2, "head_sha": head_sha, "closes": [], "refs": []}
 
     def test_repeated_passes_emit_one_event_per_state(self):
-        questions = {"app#170": ("T", "url", "needs-human: publish the registry")}
+        questions = {"app#2": ("T", "url", "needs-human: publish the registry")}
         holds = [(self._pr(), "stalled: checks not green: compat=FAILURE", [])]
         seen = None
         for step in range(3):
@@ -506,12 +506,12 @@ class SyncQuestionsHoldsDedupeTest(unittest.TestCase):
 
     def test_new_question_body_emits_a_second_review_event(self):
         rows = events.sync_questions_holds(
-            {"app#170": ("T", "url", "first question")}, [], root=self.root, now=1000.0
+            {"app#2": ("T", "url", "first question")}, [], root=self.root, now=1000.0
         )
         first = [row for row in self._open(rows) if row["kind"] == "coordinator-review"]
         self.assertEqual(len(first), 1)
         rows = events.sync_questions_holds(
-            {"app#170": ("T", "url", "second question")}, [], root=self.root, now=1060.0
+            {"app#2": ("T", "url", "second question")}, [], root=self.root, now=1060.0
         )
         open_rows = self._open(rows)
         self.assertEqual(len(open_rows), 1)
@@ -521,7 +521,7 @@ class SyncQuestionsHoldsDedupeTest(unittest.TestCase):
     def test_ack_does_not_let_the_next_pass_re_emit(self):
         # A coordinator acks the event; the cause is still there, so the
         # next pass must not open a second event for the same state.
-        questions = {"app#170": ("T", "url", "question body")}
+        questions = {"app#2": ("T", "url", "question body")}
         rows = events.sync_questions_holds(questions, [], root=self.root, now=1000.0)
         open_rows = self._open(rows)
         self.assertEqual(len(open_rows), 1)

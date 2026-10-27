@@ -607,7 +607,7 @@ def _rotate(entries, root, now):
     are never rotated out: they stay in the live file.
     """
     base = root if root is not None else project_root()
-    pruned = _prune_archives(base if root is not None else None, now)[1]
+    pruned = _prune_archives(base, now)[1]
     if len(entries) <= JOURNAL_MAX:
         return entries, pruned
     wanted = set(open_followup_ids(entries))

@@ -28,6 +28,8 @@ import json
 import os
 import time
 
+from corral.coord import LEASE_DIRNAME
+
 
 #: Snapshot attention kinds mapped onto queue kinds. Anything else
 #: passes through verbatim under its own attention kind.
@@ -42,7 +44,8 @@ ATTENTION_TO_EVENT = {
 #: are human-tier).
 DEFAULT_JUDGMENT_ATTENTION = frozenset({"question", "held-merge", "stalled-merge"})
 
-EVENTS_DIRNAME = "coord"
+#: The same directory as the lease and journal: one name, in coord.
+EVENTS_DIRNAME = LEASE_DIRNAME
 EVENTS_NAME = "events.jsonl"
 EVENTS_LOCK_NAME = "events.lock"
 

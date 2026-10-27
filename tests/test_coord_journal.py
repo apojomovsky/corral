@@ -67,7 +67,7 @@ class JournalApiTest(unittest.TestCase):
         entry = coord.append_entry(
             "decision",
             "closed as covered",
-            refs=["lib#1157"],
+            refs=["lib#1"],
             holder="h",
             generation=7,
             root=self.root,
@@ -75,7 +75,7 @@ class JournalApiTest(unittest.TestCase):
         )
         self.assertEqual(set(entry), {"at", "holder", "generation", "kind", "refs", "text"})
         self.assertEqual(entry["kind"], "decision")
-        self.assertEqual(entry["refs"], ["lib#1157"])
+        self.assertEqual(entry["refs"], ["lib#1"])
         live = coord.read_entries(root=self.root)
         self.assertEqual(len(live), 1)
         self.assertEqual(live[0]["text"], "closed as covered")
@@ -219,7 +219,7 @@ class JournalCliTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_log_followup_handoff_brief(self):
-        code, out, _ = self._run(["coord", "log", "decision", "did X", "--ref", "lib#1157"])
+        code, out, _ = self._run(["coord", "log", "decision", "did X", "--ref", "lib#1"])
         self.assertEqual(code, 0)
         self.assertIn("logged decision", out)
         code, out, _ = self._run(["coord", "followup", "add", "check CI"])

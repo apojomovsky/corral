@@ -307,8 +307,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class PerProjectTest(unittest.TestCase):
-    """Each project has its own lease, logbook and events."""
+class _ProjectCase(unittest.TestCase):
+    """A scratch state dir and no project in the environment."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -324,6 +324,10 @@ class PerProjectTest(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             code = cli.main(list(argv))
         return code, out.getvalue(), err.getvalue()
+
+
+class PerProjectTest(_ProjectCase):
+    """Each project has its own lease."""
 
     def test_two_projects_hold_their_leases_at_once(self):
         code, out, _ = self._run(["coord", "acquire", "--project", "app", "--holder", "a"])
@@ -360,3 +364,59 @@ class PerProjectTest(unittest.TestCase):
             with self.subTest(bad=bad):
                 with self.assertRaises(coord.UsageError):
                     coord.project_root(bad, env={"CORRAL_STATE": self.state})
+
+
+class PerProjectSeparationTest(_ProjectCase):
+    """A project's logbook, events and fence never reach another project."""
+
+    def test_the_logbook_is_per_project(self):
+        self._run(["coord", "log", "note", "only in app", "--project", "app"])
+        self._run(["coord", "followup", "add", "app thing", "--project", "app"])
+        _, out, _ = self._run(["coord", "followup", "list", "--project", "lib"])
+        self.assertIn("no open follow-ups", out)
+        _, out, _ = self._run(["coord", "brief", "--project", "lib", "--json"])
+        self.assertNotIn("only in app", out)
+        _, out, _ = self._run(["coord", "brief", "--project", "app", "--json"])
+        self.assertIn("only in app", out)
+
+    def test_events_are_per_project(self):
+        from corral import coordevents
+
+        coordevents.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "app only"}],
+            root=coord.project_root("app"),
+            now=1000.0,
+            event_id_fn=lambda: "aaaabbbb",
+        )
+        code, _, _ = self._run(["coord", "wait", "--timeout", "0", "--project", "lib"])
+        self.assertEqual(code, cli.NO)
+        code, _, err = self._run(["coord", "ack", "aaaabbbb", "--project", "lib"])
+        self.assertEqual(code, cli.NO)
+        self.assertIn("aaaabbbb", err)
+        code, out, _ = self._run(["coord", "wait", "--timeout", "0", "--project", "app"])
+        self.assertEqual(code, cli.OK)
+        self.assertIn("app only", out)
+
+    def test_the_generation_env_fences_only_its_own_project(self):
+        self._run(["coord", "acquire", "--project", "app", "--holder", "a"])
+        self._run(["coord", "release", "--project", "app", "--generation", "1"])
+        self._run(["coord", "acquire", "--project", "app", "--holder", "a"])  # app is at 2
+        self._run(["coord", "acquire", "--project", "lib", "--holder", "b"])  # lib is at 1
+        env = {"CORRAL_PROJECT": "app", "CORRAL_COORD_GENERATION": "2"}
+        with mock.patch.dict(os.environ, env):
+            code, _, _ = self._run(["coord", "log", "note", "x"])
+            self.assertEqual(code, 0)
+            # app's generation 2 must not be checked against lib's lease.
+            code, out, err = self._run(["coord", "log", "note", "y", "--project", "lib"])
+            self.assertEqual(code, 0, err)
+        with mock.patch.dict(os.environ, {"CORRAL_PROJECT": "lib", "CORRAL_COORD_GENERATION": "2"}):
+            code, _, err = self._run(["coord", "log", "note", "z"])
+            self.assertEqual(code, cli.RACE, err)
+
+
+class HumanPrTest(unittest.TestCase):
+    def test_only_labels_make_a_pr_wait_on_a_human(self):
+        self.assertTrue(coord.is_human_pr({"labels": [{"name": "needs-decision"}]}))
+        self.assertTrue(coord.is_human_pr({"labels": ["needs-human"]}))
+        self.assertFalse(coord.is_human_pr({"labels": [], "body": "Baseline delta: HOLD"}))
+        self.assertFalse(coord.is_human_pr({}))

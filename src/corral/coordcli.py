@@ -31,10 +31,18 @@ def _coord_human_prs():
 
 
 def _generation(args):
-    """(generation, exit code): from --coord-generation or CORRAL_COORD_GENERATION."""
+    """(generation, exit code): from --coord-generation or CORRAL_COORD_GENERATION.
+
+    The env value fences the project `CORRAL_PROJECT` names, so it is
+    ignored when `--project` picks a different one: one project's
+    generation must never be checked against another project's lease.
+    """
     given = getattr(args, "coord_generation", None)
     if given is not None:
         return given, None
+    project = getattr(args, "project", None)
+    if project and project != os.environ.get("CORRAL_PROJECT"):
+        return None, None
     raw = os.environ.get(GENERATION_ENV, "").strip()
     if not raw:
         return None, None
