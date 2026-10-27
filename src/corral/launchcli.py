@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 from corral import launch, paths, runtimes, settings, units, worktrees
 
-OK, NOTHING, RACE, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 2, 3, 4, 75
+OK, NOTHING, RACE, USAGE = 0, 1, 2, 4
 
 
 class Seams(NamedTuple):
