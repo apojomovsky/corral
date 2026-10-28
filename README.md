@@ -60,7 +60,14 @@ make install      # uv tool install
 | `corral tail REPO N [--last K] [--root PATH]` | show the ticket's agent activity, from its session file |
 | `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
 
-Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project. `corral config show` lists every setting. A `[[repo]]` entry sets `clone.path` (the repository's main clone, relative to the ops root) and `clone.default_branch` (default `main`), which `corral launch` needs. The provider pool lives beside the host config in `accounts.toml`: one `[[provider]]` entry per provider, naming its quota reader; a missing file means an empty pool.
+Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project. `corral config show` lists every setting. A `[[repo]]` entry sets `clone.path` (the repository's main clone, relative to the ops root) and `clone.default_branch` (default `main`), which `corral launch` needs. The provider pool lives beside the host config in `accounts.toml`: one `[[provider]]` entry per provider, naming its quota reader; a missing file means an empty pool. A project declares its model chains in the same `corral.toml`:
+
+```toml
+[models.default]
+chain = ["provider-a/model-x", "provider-b/model-y"]
+```
+
+Every entry names a provider from the pool as `provider/model`; an unknown provider is a configuration error (exit 4), and an id starting with `-` is refused. The per-launch overlay carries each chain with exhausted providers removed, so a launch routes around quota that is gone; when a required role has no live provider left, the launch is refused with exit 75, naming the role and its earliest known reset.
 
 Exit codes: `0` success, `1` nothing to do or a gate said no, `2` race lost (the lease is held, or a generation is stale), `3` a remote or service unreachable, `4` usage error.
 
