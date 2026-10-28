@@ -70,6 +70,7 @@ def register(key, type_, default, help_):
 #: `config show` lists them. A test keeps this list complete.
 PROVIDERS = (
     "corral.admission",
+    "corral.detect",
     "corral.hold",
     "corral.launch",
     "corral.quota",
