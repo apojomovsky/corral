@@ -165,11 +165,6 @@ def measure(path):
     return total
 
 
-def sizes(dir_paths, *, walk):
-    """`{path: bytes}` for each path. `walk(path)` is required (no default)."""
-    return {path: walk(path) for path in dir_paths}
-
-
 def newest_mtime(path):
     """The newest mtime under `path`, or None when nothing is readable."""
     try:
@@ -267,7 +262,10 @@ def plan(
         except OSError:
             continue
         real = os.path.realpath(path)
-        if is_link or not _inside(real, real_roots):
+        if is_link:
+            notes.append(f"dropped {path}: is a symlink")
+            continue
+        if not _inside(real, real_roots):
             notes.append(f"dropped {path}: resolves outside a declared root")
             continue
         if not is_file:
@@ -310,7 +308,10 @@ def plan(
         except OSError:
             continue
         real = os.path.realpath(path)
-        if is_link or not _inside(real, real_roots):
+        if is_link:
+            notes.append(f"dropped {path}: is a symlink")
+            continue
+        if not _inside(real, real_roots):
             notes.append(f"dropped {path}: resolves outside a declared root")
             continue
         if not is_dir:
@@ -377,7 +378,7 @@ def plan(
             notes.append(f"dropped {gc_path}: resolves outside a declared root")
             continue
         if os.path.islink(gc_path):
-            notes.append(f"dropped {gc_path}: resolves outside a declared root")
+            notes.append(f"dropped {gc_path}: is a symlink")
             continue
         candidates.append(Candidate(WORKTREE, gc_path, walk(gc_path), proof, True))
 

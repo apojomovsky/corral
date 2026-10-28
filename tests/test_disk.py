@@ -147,17 +147,7 @@ class PressureTest(DiskCase):
         self.assertEqual(disk.pressure(readings, min_free_pct=10, min_free_gb=5), "unknown")
 
 
-class SizesTest(DiskCase):
-    def test_sizes_calls_the_walk_per_path(self):
-        seen = []
-
-        def walk(path):
-            seen.append(path)
-            return 7
-
-        self.assertEqual(disk.sizes(["/a", "/b"], walk=walk), {"/a": 7, "/b": 7})
-        self.assertEqual(seen, ["/a", "/b"])
-
+class MeasureTest(DiskCase):
     def test_production_walk_counts_files_not_symlinks(self):
         outside = os.path.join(self.tmp.name, "outside.bin")
         with open(outside, "wb") as handle:
@@ -212,7 +202,18 @@ class PrBodyTest(DiskCase):
         os.symlink(outside, link)
         planned = self.plan()
         self.assertEqual([c for c in planned.candidates if c.kind == "pr-body"], [])
-        self.assertTrue(any("outside a declared root" in n for n in planned.notes))
+        self.assertTrue(any("is a symlink" in n for n in planned.notes))
+
+    def test_a_symlink_inside_the_roots_is_a_symlink_not_an_escape(self):
+        inside = os.path.join(self.cache, "real.md")
+        with open(inside, "w", encoding="utf-8") as handle:
+            handle.write("x")
+        os.symlink(inside, os.path.join(self.cache, "pr-98-abcdef.md"))
+        planned = self.plan()
+        notes = [n for n in planned.notes if "pr-98-abcdef.md" in n]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("is a symlink", notes[0])
+        self.assertNotIn("outside", notes[0])
 
 
 class SessionTest(DiskCase):
@@ -448,7 +449,7 @@ class ApplyTest(DiskCase):
     # -- seams have no default ------------------------------------------------
 
     def test_removal_seam_is_required(self):
-        for func in (disk.read, disk.sizes, disk.plan, disk.apply):
+        for func in (disk.read, disk.plan, disk.apply):
             with self.subTest(func=func.__name__):
                 params = inspect.signature(func).parameters
                 for name in ("usage", "walk", "remove", "list_fn"):
