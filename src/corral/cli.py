@@ -17,6 +17,7 @@ from corral import (
     quotacli,
     reviewcli,
     settings,
+    snapshot,
 )
 from corral.github import ghcli
 
@@ -163,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
     quotacli.add_parser(sub)
+    snapshot.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
     doctor.add_parser(sub, doctor.production_env)
     return parser
