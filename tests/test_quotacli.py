@@ -406,6 +406,14 @@ class QuotaVerbs(OpsCase):
         self.assertEqual(code, 1)
         self.assertIn("provider-a", err)
 
+    def test_a_no_op_unmark_or_mark_writes_no_ledger(self):
+        self.assertEqual(self.run_quota("unmark", "provider-a")[0], 1)
+        self.assertFalse(os.path.exists(quota_ledger.ledger_path()))
+        self.assertEqual(self.run_quota("mark", "provider-a", "--until", str(T0 + 600))[0], 0)
+        before = open(quota_ledger.ledger_path(), "rb").read()
+        self.assertEqual(self.run_quota("mark", "provider-a", "--until", str(T0 + 60))[0], 1)
+        self.assertEqual(open(quota_ledger.ledger_path(), "rb").read(), before)
+
     def test_quota_help_lists_the_verbs(self):
         out = io.StringIO()
         with redirect_stdout(out):
@@ -594,6 +602,38 @@ class TailHook(OpsCase):
                 now_fn=lambda: T0,
             )
         self.assertEqual(quota_ledger.load()["marks"]["provider-a"]["until"], T0 + 600)
+
+    def test_a_seek_failure_falls_back_to_a_full_read(self):
+        class Handle:
+            def __init__(self):
+                self.seeks = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def fileno(self):
+                return 0
+
+            def seek(self, offset):
+                self.seeks.append(offset)
+                if len(self.seeks) == 1:
+                    raise OSError("no seek")
+
+            def read(self):
+                return b"LIMIT provider-a 429\n" if self.seeks[-1] == 0 else b""
+
+        handle = Handle()
+        fake_stat = mock.Mock(st_size=10_000_000)
+        with (
+            mock.patch("builtins.open", return_value=handle),
+            mock.patch.object(os, "fstat", return_value=fake_stat),
+        ):
+            text = launch._tail_text("ignored")
+        self.assertEqual(text, "LIMIT provider-a 429\n")
+        self.assertEqual(handle.seeks[-1], 0)
 
 
 if __name__ == "__main__":

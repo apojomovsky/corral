@@ -378,7 +378,7 @@ def _tail_text(path):
             try:
                 handle.seek(max(0, size - quotacli.TAIL_SCAN_BYTES))
             except OSError:
-                pass
+                handle.seek(0)
         return handle.read().decode("utf-8", "replace")
 
 

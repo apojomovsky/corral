@@ -283,7 +283,7 @@ def cmd_mark(args: argparse.Namespace) -> int:
             reason=args.reason,
         )
         saved.append((moved, fresh["marks"][args.provider]["until"]))
-        return fresh
+        return fresh if moved else None
 
     quota_ledger.update(change)
     moved, until = saved[0]
@@ -300,7 +300,7 @@ def cmd_unmark(args: argparse.Namespace) -> int:
     def change(ledger):
         fresh, released = quota_ledger.release_mark(ledger, args.provider)
         saved.append(released)
-        return fresh
+        return fresh if released else None
 
     quota_ledger.update(change)
     if not saved[0]:
