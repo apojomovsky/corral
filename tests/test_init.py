@@ -1,14 +1,18 @@
-"""`corral init` for the inline layout: detection, `corral.toml`, exits."""
+"""`corral init` and `corral uninit`: files written, exits, idempotency."""
 
+import inspect
 import io
 import os
+import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
+from unittest import mock
 
-from corral import cli, detect, init, settings
+from corral import cli, detect, init, projects, settings
 from corral.gitenv import clean_env
 
 
@@ -184,27 +188,14 @@ class ExistingCase(unittest.TestCase):
             handle.write(text)
 
     def test_bare_dir_finds_nothing(self):
-        found = detect.existing(self.dir, FakeGit(self.dir))
-        self.assertEqual(found, detect.Existing(False, False, False))
+        found = detect.existing(self.dir)
+        self.assertEqual(found, detect.Existing(False, False))
 
     def test_agent_files_are_found(self):
         self.write("AGENTS.md", "")
         self.write("CLAUDE.md", "")
-        found = detect.existing(self.dir, FakeGit(self.dir))
+        found = detect.existing(self.dir)
         self.assertEqual((found.agents_md, found.claude_md), (True, True))
-
-    def test_hooks_path_counts_as_hooks(self):
-        found = detect.existing(self.dir, FakeGit(self.dir, hooks="/srv/hooks"))
-        self.assertTrue(found.hooks)
-
-    def test_a_real_hook_counts_samples_do_not(self):
-        self.write(".git/hooks/pre-commit", "")
-        found = detect.existing(self.dir, FakeGit(self.dir))
-        self.assertTrue(found.hooks)
-        os.remove(os.path.join(self.dir, ".git", "hooks", "pre-commit"))
-        self.write(".git/hooks/pre-commit.sample", "")
-        found = detect.existing(self.dir, FakeGit(self.dir))
-        self.assertFalse(found.hooks)
 
 
 TAIL = """# Defaults: uncomment to override.
@@ -329,6 +320,12 @@ class Fixture(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = os.path.join(tmp.name, self.name)
         os.makedirs(self.root)
+        cfg = tempfile.mkdtemp(prefix="corral-config-")
+        self.addCleanup(shutil.rmtree, cfg, True)
+        patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.config_dir = cfg
         self.git("init", "-q", "-b", "main")
         self.git("config", "user.name", "t")
         self.git("config", "user.email", "t@t")
@@ -360,6 +357,25 @@ class Fixture(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             code = cli.main(["init", *argv])
         return code, out.getvalue(), err.getvalue()
+
+    def run_uninit(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["uninit", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def snapshot(self):
+        """`relpath -> bytes` of every file under the root, `.git` skipped."""
+        git = os.path.join(self.root, ".git") + os.sep
+        found = {}
+        for here, _, names in os.walk(self.root):
+            if here == git[:-1] or here.startswith(git):
+                continue
+            for entry in names:
+                full = os.path.join(here, entry)
+                with open(full, "rb") as handle:
+                    found[os.path.relpath(full, self.root)] = handle.read()
+        return found
 
     def target(self):
         return os.path.join(self.root, "corral.toml")
@@ -483,7 +499,8 @@ class DocsyCase(GoldenCase):
 
     def test_existing_files_are_never_touched(self):
         before = {}
-        for here, _, names in os.walk(self.root):
+        for here, dirnames, names in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
             for entry in names:
                 full = os.path.join(here, entry)
                 with open(full, "rb") as handle:
@@ -491,13 +508,22 @@ class DocsyCase(GoldenCase):
         code, _, _ = self.run_cli(self.root)
         self.assertEqual(code, 0)
         after = {}
-        for here, _, names in os.walk(self.root):
+        for here, dirnames, names in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
             for entry in names:
                 full = os.path.join(here, entry)
                 with open(full, "rb") as handle:
                     after[os.path.relpath(full, self.root)] = handle.read()
         added = set(after) - set(before)
-        self.assertEqual(added, {"corral.toml"})
+        self.assertEqual(
+            added,
+            {
+                "corral.toml",
+                "agents.overlay.md",
+                os.path.join(".githooks", "commit-msg"),
+                os.path.join(".githooks", "pre-push"),
+            },
+        )
         for rel in before:
             self.assertEqual(after[rel], before[rel], rel)
 
@@ -658,6 +684,568 @@ class SlugCase(unittest.TestCase):
         got, inputs = init.collect(root, git=git, test_cmd="make check")
         self.assertEqual((got, inputs.name), (root, "name"))
         self.assertTrue(inputs.test_command)
+
+
+class DirectoryNameCase(Fixture):
+    name = "mydir"
+
+    def add_origin(self, url="https://github.com/org/other.git"):
+        self.git("remote", "add", "origin", url)
+
+    def test_origin_slug_does_not_name_the_registration(self):
+        self.add_origin()
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, err)
+        reg = os.path.join(self.config_dir, "projects.d", "mydir.toml")
+        self.assertTrue(os.path.isfile(reg))
+        with open(reg, encoding="utf-8") as handle:
+            self.assertIn('name = "mydir"', handle.read())
+        with open(self.target(), encoding="utf-8") as handle:
+            self.assertIn('name = "other"', handle.read())
+        self.assertEqual([p.name for p in projects.load_all()], ["mydir"])
+
+    def test_two_clones_of_one_origin_register_as_two_projects(self):
+        url = "https://github.com/org/other.git"
+        self.add_origin(url)
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        sibling = os.path.join(os.path.dirname(self.root), "sibling")
+        os.makedirs(sibling)
+        env = clean_env()
+        for args in (["init", "-q", "-b", "main"], ["remote", "add", "origin", url]):
+            proc = subprocess.run(
+                ["git", *args], cwd=sibling, capture_output=True, text=True, env=env
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        code, _, err = self.run_cli("--test-cmd", "make check", sibling)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(p.name for p in projects.load_all()), ["mydir", "sibling"])
+
+
+OVERLAY_GOLDEN = """# Agent overlay
+
+How corral's agents are driven. The project's `AGENTS.md` speaks to
+everyone, including contributors and their own agents. This file speaks only
+to the agents corral launches: worktrees, the review gate, takeoff, the
+decision protocol, house preferences, what is private.
+
+This file is yours to edit after `corral init`: a re-run never overwrites
+it. In the inline layout it is a tracked file in the project, but still
+separate from `AGENTS.md`, so contributors never read corral-only rules.
+
+## Where a new rule goes
+
+The first yes decides:
+
+1. It mentions anything private (the ops side, a client, people, quota, accounts, internal priorities): it goes in the overlay. The leak guard enforces this.
+2. It only makes sense because corral runs the agent: it goes in the overlay.
+3. A contributor's PR would be rejected for not following it: it goes in the project `AGENTS.md`.
+4. Otherwise, it is a preference for these agents only: it goes in the overlay.
+
+When in doubt, put it in the overlay first. A rule that turns out to hold for
+everyone is promoted with a PR to the project. If the overlay would
+contradict the project's file, one of them is wrong: drop the overlay rule,
+or change the project's `AGENTS.md` in a PR.
+"""
+
+
+def registration_golden(name, root, cap=1):
+    """The registration text `init` writes, as an independent copy."""
+    return (
+        "# The host registration for this project, written by `corral init`.\n"
+        "# `corral uninit` removes this file while its content still matches\n"
+        "# what `corral init` would write; edit it and `uninit` leaves it alone.\n"
+        f'name = "{name}"\n'
+        f'unit_prefix = "{name}-agent"\n'
+        f'root = "{root}"\n'
+        "floor = 0\n"
+        f"ceiling = {cap}\n"
+    )
+
+
+class OverlayCase(Fixture):
+    name = "empty"
+
+    def test_overlay_written_from_the_template(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.root, "agents.overlay.md"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), OVERLAY_GOLDEN)
+        self.assertEqual(init.overlay_text(), OVERLAY_GOLDEN)
+
+    def test_overlay_states_the_four_step_test(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.root, "agents.overlay.md"), encoding="utf-8") as handle:
+            text = handle.read()
+        for rule in (
+            "anything private",
+            "only makes sense because corral runs the agent",
+            "rejected for not following it",
+            "a preference for these agents only",
+        ):
+            self.assertIn(rule, text)
+
+    def test_rerun_never_touches_the_overlay(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        overlay = os.path.join(self.root, "agents.overlay.md")
+        with open(overlay, "a", encoding="utf-8") as handle:
+            handle.write("\nHouse rule: tea first.\n")
+        with open(overlay, encoding="utf-8") as handle:
+            edited = handle.read()
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+        self.assertEqual(code, 1)
+        with open(overlay, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), edited)
+
+
+class HooksCase(Fixture):
+    name = "empty"
+
+    def test_hooks_installed_executable_and_configured(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        for name in ("commit-msg", "pre-push"):
+            target = os.path.join(self.root, ".githooks", name)
+            with open(target, "rb") as handle:
+                self.assertEqual(handle.read(), init.hook_template(name))
+            self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
+        proc = self.git("config", "core.hooksPath")
+        self.assertEqual(proc.stdout.strip(), ".githooks")
+
+    def test_rerun_writes_nothing_and_stays_quiet(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        before = self.snapshot()
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("is up to date", out)
+        self.assertNotIn("exec", out)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_plan_writes_nothing(self):
+        before = self.snapshot()
+        code, out, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        for want in (
+            "would write",
+            ".githooks/commit-msg",
+            ".githooks/pre-push",
+            "would set core.hooksPath",
+            "agents.overlay.md",
+            "projects.d/empty.toml",
+        ):
+            self.assertIn(want, out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(os.path.exists(os.path.join(self.config_dir, "projects.d")))
+
+    def test_rerun_repairs_hook_modes(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "pre-push")
+        os.chmod(target, 0o644)
+        before = self.snapshot()
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"fixed the mode of {target}", out)
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
+        self.assertEqual(self.snapshot(), before)
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+
+    def test_a_symlinked_hook_is_blocked_and_never_chmodded(self):
+        outside = os.path.join(os.path.dirname(self.root), "outside-hook")
+        from corral import init as corral_init
+
+        with open(outside, "wb") as handle:
+            handle.write(corral_init.hook_template("pre-push"))
+        os.chmod(outside, 0o644)
+        os.makedirs(os.path.join(self.root, ".githooks"))
+        os.symlink(outside, os.path.join(self.root, ".githooks", "pre-push"))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o644)
+
+    def test_an_unwritable_registration_dir_is_exit_4(self):
+        blocker = os.path.join(self.config_dir, "projects.d")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("not a directory")
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4, err)
+
+
+class HooksExistingCase(Fixture):
+    name = "old"
+
+    def setUp(self):
+        super().setUp()
+        self.git("config", "core.hooksPath", ".git/hooks")
+
+    def test_foreign_hooks_path_get_chain_instructions(self):
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks")))
+        for want in ("exec", "commit-msg", "pre-push"):
+            self.assertIn(want, out)
+        self.assertTrue(os.path.isfile(self.target()))
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "agents.overlay.md")))
+
+    def test_rerun_repeats_the_chain_instructions(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("exec", out)
+
+    def test_legacy_git_hooks_still_converge(self):
+        self.git("config", "--unset", "core.hooksPath")
+        hooks = os.path.join(self.root, ".git", "hooks")
+        with open(os.path.join(hooks, "pre-commit"), "w") as handle:
+            handle.write("#!/bin/sh\n")
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "pre-push")))
+        self.assertNotIn("exec", out)
+
+    def test_partial_install_converges_on_rerun(self):
+        self.git("config", "--unset", "core.hooksPath")
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        missing = os.path.join(self.root, ".githooks", "commit-msg")
+        os.remove(missing)
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        with open(missing, "rb") as handle:
+            self.assertEqual(handle.read(), init.hook_template("commit-msg"))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+
+    def test_blocked_hook_is_reported_never_overwritten(self):
+        self.git("config", "--unset", "core.hooksPath")
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "pre-push")
+        with open(target, "ab") as handle:
+            handle.write(b"# edited\n")
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        self.assertIn(target, err)
+        with open(target, "rb") as handle:
+            self.assertTrue(handle.read().endswith(b"# edited\n"))
+
+    def test_plan_previews_a_conflicting_hook_file(self):
+        self.git("config", "--unset", "core.hooksPath")
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "pre-push")
+        with open(target, "ab") as handle:
+            handle.write(b"# edited\n")
+        before = self.snapshot()
+        with open(os.path.join(self.config_dir, "projects.d", "old.toml"), "rb") as handle:
+            reg_before = handle.read()
+        code, out, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"would keep {target}", out)
+        self.assertEqual(self.snapshot(), before)
+        with open(os.path.join(self.config_dir, "projects.d", "old.toml"), "rb") as handle:
+            self.assertEqual(handle.read(), reg_before)
+
+
+class ConventionalCase(Fixture):
+    name = "empty"
+    extra = ("--set", "git.commits.conventional=false")
+
+    def test_false_skips_commit_msg(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", *self.extra, self.root)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "pre-push")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks", "commit-msg")))
+        code, _, _ = self.run_cli("--test-cmd", "make check", *self.extra, self.root)
+        self.assertEqual(code, 1)
+
+    def test_false_chains_only_pre_push(self):
+        self.git("config", "core.hooksPath", ".git/hooks")
+        code, out, _ = self.run_cli("--test-cmd", "make check", *self.extra, self.root)
+        self.assertEqual(code, 0)
+        self.assertIn("pre-push", out)
+        self.assertNotIn("commit-msg", out)
+
+    def test_false_then_default_installs_commit_msg(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", *self.extra, self.root)[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks", "commit-msg")))
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.root, ".githooks", "commit-msg"), "rb") as handle:
+            self.assertEqual(handle.read(), init.hook_template("commit-msg"))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+
+    def test_default_then_false_keeps_commit_msg(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "commit-msg")
+        code, out, _ = self.run_cli("--test-cmd", "make check", "--force", *self.extra, self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("kept", out)
+        self.assertIn("git.commits.conventional is false", out)
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), init.hook_template("commit-msg"))
+
+
+class RegistrationCase(Fixture):
+    name = "empty"
+
+    def reg_target(self):
+        return os.path.join(self.config_dir, "projects.d", f"{self.name}.toml")
+
+    def test_registration_golden_and_valid(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            self.assertEqual(
+                handle.read(), registration_golden(self.name, os.path.realpath(self.root))
+            )
+        found = projects.load_all()
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            (found[0].name, found[0].unit_prefix, found[0].root, found[0].floor, found[0].ceiling),
+            (self.name, f"{self.name}-agent", os.path.realpath(self.root), 0, 1),
+        )
+
+    def test_cap_lands_in_the_ceiling(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)
+        self.assertEqual(code, 0)
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            self.assertEqual(
+                handle.read(), registration_golden(self.name, os.path.realpath(self.root), 3)
+            )
+
+    def test_no_register_skips_with_a_note(self):
+        code, out, _ = self.run_cli("--test-cmd", "make check", "--no-register", self.root)
+        self.assertEqual(code, 0)
+        self.assertIn("skipped the host registration (--no-register)", out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+        code, out, _ = self.run_cli("--test-cmd", "make check", "--no-register", self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("skipped the host registration (--no-register)", out)
+
+    def test_same_name_different_content_needs_force(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(self.reg_target(), "a", encoding="utf-8") as handle:
+            handle.write("# edited\n")
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        self.assertIn(self.reg_target(), err)
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+        self.assertEqual(code, 0)
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            self.assertEqual(
+                handle.read(), registration_golden(self.name, os.path.realpath(self.root))
+            )
+
+    def test_conflicting_prefix_is_always_4(self):
+        other = os.path.join(self.config_dir, "projects.d", "zeta.toml")
+        os.makedirs(os.path.dirname(other), exist_ok=True)
+        with open(other, "w", encoding="utf-8") as handle:
+            handle.write(
+                registration_golden("zeta", os.path.realpath(self.root) + "-elsewhere").replace(
+                    'unit_prefix = "zeta-agent"', f'unit_prefix = "{self.name}-agent"'
+                )
+            )
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+        self.assertEqual(code, 4)
+
+    def test_conflicting_root_is_always_4(self):
+        other = os.path.join(self.config_dir, "projects.d", "zeta.toml")
+        os.makedirs(os.path.dirname(other), exist_ok=True)
+        with open(other, "w", encoding="utf-8") as handle:
+            handle.write(registration_golden("zeta", os.path.realpath(self.root)))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+        self.assertEqual(code, 4)
+
+    def test_plan_writes_no_registration(self):
+        code, _, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_plan_previews_a_differing_registration(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(self.reg_target(), "a", encoding="utf-8") as handle:
+            handle.write("# edited\n")
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            edited = handle.read()
+        before = self.snapshot()
+        code, out, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"would write {self.reg_target()}", out)
+        self.assertIn("-# edited", out)
+        self.assertIn(f"a/{os.path.basename(self.reg_target())}", out)
+        self.assertNotIn("a/corral.toml", out)
+        self.assertEqual(self.snapshot(), before)
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), edited)
+
+
+class UninitCase(Fixture):
+    name = "empty"
+
+    def reg_target(self):
+        return os.path.join(self.config_dir, "projects.d", f"{self.name}.toml")
+
+    def hooks_path(self):
+        proc = subprocess.run(
+            ["git", "config", "core.hooksPath"],
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            env=clean_env(),
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else ""
+
+    def test_init_then_uninit_restores_the_tree(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(self.target(), "rb") as handle:
+            toml = handle.read()
+        with open(os.path.join(self.root, "agents.overlay.md"), "rb") as handle:
+            overlay = handle.read()
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        for rel in (".githooks/commit-msg", ".githooks/pre-push", ".githooks"):
+            self.assertFalse(os.path.exists(os.path.join(self.root, rel)), rel)
+        self.assertFalse(os.path.exists(self.reg_target()))
+        self.assertEqual(self.hooks_path(), "")
+        with open(self.target(), "rb") as handle:
+            self.assertEqual(handle.read(), toml)
+        with open(os.path.join(self.root, "agents.overlay.md"), "rb") as handle:
+            self.assertEqual(handle.read(), overlay)
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to remove", out)
+
+    def test_uninit_plan_changes_nothing(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        before = self.snapshot()
+        code, out, _ = self.run_uninit("--plan", self.root)
+        self.assertEqual(code, 0)
+        for want in (
+            "would remove",
+            ".githooks/commit-msg",
+            ".githooks/pre-push",
+            "would unset core.hooksPath",
+            ".githooks",
+            "projects.d/empty.toml",
+        ):
+            self.assertIn(want, out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertTrue(os.path.isfile(self.reg_target()))
+        self.assertEqual(self.hooks_path(), ".githooks")
+
+    def test_uninit_plan_when_clean_is_nothing_to_do(self):
+        code, out, _ = self.run_uninit("--plan", self.root)
+        self.assertEqual(code, 1)
+        self.assertNotIn("would remove", out)
+
+    def test_modified_hook_is_kept(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(os.path.join(self.root, ".githooks", "commit-msg"), "ab") as handle:
+            handle.write(b"# edited\n")
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("kept", out)
+        self.assertIn("modified since `corral init` wrote it", out)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "commit-msg")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks", "pre-push")))
+        self.assertFalse(os.path.exists(self.reg_target()))
+        self.assertEqual(self.hooks_path(), ".githooks")
+
+    def test_changed_registration_is_kept(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(self.reg_target(), "a", encoding="utf-8") as handle:
+            handle.write("# edited\n")
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("differs from what `corral init` would write now", out)
+        self.assertTrue(os.path.isfile(self.reg_target()))
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks")))
+        self.assertEqual(self.hooks_path(), "")
+
+    def test_cap_three_registration_round_trips_through_uninit(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)[0], 0)
+        self.assertTrue(os.path.isfile(self.reg_target()))
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_a_no_origin_multi_entry_toml_matches_the_directory_named_entry(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)[0], 0)
+        directory = os.path.basename(self.root)
+        with open(self.target(), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "other"\nagents.cap = 1\n\n'
+                f'[[repo]]\nname = "{directory}"\nagents.cap = 3\n'
+            )
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_uninit_without_corral_toml_falls_back_to_the_default(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        os.remove(self.target())
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_foreign_hooks_are_kept(self):
+        os.makedirs(os.path.join(self.root, ".githooks"), exist_ok=True)
+        with open(os.path.join(self.root, ".githooks", "my-hook"), "w") as handle:
+            handle.write("#!/bin/sh\n")
+        self.git("config", "core.hooksPath", ".githooks")
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 1)
+        self.assertIn("holds files `corral init` did not write", out)
+        self.assertIn("hooks remain", out)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "my-hook")))
+        self.assertEqual(self.hooks_path(), ".githooks")
+
+    def test_symlinked_hook_is_kept_not_followed(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "commit-msg")
+        outside = os.path.join(self.config_dir, "sentinel.txt")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("sentinel\n")
+        os.remove(target)
+        os.symlink(outside, target)
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("is a symlink", out)
+        self.assertTrue(os.path.islink(target))
+        with open(outside, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "sentinel\n")
+        remove = init.production_remove(
+            os.path.realpath(self.root), os.path.realpath(self.config_dir)
+        )
+        with self.assertRaises(init.InitError):
+            remove(target)
+        self.assertTrue(os.path.islink(target))
+
+    def test_remove_seam_is_a_required_argument(self):
+        params = inspect.signature(init.run_un).parameters
+        self.assertIs(params["remove"].default, inspect.Parameter.empty)
+
+    def test_real_production_remove_contained_to_temp_dir(self):
+        remove = init.production_remove(
+            os.path.realpath(self.root), os.path.realpath(self.config_dir)
+        )
+        target = os.path.join(self.root, ".githooks")
+        os.makedirs(target)
+        remove(target)
+        self.assertFalse(os.path.exists(target))
+        inner = os.path.join(self.config_dir, "projects.d", "gone.toml")
+        os.makedirs(os.path.dirname(inner), exist_ok=True)
+        with open(inner, "w") as handle:
+            handle.write("x")
+        remove(inner)
+        self.assertFalse(os.path.exists(inner))
+        with self.assertRaises(init.InitError):
+            remove(os.path.join(self.root, "..", "outside"))
+        with self.assertRaises(init.InitError):
+            remove(self.root)
 
 
 if __name__ == "__main__":

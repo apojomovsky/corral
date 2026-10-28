@@ -96,7 +96,7 @@ def _check_branch(branch, number):
     return match
 
 
-def _inside(path, parent):
+def inside(path, parent):
     """True when `path` is strictly below `parent`; both are real paths."""
     if path == parent:
         return False
@@ -180,7 +180,7 @@ def _resolve_root(main, root):
     """The real path of the worktree root; it must sit strictly inside the clone."""
     absolute = root if os.path.isabs(root) else os.path.join(main, root)
     real = os.path.realpath(absolute)
-    if not _inside(real, main):
+    if not inside(real, main):
         raise WorktreeError(
             f"worktree root {root!r} resolves to {real}, outside the main clone {main}"
         )
@@ -306,7 +306,7 @@ def ensure_worktree(
             raise WorktreeError(
                 f"{path} is registered for {branch} but missing: run `git -C {main} worktree prune`"
             )
-        if not _inside(os.path.realpath(path), real_root):
+        if not inside(os.path.realpath(path), real_root):
             raise WorktreeError(
                 f"{path} is registered for {branch} but outside the worktree root {real_root}"
             )

@@ -45,7 +45,8 @@ make install      # uv tool install
 | --- | --- |
 | `corral deps` | check the host programs and the accounts file; print how to install what is missing |
 | `corral doctor [--json]` | read-only health report for the core's own prerequisites; exit 1 on a failing check, 3 when the user manager or `loginctl` cannot be reached |
-| `corral init [PATH]` | detect the project and write `corral.toml`; `--plan` prints the diff, `--set`/`--runtime`/`--cap`/`--test-cmd` override detection |
+| `corral init [PATH]` | detect the project and write `corral.toml`, `agents.overlay.md`, the hooks (`.githooks/`, `core.hooksPath`) and the host registration; `--plan` prints the diff, `--no-register` skips the registration, `--force` replaces `corral.toml` or the registration, `--set`/`--runtime`/`--cap`/`--test-cmd` override detection |
+| `corral uninit [PATH]` | remove the hooks and the registration `corral init` wrote, only what still matches its templates; `--plan` prints the plan and changes nothing |
 | `corral paths [state\|config\|cache\|sessions] [--mkdir]` | the directories corral keeps on this host, after `CORRAL_*` and XDG overrides |
 | `corral config show [--origin] [--repo NAME] [--root PATH]` | every setting with its resolved value; `--origin` names the layer it came from and marks values clamped by a host limit |
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |

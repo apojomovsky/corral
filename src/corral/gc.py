@@ -279,7 +279,7 @@ def _scan_root(root_real, known):
         if not os.path.isdir(full) and not os.path.islink(full):
             continue
         real = os.path.realpath(full)
-        if not worktrees._inside(real, root_real):
+        if not worktrees.inside(real, root_real):
             refused.append(full)
             continue
         if real in known or any(k.startswith(real + os.sep) for k in known):
@@ -393,7 +393,7 @@ def plan(repo, *, pr_index, root, base=None, run=git, forge_note=None):
         if os.path.realpath(path) == main:
             rows.append(RegisteredRow(path, branch, None, False, "main checkout"))
             continue
-        if not worktrees._inside(os.path.realpath(path), real_root):
+        if not worktrees.inside(os.path.realpath(path), real_root):
             rows.append(
                 RegisteredRow(
                     path, branch, categories.get(branch), False, "outside the worktree root"
@@ -538,7 +538,7 @@ def apply(repo, *, pr_index, root, remove, base=None, run=git, forge_note=None):
     for row in checked.registered:
         if not row.planned:
             continue
-        if not worktrees._inside(os.path.realpath(row.path), checked.root):
+        if not worktrees.inside(os.path.realpath(row.path), checked.root):
             result.kept.append((row.path, "escapes the worktree root"))
             continue
         fresh = _registered_row(
@@ -561,7 +561,7 @@ def apply(repo, *, pr_index, root, remove, base=None, run=git, forge_note=None):
     for row in checked.dangling:
         if not row.planned:
             continue
-        if not worktrees._inside(os.path.realpath(row.path), checked.root):
+        if not worktrees.inside(os.path.realpath(row.path), checked.root):
             result.kept.append((row.path, "escapes the worktree root"))
             continue
         fresh = _dangling_row(checked.repo, checked.base, row.path, run)

@@ -1,0 +1,76 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = []
+# ///
+"""commit-msg: Conventional Commits, at most 3 lines, no trailers, no em-dashes.
+
+git's own "Merge ..." message is accepted only while a merge is in progress.
+A commit under a test-fixture identity (t@t and kin) is refused: a fixture
+that writes one into the clone config would send every later commit out
+under it.
+
+Install with: make setup-hooks
+"""
+import re
+import subprocess
+import sys
+
+TYPES = "feat|fix|docs|test|ci|build|chore|refactor|perf|revert"
+SUBJECT = re.compile(rf"^({TYPES})(\([a-z0-9._/-]+\))?!?: \S.*$")
+TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*: ")
+FIXTURE_EMAILS = {"t@t", "t@example.com", "t@t.t"}
+IDENT_EMAIL = re.compile(r"<([^>]*)>")
+
+
+def merging() -> bool:
+    return subprocess.run(
+        ["git", "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+        capture_output=True,
+    ).returncode == 0
+
+
+def fixture_identities() -> list[str]:
+    found = []
+    for role in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+        proc = subprocess.run(["git", "var", role], capture_output=True, text=True)
+        match = IDENT_EMAIL.search(proc.stdout or "")
+        if match and match.group(1).lower() in FIXTURE_EMAILS:
+            found.append(f"{role} is a test-fixture value <{match.group(1)}>: "
+                         "heal the clone identity first")
+    return found
+
+
+def problems(text: str, merge: bool) -> list[str]:
+    lines = [line for line in text.splitlines() if not line.startswith("#")]
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ["empty commit message"]
+    found = []
+    subject = lines[0]
+    if not (merge and subject.startswith("Merge ")) and not SUBJECT.match(subject):
+        found.append(
+            f"subject must be '<type>(<scope>): <summary>' with type one of "
+            f"{TYPES.replace('|', ', ')}: {subject!r}"
+        )
+    if len(lines) > 3:
+        found.append(f"at most 3 lines, found {len(lines)}")
+    if any(TRAILER.match(line) for line in lines[1:]):
+        found.append("no trailers (Co-Authored-By and the like)")
+    if "\u2014" in text:
+        found.append("no em-dashes (use a comma, colon or period)")
+    return found
+
+
+def main() -> int:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        text = handle.read()
+    found = problems(text, merging()) + fixture_identities()
+    for problem in found:
+        print(f"commit-msg: {problem}", file=sys.stderr)
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

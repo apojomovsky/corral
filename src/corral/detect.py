@@ -104,31 +104,15 @@ class Existing(NamedTuple):
 
     agents_md: bool
     claude_md: bool
-    hooks: bool
 
 
-def existing(directory, git):
-    """Which of `AGENTS.md`, `CLAUDE.md`, git hooks already exist.
+def existing(directory):
+    """Which of `AGENTS.md` and `CLAUDE.md` already exist.
 
-    `hooks` is true when `core.hooksPath` is set or `.git/hooks` holds
-    a non-`.sample` file. `init` reports these; it never edits them.
+    `init` reports these; it never edits them. Whether the repository has
+    hooks is decided in one place, `init`, from `core.hooksPath`.
     """
-    hooks = False
-    proc = git(["config", "core.hooksPath"], directory)
-    if proc is not None and getattr(proc, "returncode", 1) == 0:
-        hooks = bool((getattr(proc, "stdout", "") or "").strip())
-    if not hooks:
-        try:
-            names = os.listdir(os.path.join(directory, ".git", "hooks"))
-        except OSError:
-            names = []
-        hooks = any(
-            not name.endswith(".sample")
-            and os.path.isfile(os.path.join(directory, ".git", "hooks", name))
-            for name in names
-        )
     return Existing(
         agents_md=os.path.isfile(os.path.join(directory, "AGENTS.md")),
         claude_md=os.path.isfile(os.path.join(directory, "CLAUDE.md")),
-        hooks=hooks,
     )

@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# pre-push: refuse force pushes and remote deletes.
+#
+# A push is a force when the remote ref is not an ancestor of what is pushed:
+# it drops the branch tip for every other agent and clone. A rewrite needs the
+# human's explicit go-ahead, then:
+#   CORRAL_FORCE_PUSH_APPROVED=1 git push --force-with-lease
+# New branches always pass. Install with: make setup-hooks
+set -uo pipefail
+unset "${!GIT_@}" 2>/dev/null || true
+
+zero=0000000000000000000000000000000000000000
+while read -r local_ref local_oid remote_ref remote_oid; do
+  [ -z "${local_ref:-}" ] && continue
+  [ "$remote_oid" = "$zero" ] && continue
+  if [ "$local_oid" = "$zero" ] || ! git merge-base --is-ancestor "$remote_oid" "$local_oid" 2>/dev/null; then
+    if [ "${CORRAL_FORCE_PUSH_APPROVED:-}" != 1 ]; then
+      echo "pre-push: refusing a force push or delete of $remote_ref (needs the human's go-ahead)" >&2
+      exit 1
+    fi
+    echo "pre-push: force push of $remote_ref approved (CORRAL_FORCE_PUSH_APPROVED=1)"
+  fi
+done
