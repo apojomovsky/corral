@@ -3,6 +3,7 @@
 import calendar
 import json
 import unittest
+from typing import Any
 
 from corral import board, tracker
 from corral.github import tracker as ghtracker
@@ -72,6 +73,7 @@ class FakeTracker:
         self.changes_error = None
         self.item_errors = {}
         self.items_break_after = None
+        self.write_errors = {}
         self.calls = []
 
     def add(self, item):
@@ -112,10 +114,16 @@ class FakeTracker:
                 raise tracker.TrackerError(f"page error at index {index}")
             yield item
 
+    def write(self, repo, number, field, value):
+        """Record one corral-owned field write; programmed errors raise."""
+        self.calls.append(("write", repo, number, field, value))
+        if (repo, number) in self.write_errors:
+            raise self.write_errors[(repo, number)]
 
-def reading(repo="acme/app", number=7, **over):
+
+def reading(repo="acme/app", number=7, **over: Any):
     """One TrackerItem with sane defaults; override any field."""
-    params = {
+    params: dict[str, Any] = {
         "repo": repo,
         "number": number,
         "kind": "issue",

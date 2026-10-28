@@ -9,6 +9,7 @@ module: everything else sees ``TrackerItem``.
 import json
 
 from corral import tracker as iface
+from corral.github.gh import is_rate_limited, retry_after_s
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
@@ -17,6 +18,11 @@ PER_PAGE: int = 100
 #: the store keeps from the highest-ranked ``priority:<name>`` label.
 PRIORITIES = ("urgent", "high", "normal", "low", "backlog")
 _PRIORITY_PREFIX = "priority:"
+
+#: Corral-owned fields live on the tracker as labels. One label per field
+#: at most; when several share a prefix the smallest wins and the rest
+#: are pruned on the next write of that field.
+_FIELD_PREFIX = {"agent": "agent:", "status": "status:"}
 
 
 def priority_of(names) -> str:
@@ -32,6 +38,23 @@ def priority_of(names) -> str:
         if suffix in PRIORITIES and (not best or PRIORITIES.index(suffix) < PRIORITIES.index(best)):
             best = suffix
     return best
+
+
+def field_value_of(names, field) -> str:
+    """The tracker's value for one corral-owned field from label ``names``.
+
+    The smallest ``<field>:<value>`` label wins; anything else with the
+    prefix is pruned on the next write of that field. Absent means ``""``.
+    Pure, so the store and the tests share it.
+    """
+    prefix = _FIELD_PREFIX[field]
+    best = None
+    for name in names or ():
+        if not isinstance(name, str) or not name.startswith(prefix):
+            continue
+        if best is None or name < best:
+            best = name
+    return "" if best is None else best[len(prefix) :]
 
 
 def _fail(text):
@@ -150,6 +173,8 @@ class GithubTracker:
             url=url,
             updated_at=updated_at,
             from_fork=self._from_fork(repo, number) if kind == "pr" else False,
+            agent=field_value_of(labels, "agent"),
+            status=field_value_of(labels, "status"),
         )
 
     def _page(self, path):
@@ -215,3 +240,47 @@ class GithubTracker:
         """Every item, oldest first, for a full resync."""
         for entry in self._feed(repo, None):
             yield self._parse(repo, entry)
+
+    def _write_error(self, err: Exception) -> iface.TrackerError:
+        """One failed label call as the tracker's error. Rate-limit text
+        maps to ``TrackerRateLimited`` through the shared classifier, so
+        the mirror pass stops; anything else fails closed as
+        ``TrackerError``."""
+        text = str(err) or repr(err)
+        if is_rate_limited(text):
+            return iface.TrackerRateLimited(text, retry_after_s(text))
+        return iface.TrackerError(f"tracker unreachable: {text}")
+
+    def _label_names(self, repo: str, number: int) -> tuple[str, ...]:
+        """The item's current label names, else ``TrackerError``."""
+        try:
+            payload = json.loads(self._run(["api", f"repos/{repo}/issues/{number}/labels"]))
+        except Exception as err:
+            raise self._write_error(err) from err
+        return _parse_names(payload, "labels")
+
+    def write(self, repo: str, number: int, field: str, value: str) -> None:
+        """Set one corral-owned field through the issues-labels endpoint.
+
+        The wanted ``<field>:<value>`` label is added (creating it on first
+        use) and every other label with the field's prefix is removed, so
+        one field leaves one label behind. An already-matching tracker
+        writes nothing; ``value == ""`` only removes. Anything outside the
+        corral-owned fields is refused with ``ValueError``.
+        """
+        try:
+            prefix = _FIELD_PREFIX[field]
+        except KeyError:
+            raise ValueError(f"refusing to write non-corral field {field!r}") from None
+        current = self._label_names(repo, number)
+        want = f"{prefix}{value}" if value else None
+        have = sorted(name for name in current if name.startswith(prefix))
+        drop = [name for name in have if name != want]
+        path = f"repos/{repo}/issues/{number}/labels"
+        try:
+            if want is not None and want not in have:
+                self._run(["api", "--method", "POST", path, "-f", f"labels[]={want}"])
+            for name in drop:
+                self._run(["api", "--method", "DELETE", f"{path}/{name}"])
+        except Exception as err:
+            raise self._write_error(err) from err

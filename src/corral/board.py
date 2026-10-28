@@ -82,9 +82,11 @@ class ExternalItem(Exception):
 
 @dataclass
 class Item:
-    """One cached tracker item. ``agent``/``status`` are virtual: the
-    claims table and the queued outbox rows are their authority, and
-    ``from_fork`` is input-only for the external rule."""
+    """One cached tracker item. ``agent``/``status`` are virtual for reads:
+    the claims table and the queued outbox rows are their authority. On a
+    tracker reading they carry the tracker's reported values instead, the
+    same way ``from_fork`` is input-only for the external rule: the upsert
+    settles queued writes against them but never originates values."""
 
     repo: str
     number: int
@@ -435,7 +437,9 @@ class Store:
         tracker's value. Corral-owned fields are never originated here:
         the reading only settles queued writes. A fresh tracker value
         echoing a queued write marks it sent, a fresh different value
-        drops it as overridden, and a stale reading settles nothing."""
+        drops it as overridden, and a reading that says nothing (an empty
+        value, e.g. a title-only edit that left no label behind) settles
+        nothing. A stale reading settles nothing either."""
         with _txn(self._conn):
             stored = self._row(item.repo, item.number)
             external = bool(
@@ -506,8 +510,11 @@ class Store:
                 _id, _, _, queued_field, queued_value, created_at, _, _, _ = row
                 if item.tracker_updated_at <= created_at:
                     continue
-                if _reading_value(item, queued_field) == queued_value:
+                seen = _reading_value(item, queued_field)
+                if seen == queued_value:
                     self._conn.execute("UPDATE outbox SET state=? WHERE id=?", (SENT, _id))
+                elif seen == "":
+                    continue
                 else:
                     self._conn.execute(
                         "UPDATE outbox SET state=?, reason=? WHERE id=?",
