@@ -330,6 +330,21 @@ class OpsErrorsCase(OpsFixture):
         self.assertEqual(code, 4)
         self.assertIn(self.ops, err)
 
+    def test_an_ops_root_inside_the_clone_is_4_and_creates_nothing(self):
+        inside = os.path.join(self.clone, "sub")
+        before = self.clone_snapshot()
+        for verb in ("init", "uninit"):
+            for extra in ((), ("--plan",)):
+                with self.subTest(verb=verb, extra=extra):
+                    argv = [verb, "--ops", inside, *extra]
+                    if verb == "init":
+                        argv += ["--test-cmd", "make check"]
+                    code, _, err = self.run_cli(*argv, self.clone)
+                    self.assertEqual(code, 4, err)
+                    self.assertIn("inside the project clone", err)
+        self.assertFalse(os.path.exists(inside))
+        self.assertEqual(self.clone_snapshot(), before)
+
     def test_ops_path_holding_a_file_is_4(self):
         with open(self.ops, "w", encoding="utf-8") as handle:
             handle.write("mine\n")

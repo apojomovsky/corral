@@ -233,7 +233,21 @@ def ops_candidate(clone_root, ops, ops_name):
 
     A `--ops PATH` wins over `--ops-name NAME`; a bare `--ops` or an
     `--ops-name` alone means the sibling of that name next to the clone.
+    An ops root strictly inside the clone would put tracked files into the
+    project, so it is refused (exit 4); the clone itself is the inline layout.
     """
+    candidate = _ops_path(clone_root, ops, ops_name)
+    if candidate is not None and worktrees.inside(
+        os.path.realpath(candidate), os.path.realpath(clone_root)
+    ):
+        raise InitError(
+            f"--ops {candidate} lies inside the project clone {clone_root}: "
+            "the ops root must be outside it (nothing tracked is written into the project)"
+        )
+    return candidate
+
+
+def _ops_path(clone_root, ops, ops_name):
     if ops is not None and ops != OPS_DEFAULT:
         return os.path.abspath(ops)
     if ops_name is not None:
