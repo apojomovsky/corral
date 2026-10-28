@@ -183,7 +183,7 @@ def validate_limits(limits):
     cap. Each message names the offending numbers.
     """
     if limits.total < 0:
-        raise LimitsError(f"admission.total {limits.total} must be zero or more")
+        raise LimitsError(f"admission.total_cap {limits.total} must be zero or more")
     if limits.repo_cap < 0:
         raise LimitsError(f"admission.repo_cap {limits.repo_cap} must be zero or more")
     floors = 0
@@ -197,4 +197,6 @@ def validate_limits(limits):
             raise LimitsError(f"project {name} floor {floor} is above its ceiling {ceiling}")
         floors += floor
     if floors > limits.total:
-        raise LimitsError(f"project floors sum to {floors}, above admission.total {limits.total}")
+        raise LimitsError(
+            f"project floors sum to {floors}, above admission.total_cap {limits.total}"
+        )

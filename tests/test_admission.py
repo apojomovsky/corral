@@ -21,8 +21,12 @@ def limits(total=4, projects=None, repo_cap=0):
     return A.Limits(total=total, projects=dict(projects or {}), repo_cap=repo_cap)
 
 
-def ceilings(projects):
-    return {name: {"floor": 0, "ceiling": cap} for name, cap in projects.items()}
+class MessageNames(unittest.TestCase):
+    def test_limit_errors_name_the_registered_setting(self):
+        for bad in (limits(total=-1), limits(total=2, projects={"a": {"floor": 3}})):
+            with self.assertRaises(A.LimitsError) as caught:
+                A.validate_limits(bad)
+            self.assertIn("admission.total_cap", str(caught.exception))
 
 
 class VerdictTable(unittest.TestCase):
