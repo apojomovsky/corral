@@ -12,6 +12,7 @@ from corral import (
     deps,
     doctor,
     gccli,
+    init,
     launchcli,
     paths,
     quotacli,
@@ -158,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--base", default=None, help=base_help)
     p.set_defaults(func=cmd_budget)
+    init.add_parser(sub)
     coordcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)
