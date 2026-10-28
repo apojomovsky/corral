@@ -1,12 +1,33 @@
-"""`corral init` for the inline layout: detect, render, write `corral.toml`.
+"""`corral init` and `corral uninit` for the inline layout.
 
-Non-interactive: detected values are used, flags override them, and a
-value that is neither detected nor flagged is exit 4 (`--test-cmd` is
-the only one this layout cannot default). `--yes` is accepted and is a
-no-op, reserved for the prompting ticket.
+`init` detects what it can and asks about the rest through flags: detected
+values are used, flags override them, and a value that is neither detected
+nor flagged is exit 4 (`--test-cmd` is the only one this layout cannot
+default). `--yes` is accepted and is a no-op, reserved for the prompting
+ticket.
 
-Exactly one file is ever written: `corral.toml` at the repository root.
-`AGENTS.md`, `CLAUDE.md`, hooks and every other file are left alone.
+Inline `init` writes, all idempotent and all covered by `--plan`:
+
+- `corral.toml` at the repository root (replaced only with `--force`);
+- `agents.overlay.md` next to it, from the packaged template, created only
+  when missing: a re-run never touches an existing one, even with `--force`;
+- the hook scripts into `<root>/.githooks/` (mode 0755) plus the clone-local
+  `git config core.hooksPath .githooks`, but only when the repository has no
+  hooks of its own. With hooks already there it writes nothing and prints
+  how to chain corral's hooks from them. `git.commits.conventional = false`
+  skips the `commit-msg` hook;
+- the host registration `~/.config/corral/projects.d/<name>.toml`, the only
+  write outside the repository (skipped with a note under `--no-register`).
+
+`init` never edits `AGENTS.md`, `CLAUDE.md` or any other existing file, and
+never runs `gh` or anything outward: it prints `corral github setup` as the
+next step for the user and does nothing else.
+
+`uninit` reverses only what `init` can prove it wrote: a hook file goes only
+when its bytes still equal the packaged template, the registration only
+when its content still equals what `init` would write now. Anything modified
+since stays and is listed as kept, with the reason. `corral.toml` and
+`agents.overlay.md` are never removed.
 """
 
 import argparse
@@ -15,9 +36,12 @@ import json
 import os
 import re
 import sys
+import tomllib
+from collections.abc import Callable
+from importlib import resources
 from typing import NamedTuple
 
-from corral import detect, gc, paths, runtimes, settings
+from corral import detect, gc, paths, projects, runtimes, settings, worktrees
 
 OK, NOTHING, USAGE = 0, 1, 4
 
@@ -28,6 +52,16 @@ class InitError(ValueError):
 
 #: The `[[repo]]` entry keys always written, in file order.
 TRIO = ("clone.path", "clone.default_branch", "checks.test")
+
+#: The overlay file next to `corral.toml`, from the packaged template.
+OVERLAY_FILE = "agents.overlay.md"
+
+#: The hook directory in the repository root, and the hooks `init` installs.
+HOOKS_DIR = ".githooks"
+HOOK_FILES = ("commit-msg", "pre-push")
+
+#: The git key `init` sets (clone-local) to point git at `HOOKS_DIR`.
+HOOKS_KEY = "core.hooksPath"
 
 
 class PlanInputs(NamedTuple):
@@ -78,6 +112,12 @@ def resolve_root(path, git):
     return root
 
 
+def project_name(root, git):
+    """The registration and entry name: the origin slug's repo, else the dir."""
+    slug = detect.origin_slug(root, git)
+    return slug.split("/")[1] if slug else os.path.basename(root)
+
+
 def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=()):
     """`(root, PlanInputs)` for the repository holding `path`.
 
@@ -95,8 +135,7 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=()):
         if not sep or not key:
             raise InitError(f"--set {raw!r}: want key=value")
         overrides[key] = _coerce(key, value)
-    slug = detect.origin_slug(root, git)
-    name = slug.split("/")[1] if slug else os.path.basename(root)
+    name = project_name(root, git)
     branch = detect.default_branch(root, git)
     if branch is None:
         fallback = settings.REGISTRY["clone.default_branch"].default
@@ -203,6 +242,115 @@ def plan_diff(current, new):
     )
 
 
+def hook_template(name):
+    """The packaged hook script `name` as bytes (`importlib.resources`)."""
+    return resources.files("corral").joinpath(f"hooks/{name}").read_bytes()
+
+
+def overlay_text():
+    """The packaged `agents.overlay.md` template."""
+    return resources.files("corral").joinpath("overlay_template.md").read_text("utf-8")
+
+
+def chain_lines(conventional):
+    """How to run corral's hooks from already-installed ones (exact lines)."""
+    base = resources.files("corral").joinpath("hooks")
+    names = list(HOOK_FILES) if conventional else ["pre-push"]
+    lines = ["existing git hooks found: leaving them alone."]
+    lines.append("To run corral's hooks from yours, add these lines:")
+    for name in names:
+        lines.append(f'exec "{base.joinpath(name)}" "$@"  # in your {name} hook')
+    return lines
+
+
+def registration_text(name, root, cap):
+    """The host registration `init` writes for this repository."""
+    return "\n".join(
+        [
+            "# The host registration for this project, written by `corral init`.",
+            "# `corral uninit` removes this file while its content still matches",
+            "# what `corral init` would write; edit it and `uninit` leaves it alone.",
+            f"name = {_toml(name)}",
+            f"unit_prefix = {_toml(f'{name}-agent')}",
+            f"root = {_toml(root)}",
+            "floor = 0",
+            f"ceiling = {_toml(cap)}",
+            "",
+        ]
+    )
+
+
+def _registration_conflicts(directory, target, name, prefix, root):
+    """`InitError` when another registration claims `prefix` or `root`.
+
+    The file for `name` itself is skipped: replacing it is `--force`'s job,
+    decided by the caller. Anything unreadable is exit 4 naming the file.
+    """
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        return
+    except OSError as err:
+        raise InitError(f"cannot list {directory}: {err}") from None
+    for entry in names:
+        if not entry.endswith(".toml") or entry == f"{name}.toml":
+            continue
+        path = os.path.join(directory, entry)
+        try:
+            with open(path, "rb") as handle:
+                raw = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError) as err:
+            raise InitError(f"{path}: cannot read the registration: {err}") from None
+        if not isinstance(raw, dict):
+            raise InitError(f"{path}: the file must hold a TOML table")
+        stem = entry[: -len(".toml")]
+        if raw.get("unit_prefix") == prefix:
+            raise InitError(
+                f"{target}: unit_prefix {prefix!r} is already "
+                f"registered by project {stem!r} ({path})"
+            )
+        claimed = raw.get("root")
+        if isinstance(claimed, str) and claimed and os.path.realpath(claimed) == root:
+            raise InitError(
+                f"{target}: root {root} is already registered by project {stem!r} ({path})"
+            )
+
+
+def _git_ok(proc):
+    """True when a git seam call succeeded."""
+    return proc is not None and getattr(proc, "returncode", 1) == 0
+
+
+def _read_text(target):
+    """The file's text, None when missing; other `OSError` is `InitError`."""
+    try:
+        with open(target, encoding="utf-8") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise InitError(f"corral: cannot read {target}: {err}") from None
+
+
+def _write_text(target, text):
+    """`paths.atomic_write_text` with `InitError` on failure."""
+    try:
+        paths.atomic_write_text(target, text)
+    except OSError as err:
+        raise InitError(f"corral: cannot write {target}: {err}") from None
+
+
+def _file_bytes(target):
+    """The file's bytes, None when missing; other `OSError` is `InitError`."""
+    try:
+        with open(target, "rb") as handle:
+            return handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise InitError(f"corral: cannot read {target}: {err}") from None
+
+
 class Options(NamedTuple):
     """Parsed `corral init` flags."""
 
@@ -210,6 +358,7 @@ class Options(NamedTuple):
     plan: bool = False
     yes: bool = False
     force: bool = False
+    no_register: bool = False
     test_cmd: str | None = None
     runtime: str | None = None
     cap: int | None = None
@@ -227,39 +376,153 @@ def run(opts, git=gc.git):
             cap=opts.cap,
             sets=opts.sets,
         )
+        return _apply(root, inputs, opts, git)
     except InitError as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
+
+
+def _apply(root, inputs, opts, git):
+    """Write everything `init` owns. Raises `InitError` on refusal."""
+    toml_target = os.path.join(root, settings.PROJECT_FILE)
+    current = _read_text(toml_target)
     text = render(inputs)
-    target = os.path.join(root, settings.PROJECT_FILE)
-    try:
-        with open(target, encoding="utf-8") as handle:
-            current = handle.read()
-    except FileNotFoundError:
-        current = None
-    except OSError as err:
-        print(f"corral: cannot read {target}: {err}", file=sys.stderr)
-        return USAGE
-    if current == text:
-        sys.stdout.write(f"{target} is up to date\n")
-        return NOTHING
-    if opts.plan:
-        sys.stdout.write(plan_diff(current, text))
-        return OK
-    if current is not None and not opts.force:
+    if current is not None and current != text and not opts.force and not opts.plan:
         sys.stdout.write(plan_diff(current, text))
         print(
-            f"corral: {target} exists with different content:"
+            f"corral: {toml_target} exists with different content:"
             " re-run with --force to replace only that file",
             file=sys.stderr,
         )
         return USAGE
-    try:
-        paths.atomic_write_text(target, text)
-    except OSError as err:
-        print(f"corral: cannot write {target}: {err}", file=sys.stderr)
-        return USAGE
-    sys.stdout.write(f"wrote {target}\n")
+    extra = dict(inputs.extra)
+    cap = extra.get("agents.cap", settings.REGISTRY["agents.cap"].default)
+    if not isinstance(cap, int) or isinstance(cap, bool):
+        raise InitError("internal: agents.cap is not an int setting")
+    conventional = extra.get(
+        "git.commits.conventional", settings.REGISTRY["git.commits.conventional"].default
+    )
+    if not isinstance(conventional, bool):
+        raise InitError("internal: git.commits.conventional is not a bool setting")
+    overlay_target = os.path.join(root, OVERLAY_FILE)
+    overlay_missing = not os.path.isfile(overlay_target)
+    found = detect.existing(root, git)
+    want_hooks = [] if found.hooks else [n for n in HOOK_FILES if n != "commit-msg" or conventional]
+    hook_proc = git(["config", HOOKS_KEY], root)
+    hooks_path_set = (
+        _git_ok(hook_proc) and (getattr(hook_proc, "stdout", "") or "").strip() == HOOKS_DIR
+    )
+    hook_targets = [os.path.join(root, HOOKS_DIR, name) for name in want_hooks]
+    chained = [n for n in HOOK_FILES if n != "commit-msg" or conventional]
+    show_chain = found.hooks and not (
+        hooks_path_set
+        and all(_file_bytes(os.path.join(root, HOOKS_DIR, n)) == hook_template(n) for n in chained)
+    )
+    for target, name in zip(hook_targets, want_hooks):
+        try:
+            with open(target, "rb") as handle:
+                installed = handle.read()
+        except FileNotFoundError:
+            installed = None
+        except OSError as err:
+            raise InitError(f"corral: cannot read {target}: {err}") from None
+        if installed is not None and installed != hook_template(name):
+            raise InitError(f"{target} exists with different content: remove it or chain from it")
+    reg_target = os.path.join(projects.projects_dir(), f"{inputs.name}.toml")
+    reg_text = registration_text(inputs.name, os.path.realpath(root), cap)
+    reg_missing: bool | None = None
+    if not opts.no_register:
+        current_reg = _read_text(reg_target)
+        if current_reg is None:
+            reg_missing = True
+        elif current_reg == reg_text:
+            reg_missing = False
+        elif not opts.force:
+            raise InitError(
+                f"{reg_target} exists with different content: re-run with --force to replace it"
+            )
+        else:
+            reg_missing = True
+        if reg_missing:
+            _registration_conflicts(
+                projects.projects_dir(),
+                reg_target,
+                inputs.name,
+                f"{inputs.name}-agent",
+                os.path.realpath(root),
+            )
+    need_hooks = bool(hook_targets) and (
+        any(not os.path.isfile(t) for t in hook_targets) or not hooks_path_set
+    )
+    changed = current != text or overlay_missing or need_hooks or reg_missing is True
+    if not changed:
+        sys.stdout.write(f"{toml_target} is up to date\n")
+        if show_chain:
+            for line in chain_lines(conventional):
+                sys.stdout.write(line + "\n")
+        if opts.no_register:
+            sys.stdout.write("skipped the host registration (--no-register)\n")
+        return NOTHING
+    if opts.plan:
+        if current != text:
+            sys.stdout.write(plan_diff(current, text))
+        if overlay_missing:
+            sys.stdout.write(f"would write {overlay_target}\n")
+        for target in hook_targets:
+            if not os.path.isfile(target):
+                sys.stdout.write(f"would write {target}\n")
+        if hook_targets and not hooks_path_set:
+            sys.stdout.write(f"would set core.hooksPath to {HOOKS_DIR}\n")
+        if reg_missing is True:
+            sys.stdout.write(f"would write {reg_target}\n")
+        if show_chain:
+            for line in chain_lines(conventional):
+                sys.stdout.write(line + "\n")
+        if opts.no_register:
+            sys.stdout.write("skipped the host registration (--no-register)\n")
+        sys.stdout.write("next: corral github setup\n")
+        return OK
+    if current != text:
+        _write_text(toml_target, text)
+        sys.stdout.write(f"wrote {toml_target}\n")
+    if overlay_missing:
+        _write_text(overlay_target, overlay_text())
+        sys.stdout.write(f"wrote {overlay_target}\n")
+    if hook_targets:
+        os.makedirs(os.path.join(root, HOOKS_DIR), exist_ok=True)
+        for target, name in zip(hook_targets, want_hooks):
+            if not os.path.isfile(target):
+                _write_text(target, hook_template(name).decode("utf-8"))
+                os.chmod(target, 0o755)
+                sys.stdout.write(f"wrote {target}\n")
+        if not hooks_path_set:
+            setter = git(["config", HOOKS_KEY, HOOKS_DIR], root)
+            if not _git_ok(setter):
+                raise InitError(f"cannot set core.hooksPath in {root}")
+            sys.stdout.write(f"set core.hooksPath to {HOOKS_DIR} in {root}\n")
+    if show_chain:
+        for line in chain_lines(conventional):
+            sys.stdout.write(line + "\n")
+    if not opts.no_register and reg_missing:
+        os.makedirs(projects.projects_dir(), exist_ok=True)
+        _write_text(reg_target, reg_text)
+        try:
+            registered = projects.load_all()
+        except projects.ProjectsError as err:
+            raise InitError(str(err)) from None
+        if not any(
+            p.name == inputs.name
+            and p.unit_prefix == f"{inputs.name}-agent"
+            and p.root == os.path.normpath(os.path.realpath(root))
+            and p.floor == 0
+            and p.ceiling == cap
+            for p in registered
+        ):
+            raise InitError(f"{reg_target}: wrote the registration but cannot read it back")
+        sys.stdout.write(f"wrote {reg_target}\n")
+    elif opts.no_register:
+        sys.stdout.write("skipped the host registration (--no-register)\n")
+    sys.stdout.write("next: corral github setup\n")
     return OK
 
 
@@ -271,6 +534,7 @@ def cmd_init(args):
             plan=args.plan,
             yes=args.yes,
             force=args.force,
+            no_register=args.no_register,
             test_cmd=args.test_cmd,
             runtime=args.runtime,
             cap=args.cap,
@@ -279,8 +543,175 @@ def cmd_init(args):
     )
 
 
+class UnOptions(NamedTuple):
+    """Parsed `corral uninit` flags."""
+
+    path: str | None = None
+    plan: bool = False
+
+
+def production_remove(*roots):
+    """The real destruction seam. Only the CLI builds it.
+
+    `remove` deletes one path strictly below one of `roots` (symlinks
+    resolved); anything else is `InitError`. Tests pass a fake through
+    `run_un`; only the test named
+    `test_real_production_remove_contained_to_temp_dir` calls this, only
+    against temp dirs.
+    """
+    real_roots = [os.path.realpath(root) for root in roots]
+
+    def remove(path: str) -> None:
+        real = os.path.realpath(path)
+        if not any(real != parent and worktrees._inside(real, parent) for parent in real_roots):
+            raise InitError(f"refusing to remove {path}: escapes the removal roots")
+        try:
+            if os.path.isdir(real) and not os.path.islink(real):
+                os.rmdir(real)
+            else:
+                os.remove(real)
+        except OSError as err:
+            raise InitError(f"cannot remove {path}: {err}") from None
+
+    return remove
+
+
+def run_un(opts, remove, git=gc.git):
+    """Run `uninit` with required seams. `remove` deletes one path and has
+    no default; tests inject a fake. Returns the exit code."""
+    try:
+        return _unapply(opts, remove, git)
+    except InitError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+
+
+def _unapply(opts, remove, git):
+    """Remove what `init` can prove it wrote. Raises `InitError`."""
+    root = resolve_root(opts.path or os.getcwd(), git)
+    removed: list[str] = []
+    kept: list[tuple[str, str]] = []
+    planned: list[str] = []
+    hooks_dir = os.path.join(root, HOOKS_DIR)
+    for name in HOOK_FILES:
+        target = os.path.join(hooks_dir, name)
+        if not os.path.lexists(target):
+            continue
+        try:
+            with open(target, "rb") as handle:
+                installed = handle.read()
+        except OSError as err:
+            raise InitError(f"corral: cannot read {target}: {err}") from None
+        if installed != hook_template(name):
+            kept.append((target, "modified since `corral init` wrote it"))
+            remaining = True
+        elif opts.plan:
+            planned.append(target)
+        else:
+            _remove(remove, target)
+            removed.append(target)
+    stays = _remaining_hooks(hooks_dir, planned)
+    proc = git(["config", HOOKS_KEY], root)
+    hooks_path = (getattr(proc, "stdout", "") or "").strip() if _git_ok(proc) else ""
+    unset = False
+    if hooks_path == HOOKS_DIR and not stays:
+        if opts.plan:
+            planned.append("core.hooksPath")
+        else:
+            unset_proc = git(["config", "--unset", HOOKS_KEY], root)
+            if not _git_ok(unset_proc):
+                raise InitError(f"cannot unset core.hooksPath in {root}")
+            unset = True
+    elif hooks_path == HOOKS_DIR and stays:
+        kept.append(("core.hooksPath", "hooks remain"))
+    if os.path.isdir(hooks_dir) and not os.path.islink(hooks_dir):
+        if not stays:
+            if opts.plan:
+                planned.append(hooks_dir)
+            else:
+                _remove(remove, hooks_dir)
+                removed.append(hooks_dir)
+        else:
+            kept.append((hooks_dir, "holds files `corral init` did not write"))
+    name = project_name(root, git)
+    reg_target = os.path.join(projects.projects_dir(), f"{name}.toml")
+    default_cap = settings.REGISTRY["agents.cap"].default
+    if not isinstance(default_cap, int) or isinstance(default_cap, bool):
+        raise InitError("internal: agents.cap is not an int setting")
+    expected = registration_text(name, os.path.realpath(root), default_cap)
+    reg_current = _read_text(reg_target)
+    if reg_current is not None:
+        if reg_current == expected:
+            if opts.plan:
+                planned.append(reg_target)
+            else:
+                _remove(remove, reg_target)
+                removed.append(reg_target)
+        else:
+            kept.append((reg_target, "differs from what `corral init` would write now"))
+    if opts.plan:
+        for target in planned:
+            if target == "core.hooksPath":
+                sys.stdout.write("would unset core.hooksPath\n")
+            else:
+                sys.stdout.write(f"would remove {target}\n")
+        for target, reason in kept:
+            sys.stdout.write(f"would keep {target} ({reason})\n")
+        return OK if planned else NOTHING
+    for target in removed:
+        sys.stdout.write(f"removed {target}\n")
+    if unset:
+        sys.stdout.write("unset core.hooksPath\n")
+    for target, reason in kept:
+        sys.stdout.write(f"kept {target} ({reason})\n")
+    if removed or unset:
+        sys.stdout.write(
+            f"left for you to delete: {os.path.join(root, settings.PROJECT_FILE)},"
+            f" {os.path.join(root, OVERLAY_FILE)}\n"
+        )
+    else:
+        sys.stdout.write("nothing to remove\n")
+    return OK if removed or unset else NOTHING
+
+
+def _remaining_hooks(hooks_dir, planned):
+    """Paths under `hooks_dir` that stay: everything except `planned` removals."""
+    try:
+        names = os.listdir(hooks_dir)
+    except FileNotFoundError:
+        return []
+    except OSError as err:
+        raise InitError(f"corral: cannot list {hooks_dir}: {err}") from None
+    return [
+        os.path.join(hooks_dir, name)
+        for name in names
+        if os.path.join(hooks_dir, name) not in planned
+    ]
+
+
+def _remove(remove, target):
+    """One seam deletion with `InitError` on failure."""
+    try:
+        remove(target)
+    except InitError:
+        raise
+    except OSError as err:
+        raise InitError(f"cannot remove {target}: {err}") from None
+
+
+def cmd_uninit(args):
+    """The `corral uninit` verb: flags to `UnOptions`, then `run_un`."""
+    try:
+        root = resolve_root(args.path or os.getcwd(), gc.git)
+    except InitError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+    remove = production_remove(os.path.realpath(root), os.path.realpath(projects.projects_dir()))
+    return run_un(UnOptions(path=args.path, plan=args.plan), remove)
+
+
 def add_parser(sub):
-    """Register `corral init` on the top-level subparsers."""
+    """Register `corral init` and `corral uninit` on the top-level subparsers."""
     parser = sub.add_parser("init", help="detect the project and write corral.toml")
     parser.add_argument(
         "path",
@@ -297,7 +728,12 @@ def add_parser(sub):
     parser.add_argument(
         "--force",
         action="store_true",
-        help="replace an existing corral.toml with different content",
+        help="replace an existing corral.toml or registration with different content",
+    )
+    parser.add_argument(
+        "--no-register",
+        action="store_true",
+        help="skip the host registration in ~/.config/corral/projects.d/",
     )
     parser.add_argument(
         "--set",
@@ -310,3 +746,12 @@ def add_parser(sub):
     parser.add_argument("--cap", type=int, default=None, help="this project's agent ceiling")
     parser.add_argument("--test-cmd", default=None, help="the test command (default: detected)")
     parser.set_defaults(func=cmd_init)
+    uninit = sub.add_parser("uninit", help="remove the hooks and registration `corral init` wrote")
+    uninit.add_argument(
+        "path",
+        nargs="?",
+        default=None,
+        help="the repository to uninit (default: the current directory)",
+    )
+    uninit.add_argument("--plan", action="store_true", help="print the plan and change nothing")
+    uninit.set_defaults(func=cmd_uninit)

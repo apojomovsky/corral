@@ -4,6 +4,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from importlib import resources
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parent.parent / ".githooks"
@@ -155,6 +156,22 @@ class PrePush(Repo):
         r = git(self.repo, "push", "-q", "origin", ":master", env=self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("refusing", r.stderr)
+
+
+class PackagedHooks(unittest.TestCase):
+    """`corral init` ships copies of the repo hooks: drift must fail loudly."""
+
+    def test_commit_msg_matches_the_repo_hook_byte_for_byte(self):
+        packaged = resources.files("corral").joinpath("hooks/commit-msg").read_bytes()
+        self.assertEqual(packaged, (HOOKS / "commit-msg").read_bytes())
+
+    def test_pre_push_ships_the_guard_block_verbatim(self):
+        repo = (HOOKS / "pre-push").read_text().splitlines()
+        start = next(i for i, line in enumerate(repo) if line.startswith("zero="))
+        end = next(i for i, line in enumerate(repo) if line == "done")
+        block = "\n".join(repo[start : end + 1]) + "\n"
+        packaged = resources.files("corral").joinpath("hooks/pre-push").read_text("utf-8")
+        self.assertIn(block, packaged)
 
 
 if __name__ == "__main__":
