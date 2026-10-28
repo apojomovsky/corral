@@ -61,6 +61,13 @@ def write_config(session_dir, config):
     paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), text)
 
 
+def with_models(config, chains):
+    """`config` with the default role's head as its model. Other keys are kept."""
+    from corral import models
+
+    return {**(config or {}), "model": models.primary(chains)}
+
+
 def resume_handle(session_dir):
     """The last `sessionID` in out.log, or None."""
     found = None
@@ -88,6 +95,7 @@ class Opencode:
     argv = staticmethod(argv)
     env = staticmethod(env)
     write_config = staticmethod(write_config)
+    with_models = staticmethod(with_models)
     resume_handle = staticmethod(resume_handle)
     activity_file = staticmethod(activity_file)
 

@@ -25,9 +25,11 @@ is live at all.
 """
 
 import os
+import time
 from dataclasses import dataclass
 
-from corral import paths, registry, runtimes, settings, units, worktrees
+from corral import accounts, models, paths, quota_ledger, registry, runtimes, settings, units
+from corral import worktrees
 from corral.runtimes import tail as runtime_tail
 
 #: The run time limit handed to the runtime, in seconds for the unit's
@@ -187,6 +189,33 @@ def _env(adapter, session, unit):
     return env
 
 
+def _model_chains(tgt, pool, ledger, now):
+    """The target's validated, re-routed chains, or {} when none are declared.
+
+    Every entry must name a provider from the pool (exit 4 naming role and
+    entry); each chain keeps only its live providers, and a required role
+    with none left refuses the launch (exit 75 naming role and reset). A
+    stale reading never blocks, so the strictest freshness bound wins.
+    """
+    chains = dict(tgt.resolved.models)
+    if not chains:
+        return {}
+    models.validate(chains, pool)
+    bounds = [
+        s
+        for s in (getattr(provider, "stale_after_s", None) for provider in pool or ())
+        if isinstance(s, (int, float)) and not isinstance(s, bool)
+    ] or [accounts.DEFAULT_STALE_AFTER_S]
+    return models.check(
+        chains,
+        ledger,
+        now,
+        stale_after=min(bounds),
+        low_pct=tgt.resolved["quota.low_pct"],
+        unknown_blocks=tgt.resolved["quota.unknown_blocks"],
+    )
+
+
 def launch(
     tgt,
     number,
@@ -198,12 +227,17 @@ def launch(
     list_fn,
     run,
     git=worktrees.git,
+    pool_fn=None,
+    ledger_fn=None,
+    now_fn=None,
 ):
     """Start a new agent for ticket `number`. Returns `(unit, workdir)`.
 
     Admission runs under the spawn lock, once before the worktree is made
     and once right before the unit starts, so two launches never race on
     a slot. The worktree is made under the same lock, as its module asks.
+    The project's model chains are validated and re-routed before anything
+    is made; an exhausted chain refuses the launch.
     """
     _check_text(prompt, "prompt")
     model = _check_model(model)
@@ -213,6 +247,12 @@ def launch(
         raise LaunchError("runtime config must be a JSON object")
     adapter = _adapter(tgt.runtime)
     session = _session(tgt, number)
+    chains = _model_chains(
+        tgt,
+        (pool_fn or accounts.providers)(),
+        (ledger_fn or quota_ledger.load)(),
+        (now_fn or time.time)(),
+    )
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn)
@@ -228,7 +268,7 @@ def launch(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn)
-        _write_session(session, adapter, tgt.runtime, prompt, runtime_config)
+        _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
         unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
         command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
         argv = units.unit_argv(
@@ -238,13 +278,16 @@ def launch(
     return unit, workdir
 
 
-def _write_session(session, adapter, runtime, prompt, runtime_config):
+def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None):
     """The prompt, the runtime record and the per-launch config, into the session dir."""
     try:
         os.makedirs(session, exist_ok=True)
         paths.atomic_write_text(os.path.join(session, "prompt.md"), prompt)
         runtimes.record(session, runtime)
-        adapter.write_config(session, runtime_config or {})
+        config = runtime_config or {}
+        if chains:
+            config = adapter.with_models(config, chains)
+        adapter.write_config(session, config)
     except (ValueError, TypeError, OSError) as err:
         raise LaunchError(f"cannot write the agent's session: {err}") from None
 

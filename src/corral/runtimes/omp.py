@@ -102,6 +102,28 @@ def overlay_text(config):
     return "\n".join(_yaml_lines(_merge(config, FORCED))) + "\n"
 
 
+def with_models(config, chains):
+    """`config` with each live chain laid over it: head as the role's model,
+    tail as its fallback chain. Other keys and roles are kept; an empty
+    chain sets nothing."""
+    out = dict(config or {})
+    live = {role: chain for role, chain in (chains or {}).items() if chain}
+    if not live:
+        return out
+    roles = dict(out.get("modelRoles") or {})
+    retry = dict(out.get("retry") or {})
+    fallbacks = dict(retry.get("fallbackChains") or {})
+    for role, chain in live.items():
+        roles[role] = chain[0]
+        if len(chain) > 1:
+            fallbacks[role] = list(chain[1:])
+        else:
+            fallbacks.pop(role, None)
+    out["modelRoles"] = roles
+    out["retry"] = {**retry, "fallbackChains": fallbacks}
+    return out
+
+
 def write_config(session_dir, config):
     """Write `overlay.yml` into the session dir, atomically."""
     os.makedirs(session_dir, exist_ok=True)
@@ -164,6 +186,7 @@ class Omp:
     argv = staticmethod(argv)
     env = staticmethod(env)
     write_config = staticmethod(write_config)
+    with_models = staticmethod(with_models)
     resume_handle = staticmethod(resume_handle)
     activity_file = staticmethod(activity_file)
 

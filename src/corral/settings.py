@@ -102,6 +102,10 @@ class Value:
 @dataclass
 class Resolved:
     values: dict[str, Value] = field(default_factory=dict)
+    #: The project's model chains: role to ``["provider/model", ...]``.
+    #: From ``[models.<role>]`` tables in corral.toml; this is the one place
+    #: that reads them.
+    models: dict[str, list[str]] = field(default_factory=dict)
 
     def __getitem__(self, key):
         return self.values[key].value
@@ -136,6 +140,28 @@ def _check(key, value, where):
             f"{where}: {key} must be {setting.type.__name__}, not {type(value).__name__}"
         )
     return value
+
+
+def _check_models(raw, where):
+    """``[models.<role>]`` tables as role to chain lists. Shape errors are exit 4."""
+    if not isinstance(raw, dict):
+        raise SettingsError(f"{where}: [models] must be a table of roles")
+    chains: dict[str, list[str]] = {}
+    for role, table in raw.items():
+        if not isinstance(role, str) or not role:
+            raise SettingsError(f"{where}: [models] role names must be non-empty strings")
+        if not isinstance(table, dict) or set(table) != {"chain"}:
+            raise SettingsError(f"{where}: [models.{role}] must hold exactly a chain list")
+        chain = table["chain"]
+        if not isinstance(chain, list):
+            raise SettingsError(f"{where}: [models.{role}] chain must be a list of model ids")
+        for entry in chain:
+            if not isinstance(entry, str) or not entry:
+                raise SettingsError(
+                    f"{where}: [models.{role}] chain entries must be non-empty strings"
+                )
+        chains[role] = list(chain)
+    return chains
 
 
 _INT = re.compile(r"-?[0-9]+")
@@ -204,6 +230,7 @@ def resolve(
     repos = project.pop("repo", [])
     if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
         raise SettingsError(f"{project_name}: [[repo]] must be an array of tables")
+    chains = _check_models(project.pop("models", {}), project_name)
     for key, value in _flatten(project, project_name).items():
         result[key] = Value(_check(key, value, project_name), PROJECT)
     entries = {}
@@ -239,7 +266,7 @@ def resolve(
         current = result[key]
         if isinstance(current.value, int) and current.value > ceiling:
             result[key] = Value(ceiling, current.origin, clamped_from=current.value)
-    return Resolved(result)
+    return Resolved(result, chains)
 
 
 def load(root=None, repo=None, env=None, flags=None):
