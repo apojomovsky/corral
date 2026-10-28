@@ -25,6 +25,7 @@ is live at all.
 """
 
 import os
+import sys
 import time
 from dataclasses import dataclass
 
@@ -359,14 +360,58 @@ def stop(tgt, number, *, list_fn, stop_fn):
     )
 
 
-def tail(tgt, number, last=None, out=None):
+def _tail_text(path):
+    """The last ``TAIL_SCAN_BYTES`` of the activity file, as text.
+
+    Seeks past the head instead of reading it: a stale quota line from
+    long ago must not mark a provider after the error scrolled past.
+    A file that will not stat or seek still reads fully.
+    """
+    from corral import quotacli
+
+    with open(path, "rb") as handle:
+        try:
+            size = os.fstat(handle.fileno()).st_size
+        except OSError:
+            size = None
+        if size is not None:
+            try:
+                handle.seek(max(0, size - quotacli.TAIL_SCAN_BYTES))
+            except OSError:
+                handle.seek(0)
+        return handle.read().decode("utf-8", "replace")
+
+
+def tail(tgt, number, last=None, out=None, *, pool_fn=None, note_fn=None, now_fn=None):
     """Print the ticket's agent activity from its session file. Returns the new offset.
 
-    Raises LaunchError when the session has no activity file yet.
+    Raises LaunchError when the session has no activity file yet. The tail
+    also feeds the recent session output to each quota reader: a provider
+    whose reader parses it as a limit error gets a reactive mark, through
+    ``corral.quotacli.note_limit_error`` under the ledger lock, so a
+    concurrent refresh cannot lose the mark. An empty pool skips the
+    ledger, and quota trouble (an unreadable pool or ledger, a failing
+    reader) warns once on stderr and still returns what was shown.
     """
+    from corral import quotacli
+
     session = _session(tgt, number)
     adapter = _adapter(runtimes.recorded(session))
     path = adapter.activity_file(session)
     if path is None:
         raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} activity yet")
-    return runtime_tail.show(path, last=last, out=out)
+    shown = runtime_tail.show(path, last=last, out=out)
+    try:
+        pool = (pool_fn or accounts.providers)()
+        if pool:
+            text = _tail_text(path)
+            now = (now_fn or time.time)()
+
+            def change(ledger):
+                fresh, marked = (note_fn or quotacli.note_limit_error)(ledger, pool, text, now)
+                return fresh if marked else None
+
+            quota_ledger.update(change)
+    except Exception as err:  # AccountsError, LedgerError, or a reader surprise
+        print(f"corral: quota tail hook skipped: {err}", file=sys.stderr)
+    return shown
