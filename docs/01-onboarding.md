@@ -1,6 +1,6 @@
 # 01: onboarding a project
 
-Status: slice 1 built (inline `corral init`, detection and `corral.toml`); the split layout (`--ops`), hooks, the overlay, the host registration and prompts are still design, not built. Decided 2026-10-26: `corral.toml` at the root, `init` asks with detected defaults (`--yes` and `--set` for headless), `new` scaffolds a minimal language-agnostic repository.
+Status: slices 1 and 2 built (inline `corral init` with detection, `corral.toml`, hooks, the overlay and the host registration, plus `corral uninit`); the split layout (`--ops`) and prompts are still design, not built. Decided 2026-10-26: `corral.toml` at the root, `init` asks with detected defaults (`--yes` and `--set` for headless), `new` scaffolds a minimal language-agnostic repository.
 
 corral should take a project from zero to its first agent in a few commands, whether the project is a repository that already exists or one that does not exist yet. corral is opinionated about how agents run. It should not be opinionated about the project: its language, its branch names, its labels, its test command or its prompts.
 
@@ -212,4 +212,4 @@ Because `--fix` cannot reach beyond the user and the clones, agents may run it.
 - Rust;
 - a repository that already has `AGENTS.md` and hooks.
 
-Each run produces golden files. Re-running `init` must produce no diff. `uninit` must restore the original tree except `corral.toml`. GitHub and the host registration go through fake seams, as everywhere else.
+Each run produces golden files. Re-running `init` must produce no diff. `uninit` must restore the original tree except `corral.toml` and `agents.overlay.md`. GitHub and the host registration go through fake seams, as everywhere else.

@@ -2,8 +2,10 @@
 
 import os
 import subprocess
+import sys
 import tempfile
 import unittest
+from importlib import resources
 from pathlib import Path
 
 HOOKS = Path(__file__).resolve().parent.parent / ".githooks"
@@ -155,6 +157,101 @@ class PrePush(Repo):
         r = git(self.repo, "push", "-q", "origin", ":master", env=self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("refusing", r.stderr)
+
+
+class PackagedHooks(unittest.TestCase):
+    """`corral init` ships copies of the repo hooks: drift must fail loudly."""
+
+    def test_commit_msg_matches_the_repo_hook_byte_for_byte(self):
+        packaged = resources.files("corral").joinpath("hooks/commit-msg").read_bytes()
+        self.assertEqual(packaged, (HOOKS / "commit-msg").read_bytes())
+
+    def test_pre_push_ships_the_guard_block_verbatim(self):
+        repo_lines = (HOOKS / "pre-push").read_text().splitlines()
+        end = next(i for i, line in enumerate(repo_lines) if line == "done")
+        packaged = (
+            resources.files("corral").joinpath("hooks/pre-push").read_text("utf-8").splitlines()
+        )
+        self.assertEqual(packaged[-1], "done")
+        self.assertEqual(_code(packaged), _code(repo_lines[: end + 1]))
+
+
+def _code(lines):
+    """A hook block minus its leading header comments: the shebang stays."""
+    out = [lines[0]] if lines and lines[0].startswith("#!") else []
+    rest = lines[1:] if out else list(lines)
+    i = 0
+    while i < len(rest) and rest[i].startswith("#"):
+        i += 1
+    return out + rest[i:]
+
+
+class PackagedHookRuns(unittest.TestCase):
+    """The packaged hooks run as subprocesses in a scratch repository."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = clean_env()
+        self.repo = Path(self.tmp.name) / "repo"
+        subprocess.run(
+            ["git", "init", "-q", "-b", "main", str(self.repo)], check=True, env=self.env
+        )
+        git(self.repo, "config", "user.name", "suite", env=self.env)
+        git(self.repo, "config", "user.email", "suite@corral.invalid", env=self.env)
+        (self.repo / "f").write_text("one")
+        git(self.repo, "add", "f", env=self.env)
+        git(self.repo, "commit", "-qm", "chore: one", env=self.env)
+        (self.repo / "g").write_text("two")
+        git(self.repo, "add", "g", env=self.env)
+        git(self.repo, "commit", "-qm", "chore: two", env=self.env)
+        base = resources.files("corral").joinpath("hooks")
+        self.pre_push = str(base.joinpath("pre-push"))
+        self.commit_msg = str(base.joinpath("commit-msg"))
+
+    def run_pre_push(self, stdin, extra_env=None):
+        env = dict(self.env)
+        env.update(extra_env or {})
+        return subprocess.run(
+            ["bash", self.pre_push],
+            cwd=str(self.repo),
+            input=stdin,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    def run_commit_msg(self, message):
+        target = self.repo / "MSG"
+        target.write_text(message)
+        return subprocess.run(
+            [sys.executable, self.commit_msg, str(target)],
+            cwd=str(self.repo),
+            capture_output=True,
+            text=True,
+            env=self.env,
+        )
+
+    def test_pre_push_with_empty_stdin_passes(self):
+        self.assertEqual(self.run_pre_push("").returncode, 0)
+
+    def test_pre_push_refuses_a_non_fast_forward(self):
+        old = git(self.repo, "rev-parse", "HEAD~1", env=self.env).stdout.strip()
+        new = git(self.repo, "rev-parse", "HEAD", env=self.env).stdout.strip()
+        line = f"refs/heads/main {old} refs/heads/main {new}\n"
+        refused = self.run_pre_push(line)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("refusing", refused.stderr)
+        approved = self.run_pre_push(line, {"CORRAL_FORCE_PUSH_APPROVED": "1"})
+        self.assertEqual(approved.returncode, 0, approved.stderr)
+
+    def test_packaged_commit_msg_rejects_an_em_dash(self):
+        proc = self.run_commit_msg("docs: one \u2014 two\n")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("em-dashes", proc.stderr)
+
+    def test_packaged_commit_msg_accepts_a_conventional_subject(self):
+        self.assertEqual(self.run_commit_msg("feat(api): add the thing\n").returncode, 0)
 
 
 if __name__ == "__main__":

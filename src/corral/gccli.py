@@ -76,13 +76,13 @@ def production_remove(repo: str, root_real: str) -> Callable[[str], None]:
 
     Tests use a fake through `_run_gc`; only the test named
     `test_real_production_remove_contained_to_temp_dir` calls this,
-    against a temp dir. Containment is `worktrees._inside`: the path
+    against a temp dir. Containment is `worktrees.inside`: the path
     must sit strictly below the root, symlinks resolved.
     """
 
     def remove(path: str) -> None:
         real = os.path.realpath(path)
-        if not worktrees._inside(real, root_real):
+        if not worktrees.inside(real, root_real):
             raise gc.GcError(f"refusing to remove {path}: escapes the worktree root")
         proc = gc.git(["worktree", "remove", path], cwd=repo)
         if proc.returncode == 0:

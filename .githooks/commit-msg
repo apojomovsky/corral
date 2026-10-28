@@ -58,7 +58,7 @@ def problems(text: str, merge: bool) -> list[str]:
         found.append(f"at most 3 lines, found {len(lines)}")
     if any(TRAILER.match(line) for line in lines[1:]):
         found.append("no trailers (Co-Authored-By and the like)")
-    if "—" in text:
+    if "\u2014" in text:
         found.append("no em-dashes (use a comma, colon or period)")
     return found
 
