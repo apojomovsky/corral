@@ -12,7 +12,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import accounts, cli, launch, models, quota_ledger, settings
+from corral import accounts, cli, launch, models, quota_ledger, quotacli, settings
 from tests.test_launch import OpsCase, TOML
 
 T0 = 1_800_000_000.0
@@ -341,6 +341,29 @@ class QuotaVerbs(OpsCase):
         seen = quota_ledger.load()
         self.assertIn("weekly", seen["readings"]["provider-a"]["windows"])
 
+    def test_refresh_json_prints_only_json(self):
+        code, out, err = self.run_quota("refresh", "--json")
+        self.assertEqual((code, err), (0, ""))
+        payload = json.loads(out)
+        self.assertEqual(set(payload), {"provider-a"})
+        self.assertTrue(payload["provider-a"]["ok"])
+
+    def test_refresh_json_flag_works_before_the_verb(self):
+        code, out, err = self.run_quota("--json", "refresh")
+        self.assertEqual((code, err), (0, ""))
+        payload = json.loads(out)
+        self.assertEqual(set(payload), {"provider-a"})
+        self.assertTrue(payload["provider-a"]["ok"])
+
+    def test_refresh_json_keeps_failures_on_stderr(self):
+        self.write_accounts("tests.test_quotacli:FailingReader")
+        code, out, err = self.run_quota("refresh", "--json")
+        self.assertEqual(code, 3)
+        payload = json.loads(out)
+        self.assertFalse(payload["provider-a"]["ok"])
+        self.assertIn("refused", payload["provider-a"]["error"])
+        self.assertIn("refused", err)
+
     def test_refresh_of_an_unknown_provider_is_usage(self):
         self.assertEqual(self.run_quota("refresh", "provider-b")[0], 4)
 
@@ -484,6 +507,93 @@ class TailHook(OpsCase):
         with mock.patch.object(accounts, "providers", return_value=[]):
             launch.tail(self.target("lib"), 5, out=io.StringIO())
         self.assertFalse(os.path.exists(quota_ledger.ledger_path()))
+
+    def test_a_corrupt_ledger_leaves_the_tail_succeeding(self):
+        self.write_activity("all clear\n")
+        os.makedirs(os.path.dirname(quota_ledger.ledger_path()), exist_ok=True)
+        with open(quota_ledger.ledger_path(), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        with mock.patch.object(
+            accounts,
+            "providers",
+            return_value=[accounts.Provider(name="provider-a", reader=self.MARKER)],
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stderr(err):
+                shown = launch.tail(
+                    self.target("lib"),
+                    5,
+                    out=out,
+                    note_fn=self.note({"LimitReader": LimitReader()}),
+                    now_fn=lambda: T0,
+                )
+        self.assertEqual(shown, len("all clear\n"))
+        self.assertIn("quota tail hook skipped", err.getvalue())
+
+    def test_a_bad_accounts_file_leaves_the_tail_succeeding(self):
+        self.write_activity("all clear\n")
+        config = os.path.join(self.tmp, "config")
+        os.makedirs(config, exist_ok=True)
+        with open(os.path.join(config, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write("[[provider]\n")
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stderr(err):
+            shown = launch.tail(self.target("lib"), 5, out=out, now_fn=lambda: T0)
+        self.assertEqual(shown, len("all clear\n"))
+        self.assertIn("quota tail hook skipped", err.getvalue())
+
+    def test_a_limit_line_older_than_the_scan_window_posts_no_mark(self):
+        filler = "x" * (quotacli.TAIL_SCAN_BYTES + 1024)
+        self.write_activity("LIMIT provider-a 429\n", filler + "\n")
+        with mock.patch.object(
+            accounts,
+            "providers",
+            return_value=[accounts.Provider(name="provider-a", reader=self.MARKER)],
+        ):
+            launch.tail(
+                self.target("lib"),
+                5,
+                out=io.StringIO(),
+                note_fn=self.note({"LimitReader": LimitReader()}),
+                now_fn=lambda: T0,
+            )
+        self.assertFalse(os.path.exists(quota_ledger.ledger_path()))
+
+    def test_a_limit_line_at_the_end_of_a_big_file_posts_a_mark(self):
+        filler = "x" * (quotacli.TAIL_SCAN_BYTES + 1024)
+        self.write_activity(filler + "\n", "LIMIT provider-a 429\n")
+        with mock.patch.object(
+            accounts,
+            "providers",
+            return_value=[accounts.Provider(name="provider-a", reader=self.MARKER)],
+        ):
+            launch.tail(
+                self.target("lib"),
+                5,
+                out=io.StringIO(),
+                note_fn=self.note({"LimitReader": LimitReader()}),
+                now_fn=lambda: T0,
+            )
+        self.assertEqual(quota_ledger.load()["marks"]["provider-a"]["until"], T0 + 600)
+
+    def test_a_stat_failure_falls_back_to_a_full_read(self):
+        self.write_activity("all clear\n", "LIMIT provider-a 429\n")
+        with (
+            mock.patch.object(
+                accounts,
+                "providers",
+                return_value=[accounts.Provider(name="provider-a", reader=self.MARKER)],
+            ),
+            mock.patch.object(os, "fstat", side_effect=OSError("no stat")),
+        ):
+            launch.tail(
+                self.target("lib"),
+                5,
+                out=io.StringIO(),
+                note_fn=self.note({"LimitReader": LimitReader()}),
+                now_fn=lambda: T0,
+            )
+        self.assertEqual(quota_ledger.load()["marks"]["provider-a"]["until"], T0 + 600)
 
 
 if __name__ == "__main__":

@@ -218,7 +218,7 @@ def _show(view) -> None:
 
 def cmd_show(args: argparse.Namespace) -> int:
     view = snapshot(accounts.providers(), quota_ledger.load(), time.time(), low_pct=_low_pct())
-    if args.json:
+    if getattr(args, "json", False):
         print(json.dumps(view, sort_keys=True))
     else:
         _show(view)
@@ -232,10 +232,14 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         for provider in pool
         if args.provider is None or _pool_name(provider) == args.provider
     ]
+    as_json = getattr(args, "json", False)
     if not targets:
         if args.provider is not None:
             raise QuotaError(f"unknown provider {args.provider!r}")
-        print("no providers")
+        if as_json:
+            print("{}")
+        else:
+            print("no providers")
         return OK
     results: dict = {}
 
@@ -245,18 +249,22 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         return fresh
 
     quota_ledger.update(change)
-    for name, (ok, detail) in results.items():
-        if ok:
-            print(f"{name}: ok")
-        else:
-            _err(f"{name}: {detail}")
-    if args.json:
+    if as_json:
+        for name, (ok, detail) in results.items():
+            if not ok:
+                _err(f"{name}: {detail}")
         print(
             json.dumps(
                 {name: {"ok": ok, "error": detail} for name, (ok, detail) in results.items()},
                 sort_keys=True,
             )
         )
+    else:
+        for name, (ok, detail) in results.items():
+            if ok:
+                print(f"{name}: ok")
+            else:
+                _err(f"{name}: {detail}")
     if results and all(not ok for ok, _ in results.values()):
         return UNREACHABLE
     return OK
@@ -336,7 +344,12 @@ def add_parser(sub) -> None:
     verbs = parser.add_subparsers(dest="quota_verb")
     p = verbs.add_parser("refresh", help="run the readers, record readings or failures")
     p.add_argument("provider", nargs="?", default=None, help="only this provider")
-    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument(
+        "--json",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="machine-readable output",
+    )
     p = verbs.add_parser("mark", help="block a provider until a reset")
     p.add_argument("provider", help="the provider to block")
     p.add_argument(

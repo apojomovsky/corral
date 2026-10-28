@@ -223,14 +223,19 @@ class LedgerFile(unittest.TestCase):
         self.assertEqual(ql.load(self.path)["readings"], out["readings"])
         self.assertIn("provider-a", out["readings"])
 
-    def test_update_accepts_an_in_place_change(self):
+    def test_a_change_returning_none_writes_nothing(self):
         ql.save(ql.empty(), self.path)
+        with open(self.path, encoding="utf-8") as handle:
+            before = handle.read()
+        out = ql.update(lambda ledger: None, self.path)
+        self.assertEqual(out, ql.empty())
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
 
-        def change(ledger):
-            ledger["marks"]["provider-a"] = {"until": T0 + 60, "reason": "", "source": ""}
-
-        ql.update(change, self.path)
-        self.assertEqual(ql.load(self.path)["marks"]["provider-a"]["until"], T0 + 60)
+    def test_a_change_returning_none_creates_no_file(self):
+        out = ql.update(lambda ledger: None, self.path)
+        self.assertEqual(out, ql.empty())
+        self.assertFalse(os.path.exists(self.path))
 
     def test_concurrent_updates_all_land(self):
         ql.save(ql.empty(), self.path)
@@ -253,6 +258,34 @@ class LedgerFile(unittest.TestCase):
             thread.join()
         self.assertEqual(errors, [])
         self.assertEqual(len(ql.load(self.path)["readings"]), 8)
+
+    def test_two_interleaved_writers_both_land(self):
+        ql.save(ql.empty(), self.path)
+        entered = threading.Event()
+        release = threading.Event()
+
+        def slow(ledger):
+            entered.set()
+            self.assertTrue(release.wait(timeout=10))
+            return ql.record_reading(ledger, "provider-a", windows(), T0)
+
+        first = threading.Thread(target=ql.update, args=(slow, self.path))
+        first.start()
+        self.assertTrue(entered.wait(timeout=10))
+        timer = threading.Timer(2.0, release.set)
+        timer.start()
+        try:
+            ql.update(
+                lambda ledger: ql.record_reading(ledger, "provider-b", windows(), T0),
+                self.path,
+            )
+        finally:
+            timer.cancel()
+        first.join(timeout=10)
+        self.assertFalse(first.is_alive())
+        seen = ql.load(self.path)
+        self.assertIn("provider-a", seen["readings"])
+        self.assertIn("provider-b", seen["readings"])
 
     def test_concurrent_saves_never_corrupt_the_file(self):
         errors = []

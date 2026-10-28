@@ -281,12 +281,15 @@ def save(ledger: dict, path: str | None = None) -> dict:
 def update(change, path: str | None = None) -> dict:
     """Locked read-modify-write: `change` maps the ledger to its replacement.
 
-    `change` may also mutate in place and return None. Concurrent writers
-    serialize on the lock, so every update lands; a corrupt file raises
-    instead of being overwritten.
+    `change` returns None for no change, which writes nothing: a caller
+    that found nothing to record leaves the file (and its absence) alone.
+    Concurrent writers serialize on the lock, so every update lands;
+    a corrupt file raises instead of being overwritten.
     """
     target = path or ledger_path()
     with _locked(target):
         ledger = load(target)
         result = change(ledger)
-        return _write(target, ledger if result is None else result)
+        if result is None:
+            return ledger
+        return _write(target, result)
