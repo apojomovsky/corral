@@ -5,7 +5,7 @@ import os
 import sys
 from collections.abc import Sequence
 
-from corral import agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
+from corral import accounts, agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
 from corral.github import ghcli
 
 # Exit codes are a public interface (AGENTS.md).
@@ -156,6 +156,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return OK if err.code == 0 else USAGE
     try:
         return args.func(args)
-    except paths.PathError as err:
+    except (paths.PathError, accounts.AccountsError) as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
