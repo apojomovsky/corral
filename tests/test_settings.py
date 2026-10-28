@@ -115,6 +115,24 @@ class Errors(unittest.TestCase):
         with self.assertRaisesRegex(S.SettingsError, "no \\[\\[repo\\]\\] named 'x'"):
             resolve(project={"repo": [{"name": "app"}]}, repo="x")
 
+    def test_repo_names_lists_entries_in_order(self):
+        with tempfile.TemporaryDirectory(prefix="corral-settings-") as root:
+            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+                handle.write('[[repo]]\nname = "b"\n[[repo]]\nname = "a"\n')
+            self.assertEqual(S.repo_names(root), ["b", "a"])
+
+    def test_repo_names_is_empty_without_root_or_file(self):
+        self.assertEqual(S.repo_names(None), [])
+        with tempfile.TemporaryDirectory(prefix="corral-settings-") as root:
+            self.assertEqual(S.repo_names(root), [])
+
+    def test_repo_names_validates_like_resolve(self):
+        with tempfile.TemporaryDirectory(prefix="corral-settings-") as root:
+            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+                handle.write('[[repo]]\nname = "a"\n[[repo]]\nname = "a"\n')
+            with self.assertRaisesRegex(S.SettingsError, "appears twice"):
+                S.repo_names(root)
+
     def test_a_setting_cannot_be_registered_twice_or_with_a_bad_default(self):
         with self.assertRaises(ValueError):
             S.register("agents.cap", int, 1, "again")

@@ -42,7 +42,7 @@ from corral import paths
 
 #: Schema version stamped as ``PRAGMA user_version``. A database with a
 #: newer or unknown version fails closed instead of migrating.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 #: The store file inside the state dir.
 DB_NAME = "board.sqlite"
@@ -183,6 +183,23 @@ def _migrate(conn):
             attempts INTEGER NOT NULL DEFAULT 0,
             state TEXT NOT NULL DEFAULT 'queued',
             reason TEXT NOT NULL DEFAULT '');
+        CREATE TABLE IF NOT EXISTS cursors(
+            repo TEXT NOT NULL, name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(repo, name));
+        """
+    )
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _migrate_1_to_2(conn):
+    """Forward a version-1 database: add the tracker cursor table."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cursors(
+            repo TEXT NOT NULL, name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY(repo, name))
         """
     )
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -353,6 +370,21 @@ class Store:
             out.append(found)
         return out
 
+    def get_cursor(self, repo, name):
+        """The stored tracker cursor for ``repo`` and ``name``, or None."""
+        row = self._conn.execute(
+            "SELECT value FROM cursors WHERE repo=? AND name=?", (repo, name)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_cursor(self, repo, name, value):
+        """Store the tracker cursor for ``repo`` and ``name``."""
+        self._conn.execute(
+            "INSERT INTO cursors(repo, name, value) VALUES(?, ?, ?)"
+            " ON CONFLICT(repo, name) DO UPDATE SET value=excluded.value",
+            (repo, name, value),
+        )
+
     def queued_writes(self, limit=None):
         """Queued outbox rows, oldest first, at most ``limit``."""
         query = (
@@ -482,6 +514,21 @@ class Store:
                         (DROPPED, "overridden", _id),
                     )
             self._set_confidence(item.repo, item.number)
+
+    def mark_absent(self, repo, number, *, now):
+        """Flag a store row the tracker's full listing no longer holds.
+
+        The row stays: the item was deleted or transferred, and only the
+        tracker knows which. Confidence turns dirty with no outbox reason
+        behind it; ``fetched_at`` moves to now, since absence was just
+        verified. Unknown rows are a caller bug."""
+        with _txn(self._conn):
+            if self._row(repo, number) is None:
+                raise StoreError(f"unknown item {repo}#{number}")
+            self._conn.execute(
+                "UPDATE items SET confidence=?, fetched_at=? WHERE repo=? AND number=?",
+                (DIRTY, now, repo, number),
+            )
 
     def _require_writable(self, repo, number):
         row = self._row(repo, number)
@@ -663,6 +710,9 @@ def open_store(path=None):
         if version == 0:
             with _txn(conn):
                 _migrate(conn)
+        elif version == 1:
+            with _txn(conn):
+                _migrate_1_to_2(conn)
         elif version != SCHEMA_VERSION:
             raise StoreError(
                 f"board store {target} has schema version {version},"

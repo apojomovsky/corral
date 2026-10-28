@@ -525,6 +525,84 @@ class OpenTest(unittest.TestCase):
         self.assertEqual(board.ExternalItem.exit_code, 1)
         self.assertEqual(board.StoreError.exit_code, 4)
 
+    def test_version_1_migrates_forward_keeping_rows(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                """
+                CREATE TABLE items(
+                    repo TEXT NOT NULL, number INTEGER NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'issue',
+                    title TEXT NOT NULL DEFAULT '',
+                    body TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'open',
+                    author TEXT NOT NULL DEFAULT '',
+                    labels TEXT NOT NULL DEFAULT '[]',
+                    priority TEXT NOT NULL DEFAULT '',
+                    assignees TEXT NOT NULL DEFAULT '[]',
+                    url TEXT NOT NULL DEFAULT '',
+                    tracker_updated_at REAL NOT NULL DEFAULT 0,
+                    fetched_at REAL NOT NULL DEFAULT 0,
+                    confidence TEXT NOT NULL DEFAULT 'confirmed',
+                    external INTEGER NOT NULL DEFAULT 0,
+                    extra TEXT NOT NULL DEFAULT '{}',
+                    PRIMARY KEY(repo, number));
+                CREATE TABLE claims(
+                    repo TEXT NOT NULL, number INTEGER NOT NULL,
+                    agent TEXT NOT NULL, host TEXT NOT NULL,
+                    epoch INTEGER NOT NULL, claimed_at REAL NOT NULL,
+                    PRIMARY KEY(repo, number));
+                CREATE TABLE outbox(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    repo TEXT NOT NULL, number INTEGER NOT NULL,
+                    field TEXT NOT NULL, value TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    state TEXT NOT NULL DEFAULT 'queued',
+                    reason TEXT NOT NULL DEFAULT '');
+                """
+            )
+            conn.execute(
+                "INSERT INTO items(repo, number, title) VALUES(?, ?, ?)",
+                ("app", 7, "Kept"),
+            )
+            conn.execute("PRAGMA user_version=1")
+            conn.commit()
+            conn.close()
+            with board.open_store(path) as store:
+                self.assertEqual(board.SCHEMA_VERSION, 2)
+                row, _ = store.item("app", 7, now=1000.0)
+                self.assertEqual(row.title, "Kept")
+                self.assertIsNone(store.get_cursor("app", "tracker"))
+                store.set_cursor("app", "tracker", "cursor-1")
+                self.assertEqual(store.get_cursor("app", "tracker"), "cursor-1")
+                store.set_cursor("app", "tracker", "cursor-2")
+                self.assertEqual(store.get_cursor("app", "tracker"), "cursor-2")
+                self.assertIsNone(store.get_cursor("other", "tracker"))
+
+    def test_unknown_version_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            conn = sqlite3.connect(path)
+            conn.execute("PRAGMA user_version=3")
+            conn.commit()
+            conn.close()
+            with self.assertRaises(board.StoreError):
+                board.open_store(path)
+
+    def test_absent_mark_is_dirty_without_deleting(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            with board.open_store(path) as store:
+                store.upsert_item(reading(title="Gone"), operators=["alice"], now=1000.0)
+                store.mark_absent("app", 7, now=2000.0)
+                row, _ = store.item("app", 7, now=2000.0)
+                self.assertEqual(row.title, "Gone")
+                self.assertEqual(row.confidence, board.DIRTY)
+                with self.assertRaises(board.StoreError):
+                    store.mark_absent("app", 404, now=2000.0)
+
 
 if __name__ == "__main__":
     unittest.main()
