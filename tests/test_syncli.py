@@ -177,6 +177,32 @@ class WiringTest(SyncRootCase):
         row, _ = self.store.item(REPO, 5, now=T0)
         self.assertEqual(row.confidence, board.DIRTY)
 
+    def test_resync_conflict_prints_on_stderr_without_changing_exit(self):
+        self.store.upsert_item(
+            board.Item(repo=REPO, number=1, tracker_updated_at=T0 - 200, author="acme"),
+            operators=["acme"],
+            now=T0 - 200,
+        )
+        self.store.claim(REPO, 1, "agent-1", "host-1", now=T0 - 100)
+        fake = FakeTracker([reading(number=1, author="acme", agent="agent-2", updated_at=T0)])
+        self.assertEqual(self.run_sync(fake, resync=True), 0)
+        self.assertIn(f"{REPO}#1: store=agent-1 tracker=agent-2", self.err.getvalue())
+
+    def test_resync_conflict_appears_in_json(self):
+        self.store.upsert_item(
+            board.Item(repo=REPO, number=1, tracker_updated_at=T0 - 200, author="acme"),
+            operators=["acme"],
+            now=T0 - 200,
+        )
+        self.store.claim(REPO, 1, "agent-1", "host-1", now=T0 - 100)
+        fake = FakeTracker([reading(number=1, author="acme", agent="agent-2", updated_at=T0)])
+        self.assertEqual(self.run_sync(fake, resync=True, as_json=True), 0)
+        doc = json.loads(self.out.getvalue())
+        self.assertEqual(
+            doc["repos"]["app"]["conflicts"],
+            [f"{REPO}#1: store=agent-1 tracker=agent-2"],
+        )
+
     def test_audit_rereads_only_limit(self):
         for number in (1, 2, 3):
             self.store.upsert_item(
