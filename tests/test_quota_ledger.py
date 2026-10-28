@@ -45,6 +45,15 @@ class RecordReadings(unittest.TestCase):
         with self.assertRaises(ql.LedgerError):
             ql.record_reading(ql.empty(), "provider-a", {"session": {"used_pct": "high"}}, T0)
 
+    def test_success_accepts_a_window_without_a_reset(self):
+        fresh = ql.record_reading(
+            ql.empty(), "provider-a", {"session": {"used_pct": 10.0, "resets_at": None}}, T0
+        )
+        self.assertEqual(
+            fresh["readings"]["provider-a"]["windows"],
+            {"session": {"used_pct": 10.0, "resets_at": None}},
+        )
+
     def test_failure_stores_error_and_time_with_no_windows(self):
         fresh = ql.record_failure(ql.empty(), "provider-a", "reader timed out", T0)
         entry = fresh["readings"]["provider-a"]
@@ -136,6 +145,25 @@ class ReactiveMarks(unittest.TestCase):
         ledger, _ = ql.post_mark(ql.empty(), "provider-a", T0 + 60)
         fresh, dropped = ql.prune(ledger, T0)
         self.assertEqual((dropped, fresh["marks"]), ([], ledger["marks"]))
+
+    def test_release_drops_the_mark_and_reports_released(self):
+        ledger, _ = ql.post_mark(ql.empty(), "provider-a", T0 + 60, "quota", "reader")
+        fresh, released = ql.release_mark(ledger, "provider-a")
+        self.assertTrue(released)
+        self.assertEqual(fresh["marks"], {})
+        self.assertIn("provider-a", ledger["marks"])
+
+    def test_release_without_a_mark_reports_not_released(self):
+        fresh, released = ql.release_mark(ql.empty(), "provider-b")
+        self.assertFalse(released)
+        self.assertEqual(fresh, ql.empty())
+
+    def test_release_leaves_other_marks_alone(self):
+        ledger, _ = ql.post_mark(ql.empty(), "provider-a", T0 + 60)
+        ledger, _ = ql.post_mark(ledger, "provider-b", T0 + 120)
+        fresh, released = ql.release_mark(ledger, "provider-b")
+        self.assertTrue(released)
+        self.assertEqual(set(fresh["marks"]), {"provider-a"})
 
     def test_helpers_keep_unknown_top_level_keys(self):
         ledger = {**ql.empty(), "future": {"v": 1}}

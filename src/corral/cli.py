@@ -5,7 +5,17 @@ import os
 import sys
 from collections.abc import Sequence
 
-from corral import accounts, agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
+from corral import (
+    accounts,
+    agentcli,
+    coordcli,
+    deps,
+    launchcli,
+    paths,
+    quotacli,
+    reviewcli,
+    settings,
+)
 from corral.github import ghcli
 
 # Exit codes are a public interface (AGENTS.md).
@@ -149,6 +159,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
+    quotacli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
     return parser
 

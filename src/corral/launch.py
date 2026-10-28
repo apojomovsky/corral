@@ -359,14 +359,30 @@ def stop(tgt, number, *, list_fn, stop_fn):
     )
 
 
-def tail(tgt, number, last=None, out=None):
+def tail(tgt, number, last=None, out=None, *, pool_fn=None, note_fn=None, now_fn=None):
     """Print the ticket's agent activity from its session file. Returns the new offset.
 
-    Raises LaunchError when the session has no activity file yet.
+    Raises LaunchError when the session has no activity file yet. The tail
+    also feeds the recent session output to each quota reader: a provider
+    whose reader parses it as a limit error gets a reactive mark, through
+    ``corral.quotacli.note_limit_error``. An empty pool skips the ledger.
     """
+    from corral import quotacli
+
     session = _session(tgt, number)
     adapter = _adapter(runtimes.recorded(session))
     path = adapter.activity_file(session)
     if path is None:
         raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} activity yet")
-    return runtime_tail.show(path, last=last, out=out)
+    shown = runtime_tail.show(path, last=last, out=out)
+    pool = (pool_fn or accounts.providers)()
+    if pool:
+        with open(path, "rb") as handle:
+            data = handle.read()
+        text = data[-quotacli.TAIL_SCAN_BYTES :].decode("utf-8", "replace")
+        fresh, marked = (note_fn or quotacli.note_limit_error)(
+            quota_ledger.load(), pool, text, (now_fn or time.time)()
+        )
+        if marked:
+            quota_ledger.save(fresh)
+    return shown

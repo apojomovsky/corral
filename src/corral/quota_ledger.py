@@ -70,7 +70,10 @@ def _check_windows(windows: object) -> dict:
         if not isinstance(entry, dict):
             raise LedgerError(f"window {window_id!r} must be an object")
         used = _as_epoch(entry.get("used_pct"), f"window {window_id!r} used_pct")
-        resets_at = _as_epoch(entry.get("resets_at"), f"window {window_id!r} resets_at")
+        resets_at = entry.get("resets_at")
+        resets_at = (
+            None if resets_at is None else _as_epoch(resets_at, f"window {window_id!r} resets_at")
+        )
         kept = {"used_pct": used, "resets_at": resets_at}
         for key, value in entry.items():
             if key not in kept:
@@ -186,6 +189,23 @@ def post_mark(
     fresh = dict(checked)
     marks = dict(checked["marks"])
     marks[provider] = {"until": limit, "reason": reason, "source": source}
+    fresh["marks"] = marks
+    return fresh, True
+
+
+def release_mark(ledger: dict, provider: str) -> tuple:
+    """Drop the stored mark for `provider`. Returns ``(ledger, released)``.
+
+    Releasing a provider with no stored mark is a no-op returning the
+    ledger unchanged and released False.
+    """
+    _check_provider(provider)
+    checked = _check_ledger(ledger)
+    if provider not in checked["marks"]:
+        return checked, False
+    fresh = dict(checked)
+    marks = dict(checked["marks"])
+    del marks[provider]
     fresh["marks"] = marks
     return fresh, True
 
