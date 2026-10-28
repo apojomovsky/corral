@@ -1,9 +1,11 @@
 """System dependency checks, against a fake probe."""
 
 import io
+import os
+import tempfile
 import unittest
-from pathlib import Path
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
 from corral import cli, deps
@@ -113,7 +115,12 @@ class ShippedList(unittest.TestCase):
 class Command(unittest.TestCase):
     def run_cli(self, outputs):
         out = io.StringIO()
-        with mock.patch.object(deps, "run_probe", fake(outputs)), redirect_stdout(out):
+        with (
+            tempfile.TemporaryDirectory(prefix="corral-deps-") as directory,
+            mock.patch.dict(os.environ, {"CORRAL_CONFIG": directory}),
+            mock.patch.object(deps, "run_probe", fake(outputs)),
+            redirect_stdout(out),
+        ):
             code = cli.main(["deps"])
         return code, out.getvalue()
 
