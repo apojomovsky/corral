@@ -12,10 +12,11 @@ Inline `init` writes, all idempotent and all covered by `--plan`:
 - `agents.overlay.md` next to it, from the packaged template, created only
   when missing: a re-run never touches an existing one, even with `--force`;
 - the hook scripts into `<root>/.githooks/` (mode 0755) plus the clone-local
-  `git config core.hooksPath .githooks`, but only when the repository has no
-  hooks of its own. With hooks already there it writes nothing and prints
-  how to chain corral's hooks from them. `git.commits.conventional = false`
-  skips the `commit-msg` hook;
+  `git config core.hooksPath .githooks`, converged per file: a missing or
+  mismatched wanted hook is installed, modes are repaired, and a file that is
+  not a template in the way is refused (exit 4). A `core.hooksPath` pointing
+  elsewhere makes `init` write no hooks and print how to chain corral's
+  from it. `git.commits.conventional = false` skips the `commit-msg` hook;
 - the host registration `~/.config/corral/projects.d/<name>.toml`, the only
   write outside the repository (skipped with a note under `--no-register`).
 
@@ -235,15 +236,23 @@ def render(inputs):
     return "\n".join(lines)
 
 
-def plan_diff(current, new):
-    """The unified diff from `current` (None for a new file) to `new`."""
+def _makedirs(path):
+    """`os.makedirs` with failures as `InitError`, like every neighbouring write."""
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as err:
+        raise InitError(f"corral: cannot create {path}: {err}") from None
+
+
+def plan_diff(current, new, name="corral.toml"):
+    """The unified diff from `current` (None for a new file) to `new`, for `name`."""
     old = [] if current is None else current.splitlines(keepends=True)
     return "".join(
         difflib.unified_diff(
             old,
             new.splitlines(keepends=True),
-            fromfile="a/corral.toml",
-            tofile="b/corral.toml",
+            fromfile=f"a/{name}",
+            tofile=f"b/{name}",
         )
     )
 
@@ -383,7 +392,7 @@ def _expected_ceiling(root, git):
     if not isinstance(entries, list):
         return default
     slug = detect.origin_slug(root, git)
-    entry_name = slug.split("/")[1] if slug else None
+    entry_name = slug.split("/")[1] if slug else os.path.basename(os.path.realpath(root))
     table = None
     for entry in entries:
         if isinstance(entry, dict) and entry.get("name") == entry_name:
@@ -468,7 +477,9 @@ def _apply(root, inputs, opts, git):
         for name in chained:
             target = os.path.join(root, HOOKS_DIR, name)
             installed = _file_bytes(target)
-            if installed is None:
+            if os.path.islink(target):
+                blocked.append((target, name))
+            elif installed is None:
                 missing.append((target, name))
             elif installed != hook_template(name):
                 blocked.append((target, name))
@@ -556,7 +567,7 @@ def _apply(root, inputs, opts, git):
             )
         if reg_missing is True:
             if current_reg is not None:
-                sys.stdout.write(plan_diff(current_reg, reg_text))
+                sys.stdout.write(plan_diff(current_reg, reg_text, os.path.basename(reg_target)))
             sys.stdout.write(f"would write {reg_target}\n")
         if show_chain:
             for line in chain_lines(conventional):
@@ -572,7 +583,7 @@ def _apply(root, inputs, opts, git):
         _write_text(overlay_target, overlay_text())
         sys.stdout.write(f"wrote {overlay_target}\n")
     if missing or fixable or (chained and not hooks_path_set and not foreign_hooks):
-        os.makedirs(os.path.join(root, HOOKS_DIR), exist_ok=True)
+        _makedirs(os.path.join(root, HOOKS_DIR))
         for target, name in missing:
             _write_text(target, hook_template(name).decode("utf-8"))
             os.chmod(target, 0o755)
@@ -597,7 +608,7 @@ def _apply(root, inputs, opts, git):
         for line in chain_lines(conventional):
             sys.stdout.write(line + "\n")
     if not opts.no_register and reg_missing:
-        os.makedirs(projects.projects_dir(), exist_ok=True)
+        _makedirs(projects.projects_dir())
         _write_text(reg_target, reg_text)
         try:
             registered = projects.load_all()
@@ -649,8 +660,7 @@ def production_remove(*roots):
     `remove` deletes one path strictly below one of `roots`; anything
     else, and any symlink, is `InitError`. Symlinks are refused by
     `lstat`: the seam never resolves-then-deletes a link's target. Tests
-    pass a fake through `run_un`; only the test named
-    `test_real_production_remove_contained_to_temp_dir` calls this, only
+    pass a fake through `run_un`; the tests that call this one do so only
     against temp dirs.
     """
     real_roots = [os.path.realpath(root) for root in roots]

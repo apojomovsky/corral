@@ -188,27 +188,14 @@ class ExistingCase(unittest.TestCase):
             handle.write(text)
 
     def test_bare_dir_finds_nothing(self):
-        found = detect.existing(self.dir, FakeGit(self.dir))
-        self.assertEqual(found, detect.Existing(False, False, False))
+        found = detect.existing(self.dir)
+        self.assertEqual(found, detect.Existing(False, False))
 
     def test_agent_files_are_found(self):
         self.write("AGENTS.md", "")
         self.write("CLAUDE.md", "")
-        found = detect.existing(self.dir, FakeGit(self.dir))
+        found = detect.existing(self.dir)
         self.assertEqual((found.agents_md, found.claude_md), (True, True))
-
-    def test_hooks_path_counts_as_hooks(self):
-        found = detect.existing(self.dir, FakeGit(self.dir, hooks="/srv/hooks"))
-        self.assertTrue(found.hooks)
-
-    def test_a_real_hook_counts_samples_do_not(self):
-        self.write(".git/hooks/pre-commit", "")
-        found = detect.existing(self.dir, FakeGit(self.dir))
-        self.assertTrue(found.hooks)
-        os.remove(os.path.join(self.dir, ".git", "hooks", "pre-commit"))
-        self.write(".git/hooks/pre-commit.sample", "")
-        found = detect.existing(self.dir, FakeGit(self.dir))
-        self.assertFalse(found.hooks)
 
 
 TAIL = """# Defaults: uncomment to override.
@@ -863,6 +850,26 @@ class HooksCase(Fixture):
         code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
         self.assertEqual(code, 1)
 
+    def test_a_symlinked_hook_is_blocked_and_never_chmodded(self):
+        outside = os.path.join(os.path.dirname(self.root), "outside-hook")
+        from corral import init as corral_init
+
+        with open(outside, "wb") as handle:
+            handle.write(corral_init.hook_template("pre-push"))
+        os.chmod(outside, 0o644)
+        os.makedirs(os.path.join(self.root, ".githooks"))
+        os.symlink(outside, os.path.join(self.root, ".githooks", "pre-push"))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o644)
+
+    def test_an_unwritable_registration_dir_is_exit_4(self):
+        blocker = os.path.join(self.config_dir, "projects.d")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("not a directory")
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4, err)
+
 
 class HooksExistingCase(Fixture):
     name = "old"
@@ -1068,6 +1075,8 @@ class RegistrationCase(Fixture):
         self.assertEqual(code, 0, out)
         self.assertIn(f"would write {self.reg_target()}", out)
         self.assertIn("-# edited", out)
+        self.assertIn(f"a/{os.path.basename(self.reg_target())}", out)
+        self.assertNotIn("a/corral.toml", out)
         self.assertEqual(self.snapshot(), before)
         with open(self.reg_target(), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), edited)
@@ -1159,6 +1168,18 @@ class UninitCase(Fixture):
     def test_cap_three_registration_round_trips_through_uninit(self):
         self.assertEqual(self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)[0], 0)
         self.assertTrue(os.path.isfile(self.reg_target()))
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_a_no_origin_multi_entry_toml_matches_the_directory_named_entry(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)[0], 0)
+        directory = os.path.basename(self.root)
+        with open(self.target(), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "other"\nagents.cap = 1\n\n'
+                f'[[repo]]\nname = "{directory}"\nagents.cap = 3\n'
+            )
         code, out, _ = self.run_uninit(self.root)
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.exists(self.reg_target()))
