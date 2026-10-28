@@ -11,12 +11,16 @@ from corral import (
     coordcli,
     deps,
     gccli,
+    launch,
     launchcli,
     paths,
+    projects,
     quotacli,
+    registry,
     reviewcli,
     settings,
     snapshot,
+    units,
 )
 from corral.github import ghcli
 
@@ -28,6 +32,7 @@ def cmd_deps(args: argparse.Namespace) -> int:
     text, ok = deps.report(deps.check_all(deps.load()))
     sys.stdout.write(text)
     problems = accounts.check()
+    problems.extend(projects.check())
     for problem in problems:
         print(f"corral: {problem}", file=sys.stderr)
     if problems:
@@ -75,6 +80,49 @@ def cmd_paths(args: argparse.Namespace) -> int:
     else:
         for name, path in resolved.items():
             print(f"{name} = {path}")
+    return OK
+
+
+def cmd_projects(args: argparse.Namespace) -> int:
+    import json
+
+    try:
+        registered = projects.load_all()
+    except projects.ProjectsError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+    try:
+        counts = (
+            launch.project_live_counts(registered, units.list_units, registry.config())
+            if registered
+            else {}
+        )
+    except units.UnitsError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return err.exit_code
+    except settings.SettingsError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+    rows = [
+        {
+            "name": project.name,
+            "unit_prefix": project.unit_prefix,
+            "root": project.root,
+            "floor": project.floor,
+            "ceiling": project.ceiling,
+            "live": counts.get(project.name, 0),
+        }
+        for project in registered
+    ]
+    if args.json:
+        print(json.dumps({"projects": rows}, indent=2, sort_keys=True))
+        return OK
+    for row in rows:
+        ceiling = "none" if row["ceiling"] is None else row["ceiling"]
+        print(
+            f"{row['name']} prefix={row['unit_prefix']} root={row['root']} "
+            f"floor={row['floor']} ceiling={ceiling} live={row['live']}"
+        )
     return OK
 
 
@@ -132,6 +180,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", choices=list(PATHS), help="print only this one")
     p.add_argument("--mkdir", action="store_true", help="create the directories first")
     p.set_defaults(func=cmd_paths)
+    p = sub.add_parser("projects", help="the registered projects and their live agents")
+    p.add_argument("--json", action="store_true", help="print the stable document")
+    p.set_defaults(func=cmd_projects)
     from corral.diffscope import BASE_HELP
 
     base_help = f"base ref to diff against ({BASE_HELP})"
@@ -176,6 +227,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return OK if err.code == 0 else USAGE
     try:
         return args.func(args)
-    except (paths.PathError, accounts.AccountsError) as err:
+    except (paths.PathError, accounts.AccountsError, projects.ProjectsError) as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
