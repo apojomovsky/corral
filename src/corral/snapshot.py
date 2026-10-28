@@ -20,23 +20,6 @@ OK, UNREACHABLE, USAGE = 0, 3, 4
 #: The document schema version, printed as `schema_version`.
 SCHEMA_VERSION = 1
 
-#: Top-level keys, in the order they print.
-TOP_ORDER = ("schema_version", "fleet_header", "agents", "quota", "capacity", "disk")
-
-#: One agent row, in the order it prints.
-ROW_ORDER = (
-    "id",
-    "project",
-    "repo",
-    "number",
-    "runtime",
-    "model",
-    "state",
-    "started_at",
-    "last_seen",
-    "note",
-)
-
 
 def _err(text):
     print(f"corral snapshot: {text}", file=sys.stderr)
@@ -98,13 +81,13 @@ def _agents_and_header(registry_view):
     return header, rows
 
 
-def _capacity(registry_view, settings):
+def _capacity(registry_view, settings, host):
     """`{total_cap, repo_cap, live, by_project, pending}` (pure).
 
     `live` counts counted tickets, not entries: one ticket holds one slot
     no matter how many entries name it, exactly like
-    `registry.counted_tickets`. `pending` is not tracked yet and always
-    reads `[]`.
+    `registry.counted_tickets`; like it, only this host's entries count.
+    `pending` is not tracked yet and always reads `[]`.
     """
     from corral import registry
 
@@ -113,7 +96,7 @@ def _capacity(registry_view, settings):
     tickets = {}
     if settings.get("registry.count_toward_cap", True):
         for entry, state in registry_view:
-            if state != registry.LIVE:
+            if state != registry.LIVE or entry.get("host") != host:
                 continue
             held = registry.ticket_of(entry)
             if held is None or held in tickets:
@@ -189,7 +172,7 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None):
         capacity = _section_error(settings if isinstance(settings, Exception) else registry_view)
     else:
         try:
-            capacity = _capacity(registry_view, settings)
+            capacity = _capacity(registry_view, settings, host)
         except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
             capacity = _section_error(exc)
     try:

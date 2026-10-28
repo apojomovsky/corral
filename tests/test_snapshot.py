@@ -279,6 +279,12 @@ class SectionErrors(unittest.TestCase):
 
 
 class CapacityAgreesWithRegistry(unittest.TestCase):
+    def test_capacity_ignores_other_hosts(self):
+        foreign = entry("a9", repo="repo-b", number=9)
+        foreign["host"] = "host-2"
+        doc = doc_of(registry_view=view((entry("a1"), "live"), (foreign, "live")))
+        self.assertEqual(doc["capacity"]["live"], 1)
+
     def test_capacity_counts_match_counted_tickets(self):
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp)
