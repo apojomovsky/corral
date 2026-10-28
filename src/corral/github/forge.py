@@ -20,6 +20,13 @@ PER_PAGE = 100
 
 _SHA = re.compile(r"[0-9a-f]{40}")
 _REPO = re.compile(r"[^/\s]+/[^/\s]+")
+
+
+def is_repo_name(text):
+    """Whether `text` is an `owner/name` the forge can look up. The one definition."""
+    return isinstance(text, str) and _REPO.fullmatch(text) is not None
+
+
 _SCP = re.compile(r"^(?:[^@/:]+@)?github\.com:(.+)$", re.IGNORECASE)
 _URL = re.compile(r"^(?:https?|ssh|git)://(?:[^@/]+@)?([^/]+)/(.+)$", re.IGNORECASE)
 

@@ -32,9 +32,6 @@ AGENT_ID_ENV = "CORRAL_AGENT_ID"
 
 _FULL_SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 
-#: `owner/name` for the forge lookup.
-_FORGE_REPO = re.compile(r"[^/\s]+/[^/\s]+")
-
 
 def _err(text):
     print(f"corral: {text}", file=sys.stderr)
@@ -63,10 +60,6 @@ def _production_forge():
     from corral.github.gh import paced_run
 
     return ghforge.GithubForge(paced_run)
-
-
-def _err(text):
-    print(f"corral: {text}", file=sys.stderr)
 
 
 def _commit(raw, cwd):
@@ -138,7 +131,7 @@ def cmd_show(args: argparse.Namespace, forge=None) -> int:
     if forge_repo is None:
         _err("review show needs --forge-repo owner/name: no forge repo in the origin remote")
         return NO
-    if not _FORGE_REPO.fullmatch(forge_repo):
+    if not ghforge.is_repo_name(forge_repo):
         _err(f"review show needs --forge-repo as owner/name, got {forge_repo!r}")
         return USAGE
     adapter = forge if forge is not None else _production_forge()

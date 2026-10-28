@@ -320,5 +320,16 @@ class OriginRepoTest(unittest.TestCase):
         self.assertIsNone(ghforge.origin_repo("/clone", self.git("/srv/clones/lib\n")))
 
 
+class RepoNameHelper(unittest.TestCase):
+    def test_the_cli_and_adapter_share_one_definition(self):
+        from corral import reviewcli
+
+        self.assertFalse(hasattr(reviewcli, "_FORGE_REPO"))
+        for good in ("acme/lib", "a-b/c.d"):
+            self.assertTrue(ghforge.is_repo_name(good))
+        for bad in ("lib", "a/b/c", "a b/c", "", None, 7):
+            self.assertFalse(ghforge.is_repo_name(bad))
+
+
 if __name__ == "__main__":
     unittest.main()
