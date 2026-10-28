@@ -223,11 +223,6 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
     )
 
 
-def want_split(ops, ops_name):
-    """True when `--ops` or `--ops-name` requests the split layout."""
-    return ops is not None or ops_name is not None
-
-
 def default_ops_name(clone_root):
     """The default ops directory name: `<clone-dir-name>_ops`."""
     return f"{os.path.basename(os.path.realpath(clone_root))}_ops"
@@ -253,11 +248,13 @@ def ops_candidate(clone_root, ops, ops_name):
 
 
 def ensure_ops_root(candidate, git, plan):
-    """The ops root at `candidate`, created with `git init` when missing.
+    """`(root, fresh)` for the ops root at `candidate`.
 
-    An existing path must be a directory; an existing non-empty directory
-    that is not a git repository is exit 4. `--plan` creates nothing and
-    runs no `git init`. Returns the root with symlinks resolved.
+    A missing root is created with `git init`; an existing empty directory
+    is initialised in place. An existing path must be a directory; an
+    existing non-empty directory that is not a git repository is exit 4.
+    `--plan` creates nothing and runs no `git init`. `fresh` is true when
+    apply runs the `git init` (or the plan reports it).
     """
     if os.path.exists(candidate) and not os.path.isdir(candidate):
         raise InitError(f"not a directory: {candidate}")
@@ -270,19 +267,21 @@ def ensure_ops_root(candidate, git, plan):
             raise InitError(f"not a git repository: {candidate}") from None
         is_repo = proc is not None and getattr(proc, "returncode", 1) == 0
     if is_repo:
-        return os.path.realpath(candidate)
+        return os.path.realpath(candidate), False
     if exists and os.listdir(candidate):
         raise InitError(
             f"{candidate} exists, is not empty and is not a git repository:"
             " point --ops at an empty directory or a git repository"
         )
     if plan:
-        return os.path.realpath(candidate) if exists else os.path.abspath(candidate)
+        if exists:
+            return os.path.realpath(candidate), True
+        return os.path.abspath(candidate), True
     _makedirs(candidate)
     creator = git(["init", "-b", "main"], os.path.abspath(candidate))
     if not _git_ok(creator):
         raise InitError(f"cannot git init {candidate}")
-    return os.path.realpath(candidate)
+    return os.path.realpath(candidate), True
 
 
 def resolve_existing_ops_root(candidate, git):
@@ -300,11 +299,41 @@ def ops_hooks_dir(ops_root, entry_name):
     return os.path.join(os.path.realpath(ops_root), OPS_HOOKS_PARENT, entry_name)
 
 
+def split_entry_name(ops_root, clone_root):
+    """The `[[repo]]` name already registered for this clone, else None.
+
+    Matches on `clone.path` against the clone's real path: the stored name
+    survives a later remote change, where live detection would drift. One
+    lookup shared by split `init` (refuse a second entry for the same
+    clone) and split `uninit` (find this clone's hooks after a rename).
+    """
+    raw = _read_text(os.path.join(ops_root, settings.PROJECT_FILE))
+    if raw is None:
+        return None
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError:
+        return None
+    entries = data.get("repo")
+    if not isinstance(entries, list):
+        return None
+    want = os.path.realpath(clone_root)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        clone = entry.get("clone")
+        path = clone.get("path") if isinstance(clone, dict) else None
+        if isinstance(path, str) and os.path.realpath(path) == want:
+            name = entry.get("name")
+            return name if isinstance(name, str) else None
+    return None
+
+
 def hooks_state(hooks_dir, wanted):
     """`(missing, fixable, blocked)` hook files under `hooks_dir`.
 
-    Missing or mismatched wanted hooks are installed by `init`; a wrong
-    mode is repaired; a symlink or a foreign file in the way blocks with
+    Missing wanted hooks are installed by `init`; a wrong mode is repaired;
+    a symlink, a mismatched file or a foreign file in the way blocks with
     exit 4. Shared by both layouts.
     """
     missing: list[tuple[str, str]] = []
@@ -413,14 +442,7 @@ def _entry_block(name, active):
 
 def _entry_values_equal(entry, name, active):
     """True when the parsed `[[repo]]` table equals the entry we would write."""
-    if not isinstance(entry, dict) or entry.get("name") != name:
-        return False
-    for key, value in active.items():
-        prefix, _, leaf = key.partition(".")
-        table = entry.get(prefix)
-        if not isinstance(table, dict) or table.get(leaf) != value:
-            return False
-    return True
+    return isinstance(entry, dict) and entry.get("name") == name and _flatten_entry(entry) == active
 
 
 def render(inputs):
@@ -606,8 +628,7 @@ def _expected_ceiling(root, git):
     entries = data.get("repo")
     if not isinstance(entries, list):
         return default
-    slug = detect.origin_slug(root, git)
-    entry_name = slug.split("/")[1] if slug else os.path.basename(os.path.realpath(root))
+    entry_name = project_name(root, git)
     table = None
     for entry in entries:
         if isinstance(entry, dict) and entry.get("name") == entry_name:
@@ -649,9 +670,9 @@ def run(opts, git=gc.git):
         candidate = ops_candidate(clone_root, opts.ops, opts.ops_name)
         ops_created = candidate is not None and not os.path.exists(candidate)
         if candidate is None:
-            ops_root, split = clone_root, False
+            ops_root, split, ops_fresh = clone_root, False, False
         else:
-            ops_root = ensure_ops_root(candidate, git, opts.plan)
+            ops_root, ops_fresh = ensure_ops_root(candidate, git, opts.plan)
             split = os.path.realpath(ops_root) != os.path.realpath(clone_root)
         _, inputs = collect(
             clone_arg,
@@ -662,7 +683,7 @@ def run(opts, git=gc.git):
             sets=opts.sets,
             clone_path="." if not split else os.path.realpath(clone_root),
         )
-        return _apply(ops_root, clone_root, inputs, opts, git, split, ops_created)
+        return _apply(ops_root, clone_root, inputs, opts, git, split, ops_created, ops_fresh)
     except InitError as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
@@ -696,6 +717,8 @@ def _split_toml_change(toml_target, inputs):
     except tomllib.TOMLDecodeError as err:
         raise InitError(f"{toml_target}: cannot parse the ops corral.toml: {err}") from None
     entries = data.get("repo")
+    if entries is None:
+        entries = []
     if not isinstance(entries, list):
         raise InitError(f"{toml_target}: the file must hold a [[repo]] list to append to")
     matches = [e for e in entries if isinstance(e, dict) and e.get("name") == inputs.name]
@@ -720,22 +743,28 @@ def _split_toml_change(toml_target, inputs):
     return current + sep + block, False
 
 
-def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False):
+def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops_fresh=False):
     """Write everything `init` owns. Raises `InitError` on refusal.
 
     `ops_root` holds `corral.toml`, the overlay and the hooks; the clone
     holds only local git state in the split layout. Inline is the case
-    where both roots are the same directory.
+    where both roots are the same directory. `ops_created` is true when the
+    ops root did not exist; `ops_fresh` when apply runs `git init` there.
     """
     toml_target = os.path.join(ops_root, settings.PROJECT_FILE)
     if split:
-        text, toml_noop = _split_toml_change(toml_target, inputs)
+        stored = split_entry_name(ops_root, clone_root)
+        if stored is not None and stored != inputs.name:
+            raise InitError(
+                f"this clone is already registered as {stored!r} in {toml_target}:"
+                " edit the entry by hand"
+            )
+        text, _ = _split_toml_change(toml_target, inputs)
         current = _read_text(toml_target)
         toml_changed = text is not None
     else:
         current = _read_text(toml_target)
         text = render(inputs)
-        toml_noop = False
         if current is not None and current != text and not opts.force and not opts.plan:
             sys.stdout.write(plan_diff(current, text))
             print(
@@ -779,8 +808,8 @@ def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False):
             kept_commit_msg = cm_target
     show_chain = foreign_hooks or bool(blocked)
     if split:
-        reg_name = os.path.basename(os.path.realpath(ops_root))
         reg_root = os.path.realpath(ops_root)
+        reg_name = registration_name(reg_root)
     else:
         reg_name = registration_name(clone_root)
         reg_root = os.path.realpath(clone_root)
@@ -853,6 +882,7 @@ def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False):
     if opts.plan:
         if split and ops_created:
             sys.stdout.write(f"would create {ops_root}\n")
+        if split and ops_fresh:
             sys.stdout.write(f"would run git init -b main in {ops_root}\n")
         if text is not None and (not split or current is None or text != current):
             sys.stdout.write(plan_diff(current, text))
@@ -886,6 +916,8 @@ def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False):
         return OK
     if split and ops_created:
         sys.stdout.write(f"created {ops_root}\n")
+    elif split and ops_fresh:
+        sys.stdout.write(f"initialised {ops_root}\n")
     if toml_changed and text is not None:
         _write_text(toml_target, text)
         sys.stdout.write(f"wrote {toml_target}\n")
@@ -1024,7 +1056,7 @@ def _unapply(opts, remove, git):
         ops_root = resolve_existing_ops_root(candidate, git)
         split = os.path.realpath(ops_root) != os.path.realpath(clone_root)
     if split:
-        entry_name = project_name(clone_root, git)
+        entry_name = split_entry_name(ops_root, clone_root) or project_name(clone_root, git)
         hooks_dir = ops_hooks_dir(ops_root, entry_name)
         want_hooks = hooks_dir
     else:
@@ -1086,7 +1118,7 @@ def _unapply(opts, remove, git):
             else:
                 exclude_removed = remove_exclude_line(exclude_target)
     if split:
-        ops_reg_name = os.path.basename(os.path.realpath(ops_root))
+        ops_reg_name = registration_name(os.path.realpath(ops_root))
         ops_reg_target = os.path.join(projects.projects_dir(), f"{ops_reg_name}.toml")
         if os.path.isfile(ops_reg_target):
             kept.append((ops_reg_target, "shared by the ops root"))

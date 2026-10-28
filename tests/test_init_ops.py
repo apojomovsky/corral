@@ -205,7 +205,7 @@ class FreshOpsCase(OpsFixture):
         self.assertTrue(os.path.isfile(os.path.join(custom, "corral.toml")))
         reg = os.path.join(self.config_dir, "projects.d", "custom.toml")
         with open(reg, encoding="utf-8") as handle:
-            self.assertIn('root = "%s"\n' % os.path.realpath(custom), handle.read())
+            self.assertIn(f'root = "{os.path.realpath(custom)}"\n', handle.read())
 
     def test_ops_path_wins_over_ops_name(self):
         other = os.path.join(self.work, "other")
@@ -277,6 +277,47 @@ class FreshOpsCase(OpsFixture):
                 handle.read(), registration_golden("proj_ops", os.path.realpath(self.ops), 3)
             )
 
+    def test_comments_only_ops_toml_gets_entry_appended(self):
+        os.makedirs(self.ops)
+        self.git("init", "-q", "-b", "main", cwd=self.ops)
+        with open(os.path.join(self.ops, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write("# hand-kept header\n")
+        code, out, _ = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
+        )
+        self.assertEqual(code, 0, out)
+        text = self.ops_toml()
+        self.assertTrue(text.startswith("# hand-kept header\n"))
+        self.assertIn("\n[[repo]]\n", text)
+        self.assertIn('name = "proj"\n', text)
+
+    def test_empty_ops_dir_plan_reports_git_init(self):
+        os.makedirs(self.ops)
+        code, out, _ = self.run_cli(
+            "init", "--plan", "--ops", self.ops, "--test-cmd", "make check", self.clone
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("would run git init", out)
+        self.assertNotIn("would create", out)
+        self.assertFalse(os.path.exists(os.path.join(self.ops, ".git")))
+        self.assertEqual(self.hooks_path(), "")
+
+    def test_empty_ops_dir_apply_initialises(self):
+        os.makedirs(self.ops)
+        code, out, _ = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
+        )
+        self.assertEqual(code, 0, out)
+        self.assertIn("initialised", out)
+        proc = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=self.ops,
+            capture_output=True,
+            text=True,
+            env=clean_env(),
+        )
+        self.assertEqual(proc.returncode, 0)
+
 
 class OpsErrorsCase(OpsFixture):
     def test_nonempty_nonrepo_ops_root_is_4(self):
@@ -328,6 +369,92 @@ class OpsErrorsCase(OpsFixture):
         self.assertIn("corral.toml", err)
         self.assertIn("-test = ", out)
         self.assertIn("+test = ", out)
+        self.assertEqual(self.ops_toml(), before)
+
+    def test_dropping_cap_is_4_even_with_force(self):
+        self.assertEqual(
+            self.run_cli(
+                "init",
+                "--ops",
+                self.ops,
+                "--test-cmd",
+                "make check",
+                "--cap",
+                "3",
+                "--no-register",
+                self.clone,
+            )[0],
+            0,
+        )
+        before = self.ops_toml()
+        for extra in ([], ["--force"]):
+            code, _, err = self.run_cli(
+                "init",
+                "--ops",
+                self.ops,
+                "--test-cmd",
+                "make check",
+                "--no-register",
+                *extra,
+                self.clone,
+            )
+            self.assertEqual(code, 4)
+            self.assertIn("corral.toml", err)
+        self.assertEqual(self.ops_toml(), before)
+
+    def test_dropping_set_value_is_4(self):
+        self.assertEqual(
+            self.run_cli(
+                "init",
+                "--ops",
+                self.ops,
+                "--test-cmd",
+                "make check",
+                "--set",
+                "agents.cap=3",
+                "--no-register",
+                self.clone,
+            )[0],
+            0,
+        )
+        code, _, err = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", "--no-register", self.clone
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("corral.toml", err)
+
+    def test_dropping_runtime_is_4(self):
+        self.assertEqual(
+            self.run_cli(
+                "init",
+                "--ops",
+                self.ops,
+                "--test-cmd",
+                "make check",
+                "--runtime",
+                "opencode",
+                "--no-register",
+                self.clone,
+            )[0],
+            0,
+        )
+        code, _, err = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", "--no-register", self.clone
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("corral.toml", err)
+
+    def test_init_refuses_second_name_for_same_clone(self):
+        self.assertEqual(
+            self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", self.clone)[0], 0
+        )
+        self.git("remote", "add", "origin", "https://github.com/owner/renamed.git")
+        before = self.ops_toml()
+        code, _, err = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("already registered as 'proj'", err)
         self.assertEqual(self.ops_toml(), before)
 
 
@@ -430,9 +557,6 @@ class UninitOpsCase(OpsFixture):
 
     def test_uninit_plan_changes_nothing(self):
         self.init()
-        before = self.clone_snapshot()
-        with open(os.path.join(self.ops, "corral.toml"), "rb") as handle:
-            toml = handle.read()
         code, out, _ = self.uninit("--plan", "--ops", self.ops, self.clone)
         self.assertEqual(code, 0, out)
         for want in (
@@ -493,6 +617,16 @@ class UninitOpsCase(OpsFixture):
         code, _, err = self.uninit("--ops", self.ops, self.clone)
         self.assertEqual(code, 4)
         self.assertIn(self.ops, err)
+
+    def test_uninit_finds_hooks_after_remote_rename(self):
+        self.init()
+        self.git("remote", "add", "origin", "https://github.com/owner/renamed.git")
+        code, out, _ = self.uninit("--ops", self.ops, self.clone)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "proj")))
+        self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "renamed")))
+        self.assertEqual(self.hooks_path(), "")
+        self.assertEqual(self.status(), "")
 
 
 if __name__ == "__main__":
