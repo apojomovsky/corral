@@ -177,8 +177,13 @@ class PackagedHooks(unittest.TestCase):
 
 
 def _code(lines):
-    """A hook block without its header comments: the shebang stays."""
-    return [line for line in lines if line.startswith("#!") or not line.startswith("#")]
+    """A hook block minus its leading header comments: the shebang stays."""
+    out = [lines[0]] if lines and lines[0].startswith("#!") else []
+    rest = lines[1:] if out else list(lines)
+    i = 0
+    while i < len(rest) and rest[i].startswith("#"):
+        i += 1
+    return out + rest[i:]
 
 
 class PackagedHookRuns(unittest.TestCase):

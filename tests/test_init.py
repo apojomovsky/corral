@@ -504,7 +504,8 @@ class DocsyCase(GoldenCase):
 
     def test_existing_files_are_never_touched(self):
         before = {}
-        for here, _, names in os.walk(self.root):
+        for here, dirnames, names in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
             for entry in names:
                 full = os.path.join(here, entry)
                 with open(full, "rb") as handle:
@@ -512,13 +513,22 @@ class DocsyCase(GoldenCase):
         code, _, _ = self.run_cli(self.root)
         self.assertEqual(code, 0)
         after = {}
-        for here, _, names in os.walk(self.root):
+        for here, dirnames, names in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d != ".git"]
             for entry in names:
                 full = os.path.join(here, entry)
                 with open(full, "rb") as handle:
                     after[os.path.relpath(full, self.root)] = handle.read()
         added = set(after) - set(before)
-        self.assertEqual(added, {"corral.toml", "agents.overlay.md"})
+        self.assertEqual(
+            added,
+            {
+                "corral.toml",
+                "agents.overlay.md",
+                os.path.join(".githooks", "commit-msg"),
+                os.path.join(".githooks", "pre-push"),
+            },
+        )
         for rel in before:
             self.assertEqual(after[rel], before[rel], rel)
 
@@ -851,10 +861,9 @@ class HooksExistingCase(Fixture):
 
     def setUp(self):
         super().setUp()
-        with open(os.path.join(self.root, ".git", "hooks", "pre-commit"), "w") as handle:
-            handle.write("#!/bin/sh\n")
+        self.git("config", "core.hooksPath", ".git/hooks")
 
-    def test_existing_hooks_get_chain_instructions(self):
+    def test_foreign_hooks_path_get_chain_instructions(self):
         code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks")))
@@ -868,6 +877,56 @@ class HooksExistingCase(Fixture):
         code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
         self.assertEqual(code, 1)
         self.assertIn("exec", out)
+
+    def test_legacy_git_hooks_still_converge(self):
+        self.git("config", "--unset", "core.hooksPath")
+        hooks = os.path.join(self.root, ".git", "hooks")
+        with open(os.path.join(hooks, "pre-commit"), "w") as handle:
+            handle.write("#!/bin/sh\n")
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "pre-push")))
+        self.assertNotIn("exec", out)
+
+    def test_partial_install_converges_on_rerun(self):
+        self.git("config", "--unset", "core.hooksPath")
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        missing = os.path.join(self.root, ".githooks", "commit-msg")
+        os.remove(missing)
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        with open(missing, "rb") as handle:
+            self.assertEqual(handle.read(), init.hook_template("commit-msg"))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+
+    def test_blocked_hook_is_reported_never_overwritten(self):
+        self.git("config", "--unset", "core.hooksPath")
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "pre-push")
+        with open(target, "ab") as handle:
+            handle.write(b"# edited\n")
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 4)
+        self.assertIn(target, err)
+        with open(target, "rb") as handle:
+            self.assertTrue(handle.read().endswith(b"# edited\n"))
+
+    def test_plan_previews_a_conflicting_hook_file(self):
+        self.git("config", "--unset", "core.hooksPath")
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "pre-push")
+        with open(target, "ab") as handle:
+            handle.write(b"# edited\n")
+        before = self.snapshot()
+        with open(os.path.join(self.config_dir, "projects.d", "old.toml"), "rb") as handle:
+            reg_before = handle.read()
+        code, out, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"would keep {target}", out)
+        self.assertEqual(self.snapshot(), before)
+        with open(os.path.join(self.config_dir, "projects.d", "old.toml"), "rb") as handle:
+            self.assertEqual(handle.read(), reg_before)
 
 
 class ConventionalCase(Fixture):
@@ -883,13 +942,31 @@ class ConventionalCase(Fixture):
         self.assertEqual(code, 1)
 
     def test_false_chains_only_pre_push(self):
-        hooks = os.path.join(self.root, ".git", "hooks")
-        with open(os.path.join(hooks, "pre-commit"), "w") as handle:
-            handle.write("#!/bin/sh\n")
+        self.git("config", "core.hooksPath", ".git/hooks")
         code, out, _ = self.run_cli("--test-cmd", "make check", *self.extra, self.root)
         self.assertEqual(code, 0)
         self.assertIn("pre-push", out)
         self.assertNotIn("commit-msg", out)
+
+    def test_false_then_default_installs_commit_msg(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", *self.extra, self.root)[0], 0)
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks", "commit-msg")))
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+        self.assertEqual(code, 0)
+        with open(os.path.join(self.root, ".githooks", "commit-msg"), "rb") as handle:
+            self.assertEqual(handle.read(), init.hook_template("commit-msg"))
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
+
+    def test_default_then_false_keeps_commit_msg(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "commit-msg")
+        code, out, _ = self.run_cli("--test-cmd", "make check", "--force", *self.extra, self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("kept", out)
+        self.assertIn("git.commits.conventional is false", out)
+        with open(target, "rb") as handle:
+            self.assertEqual(handle.read(), init.hook_template("commit-msg"))
 
 
 class RegistrationCase(Fixture):
@@ -971,6 +1048,21 @@ class RegistrationCase(Fixture):
         code, _, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_plan_previews_a_differing_registration(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(self.reg_target(), "a", encoding="utf-8") as handle:
+            handle.write("# edited\n")
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            edited = handle.read()
+        before = self.snapshot()
+        code, out, _ = self.run_cli("--plan", "--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"would write {self.reg_target()}", out)
+        self.assertIn("-# edited", out)
+        self.assertEqual(self.snapshot(), before)
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), edited)
 
 
 class UninitCase(Fixture):
@@ -1081,6 +1173,27 @@ class UninitCase(Fixture):
         self.assertIn("hooks remain", out)
         self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "my-hook")))
         self.assertEqual(self.hooks_path(), ".githooks")
+
+    def test_symlinked_hook_is_kept_not_followed(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "commit-msg")
+        outside = os.path.join(self.config_dir, "sentinel.txt")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("sentinel\n")
+        os.remove(target)
+        os.symlink(outside, target)
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn("is a symlink", out)
+        self.assertTrue(os.path.islink(target))
+        with open(outside, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "sentinel\n")
+        remove = init.production_remove(
+            os.path.realpath(self.root), os.path.realpath(self.config_dir)
+        )
+        with self.assertRaises(init.InitError):
+            remove(target)
+        self.assertTrue(os.path.islink(target))
 
     def test_remove_seam_is_a_required_argument(self):
         params = inspect.signature(init.run_un).parameters

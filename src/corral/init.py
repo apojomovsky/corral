@@ -456,45 +456,52 @@ def _apply(root, inputs, opts, git):
         raise InitError("internal: git.commits.conventional is not a bool setting")
     overlay_target = os.path.join(root, OVERLAY_FILE)
     overlay_missing = not os.path.isfile(overlay_target)
-    found = detect.existing(root, git)
     hook_proc = git(["config", HOOKS_KEY], root)
-    hooks_path_set = (
-        _git_ok(hook_proc) and (getattr(hook_proc, "stdout", "") or "").strip() == HOOKS_DIR
-    )
+    hooks_path = (getattr(hook_proc, "stdout", "") or "").strip() if _git_ok(hook_proc) else ""
+    hooks_path_set = hooks_path == HOOKS_DIR
+    foreign_hooks = hooks_path != "" and hooks_path != HOOKS_DIR
     chained = [n for n in HOOK_FILES if n != "commit-msg" or conventional]
-    owned = hooks_path_set and all(
-        _file_bytes(os.path.join(root, HOOKS_DIR, n)) == hook_template(n) for n in chained
-    )
-    want_hooks = [] if (found.hooks and not owned) else list(chained)
-    hook_targets = [os.path.join(root, HOOKS_DIR, name) for name in want_hooks]
-    show_chain = found.hooks and not owned
-    for target, name in zip(hook_targets, want_hooks):
-        try:
-            with open(target, "rb") as handle:
-                installed = handle.read()
-        except FileNotFoundError:
-            installed = None
-        except OSError as err:
-            raise InitError(f"corral: cannot read {target}: {err}") from None
-        if installed is not None and installed != hook_template(name):
-            raise InitError(f"{target} exists with different content: remove it or chain from it")
+    missing: list[tuple[str, str]] = []
+    fixable: list[str] = []
+    blocked: list[tuple[str, str]] = []
+    if not foreign_hooks:
+        for name in chained:
+            target = os.path.join(root, HOOKS_DIR, name)
+            installed = _file_bytes(target)
+            if installed is None:
+                missing.append((target, name))
+            elif installed != hook_template(name):
+                blocked.append((target, name))
+            elif _hook_needs_chmod(target):
+                fixable.append(target)
+    kept_commit_msg: str | None = None
+    if not conventional and not foreign_hooks:
+        cm_target = os.path.join(root, HOOKS_DIR, "commit-msg")
+        if os.path.isfile(cm_target) and _file_bytes(cm_target) == hook_template("commit-msg"):
+            kept_commit_msg = cm_target
+    show_chain = foreign_hooks or bool(blocked)
     reg_name = registration_name(root)
     reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
     reg_text = registration_text(reg_name, os.path.realpath(root), cap)
     reg_missing: bool | None = None
+    current_reg: str | None = None
     if not opts.no_register:
         current_reg = _read_text(reg_target)
         if current_reg is None:
             reg_missing = True
         elif current_reg == reg_text:
             reg_missing = False
-        elif not opts.force:
+        elif not opts.force and not opts.plan:
             raise InitError(
                 f"{reg_target} exists with different content: re-run with --force to replace it"
             )
         else:
             reg_missing = True
-        if reg_missing:
+    if not opts.plan:
+        if blocked:
+            target, _ = blocked[0]
+            raise InitError(f"{target} exists with different content: remove it or chain from it")
+        if not opts.no_register and reg_missing:
             _registration_conflicts(
                 projects.projects_dir(),
                 reg_target,
@@ -502,14 +509,27 @@ def _apply(root, inputs, opts, git):
                 f"{reg_name}-agent",
                 os.path.realpath(root),
             )
-    need_hooks = bool(hook_targets) and (
-        any(not os.path.isfile(t) for t in hook_targets)
-        or any(_hook_needs_chmod(t) for t in hook_targets)
-        or not hooks_path_set
+    need_hooks = not foreign_hooks and (
+        bool(missing) or bool(fixable) or (bool(chained) and not hooks_path_set)
     )
-    changed = current != text or overlay_missing or need_hooks or reg_missing is True
+    changed = (
+        current != text or overlay_missing or need_hooks or bool(blocked) or reg_missing is True
+    )
+    if not changed and kept_commit_msg is None:
+        sys.stdout.write(f"{toml_target} is up to date\n")
+        if show_chain:
+            for line in chain_lines(conventional):
+                sys.stdout.write(line + "\n")
+        if opts.no_register:
+            sys.stdout.write("skipped the host registration (--no-register)\n")
+        return NOTHING
     if not changed:
         sys.stdout.write(f"{toml_target} is up to date\n")
+        if kept_commit_msg is not None:
+            sys.stdout.write(
+                f"kept {kept_commit_msg} (git.commits.conventional is false);"
+                " delete it to stop enforcing\n"
+            )
         if show_chain:
             for line in chain_lines(conventional):
                 sys.stdout.write(line + "\n")
@@ -521,14 +541,22 @@ def _apply(root, inputs, opts, git):
             sys.stdout.write(plan_diff(current, text))
         if overlay_missing:
             sys.stdout.write(f"would write {overlay_target}\n")
-        for target in hook_targets:
-            if not os.path.isfile(target):
-                sys.stdout.write(f"would write {target}\n")
-            elif _hook_needs_chmod(target):
-                sys.stdout.write(f"would fix the mode of {target} to 0755\n")
-        if hook_targets and not hooks_path_set:
+        for target, _ in missing:
+            sys.stdout.write(f"would write {target}\n")
+        for target in fixable:
+            sys.stdout.write(f"would fix the mode of {target} to 0755\n")
+        for target, _ in blocked:
+            sys.stdout.write(f"would keep {target} (differs: remove it or chain from it)\n")
+        if chained and not hooks_path_set and not foreign_hooks:
             sys.stdout.write(f"would set core.hooksPath to {HOOKS_DIR}\n")
+        if kept_commit_msg is not None:
+            sys.stdout.write(
+                f"kept {kept_commit_msg} (git.commits.conventional is false);"
+                " delete it to stop enforcing\n"
+            )
         if reg_missing is True:
+            if current_reg is not None:
+                sys.stdout.write(plan_diff(current_reg, reg_text))
             sys.stdout.write(f"would write {reg_target}\n")
         if show_chain:
             for line in chain_lines(conventional):
@@ -543,24 +571,28 @@ def _apply(root, inputs, opts, git):
     if overlay_missing:
         _write_text(overlay_target, overlay_text())
         sys.stdout.write(f"wrote {overlay_target}\n")
-    if hook_targets:
+    if missing or fixable or (chained and not hooks_path_set and not foreign_hooks):
         os.makedirs(os.path.join(root, HOOKS_DIR), exist_ok=True)
-        for target, name in zip(hook_targets, want_hooks):
-            if not os.path.isfile(target):
-                _write_text(target, hook_template(name).decode("utf-8"))
+        for target, name in missing:
+            _write_text(target, hook_template(name).decode("utf-8"))
+            os.chmod(target, 0o755)
+            sys.stdout.write(f"wrote {target}\n")
+        for target in fixable:
+            try:
                 os.chmod(target, 0o755)
-                sys.stdout.write(f"wrote {target}\n")
-            elif _hook_needs_chmod(target):
-                try:
-                    os.chmod(target, 0o755)
-                except OSError as err:
-                    raise InitError(f"corral: cannot chmod {target}: {err}") from None
-                sys.stdout.write(f"fixed the mode of {target} to 0755\n")
-        if not hooks_path_set:
+            except OSError as err:
+                raise InitError(f"corral: cannot chmod {target}: {err}") from None
+            sys.stdout.write(f"fixed the mode of {target} to 0755\n")
+        if chained and not hooks_path_set and not foreign_hooks:
             setter = git(["config", HOOKS_KEY, HOOKS_DIR], root)
             if not _git_ok(setter):
                 raise InitError(f"cannot set core.hooksPath in {root}")
             sys.stdout.write(f"set core.hooksPath to {HOOKS_DIR} in {root}\n")
+    if kept_commit_msg is not None:
+        sys.stdout.write(
+            f"kept {kept_commit_msg} (git.commits.conventional is false);"
+            " delete it to stop enforcing\n"
+        )
     if show_chain:
         for line in chain_lines(conventional):
             sys.stdout.write(line + "\n")
@@ -614,23 +646,26 @@ class UnOptions(NamedTuple):
 def production_remove(*roots):
     """The real destruction seam. Only the CLI builds it.
 
-    `remove` deletes one path strictly below one of `roots` (symlinks
-    resolved); anything else is `InitError`. Tests pass a fake through
-    `run_un`; only the test named
+    `remove` deletes one path strictly below one of `roots`; anything
+    else, and any symlink, is `InitError`. Symlinks are refused by
+    `lstat`: the seam never resolves-then-deletes a link's target. Tests
+    pass a fake through `run_un`; only the test named
     `test_real_production_remove_contained_to_temp_dir` calls this, only
     against temp dirs.
     """
     real_roots = [os.path.realpath(root) for root in roots]
 
     def remove(path: str) -> None:
+        if os.path.islink(path):
+            raise InitError(f"refusing to remove {path}: is a symlink")
         real = os.path.realpath(path)
-        if not any(real != parent and worktrees._inside(real, parent) for parent in real_roots):
+        if not any(real != parent and worktrees.inside(real, parent) for parent in real_roots):
             raise InitError(f"refusing to remove {path}: escapes the removal roots")
         try:
-            if os.path.isdir(real) and not os.path.islink(real):
-                os.rmdir(real)
+            if os.path.isdir(path):
+                os.rmdir(path)
             else:
-                os.remove(real)
+                os.remove(path)
         except OSError as err:
             raise InitError(f"cannot remove {path}: {err}") from None
 
@@ -658,6 +693,9 @@ def _unapply(opts, remove, git):
         target = os.path.join(hooks_dir, name)
         if not os.path.lexists(target):
             continue
+        if os.path.islink(target):
+            kept.append((target, "is a symlink"))
+            continue
         try:
             with open(target, "rb") as handle:
                 installed = handle.read()
@@ -665,7 +703,6 @@ def _unapply(opts, remove, git):
             raise InitError(f"corral: cannot read {target}: {err}") from None
         if installed != hook_template(name):
             kept.append((target, "modified since `corral init` wrote it"))
-            remaining = True
         elif opts.plan:
             planned.append(target)
         else:
