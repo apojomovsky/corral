@@ -21,7 +21,7 @@ import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
-from corral import accounts, deps, paths, registry, settings, units
+from corral import accounts, deps, paths, prompts, registry, settings, units
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
 
@@ -38,7 +38,7 @@ class Check(NamedTuple):
 
 
 class Env(NamedTuple):
-    """Everything `run_checks` reads. All seams are required arguments."""
+    """Everything `run_checks` reads. Only the first rows are required arguments."""
 
     dep_results: Sequence[deps.Result]
     account_problems: Sequence[str]
@@ -52,6 +52,12 @@ class Env(NamedTuple):
     registry_rows: Sequence[tuple[Mapping, str]]
     registry_error: str | None = None
     deps_error: str | None = None
+    #: Roles with invalid prompt overrides, as "role: problem".
+    prompts_invalid: Sequence[str] = ()
+    #: Roles whose ejected prompt is older than the built-in.
+    prompts_stale: Sequence[str] = ()
+    #: The prompts check itself failed (usage or configuration error).
+    prompts_error: str | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -192,6 +198,31 @@ def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = Non
     )
 
 
+def _check_prompts(invalid: Sequence[str], stale_roles: Sequence[str], error: str | None) -> Check:
+    if error is not None:
+        return Check(
+            "prompts",
+            "fail",
+            error,
+            "fix the prompts configuration, then run `corral prompts check`",
+        )
+    if invalid:
+        return Check(
+            "prompts",
+            "fail",
+            f"invalid prompt overrides: {'; '.join(invalid)}",
+            "fix the placeholders or re-eject the template",
+        )
+    if stale_roles:
+        return Check(
+            "prompts",
+            "warn",
+            f"built-in changed since eject: {', '.join(stale_roles)}",
+            "review the diff and re-eject with --force",
+        )
+    return Check("prompts", "ok", "the role prompts are built-in or valid overrides", "")
+
+
 def run_checks(env: Env) -> list[Check]:
     """Every check, in report order. Pure over the seams in `env`."""
     return [
@@ -203,6 +234,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_readers(env.reader_errors),
         _check_registry(env.registry_rows, env.registry_error),
+        _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
     ]
 
 
@@ -373,6 +405,13 @@ def production_env() -> Env:
         registry_rows = ()
         registry_error = str(err)
     dep_results, deps_error = load_dep_results()
+    try:
+        found = prompts.check(settings.find_root(os.getcwd()))
+        prompts_invalid = tuple(f"{role}: {found.invalid[role]}" for role in sorted(found.invalid))
+        prompts_stale = tuple(found.stale)
+        prompts_error = None
+    except (prompts.PromptsError, settings.SettingsError) as err:
+        prompts_invalid, prompts_stale, prompts_error = (), (), str(err)
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,
@@ -386,6 +425,9 @@ def production_env() -> Env:
         reader_errors=load_readers(),
         registry_rows=registry_rows,
         registry_error=registry_error,
+        prompts_invalid=prompts_invalid,
+        prompts_stale=prompts_stale,
+        prompts_error=prompts_error,
     )
 
 

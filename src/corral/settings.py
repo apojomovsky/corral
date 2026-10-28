@@ -73,6 +73,7 @@ PROVIDERS = (
     "corral.detect",
     "corral.hold",
     "corral.launch",
+    "corral.prompts",
     "corral.quota",
     "corral.registry",
     "corral.runtimes",
