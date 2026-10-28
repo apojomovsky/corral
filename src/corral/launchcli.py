@@ -174,6 +174,13 @@ def _role_prompt(args, tgt, seams):
         "project_agents_md": agents_md if os.path.isfile(agents_md) else "AGENTS.md (none found)",
     }
 
+    # Validate every placeholder and the override before launch makes a
+    # worktree: a bad override must not leave a stray branch behind.
+    try:
+        prompts.render(args.role, {**base, "worktree": "-", "branch": "-"}, ops_root=tgt.root)
+    except prompts.PromptsError as err:
+        raise launch.LaunchError(str(err)) from None
+
     def render_prompt(workdir, branch):
         try:
             return prompts.render(

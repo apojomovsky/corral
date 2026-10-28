@@ -137,6 +137,11 @@ class PrecedenceTest(PromptsCase):
         with self.assertRaises(prompts.PromptsError):
             prompts.effective("worker", self.root)
 
+    def test_a_directory_at_the_ejected_path_is_a_configuration_error(self):
+        os.makedirs(os.path.join(self.root, ".corral", "prompts", "worker.md"))
+        with self.assertRaises(prompts.PromptsError):
+            prompts.effective("worker", self.root)
+
 
 class EjectTest(PromptsCase):
     def test_eject_writes_the_hash_line_then_the_builtin(self):
@@ -242,7 +247,7 @@ class BuiltinsTest(PromptsCase):
         for role in prompts.ROLES:
             with self.subTest(role=role):
                 text = prompts._builtin_text(role)
-                for bad in ("epic", "ros2", "/home/", "@"):
+                for bad in ("/home/", "@", "http://", "https://"):
                     self.assertNotIn(bad, text)
 
     def test_worker_states_the_ticket_rules(self):
@@ -321,6 +326,21 @@ class DoctorPromptsTest(PromptsCase):
         self.assertEqual(row.status, "fail")
 
 
+class DoctorGatheringTest(unittest.TestCase):
+    def test_lookup_failures_degrade_to_an_error_string(self):
+        for error in (
+            prompts.PromptsError("bad override"),
+            settings.SettingsError("bad settings"),
+            doctor.paths.PathError("CORRAL_CONFIG must be an absolute path"),
+            OSError("no cwd"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(doctor.prompts, "check", side_effect=error):
+                    invalid, stale, message = doctor.load_prompts_state()
+                self.assertEqual((invalid, stale), ((), ()))
+                self.assertIn(str(error), message)
+
+
 class LaunchRoleTest(OpsCase):
     def run_launch(self, argv, board_fn=None):
         out, err = io.StringIO(), io.StringIO()
@@ -360,6 +380,16 @@ class LaunchRoleTest(OpsCase):
         self.assertIn("AGENTS.md (none found)", prompt)
         self.assertNotIn("{", prompt)
         self.assertNotIn("}", prompt)
+
+    def test_a_bad_override_fails_before_any_worktree_exists(self):
+        override = os.path.join(self.root, ".corral", "prompts", "worker.md")
+        os.makedirs(os.path.dirname(override))
+        with open(override, "w", encoding="utf-8") as handle:
+            handle.write("{bogus}\n")
+        code, _, err = self.run_launch(["launch", "lib", "7", "--role", "worker", "--title", "x"])
+        self.assertEqual(code, 4, err)
+        worktrees_dir = os.path.join(self.root, "clones", "lib", ".worktrees")
+        self.assertFalse(os.path.isdir(worktrees_dir) and os.listdir(worktrees_dir))
 
     def test_role_falls_back_to_the_title_flag(self):
         code, _, err = self.run_launch(

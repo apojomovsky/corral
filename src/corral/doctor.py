@@ -373,6 +373,20 @@ def production_list_fn(prefix: str) -> list:
     return units.list_units(prefix)
 
 
+def load_prompts_state() -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
+    """(invalid, stale, error) for the prompt overrides, gathered once.
+
+    Every failure to look is data for a failing row, never a traceback:
+    a broken settings file, a relative config path or an unreadable cwd.
+    """
+    try:
+        found = prompts.check(settings.find_root(os.getcwd()))
+    except (prompts.PromptsError, settings.SettingsError, paths.PathError, OSError) as err:
+        return (), (), str(err)
+    invalid = tuple(f"{role}: {found.invalid[role]}" for role in sorted(found.invalid))
+    return invalid, tuple(found.stale), None
+
+
 def production_env() -> Env:
     """The live environment. Only the CLI calls this; tests never call this.
 
@@ -405,13 +419,7 @@ def production_env() -> Env:
         registry_rows = ()
         registry_error = str(err)
     dep_results, deps_error = load_dep_results()
-    try:
-        found = prompts.check(settings.find_root(os.getcwd()))
-        prompts_invalid = tuple(f"{role}: {found.invalid[role]}" for role in sorted(found.invalid))
-        prompts_stale = tuple(found.stale)
-        prompts_error = None
-    except (prompts.PromptsError, settings.SettingsError) as err:
-        prompts_invalid, prompts_stale, prompts_error = (), (), str(err)
+    prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,

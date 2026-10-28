@@ -148,7 +148,7 @@ def effective(role, ops_root=None):
             raise PromptsError(f"{role}: cannot read the prompts override: {err}") from None
     if ops_root:
         path = ejected_path(role, ops_root)
-        if os.path.isfile(path):
+        if os.path.lexists(path):
             try:
                 with open(path, encoding="utf-8") as handle:
                     return handle.read(), "file"
