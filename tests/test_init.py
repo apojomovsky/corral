@@ -124,6 +124,17 @@ class TestCommandCase(unittest.TestCase):
         self.write("Cargo.toml", "")
         self.assertEqual(detect.test_command(self.dir), "cargo test")
 
+    def test_a_test_variable_is_not_a_test_target(self):
+        for line in ("test := unit\n", "test ::= unit\n", "test= unit\n"):
+            with self.subTest(line=line):
+                self.write("Makefile", line)
+                self.write("Cargo.toml", "")
+                self.assertEqual(detect.test_command(self.dir), "cargo test")
+
+    def test_a_double_colon_test_rule_is_a_target(self):
+        self.write("Makefile", "test::\n\ttrue\n")
+        self.assertEqual(detect.test_command(self.dir), "make test")
+
     def test_pyproject_with_tests_uses_unittest(self):
         self.write("pyproject.toml", "")
         self.write("tests/test_app.py", "")

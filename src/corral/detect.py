@@ -17,8 +17,9 @@ from corral.github import forge as ghforge
 
 settings.register("checks.test", str, "", "the test command the agent and takeoff run")
 
-#: A Makefile line that defines the `test` target (`test:`, `test :`, ...).
-_MAKE_TEST_TARGET = re.compile(r"^test\s*:", re.MULTILINE)
+#: A Makefile line that defines the `test` target (`test:`, `test :`, ...),
+#: not a variable assignment (`test := x`, `test ::= x`).
+_MAKE_TEST_TARGET = re.compile(r"^test\s*:(?!:?\s*=)", re.MULTILINE)
 
 
 def remote_slug(url):
