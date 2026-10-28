@@ -1,10 +1,17 @@
-"""`corral init` and `corral uninit` for the inline layout.
+"""`corral init` and `corral uninit` for the inline and split layouts.
 
 `init` detects what it can and asks about the rest through flags: detected
 values are used, flags override them, and a value that is neither detected
 nor flagged is exit 4 (`--test-cmd` is the only one this layout cannot
 default). `--yes` is accepted and is a no-op, reserved for the prompting
 ticket.
+
+The inline layout writes everything into the repository itself. The split
+layout (`--ops`) keeps the agent side in a separate ops repository that
+points at the project's clone: the inline layout is the case where the ops
+root and the project clone are the same directory, so both layouts go
+through the shared pieces below (`collect`, the entry block, the hook
+convergence, the overlay, the registration).
 
 Inline `init` writes, all idempotent and all covered by `--plan`:
 
@@ -20,15 +27,35 @@ Inline `init` writes, all idempotent and all covered by `--plan`:
 - the host registration `~/.config/corral/projects.d/<name>.toml`, the only
   write outside the repository (skipped with a note under `--no-register`).
 
+Split `init --ops PATH` (optionally `--ops-name NAME`) writes the same files
+into the ops root instead, and touches the project clone only through local,
+untracked git state:
+
+- `corral.toml` in the ops root: created when missing, otherwise the new
+  `[[repo]]` entry is appended as a block and nothing else in the file is
+  touched. An entry with the same name but different values is refused
+  (exit 4), even with `--force`: edit it by hand;
+- `agents.overlay.md` next to it, created only when missing;
+- the hook scripts under `<ops>/hooks/<clone-name>/`, with the clone-local
+  `core.hooksPath` set to that directory's absolute path (same convergence
+  and foreign-hook rules as inline);
+- one `.worktrees/` line in the clone's `.git/info/exclude`, added when
+  absent and never touching any other line.
+
+The host registration is for the ops root (`projects.d/<ops-dir-name>.toml`
+with the ops root as its root). A missing ops root is created with a local
+`git init -b main`; an existing non-empty non-repository is refused.
+
 `init` never edits `AGENTS.md`, `CLAUDE.md` or any other existing file, and
 never runs `gh` or anything outward: it prints `corral github setup` as the
 next step for the user and does nothing else.
 
 `uninit` reverses only what `init` can prove it wrote: a hook file goes only
 when its bytes still equal the packaged template, the registration only
-when its content still equals what `init` would write now. Anything modified
-since stays and is listed as kept, with the reason. `corral.toml` and
-`agents.overlay.md` are never removed.
+when its content still equals what `init` would write now. In the split
+layout the `[[repo]]` entry, `corral.toml`, `agents.overlay.md` and the ops
+registration stay; the registration is reported as kept (shared by the ops
+root). Anything modified since stays and is listed as kept, with the reason.
 """
 
 import argparse
@@ -64,6 +91,16 @@ HOOK_FILES = ("commit-msg", "pre-push")
 
 #: The git key `init` sets (clone-local) to point git at `HOOKS_DIR`.
 HOOKS_KEY = "core.hooksPath"
+
+#: The hooks parent inside an ops root: hooks live at `<ops>/hooks/<name>/`.
+OPS_HOOKS_PARENT = "hooks"
+
+#: The line `init --ops` adds to the clone's `.git/info/exclude`.
+EXCLUDE_LINE = ".worktrees/"
+
+#: `argparse` value for a bare `--ops` (no PATH): the default `<clone>_ops`
+#: sibling. A real path is never this value.
+OPS_DEFAULT = ""
 
 
 class PlanInputs(NamedTuple):
@@ -125,12 +162,14 @@ def registration_name(root):
     return os.path.basename(root)
 
 
-def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=()):
+def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_path="."):
     """`(root, PlanInputs)` for the repository holding `path`.
 
     Flags win over detection. A missing test command, an unknown
     `--set` key, a mistyped `--set` value and an unknown `--runtime`
-    are `InitError`.
+    are `InitError`. `clone_path` is the `clone.path` value when no
+    `--set clone.path=` override is given: `"."` in the inline layout,
+    the clone's absolute path in the split layout.
     """
     settings._load_providers()
     if runtime is not None and runtime not in runtimes.NAMES:
@@ -153,7 +192,7 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=()):
     if command is None:
         raise InitError("no test command detected: pass --test-cmd CMD")
     trio = {
-        "clone.path": ".",
+        "clone.path": clone_path,
         "clone.default_branch": branch,
         "checks.test": command,
     }
@@ -184,6 +223,155 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=()):
     )
 
 
+def want_split(ops, ops_name):
+    """True when `--ops` or `--ops-name` requests the split layout."""
+    return ops is not None or ops_name is not None
+
+
+def default_ops_name(clone_root):
+    """The default ops directory name: `<clone-dir-name>_ops`."""
+    return f"{os.path.basename(os.path.realpath(clone_root))}_ops"
+
+
+def ops_candidate(clone_root, ops, ops_name):
+    """The ops root path for the flags, None for the inline layout.
+
+    A `--ops PATH` wins over `--ops-name NAME`; a bare `--ops` or an
+    `--ops-name` alone means the sibling of that name next to the clone.
+    """
+    if ops is not None and ops != OPS_DEFAULT:
+        return os.path.abspath(ops)
+    if ops_name is not None:
+        if not ops_name or ops_name in (".", "..") or os.path.basename(ops_name) != ops_name:
+            raise InitError(f"--ops-name {ops_name!r}: want a plain directory name")
+        parent = os.path.dirname(os.path.realpath(clone_root))
+        return os.path.join(parent, ops_name)
+    if ops is not None:
+        parent = os.path.dirname(os.path.realpath(clone_root))
+        return os.path.join(parent, default_ops_name(clone_root))
+    return None
+
+
+def ensure_ops_root(candidate, git, plan):
+    """The ops root at `candidate`, created with `git init` when missing.
+
+    An existing path must be a directory; an existing non-empty directory
+    that is not a git repository is exit 4. `--plan` creates nothing and
+    runs no `git init`. Returns the root with symlinks resolved.
+    """
+    if os.path.exists(candidate) and not os.path.isdir(candidate):
+        raise InitError(f"not a directory: {candidate}")
+    exists = os.path.exists(candidate)
+    is_repo = False
+    if exists:
+        try:
+            proc = git(["rev-parse", "--show-toplevel"], os.path.abspath(candidate))
+        except OSError:
+            raise InitError(f"not a git repository: {candidate}") from None
+        is_repo = proc is not None and getattr(proc, "returncode", 1) == 0
+    if is_repo:
+        return os.path.realpath(candidate)
+    if exists and os.listdir(candidate):
+        raise InitError(
+            f"{candidate} exists, is not empty and is not a git repository:"
+            " point --ops at an empty directory or a git repository"
+        )
+    if plan:
+        return os.path.realpath(candidate) if exists else os.path.abspath(candidate)
+    _makedirs(candidate)
+    creator = git(["init", "-b", "main"], os.path.abspath(candidate))
+    if not _git_ok(creator):
+        raise InitError(f"cannot git init {candidate}")
+    return os.path.realpath(candidate)
+
+
+def resolve_existing_ops_root(candidate, git):
+    """The existing ops root at `candidate`, else exit 4 (for `uninit`)."""
+    if not os.path.isdir(candidate):
+        raise InitError(f"not a git repository: {candidate}")
+    try:
+        return resolve_root(candidate, git)
+    except InitError:
+        raise InitError(f"not a git repository: {candidate}") from None
+
+
+def ops_hooks_dir(ops_root, entry_name):
+    """The hook directory for entry `entry_name` in the ops root."""
+    return os.path.join(os.path.realpath(ops_root), OPS_HOOKS_PARENT, entry_name)
+
+
+def hooks_state(hooks_dir, wanted):
+    """`(missing, fixable, blocked)` hook files under `hooks_dir`.
+
+    Missing or mismatched wanted hooks are installed by `init`; a wrong
+    mode is repaired; a symlink or a foreign file in the way blocks with
+    exit 4. Shared by both layouts.
+    """
+    missing: list[tuple[str, str]] = []
+    fixable: list[str] = []
+    blocked: list[tuple[str, str]] = []
+    for name in wanted:
+        target = os.path.join(hooks_dir, name)
+        installed = _file_bytes(target)
+        if os.path.islink(target):
+            blocked.append((target, name))
+        elif installed is None:
+            missing.append((target, name))
+        elif installed != hook_template(name):
+            blocked.append((target, name))
+        elif _hook_needs_chmod(target):
+            fixable.append(target)
+    return missing, fixable, blocked
+
+
+def exclude_path(clone_root):
+    """The clone's `.git/info/exclude` file."""
+    return os.path.join(clone_root, ".git", "info", "exclude")
+
+
+def _exclude_lines(target):
+    """The exclude file's lines (no newlines), None when missing."""
+    try:
+        with open(target, encoding="utf-8") as handle:
+            return handle.read().splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise InitError(f"corral: cannot read {target}: {err}") from None
+
+
+def ensure_exclude_line(target, plan):
+    """Add `EXCLUDE_LINE` to the exclude file when absent. Returns changed."""
+    lines = _exclude_lines(target)
+    if lines is not None and EXCLUDE_LINE in lines:
+        return False
+    if plan:
+        return True
+    if lines is None:
+        _makedirs(os.path.dirname(target))
+        try:
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(EXCLUDE_LINE + "\n")
+        except OSError as err:
+            raise InitError(f"corral: cannot write {target}: {err}") from None
+        return True
+    current = _read_text(target) or ""
+    if current and not current.endswith("\n"):
+        current += "\n"
+    _write_text(target, current + EXCLUDE_LINE + "\n")
+    return True
+
+
+def remove_exclude_line(target):
+    """Drop every exact `EXCLUDE_LINE` line, touching no other line."""
+    lines = _exclude_lines(target)
+    if lines is None or EXCLUDE_LINE not in lines:
+        return False
+    kept = [line for line in lines if line != EXCLUDE_LINE]
+    _write_text(target, "".join(line + "\n" for line in kept))
+    return True
+
+
 def _toml(value):
     """A registry default or active value as TOML."""
     if isinstance(value, bool):
@@ -193,26 +381,20 @@ def _toml(value):
     return json.dumps(value)
 
 
-def render(inputs):
-    """The `corral.toml` text for `inputs`: the settings that differ
-    from the defaults live in the single `[[repo]]` entry; every other
-    registered setting is commented out with its default and one-line
-    help, grouped by prefix, so the template never goes stale."""
-    settings._load_providers()
+def _active(inputs):
+    """The `[[repo]]` entry values for `inputs`, as flat `prefix.leaf` keys."""
     active = {
         "clone.path": inputs.path,
         "clone.default_branch": inputs.default_branch,
         "checks.test": inputs.test_command,
     }
     active.update(inputs.extra)
-    lines = [
-        "# corral.toml, written by `corral init`. Settings that differ",
-        "# from the defaults live in [[repo]]; everything else is",
-        "# commented out below with its default.",
-        "[[repo]]",
-        f"name = {_toml(inputs.name)}",
-        "",
-    ]
+    return active
+
+
+def _entry_lines(name, active):
+    """The `[[repo]]` block lines for entry `name` with flat `active` values."""
+    lines = ["[[repo]]", f"name = {_toml(name)}", ""]
     groups: dict[str, list[str]] = {}
     for key in active:
         groups.setdefault(key.split(".")[0], []).append(key)
@@ -221,6 +403,39 @@ def render(inputs):
         for key in sorted(groups[prefix]):
             lines.append(f"{key.split('.', 1)[1]} = {_toml(active[key])}")
         lines.append("")
+    return lines
+
+
+def _entry_block(name, active):
+    """The `[[repo]]` block text for entry `name` (trailing newline)."""
+    return "\n".join(_entry_lines(name, active)) + "\n"
+
+
+def _entry_values_equal(entry, name, active):
+    """True when the parsed `[[repo]]` table equals the entry we would write."""
+    if not isinstance(entry, dict) or entry.get("name") != name:
+        return False
+    for key, value in active.items():
+        prefix, _, leaf = key.partition(".")
+        table = entry.get(prefix)
+        if not isinstance(table, dict) or table.get(leaf) != value:
+            return False
+    return True
+
+
+def render(inputs):
+    """The `corral.toml` text for `inputs`: the settings that differ
+    from the defaults live in the single `[[repo]]` entry; every other
+    registered setting is commented out with its default and one-line
+    help, grouped by prefix, so the template never goes stale."""
+    settings._load_providers()
+    active = _active(inputs)
+    lines = [
+        "# corral.toml, written by `corral init`. Settings that differ",
+        "# from the defaults live in [[repo]]; everything else is",
+        "# commented out below with its default.",
+    ]
+    lines.extend(_entry_lines(inputs.name, active))
     commented = [key for key in settings.REGISTRY if key not in active]
     lines.append("# Defaults: uncomment to override.")
     groups = {}
@@ -422,38 +637,114 @@ class Options(NamedTuple):
     runtime: str | None = None
     cap: int | None = None
     sets: tuple = ()
+    ops: str | None = None
+    ops_name: str | None = None
 
 
 def run(opts, git=gc.git):
     """Run `init` with an injectable git seam. Returns the exit code."""
     try:
-        root, inputs = collect(
-            opts.path or os.getcwd(),
+        clone_arg = opts.path or os.getcwd()
+        clone_root = resolve_root(clone_arg, git)
+        candidate = ops_candidate(clone_root, opts.ops, opts.ops_name)
+        ops_created = candidate is not None and not os.path.exists(candidate)
+        if candidate is None:
+            ops_root, split = clone_root, False
+        else:
+            ops_root = ensure_ops_root(candidate, git, opts.plan)
+            split = os.path.realpath(ops_root) != os.path.realpath(clone_root)
+        _, inputs = collect(
+            clone_arg,
             git=git,
             test_cmd=opts.test_cmd,
             runtime=opts.runtime,
             cap=opts.cap,
             sets=opts.sets,
+            clone_path="." if not split else os.path.realpath(clone_root),
         )
-        return _apply(root, inputs, opts, git)
+        return _apply(ops_root, clone_root, inputs, opts, git, split, ops_created)
     except InitError as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
 
 
-def _apply(root, inputs, opts, git):
-    """Write everything `init` owns. Raises `InitError` on refusal."""
-    toml_target = os.path.join(root, settings.PROJECT_FILE)
+def _flatten_entry(entry):
+    """A parsed `[[repo]]` table as flat `prefix.leaf` values (no `name`)."""
+    flat: dict[str, object] = {}
+    for prefix, table in entry.items():
+        if prefix == "name" or not isinstance(table, dict):
+            continue
+        for leaf, value in table.items():
+            flat[f"{prefix}.{leaf}"] = value
+    return flat
+
+
+def _split_toml_change(toml_target, inputs):
+    """`(new_text, is_noop)` for the split layout's append-only `corral.toml`.
+
+    A missing file is created from `render(inputs)`; otherwise the new
+    `[[repo]]` entry is appended and every existing byte is preserved. An
+    entry with the same name but different values prints its diff and is
+    exit 4, even with `--force`: edit it by hand.
+    """
+    active = _active(inputs)
     current = _read_text(toml_target)
-    text = render(inputs)
-    if current is not None and current != text and not opts.force and not opts.plan:
-        sys.stdout.write(plan_diff(current, text))
-        print(
-            f"corral: {toml_target} exists with different content:"
-            " re-run with --force to replace only that file",
-            file=sys.stderr,
+    if current is None:
+        return render(inputs), False
+    try:
+        data = tomllib.loads(current)
+    except tomllib.TOMLDecodeError as err:
+        raise InitError(f"{toml_target}: cannot parse the ops corral.toml: {err}") from None
+    entries = data.get("repo")
+    if not isinstance(entries, list):
+        raise InitError(f"{toml_target}: the file must hold a [[repo]] list to append to")
+    matches = [e for e in entries if isinstance(e, dict) and e.get("name") == inputs.name]
+    if matches and all(_entry_values_equal(m, inputs.name, active) for m in matches):
+        return None, True
+    if matches:
+        old_block = _entry_block(inputs.name, _flatten_entry(matches[0]))
+        sys.stdout.write(
+            plan_diff(old_block, _entry_block(inputs.name, active), os.path.basename(toml_target))
         )
-        return USAGE
+        raise InitError(
+            f"{toml_target} already holds a [[repo]] entry for {inputs.name!r}"
+            " with different values: edit it by hand"
+        )
+    block = _entry_block(inputs.name, active)
+    if current.endswith("\n\n"):
+        sep = ""
+    elif current.endswith("\n"):
+        sep = "\n"
+    else:
+        sep = "\n\n"
+    return current + sep + block, False
+
+
+def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False):
+    """Write everything `init` owns. Raises `InitError` on refusal.
+
+    `ops_root` holds `corral.toml`, the overlay and the hooks; the clone
+    holds only local git state in the split layout. Inline is the case
+    where both roots are the same directory.
+    """
+    toml_target = os.path.join(ops_root, settings.PROJECT_FILE)
+    if split:
+        text, toml_noop = _split_toml_change(toml_target, inputs)
+        current = _read_text(toml_target)
+        toml_changed = text is not None
+    else:
+        current = _read_text(toml_target)
+        text = render(inputs)
+        toml_noop = False
+        if current is not None and current != text and not opts.force and not opts.plan:
+            sys.stdout.write(plan_diff(current, text))
+            print(
+                f"corral: {toml_target} exists with different content:"
+                " re-run with --force to replace only that file",
+                file=sys.stderr,
+            )
+            return USAGE
+        toml_changed = current != text
     extra = dict(inputs.extra)
     cap = extra.get("agents.cap", settings.REGISTRY["agents.cap"].default)
     if not isinstance(cap, int) or isinstance(cap, bool):
@@ -463,37 +754,38 @@ def _apply(root, inputs, opts, git):
     )
     if not isinstance(conventional, bool):
         raise InitError("internal: git.commits.conventional is not a bool setting")
-    overlay_target = os.path.join(root, OVERLAY_FILE)
+    overlay_target = os.path.join(ops_root, OVERLAY_FILE)
     overlay_missing = not os.path.isfile(overlay_target)
-    hook_proc = git(["config", HOOKS_KEY], root)
+    if split:
+        hooks_dir = ops_hooks_dir(ops_root, inputs.name)
+        want_hooks = hooks_dir
+    else:
+        hooks_dir = os.path.join(clone_root, HOOKS_DIR)
+        want_hooks = HOOKS_DIR
+    hook_proc = git(["config", HOOKS_KEY], clone_root)
     hooks_path = (getattr(hook_proc, "stdout", "") or "").strip() if _git_ok(hook_proc) else ""
-    hooks_path_set = hooks_path == HOOKS_DIR
-    foreign_hooks = hooks_path != "" and hooks_path != HOOKS_DIR
+    hooks_path_set = hooks_path == want_hooks
+    foreign_hooks = hooks_path != "" and hooks_path != want_hooks
     chained = [n for n in HOOK_FILES if n != "commit-msg" or conventional]
     missing: list[tuple[str, str]] = []
     fixable: list[str] = []
     blocked: list[tuple[str, str]] = []
     if not foreign_hooks:
-        for name in chained:
-            target = os.path.join(root, HOOKS_DIR, name)
-            installed = _file_bytes(target)
-            if os.path.islink(target):
-                blocked.append((target, name))
-            elif installed is None:
-                missing.append((target, name))
-            elif installed != hook_template(name):
-                blocked.append((target, name))
-            elif _hook_needs_chmod(target):
-                fixable.append(target)
+        missing, fixable, blocked = hooks_state(hooks_dir, chained)
     kept_commit_msg: str | None = None
     if not conventional and not foreign_hooks:
-        cm_target = os.path.join(root, HOOKS_DIR, "commit-msg")
+        cm_target = os.path.join(hooks_dir, "commit-msg")
         if os.path.isfile(cm_target) and _file_bytes(cm_target) == hook_template("commit-msg"):
             kept_commit_msg = cm_target
     show_chain = foreign_hooks or bool(blocked)
-    reg_name = registration_name(root)
+    if split:
+        reg_name = os.path.basename(os.path.realpath(ops_root))
+        reg_root = os.path.realpath(ops_root)
+    else:
+        reg_name = registration_name(clone_root)
+        reg_root = os.path.realpath(clone_root)
     reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
-    reg_text = registration_text(reg_name, os.path.realpath(root), cap)
+    reg_text = registration_text(reg_name, reg_root, cap)
     reg_missing: bool | None = None
     current_reg: str | None = None
     if not opts.no_register:
@@ -508,6 +800,12 @@ def _apply(root, inputs, opts, git):
             )
         else:
             reg_missing = True
+    exclude_target = exclude_path(clone_root) if split else ""
+    if split:
+        exclude_lines = _exclude_lines(exclude_target)
+        exclude_need = exclude_lines is None or EXCLUDE_LINE not in exclude_lines
+    else:
+        exclude_need = False
     if not opts.plan:
         if blocked:
             target, _ = blocked[0]
@@ -518,13 +816,18 @@ def _apply(root, inputs, opts, git):
                 reg_target,
                 reg_name,
                 f"{reg_name}-agent",
-                os.path.realpath(root),
+                reg_root,
             )
     need_hooks = not foreign_hooks and (
         bool(missing) or bool(fixable) or (bool(chained) and not hooks_path_set)
     )
     changed = (
-        current != text or overlay_missing or need_hooks or bool(blocked) or reg_missing is True
+        toml_changed
+        or overlay_missing
+        or need_hooks
+        or bool(blocked)
+        or reg_missing is True
+        or exclude_need
     )
     if not changed and kept_commit_msg is None:
         sys.stdout.write(f"{toml_target} is up to date\n")
@@ -548,7 +851,10 @@ def _apply(root, inputs, opts, git):
             sys.stdout.write("skipped the host registration (--no-register)\n")
         return NOTHING
     if opts.plan:
-        if current != text:
+        if split and ops_created:
+            sys.stdout.write(f"would create {ops_root}\n")
+            sys.stdout.write(f"would run git init -b main in {ops_root}\n")
+        if text is not None and (not split or current is None or text != current):
             sys.stdout.write(plan_diff(current, text))
         if overlay_missing:
             sys.stdout.write(f"would write {overlay_target}\n")
@@ -559,12 +865,14 @@ def _apply(root, inputs, opts, git):
         for target, _ in blocked:
             sys.stdout.write(f"would keep {target} (differs: remove it or chain from it)\n")
         if chained and not hooks_path_set and not foreign_hooks:
-            sys.stdout.write(f"would set core.hooksPath to {HOOKS_DIR}\n")
+            sys.stdout.write(f"would set core.hooksPath to {want_hooks}\n")
         if kept_commit_msg is not None:
             sys.stdout.write(
                 f"kept {kept_commit_msg} (git.commits.conventional is false);"
                 " delete it to stop enforcing\n"
             )
+        if split and exclude_need:
+            sys.stdout.write(f"would add {EXCLUDE_LINE} to {exclude_target}\n")
         if reg_missing is True:
             if current_reg is not None:
                 sys.stdout.write(plan_diff(current_reg, reg_text, os.path.basename(reg_target)))
@@ -576,14 +884,16 @@ def _apply(root, inputs, opts, git):
             sys.stdout.write("skipped the host registration (--no-register)\n")
         sys.stdout.write("next: corral github setup\n")
         return OK
-    if current != text:
+    if split and ops_created:
+        sys.stdout.write(f"created {ops_root}\n")
+    if toml_changed and text is not None:
         _write_text(toml_target, text)
         sys.stdout.write(f"wrote {toml_target}\n")
     if overlay_missing:
         _write_text(overlay_target, overlay_text())
         sys.stdout.write(f"wrote {overlay_target}\n")
     if missing or fixable or (chained and not hooks_path_set and not foreign_hooks):
-        _makedirs(os.path.join(root, HOOKS_DIR))
+        _makedirs(hooks_dir)
         for target, name in missing:
             _write_text(target, hook_template(name).decode("utf-8"))
             os.chmod(target, 0o755)
@@ -595,10 +905,13 @@ def _apply(root, inputs, opts, git):
                 raise InitError(f"corral: cannot chmod {target}: {err}") from None
             sys.stdout.write(f"fixed the mode of {target} to 0755\n")
         if chained and not hooks_path_set and not foreign_hooks:
-            setter = git(["config", HOOKS_KEY, HOOKS_DIR], root)
+            setter = git(["config", HOOKS_KEY, want_hooks], clone_root)
             if not _git_ok(setter):
-                raise InitError(f"cannot set core.hooksPath in {root}")
-            sys.stdout.write(f"set core.hooksPath to {HOOKS_DIR} in {root}\n")
+                raise InitError(f"cannot set core.hooksPath in {clone_root}")
+            sys.stdout.write(f"set core.hooksPath to {want_hooks} in {clone_root}\n")
+    if split and exclude_need:
+        ensure_exclude_line(exclude_target, False)
+        sys.stdout.write(f"added {EXCLUDE_LINE} to {exclude_target}\n")
     if kept_commit_msg is not None:
         sys.stdout.write(
             f"kept {kept_commit_msg} (git.commits.conventional is false);"
@@ -617,7 +930,7 @@ def _apply(root, inputs, opts, git):
         if not any(
             p.name == reg_name
             and p.unit_prefix == f"{reg_name}-agent"
-            and p.root == os.path.normpath(os.path.realpath(root))
+            and p.root == os.path.normpath(reg_root)
             and p.floor == 0
             and p.ceiling == cap
             for p in registered
@@ -643,6 +956,8 @@ def cmd_init(args):
             runtime=args.runtime,
             cap=args.cap,
             sets=tuple(args.set),
+            ops=args.ops,
+            ops_name=args.ops_name,
         )
     )
 
@@ -652,6 +967,8 @@ class UnOptions(NamedTuple):
 
     path: str | None = None
     plan: bool = False
+    ops: str | None = None
+    ops_name: str | None = None
 
 
 def production_remove(*roots):
@@ -693,12 +1010,30 @@ def run_un(opts, remove, git=gc.git):
 
 
 def _unapply(opts, remove, git):
-    """Remove what `init` can prove it wrote. Raises `InitError`."""
-    root = resolve_root(opts.path or os.getcwd(), git)
+    """Remove what `init` can prove it wrote. Raises `InitError`.
+
+    In the split layout only this clone's hook files, its `core.hooksPath`
+    and its `.worktrees/` exclude line go; the `[[repo]]` entry,
+    `corral.toml`, the overlay and the ops registration stay.
+    """
+    clone_root = resolve_root(opts.path or os.getcwd(), git)
+    candidate = ops_candidate(clone_root, opts.ops, opts.ops_name)
+    if candidate is None:
+        ops_root, split = clone_root, False
+    else:
+        ops_root = resolve_existing_ops_root(candidate, git)
+        split = os.path.realpath(ops_root) != os.path.realpath(clone_root)
+    if split:
+        entry_name = project_name(clone_root, git)
+        hooks_dir = ops_hooks_dir(ops_root, entry_name)
+        want_hooks = hooks_dir
+    else:
+        hooks_dir = os.path.join(clone_root, HOOKS_DIR)
+        want_hooks = HOOKS_DIR
+        ops_root = clone_root
     removed: list[str] = []
     kept: list[tuple[str, str]] = []
     planned: list[str] = []
-    hooks_dir = os.path.join(root, HOOKS_DIR)
     for name in HOOK_FILES:
         target = os.path.join(hooks_dir, name)
         if not os.path.lexists(target):
@@ -719,18 +1054,18 @@ def _unapply(opts, remove, git):
             _remove(remove, target)
             removed.append(target)
     stays = _remaining_hooks(hooks_dir, planned)
-    proc = git(["config", HOOKS_KEY], root)
+    proc = git(["config", HOOKS_KEY], clone_root)
     hooks_path = (getattr(proc, "stdout", "") or "").strip() if _git_ok(proc) else ""
     unset = False
-    if hooks_path == HOOKS_DIR and not stays:
+    if hooks_path == want_hooks and not stays:
         if opts.plan:
             planned.append("core.hooksPath")
         else:
-            unset_proc = git(["config", "--unset", HOOKS_KEY], root)
+            unset_proc = git(["config", "--unset", HOOKS_KEY], clone_root)
             if not _git_ok(unset_proc):
-                raise InitError(f"cannot unset core.hooksPath in {root}")
+                raise InitError(f"cannot unset core.hooksPath in {clone_root}")
             unset = True
-    elif hooks_path == HOOKS_DIR and stays:
+    elif hooks_path == want_hooks and stays:
         kept.append(("core.hooksPath", "hooks remain"))
     if os.path.isdir(hooks_dir) and not os.path.islink(hooks_dir):
         if not stays:
@@ -741,23 +1076,44 @@ def _unapply(opts, remove, git):
                 removed.append(hooks_dir)
         else:
             kept.append((hooks_dir, "holds files `corral init` did not write"))
-    reg_name = registration_name(root)
-    reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
-    expected = registration_text(reg_name, os.path.realpath(root), _expected_ceiling(root, git))
-    reg_current = _read_text(reg_target)
-    if reg_current is not None:
-        if reg_current == expected:
+    exclude_target = exclude_path(clone_root) if split else ""
+    exclude_removed = False
+    if split:
+        lines = _exclude_lines(exclude_target)
+        if lines is not None and EXCLUDE_LINE in lines:
             if opts.plan:
-                planned.append(reg_target)
+                planned.append(f"exclude-line:{exclude_target}")
             else:
-                _remove(remove, reg_target)
-                removed.append(reg_target)
-        else:
-            kept.append((reg_target, "differs from what `corral init` would write now"))
+                exclude_removed = remove_exclude_line(exclude_target)
+    if split:
+        ops_reg_name = os.path.basename(os.path.realpath(ops_root))
+        ops_reg_target = os.path.join(projects.projects_dir(), f"{ops_reg_name}.toml")
+        if os.path.isfile(ops_reg_target):
+            kept.append((ops_reg_target, "shared by the ops root"))
+    else:
+        reg_name = registration_name(clone_root)
+        reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
+        expected = registration_text(
+            reg_name, os.path.realpath(clone_root), _expected_ceiling(clone_root, git)
+        )
+        reg_current = _read_text(reg_target)
+        if reg_current is not None:
+            if reg_current == expected:
+                if opts.plan:
+                    planned.append(reg_target)
+                else:
+                    _remove(remove, reg_target)
+                    removed.append(reg_target)
+            else:
+                kept.append((reg_target, "differs from what `corral init` would write now"))
     if opts.plan:
         for target in planned:
             if target == "core.hooksPath":
                 sys.stdout.write("would unset core.hooksPath\n")
+            elif target.startswith("exclude-line:"):
+                sys.stdout.write(
+                    f"would remove the {EXCLUDE_LINE} line from {target[len('exclude-line:') :]}\n"
+                )
             else:
                 sys.stdout.write(f"would remove {target}\n")
         for target, reason in kept:
@@ -767,16 +1123,18 @@ def _unapply(opts, remove, git):
         sys.stdout.write(f"removed {target}\n")
     if unset:
         sys.stdout.write("unset core.hooksPath\n")
+    if exclude_removed:
+        sys.stdout.write(f"removed the {EXCLUDE_LINE} line from {exclude_target}\n")
     for target, reason in kept:
         sys.stdout.write(f"kept {target} ({reason})\n")
-    if removed or unset:
+    if removed or unset or exclude_removed:
         sys.stdout.write(
-            f"left for you to delete: {os.path.join(root, settings.PROJECT_FILE)},"
-            f" {os.path.join(root, OVERLAY_FILE)}\n"
+            f"left for you to delete: {os.path.join(ops_root, settings.PROJECT_FILE)},"
+            f" {os.path.join(ops_root, OVERLAY_FILE)}\n"
         )
     else:
         sys.stdout.write("nothing to remove\n")
-    return OK if removed or unset else NOTHING
+    return OK if removed or unset or exclude_removed else NOTHING
 
 
 def _remaining_hooks(hooks_dir, planned):
@@ -807,12 +1165,20 @@ def _remove(remove, target):
 def cmd_uninit(args):
     """The `corral uninit` verb: flags to `UnOptions`, then `run_un`."""
     try:
-        root = resolve_root(args.path or os.getcwd(), gc.git)
+        clone_root = resolve_root(args.path or os.getcwd(), gc.git)
+        candidate = ops_candidate(clone_root, args.ops, args.ops_name)
+        roots = [os.path.realpath(clone_root), os.path.realpath(projects.projects_dir())]
+        if candidate is not None:
+            ops_root = resolve_existing_ops_root(candidate, gc.git)
+            if os.path.realpath(ops_root) != os.path.realpath(clone_root):
+                roots.append(os.path.realpath(ops_root))
     except InitError as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
-    remove = production_remove(os.path.realpath(root), os.path.realpath(projects.projects_dir()))
-    return run_un(UnOptions(path=args.path, plan=args.plan), remove)
+    remove = production_remove(*roots)
+    return run_un(
+        UnOptions(path=args.path, plan=args.plan, ops=args.ops, ops_name=args.ops_name), remove
+    )
 
 
 def add_parser(sub):
@@ -822,7 +1188,7 @@ def add_parser(sub):
         "path",
         nargs="?",
         default=None,
-        help="the repository to onboard (default: the current directory)",
+        help="the project clone to onboard (default: the current directory)",
     )
     parser.add_argument("--plan", action="store_true", help="print the diff and write nothing")
     parser.add_argument(
@@ -850,13 +1216,42 @@ def add_parser(sub):
     parser.add_argument("--runtime", default=None, help="the agent runtime")
     parser.add_argument("--cap", type=int, default=None, help="this project's agent ceiling")
     parser.add_argument("--test-cmd", default=None, help="the test command (default: detected)")
+    parser.add_argument(
+        "--ops",
+        nargs="?",
+        const=OPS_DEFAULT,
+        default=None,
+        metavar="PATH",
+        help="write the agent side to the ops root at PATH"
+        " (bare --ops uses the <clone>_ops sibling)",
+    )
+    parser.add_argument(
+        "--ops-name",
+        default=None,
+        metavar="NAME",
+        help="write the agent side to the NAME sibling of the clone (--ops wins)",
+    )
     parser.set_defaults(func=cmd_init)
     uninit = sub.add_parser("uninit", help="remove the hooks and registration `corral init` wrote")
     uninit.add_argument(
         "path",
         nargs="?",
         default=None,
-        help="the repository to uninit (default: the current directory)",
+        help="the project clone to uninit (default: the current directory)",
     )
     uninit.add_argument("--plan", action="store_true", help="print the plan and change nothing")
+    uninit.add_argument(
+        "--ops",
+        nargs="?",
+        const=OPS_DEFAULT,
+        default=None,
+        metavar="PATH",
+        help="the ops root holding this clone's entry (bare --ops uses the sibling)",
+    )
+    uninit.add_argument(
+        "--ops-name",
+        default=None,
+        metavar="NAME",
+        help="the NAME sibling of the clone as the ops root (--ops wins)",
+    )
     uninit.set_defaults(func=cmd_uninit)
