@@ -103,6 +103,16 @@ def _inside(path, parent):
     return os.path.commonpath([path, parent]) == parent
 
 
+def root(main_clone, root):
+    """The real path of the worktree root. The one resolver for it.
+
+    `root` is the `git.worktrees` setting value, relative to the main
+    clone or absolute, and must resolve strictly inside the clone.
+    Refused with `WorktreeError` when it escapes.
+    """
+    return _resolve_root(os.path.realpath(main_clone), root)
+
+
 def slugify(title):
     """The title without its Conventional prefix, as lowercase hyphenated words.
 

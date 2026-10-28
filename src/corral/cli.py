@@ -5,7 +5,7 @@ import os
 import sys
 from collections.abc import Sequence
 
-from corral import accounts, agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
+from corral import accounts, agentcli, coordcli, deps, gccli, launchcli, paths, reviewcli, settings
 from corral.github import ghcli
 
 # Exit codes are a public interface (AGENTS.md).
@@ -146,6 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", default=None, help=base_help)
     p.set_defaults(func=cmd_budget)
     coordcli.add_parser(sub)
+    gccli.add_parser(sub)
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
