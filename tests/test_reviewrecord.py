@@ -13,7 +13,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, mergeup, paths, reviewrecord
+from corral import cli, mergeup, paths, reviewcli, reviewrecord
+from tests.test_forge import FakeForge, make_pr
 
 REPO = "lib"
 
@@ -229,23 +230,39 @@ class VerbTest(unittest.TestCase):
             *extra,
         )
 
+    def show(self, *extra):
+        fake = FakeForge(
+            pulls=[
+                make_pr(
+                    repo="acme/lib",
+                    number=7,
+                    base_sha=self.head,
+                    head_sha=self.head,
+                )
+            ]
+        )
+        with mock.patch.object(reviewcli, "_production_forge", return_value=fake):
+            return self.run_cli(
+                "review", "show", REPO, "7", "--pr", "7", "--forge-repo", "acme/lib", *extra
+            )
+
     def test_record_then_show(self):
         code, out, _ = self.record(
             self.head[:7], "--reviewer", "reviewer-1", "--finding", "low: a nit", "--finding", "odd"
         )
         self.assertEqual(code, 0)
         self.assertTrue(out.strip().endswith(f"review-{self.head[:12]}.json"))
-        code, out, _ = self.run_cli("review", "show", REPO, "7")
+        code, out, _ = self.show()
         self.assertEqual(code, 0)
         self.assertIn(f"approve by reviewer-1 on {self.head[:12]}", out)
         self.assertIn("- low: a nit", out)
         self.assertIn("- note: odd", out)
-        code, out, _ = self.run_cli("review", "show", REPO, "7", "--json")
+        code, out, _ = self.show("--json")
         payload = json.loads(out)
         self.assertEqual((payload["verdict"], payload["inherited_from"]), ("approve", None))
 
     def test_show_without_a_record_exits_1(self):
-        code, _, err = self.run_cli("review", "show", REPO, "7")
+        code, _, err = self.show()
         self.assertEqual(code, 1)
         self.assertIn("no review record", err)
 
@@ -314,10 +331,10 @@ class VerbTest(unittest.TestCase):
             "author-1",
         )
         self.assertEqual(code, 0)
-        code, out, _ = self.run_cli("review", "show", REPO, "7")
+        code, out, _ = self.show()
         self.assertEqual(code, 1)
         self.assertIn("block by r-1", out)
-        self.assertEqual(self.run_cli("review", "show", REPO, "7", "--json")[0], 1)
+        self.assertEqual(self.show("--json")[0], 1)
 
     def test_an_unresolvable_id_is_refused_not_hashed(self):
         for commit in ("1234567" if not self.head.startswith("1234567") else "7654321", "a9c992g"):

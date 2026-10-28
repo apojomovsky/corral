@@ -19,15 +19,43 @@ from corral import gc, settings, worktrees
 
 OK, NOTHING, UNREACHABLE, USAGE = 0, 1, 3, 4
 
-#: No PR adapter exists behind the forge interface today, so the verb
-#: passes an index that says nothing (merged-pr never fires) with this
-#: note in the plan.
-EMPTY_FORGE_NOTE = "no forge data wired: merged-pr never fires"
+#: The forge has no data for a clone whose origin names no GitHub repo
+#: (or names none at all): merged-pr never fires, and the plan says so.
+NO_ORIGIN_NOTE = "no forge repo from the origin remote: merged-pr never fires"
 
 
 def empty_pr_index():
-    """The forge seam when no adapter provides one: nothing is merged."""
+    """An empty forge index: nothing is merged."""
     return {}
+
+
+def _production_forge():
+    """The live forge over the production `gh` runner."""
+    from corral.github import forge as ghforge
+    from corral.github.gh import paced_run
+
+    return ghforge.GithubForge(paced_run)
+
+
+def live_pr_index(repo, _forge=None):
+    """`(index, note)` for the clone's origin repo on the forge.
+
+    The repo name comes from the origin remote; when it cannot be
+    derived, or the forge is unreachable, the index is empty (merged-pr
+    never fires) with a note saying so, and the exit is unchanged.
+    Tests pass a fake forge; production builds the GitHub adapter.
+    """
+    from corral import forge as iface
+    from corral.github import forge as ghforge
+
+    origin = ghforge.origin_repo(repo, gc.git)
+    if origin is None:
+        return {}, NO_ORIGIN_NOTE
+    adapter = _forge if _forge is not None else _production_forge()
+    try:
+        return adapter.pr_index(origin), None
+    except iface.ForgeError as err:
+        return {}, f"forge unreachable ({err}): merged-pr never fires"
 
 
 def plan_json(plan, result=None):
@@ -85,21 +113,22 @@ def cmd_gc(args: argparse.Namespace) -> int:
     except settings.SettingsError as err:
         _err(str(err))
         return USAGE
+    index, note = live_pr_index(repo)
     try:
         if args.apply:
             plan, result = gc.apply(
                 repo,
-                pr_index=empty_pr_index(),
+                pr_index=index,
                 root=root_setting,
                 remove=production_remove(repo, worktrees.root(repo, root_setting)),
-                forge_note=EMPTY_FORGE_NOTE,
+                forge_note=note,
             )
         else:
             plan = gc.plan(
                 repo,
-                pr_index=empty_pr_index(),
+                pr_index=index,
                 root=root_setting,
-                forge_note=EMPTY_FORGE_NOTE,
+                forge_note=note,
             )
             result = None
     except worktrees.WorktreeError as err:
