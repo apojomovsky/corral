@@ -216,6 +216,7 @@ TAIL = """# Defaults: uncomment to override.
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
 # checks.takeoff = []  # takeoff gate commands, run in order in the worktree
+# checks.timeout_s = 1800  # seconds before a takeoff command is killed
 #
 # [disk]
 # disk.min_free_gb = 5  # free gigabytes under which the disk reads low
@@ -310,6 +311,7 @@ commits.conventional = false
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
 # checks.takeoff = []  # takeoff gate commands, run in order in the worktree
+# checks.timeout_s = 1800  # seconds before a takeoff command is killed
 #
 # [disk]
 # disk.min_free_gb = 5  # free gigabytes under which the disk reads low

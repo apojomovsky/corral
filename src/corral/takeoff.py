@@ -17,6 +17,7 @@ call here is a local verb. Exit codes: 0 every check ok or skipped,
 1 a check failed, 3 the remote is unreachable, 4 usage or configuration.
 """
 
+import functools
 import importlib.machinery
 import importlib.util
 import os
@@ -37,6 +38,8 @@ OK, FAIL, SKIPPED = "ok", "fail", "skipped"
 #: Never written literally: the commit-msg hook refuses it anywhere.
 EM_DASH = chr(0x2014)
 settings.register("checks.takeoff", list, [], "takeoff gate commands, run in order in the worktree")
+settings.register("checks.timeout_s", int, 1800, "seconds before a takeoff command is killed")
+
 settings.register(
     "checks.no_em_dash", bool, True, "takeoff refuses added lines and bodies with an em-dash"
 )
@@ -72,14 +75,19 @@ class Result(NamedTuple):
 
 def production_ls_remote(branch, cwd):
     """The SHA `git ls-remote` reports for `origin`'s `branch` (the one seam)."""
-    proc = subprocess.run(
-        ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        env=gitenv.clean_env(),
-        timeout=30,
-    )
+    try:
+        proc = subprocess.run(
+            ["git", "ls-remote", "origin", f"refs/heads/{branch}"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=gitenv.clean_env(),
+            timeout=30,
+        )
+    except (subprocess.TimeoutExpired, OSError) as err:
+        raise LsRemoteError(
+            f"cannot read origin/refs/heads/{branch} from the remote: {err}"
+        ) from None
     if proc.returncode != 0:
         raise LsRemoteError((proc.stderr or "").strip() or "git ls-remote failed")
     for line in (proc.stdout or "").splitlines():
@@ -89,10 +97,23 @@ def production_ls_remote(branch, cwd):
     raise LsRemoteError(f"origin has no branch {branch!r}")
 
 
-def production_run_cmd(cmd, cwd):
-    """Run one takeoff command string in the worktree (the other seam)."""
+def production_run_cmd(cmd, cwd, timeout=None):
+    """Run one takeoff command string in the worktree (the other seam).
+
+    `timeout` kills a hanging command; None means the registered
+    `checks.timeout_s` default, so direct calls agree with the gate.
+    """
+    if timeout is None:
+        default = settings.REGISTRY["checks.timeout_s"].default
+        timeout = default if isinstance(default, int) else 1800
     return subprocess.run(
-        cmd, shell=True, cwd=cwd, capture_output=True, text=True, env=gitenv.clean_env()
+        cmd,
+        shell=True,
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        env=gitenv.clean_env(),
+        timeout=timeout,
     )
 
 
@@ -162,7 +183,7 @@ def _check_base(branch, cwd, ls_remote):
     """The base check, or `(None, fail, unreachable)` when the remote is mute."""
     try:
         sha = ls_remote(branch, cwd)
-    except LsRemoteError as err:
+    except (LsRemoteError, subprocess.TimeoutExpired, OSError) as err:
         detail = f"cannot read origin/refs/heads/{branch} from the remote: {err}"
         return None, Check("base", FAIL, detail, f"git fetch origin {branch}"), True
     if not sha or _git(["cat-file", "-e", sha], cwd).returncode != 0:
@@ -216,7 +237,10 @@ def _check_worktree(toplevel, main_clone, root_setting, base_sha, default_branch
             branch,
             None,
         )
-    if _git(["status", "--porcelain"], toplevel).stdout.strip():
+    status = _git(["status", "--porcelain"], toplevel)
+    if status.returncode != 0:
+        raise TakeoffError(f"cannot read the worktree status: {(status.stderr or '').strip()}")
+    if status.stdout.strip():
         return (
             Check(
                 "worktree",
@@ -248,12 +272,7 @@ def _check_worktree(toplevel, main_clone, root_setting, base_sha, default_branch
 def _leak_terms(ops_root):
     """The private terms guarding `ops_root`, usable before any check runs."""
     try:
-        return leakguard.terms(
-            ops_root,
-            host=leakcli._hostname(),
-            home=leakcli._homedir(),
-            ops_name=os.path.basename(os.path.abspath(ops_root)) if ops_root else "",
-        )
+        return leakcli.guard_terms(ops_root)
     except settings.SettingsError as err:
         raise TakeoffError(str(err)) from None
 
@@ -335,7 +354,7 @@ def _check_em_dash(enabled, toplevel, base, body_text, scrub):
 
 def _check_body(text, number):
     """The PR body: real newlines, a link to the ticket, a review record."""
-    prose = gh._body_text_outside_code(text)
+    prose = gh.body_text_outside_code(text)
     found = []
     if "\\n" in prose or "\\r" in prose:
         found.append("literal \\n in the PR body: write it to a file with real newlines")
@@ -424,7 +443,18 @@ def _check_review(required, repo, number, toplevel, base):
     return Check("review", OK, "", "")
 
 
-def _check_commands(commands, test_command, with_test, toplevel, run_cmd, scrub):
+def _expired_tail(err):
+    """The last 20 lines of a timed-out command's partial output."""
+    out = err.stdout
+    errs = err.stderr
+    if isinstance(out, bytes):
+        out = out.decode("utf-8", "replace")
+    if isinstance(errs, bytes):
+        errs = errs.decode("utf-8", "replace")
+    return "\n".join(((out or "") + (errs or "")).splitlines()[-20:])
+
+
+def _check_commands(commands, test_command, with_test, toplevel, run_cmd, scrub, timeout_s):
     """Each configured takeoff command exits 0, with the tail shown on failure."""
     if not isinstance(commands, list) or any(not isinstance(c, str) for c in commands):
         raise TakeoffError("checks.takeoff must be a list of command strings")
@@ -438,6 +468,17 @@ def _check_commands(commands, test_command, with_test, toplevel, run_cmd, scrub)
     for cmd in wanted:
         try:
             proc = run_cmd(cmd, toplevel)
+        except subprocess.TimeoutExpired as err:
+            tail = _expired_tail(err)
+            detail = f"`{cmd}` exceeded checks.timeout_s ({timeout_s}s)"
+            if tail.strip():
+                detail += f":\n{tail}"
+            return Check(
+                "checks",
+                FAIL,
+                scrub(detail),
+                f"raise checks.timeout_s or fix the hang: run `{cmd}` in the worktree",
+            )
         except Exception as err:
             return Check(
                 "checks",
@@ -528,6 +569,11 @@ def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remot
         checks.append(_check_body(body_text, number))
     checks.append(_check_leak(toplevel, base, body_file, found_terms))
     checks.append(_check_review(resolved["review.required"], repo, number, toplevel, base))
+    timeout_s = resolved["checks.timeout_s"]
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
+        raise TakeoffError("checks.timeout_s must be a positive number of seconds")
+    if run_cmd is production_run_cmd:
+        run_cmd = functools.partial(production_run_cmd, timeout=timeout_s)
     checks.append(
         _check_commands(
             resolved["checks.takeoff"],
@@ -536,6 +582,7 @@ def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remot
             toplevel,
             run_cmd,
             scrub,
+            timeout_s,
         )
     )
     if any(check.status == FAIL for check in checks):

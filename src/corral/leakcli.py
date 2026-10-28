@@ -147,6 +147,21 @@ def find_ops_root(cwd, flag=None):
     return None
 
 
+def guard_terms(ops_root):
+    """The private terms guarding `ops_root`, for every gate that needs them.
+
+    One definition shared by `leakcheck` and `takeoff`: the host and home
+    seams stay here, so both gates guard the same terms. `SettingsError`
+    propagates; each gate reports it in its own way.
+    """
+    return leakguard.terms(
+        ops_root,
+        host=_hostname(),
+        home=_homedir(),
+        ops_name=os.path.basename(os.path.abspath(ops_root)) if ops_root else "",
+    )
+
+
 def _as_json(findings):
     return {
         "schema_version": SCHEMA_VERSION,
@@ -174,12 +189,7 @@ def cmd_leakcheck(args):
         print(f"corral leakcheck: {err}", file=sys.stderr)
         return USAGE
     try:
-        found_terms = leakguard.terms(
-            ops_root,
-            host=_hostname(),
-            home=_homedir(),
-            ops_name=os.path.basename(os.path.abspath(ops_root)) if ops_root else "",
-        )
+        found_terms = guard_terms(ops_root)
     except settings.SettingsError as err:
         print(f"corral leakcheck: {err}", file=sys.stderr)
         return USAGE

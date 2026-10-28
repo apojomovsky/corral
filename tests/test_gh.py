@@ -339,6 +339,23 @@ class ReviewRecordTest(unittest.TestCase):
         self.assertFalse(gh.has_review_record(""))
 
 
+class BodyTextOutsideCodeTest(unittest.TestCase):
+    def test_fenced_blocks_are_dropped(self):
+        body = "Keep this.\n\n```\nDrop this.\n```\n\nAnd this.\n"
+        text = gh.body_text_outside_code(body)
+        self.assertIn("Keep this.", text)
+        self.assertIn("And this.", text)
+        self.assertNotIn("Drop this.", text)
+
+    def test_inline_code_spans_are_stripped(self):
+        text = gh.body_text_outside_code("Run `Closes #79` to link.\n")
+        self.assertNotIn("Closes #79", text)
+        self.assertIn("Run  to link.", text)
+
+    def test_old_name_still_works_inside_gh(self):
+        self.assertIs(gh._body_text_outside_code, gh.body_text_outside_code)
+
+
 class ClosingRefsTest(unittest.TestCase):
     def test_numbers_from_closing_references(self):
         pr = {"closingIssuesReferences": [{"number": 119}, {"number": 120}]}

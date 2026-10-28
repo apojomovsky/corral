@@ -212,6 +212,18 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(found.status, "fail")
         self.assertIn("uncommitted changes", found.detail)
 
+    def test_status_failure_is_a_usage_error(self):
+        real_git = takeoff._git
+
+        def fake_git(args, cwd):
+            if list(args) == ["status", "--porcelain"]:
+                return _proc(args, 1, "")
+            return real_git(args, cwd)
+
+        with mock.patch.object(takeoff, "_git", side_effect=fake_git):
+            with self.assertRaises(takeoff.TakeoffError):
+                self.gate()
+
     def test_branch_must_match_the_ticket_pattern(self):
         self.git("checkout", "-q", "-b", "odd-name", cwd=self.work)
         result = self.gate()
@@ -244,6 +256,20 @@ class TakeoffCase(unittest.TestCase):
 
     def test_unreachable_remote_fails_closed_with_exit_3(self):
         self.ls_error = takeoff.LsRemoteError("connection refused")
+        result = self.gate()
+        self.assertEqual(result.exit_code, 3)
+        found = [c for c in result.checks if c.name == "base"][0]
+        self.assertEqual(found.status, "fail")
+
+    def test_ls_timeout_fails_closed_with_exit_3(self):
+        self.ls_error = subprocess.TimeoutExpired(["git", "ls-remote"], 30)
+        result = self.gate()
+        self.assertEqual(result.exit_code, 3)
+        found = [c for c in result.checks if c.name == "base"][0]
+        self.assertEqual(found.status, "fail")
+
+    def test_ls_oserror_fails_closed_with_exit_3(self):
+        self.ls_error = OSError("git is missing")
         result = self.gate()
         self.assertEqual(result.exit_code, 3)
         found = [c for c in result.checks if c.name == "base"][0]
@@ -482,6 +508,13 @@ class TakeoffCase(unittest.TestCase):
             ),
         )
 
+    def test_leak_term_errors_are_usage_errors(self):
+        with mock.patch.object(
+            leakcli, "guard_terms", side_effect=settings.SettingsError("bad pattern")
+        ):
+            with self.assertRaises(takeoff.TakeoffError):
+                self.gate()
+
     def test_scrubbed_commit_message_hides_the_term(self):
         term = "Alpine Schema"
         self.write_ops(
@@ -600,6 +633,25 @@ class TakeoffCase(unittest.TestCase):
         self.assertNotIn("line05", found.detail)
         self.assertIn("make test", found.fix)
 
+    def test_a_timed_out_command_fails_with_the_raise_fix(self):
+        lines = "".join(f"line{i:02d}\n" for i in range(1, 26))
+
+        def slow(cmd, cwd):
+            raise subprocess.TimeoutExpired(cmd, 1800, output=lines)
+
+        result = self.gate(run_cmd=slow)
+        self.assertEqual(result.exit_code, 1)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "fail")
+        self.assertIn("raise checks.timeout_s or fix the hang", found.fix)
+        self.assertIn("line25", found.detail)
+        self.assertIn("line06", found.detail)
+        self.assertNotIn("line05", found.detail)
+
+    def test_production_run_cmd_kills_a_hanging_command(self):
+        with self.assertRaises(subprocess.TimeoutExpired):
+            takeoff.production_run_cmd("sleep 30", self.work, timeout=1)
+
     def test_test_flag_adds_the_test_command(self):
         self.cmd_results["make test"] = (0, "green\n")
         result = self.gate(body_file=None, with_test=True)
@@ -676,6 +728,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["checks.takeoff"].default, [])
         self.assertEqual(settings.REGISTRY["checks.no_em_dash"].default, True)
         self.assertEqual(settings.REGISTRY["review.required"].default, True)
+        self.assertEqual(settings.REGISTRY["checks.timeout_s"].default, 1800)
         self.assertIn("corral.takeoff", settings.PROVIDERS)
 
 
