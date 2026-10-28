@@ -31,6 +31,7 @@ never calls `gh` itself.
 """
 
 import os
+import shlex
 import subprocess
 from dataclasses import dataclass, field
 
@@ -61,11 +62,6 @@ def git(args, cwd):
 def _tail(proc):
     lines = (proc.stderr or "").strip().splitlines()
     return lines[-1] if lines else "git failed"
-
-
-def _inside(path, parent):
-    """True when real path `path` sits at or below real path `parent`."""
-    return os.path.commonpath([os.path.realpath(path), parent]) == parent
 
 
 @dataclass
@@ -429,7 +425,7 @@ def format_plan(plan):
         for audit in sorted(group, key=lambda a: a.branch.name):
             lines.append(f"  {audit.branch.name}  ({audit.evidence})")
             if cat in SAFE:
-                lines.append(f"    git branch -d {audit.branch.name}")
+                lines.append(f"    git branch -d {shlex.quote(audit.branch.name)}")
         lines.append("")
     if plan.registered:
         lines.append("registered worktrees:")
@@ -467,7 +463,9 @@ def plan_dict(plan):
                 "name": a.branch.name,
                 "category": a.category,
                 "evidence": a.evidence,
-                "delete_command": f"git branch -d {a.branch.name}" if a.category in SAFE else None,
+                "delete_command": f"git branch -d {shlex.quote(a.branch.name)}"
+                if a.category in SAFE
+                else None,
             }
             for a in sorted(plan.audits, key=lambda a: a.branch.name)
         ],
@@ -509,6 +507,9 @@ def apply(repo, *, pr_index, root, remove, base=None, run=git, forge_note=None):
             result.prune_error = _tail(proc)
     for row in checked.registered:
         if not row.planned:
+            continue
+        if os.path.commonpath([os.path.realpath(row.path), checked.root]) != checked.root:
+            result.kept.append((row.path, "escapes the worktree root"))
             continue
         fresh = _registered_row(
             checked.repo,

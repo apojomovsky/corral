@@ -29,9 +29,17 @@ def empty_pr_index():
     return {}
 
 
-def plan_json(plan):
-    """The machine-readable plan."""
-    return json.dumps(gc.plan_dict(plan), indent=2, sort_keys=True) + "\n"
+def plan_json(plan, result=None):
+    """The machine-readable plan, with the apply result nested when given."""
+    doc = gc.plan_dict(plan)
+    if result is not None:
+        doc["applied"] = {
+            "pruned": result.pruned,
+            "prune_error": result.prune_error,
+            "removed": list(result.removed),
+            "kept": [{"path": path, "reason": reason} for path, reason in result.kept],
+        }
+    return json.dumps(doc, indent=2, sort_keys=True) + "\n"
 
 
 def production_remove(repo, root_real):
@@ -59,6 +67,11 @@ def _err(text):
 
 def cmd_gc(args: argparse.Namespace) -> int:
     repo = os.path.abspath(args.repo or os.getcwd())
+    top = gc.git(["rev-parse", "--show-toplevel"], cwd=repo)
+    if top.returncode != 0:
+        _err(f"not a git clone: {repo}")
+        return UNREACHABLE
+    repo = os.path.realpath(top.stdout.strip())
     try:
         cfg = settings.load(root=settings.find_root(repo))
         root_setting = cfg["git.worktrees"]
@@ -89,7 +102,7 @@ def cmd_gc(args: argparse.Namespace) -> int:
         _err(str(err))
         return UNREACHABLE
     if args.json:
-        sys.stdout.write(plan_json(plan))
+        sys.stdout.write(plan_json(plan, result))
     else:
         text = gc.format_plan(plan)
         sys.stdout.write((text + "\n") if text else "")
@@ -98,14 +111,16 @@ def cmd_gc(args: argparse.Namespace) -> int:
             print("nothing to do")
         return NOTHING
     if result is not None:
+        # stdout stays one JSON document under --json; the report goes to stderr.
+        report = sys.stderr if args.json else sys.stdout
         if result.pruned:
-            print("applied: pruned stale worktree entries")
+            print("applied: pruned stale worktree entries", file=report)
         elif result.prune_error is not None:
-            print(f"kept: prune failed ({result.prune_error})")
+            print(f"kept: prune failed ({result.prune_error})", file=report)
         for path in result.removed:
-            print(f"applied: removed {path}")
+            print(f"applied: removed {path}", file=report)
         for path, reason in result.kept:
-            print(f"kept: {path} ({reason})")
+            print(f"kept: {path} ({reason})", file=report)
     return OK
 
 

@@ -10,6 +10,7 @@ import inspect
 import io
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -455,6 +456,99 @@ class GcTest(unittest.TestCase):
         code, _ = self._run_gc(self._args(apply=True))
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(path))
+
+    def test_registered_escape_between_plan_and_apply_is_kept(self):
+        self._land("wt-esc")
+        path = self._add_worktree("esc-wt", "on-esc")
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        real_row = gc._registered_row
+
+        def swapping(repo, base, wt_path, branch, categories, run):
+            row = real_row(repo, base, wt_path, branch, categories, run)
+            if wt_path == path and row.planned:
+                shutil.rmtree(wt_path)
+                os.symlink(outside, wt_path)
+                return gc.RegisteredRow(wt_path, branch, row.category, True, row.reason)
+            return row
+
+        removed = []
+        with mock.patch.object(gc, "_registered_row", side_effect=swapping):
+            _, result = gc.apply(
+                self.repo.path,
+                base=BASE,
+                pr_index={"on-esc": "merged"},
+                root=".worktrees/",
+                remove=removed.append,
+            )
+        self.assertEqual(removed, [])
+        kept = dict(result.kept)
+        self.assertIn(path, kept)
+        self.assertIn("escapes", kept[path])
+        self.assertTrue(os.path.isdir(outside))
+
+    def test_json_apply_stdout_is_one_document(self):
+        path = self._dangling()
+        code, out = self._run_gc(self._args(json=True, apply=True))
+        self.assertEqual(code, 0)
+        body = json.loads(out)
+        self.assertEqual(body["applied"]["removed"], [path])
+        self.assertFalse(os.path.exists(path))
+
+    def test_repo_subdir_resolves_to_toplevel(self):
+        path = self._dangling()
+        sub = os.path.join(self.repo.path, "sub")
+        os.makedirs(sub)
+        code, _ = self._run_gc(self._args(repo=sub, apply=True))
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(path))
+
+    def test_bad_settings_is_usage_error(self):
+        with mock.patch.object(
+            gccli.settings, "load", side_effect=gccli.settings.SettingsError("bad config")
+        ):
+            with mock.patch.object(gccli.settings, "find_root", return_value=None):
+                code = gccli.cmd_gc(self._args())
+        self.assertEqual(code, 4)
+
+    def test_superseded_worktree_is_not_planned(self):
+        self.repo.checkout("sq-wt", new=True)
+        self.repo.write("sq-wt.txt", "sq\n")
+        self.repo.git("add", "-A")
+        self.repo.commit("add widget for worktree")
+        self.repo.checkout(BASE)
+        self.assertEqual(self.repo.git("merge", "--squash", "sq-wt").returncode, 0)
+        self.assertEqual(
+            self.repo.git(
+                "commit", "-q", "-m", "add widget for worktree", "-m", "squashed"
+            ).returncode,
+            0,
+        )
+        os.makedirs(self.repo.worktrees_root(), exist_ok=True)
+        proc = self.repo.git(
+            "worktree", "add", os.path.join(self.repo.path, ".worktrees", "sq"), "sq-wt"
+        )
+        assert proc.returncode == 0, proc.stderr
+        plan = gc.plan(self.repo.path, base=BASE, pr_index={}, root=".worktrees/")
+        rows = {os.path.basename(r.path): r for r in plan.registered}
+        self.assertFalse(rows["sq"].planned)
+        self.assertIn("superseded", rows["sq"].reason)
+        self.assertFalse(any(r.planned for r in plan.registered))
+
+    def test_hostile_branch_name_is_quoted(self):
+        name = "evil$(touch-pwned)"
+        self.repo.checkout(name, new=True)
+        self.repo.write("evil.txt", "evil\n")
+        self.repo.git("add", "-A")
+        self.repo.commit("evil work")
+        self.repo.checkout(BASE)
+        self.repo.git("merge", "-q", name)
+        plan = gc.plan(self.repo.path, base=BASE, pr_index={}, root=".worktrees/")
+        quoted = shlex.quote(name)
+        self.assertIn(f"git branch -d {quoted}", gc.format_plan(plan))
+        body = json.loads(gccli.plan_json(plan))
+        cmds = {b["name"]: b["delete_command"] for b in body["branches"]}
+        self.assertEqual(cmds[name], f"git branch -d {quoted}")
 
 
 if __name__ == "__main__":
