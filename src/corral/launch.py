@@ -11,9 +11,9 @@ Every subprocess and every listing goes through an injected seam:
 `stop_fn(unit)` stops one. `stop_fn` has no default. Only the CLI passes
 the production stop (see `corral.launchcli`).
 
-Errors carry the public exit code: LaunchError 4, CapFull 75. The units
-errors (UnitExists 2, Unreachable 3, UnitsError 4) pass through unchanged.
-
+Errors carry the public exit code: LaunchError 4, CapFull 75, HeldError 1.
+The units errors (UnitExists 2, Unreachable 3, UnitsError 4) pass through
+unchanged.
 A launch or resume writes nothing into the ticket's session until its
 second admission has passed, under the same spawn lock as the start. A
 launch that loses the race leaves the live agent's session as it was.
@@ -59,6 +59,12 @@ class CapFull(LaunchError):
     """Every agent slot on this host is taken: try later (exit 75)."""
 
     exit_code = 75
+
+
+class HeldError(LaunchError):
+    """The ticket carries the hold label, or its labels are unreadable: no resume (exit 1)."""
+
+    exit_code = 1
 
 
 @dataclass(frozen=True)
@@ -383,6 +389,7 @@ def resume(
     number,
     message,
     *,
+    hold_reason_fn,
     model=None,
     list_fn,
     run,
@@ -391,8 +398,14 @@ def resume(
     """Resume ticket `number`'s newest runtime session in a new unit. Returns `(unit, workdir)`.
 
     The runtime is the one the session recorded at launch. Raises LaunchError
-    when there is no session to resume.
+    when there is no session to resume, and HeldError when the ticket is
+    held for a human. `hold_reason_fn(tgt, number)` returns the hold text,
+    or None when the ticket is free to resume; it is required, and it runs
+    before the spawn lock is taken or any worktree is touched.
     """
+    reason = hold_reason_fn(tgt, number)
+    if reason is not None:
+        raise HeldError(reason)
     _check_text(message, "message")
     model = _check_model(model)
     session = _session(tgt, number)

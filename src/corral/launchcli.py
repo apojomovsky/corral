@@ -1,10 +1,11 @@
 """`corral launch|resume|stop|tail`: the agent verbs over `corral.launch`.
 
-Exit codes: 0 ok; 1 nothing to stop (no live agent of the ticket at all);
-2 already live or race lost, or, for stop, a live unit this ticket's log
-does not prove ours was left running (it is named on stderr and never
-stopped); 3 systemd or a host unreachable; 4 usage or configuration error;
-75 no free slot.
+Exit codes: 0 ok; 1 nothing to stop (no live agent of the ticket at all),
+or a resume refused while the ticket carries the hold label (a human
+removes the label); 2 already live or race lost, or, for stop, a live
+unit this ticket's log does not prove ours was left running (it is named
+on stderr and never stopped); 3 systemd or a host unreachable; 4 usage
+or configuration error; 75 no free slot.
 
 The production seams are built in one place, `production_seams`, and passed
 to `add_parser` as a required argument. A test passes fakes instead.
@@ -17,7 +18,18 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
-from corral import admission, launch, models, paths, projects, prompts, runtimes, settings, units
+from corral import (
+    admission,
+    hold,
+    launch,
+    models,
+    paths,
+    projects,
+    prompts,
+    runtimes,
+    settings,
+    units,
+)
 from corral import worktrees
 
 
@@ -46,20 +58,36 @@ class Seams(NamedTuple):
     stop_fn: Callable[[str], object]
     #: The board store's item for `(repo, number)`, or None. Read-only; tests pass a fake.
     board_fn: Callable | None = None
+    #: The live label read `labels_fn(kind, repo, number) -> list[str]`,
+    #: where `kind` is `"issue"` or `"pr"` and `repo` is the tracker repo.
+    #: None means there is no way to read labels: the resume refuses
+    #: fail-closed, never as "no labels". Tests pass a fake.
+    labels_fn: Callable | None = None
 
 
 def production_seams() -> Seams:
     """The real seams. Only the CLI builds them; tests never call this."""
+    from corral.github import tracker as ghtracker
+    from corral.github.gh import paced_run
+
+    live = ghtracker.GithubTracker(paced_run)
+
+    def labels_fn(kind, repo, number):
+        # A PR is an item in the same issues feed, so both kinds read one way.
+        return list(live.item(repo, number).labels)
+
     return Seams(
         list_fn=lambda prefix: units.list_units(prefix, run=units.default_run),
         run=units.default_run,
         stop_fn=units.systemctl_stop,
+        labels_fn=labels_fn,
     )
 
 
 #: Errors the verbs report as one line on stderr. Anything else is a bug.
 KNOWN = (
     admission.LimitsError,
+    launch.HeldError,
     launch.LaunchError,
     models.Exhausted,
     projects.ProjectsError,
@@ -217,11 +245,30 @@ def cmd_launch(args, seams: Seams) -> int:
 
 
 def cmd_resume(args, seams: Seams) -> int:
+    from corral import syncli
+
     tgt = _target(args)
+    tracker_repo, problem = syncli._tracker_repo(tgt.root, tgt.repo, tgt.resolved, worktrees.git)
+    if problem is not None:
+        raise launch.LaunchError(problem)
+    labels_fn = seams.labels_fn
+
+    def read(kind, repo, number):
+        if labels_fn is None:
+            raise RuntimeError("no label read")
+        return labels_fn(kind, repo, number)
+
+    hold_label = tgt.resolved["board.hold_label"]
+
+    def hold_reason_fn(t, n):
+        # Linked PRs are not looked up in this ticket.
+        return hold.reason(read, (tracker_repo, n), (), hold_label=hold_label)
+
     unit, workdir = launch.resume(
         tgt,
         args.number,
         args.message,
+        hold_reason_fn=hold_reason_fn,
         model=args.model,
         list_fn=seams.list_fn,
         run=seams.run,
