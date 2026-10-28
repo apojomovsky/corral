@@ -76,6 +76,7 @@ PROVIDERS = (
     "corral.quota",
     "corral.registry",
     "corral.runtimes",
+    "corral.sync",
     "corral.units",
 )
 
@@ -197,6 +198,34 @@ def _load(path):
         raise SettingsError(f"{path}: {err}") from None
 
 
+def _repo_entries(repos, project_name):
+    """``{name: {dotted key: checked value}}`` for each ``[[repo]]``
+    entry, in file order. The one validation of entry names and keys."""
+    if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
+        raise SettingsError(f"{project_name}: [[repo]] must be an array of tables")
+    entries: dict = {}
+    for index, raw in enumerate(repos, 1):
+        entry = dict(raw)
+        name = entry.pop("name", None)
+        if not isinstance(name, str) or not name:
+            raise SettingsError(f"{project_name}: [[repo]] number {index} needs a name")
+        if name in entries:
+            raise SettingsError(f"{project_name}: [[repo]] {name!r} appears twice")
+        where = f"{project_name} [[repo]] {name}"
+        entries[name] = {k: _check(k, v, where) for k, v in _flatten(entry, where).items()}
+    return entries
+
+
+def repo_names(root):
+    """Names of the ``[[repo]]`` entries in the ops root's corral.toml,
+    in file order. Empty when there is no root or no file."""
+    if not root:
+        return []
+    project_path = os.path.join(root, PROJECT_FILE)
+    project = _load(project_path)
+    return list(_repo_entries(project.get("repo", []), project_path))
+
+
 def find_root(start):
     """The nearest directory at or above `start` holding corral.toml, else None."""
     here = os.path.abspath(start)
@@ -232,21 +261,10 @@ def resolve(
         result[key] = Value(_check(key, value, host_name), HOST)
 
     repos = project.pop("repo", [])
-    if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
-        raise SettingsError(f"{project_name}: [[repo]] must be an array of tables")
     chains = _check_models(project.pop("models", {}), project_name)
     for key, value in _flatten(project, project_name).items():
         result[key] = Value(_check(key, value, project_name), PROJECT)
-    entries = {}
-    for index, raw in enumerate(repos, 1):
-        entry = dict(raw)
-        name = entry.pop("name", None)
-        if not isinstance(name, str) or not name:
-            raise SettingsError(f"{project_name}: [[repo]] number {index} needs a name")
-        if name in entries:
-            raise SettingsError(f"{project_name}: [[repo]] {name!r} appears twice")
-        where = f"{project_name} [[repo]] {name}"
-        entries[name] = {k: _check(k, v, where) for k, v in _flatten(entry, where).items()}
+    entries = _repo_entries(repos, project_name)
     if repo is not None:
         if repo not in entries:
             raise SettingsError(f"{project_name}: no [[repo]] named {repo!r}")
