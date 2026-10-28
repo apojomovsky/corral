@@ -58,6 +58,10 @@ make install      # uv tool install
 | `corral resume REPO N --message TEXT [--model M] [--root PATH]` | resume the ticket's newest runtime session in a new unit; exit 4 when there is no session to resume |
 | `corral stop REPO N [--root PATH]` | stop the ticket's live agents that its own log proves it started; exit 1 when none is live, exit 2 when a live unit the log does not prove ours is left running (named on stderr, never stopped) |
 | `corral tail REPO N [--last K] [--root PATH]` | show the ticket's agent activity, from its session file |
+| `corral quota [--json]` | the provider pool and its quota ledger: state, windows, marks and staleness |
+| `corral quota refresh [provider]` | run the readers, record readings or failures; exit 3 when every reader failed |
+| `corral quota mark PROVIDER [--until T] [--reason R]` | block a provider until T (default: now plus the cooldown); exit 1 when a further mark stands |
+| `corral quota unmark PROVIDER [--reason R]` | release a provider's mark early; exit 1 when none is stored |
 | `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
 
 Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project. `corral config show` lists every setting. A `[[repo]]` entry sets `clone.path` (the repository's main clone, relative to the ops root) and `clone.default_branch` (default `main`), which `corral launch` needs. The provider pool lives beside the host config in `accounts.toml`: one `[[provider]]` entry per provider, naming its quota reader; a missing file means an empty pool. A project declares its model chains in the same `corral.toml`:
