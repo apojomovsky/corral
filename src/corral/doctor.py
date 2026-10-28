@@ -14,12 +14,13 @@ import functools
 import getpass
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
-
 from corral import accounts, deps, paths, registry, settings, units
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
@@ -50,9 +51,19 @@ class Env(NamedTuple):
     reader_errors: Sequence[tuple[str, str, str]]
     registry_rows: Sequence[tuple[Mapping, str]]
     registry_error: str | None = None
+    deps_error: str | None = None
 
 
-def _check_deps(results: Sequence[deps.Result]) -> list[Check]:
+def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
+    if error is not None:
+        return [
+            Check(
+                "deps",
+                "fail",
+                error,
+                "reinstall corral so system_deps.toml parses, then run `corral deps`",
+            )
+        ]
     failed = [r for r in results if r.problem and not r.dep.optional]
     if not failed:
         total = len([r for r in results if not r.dep.optional])
@@ -117,15 +128,20 @@ def _linger_fix() -> str:
     return "log in on the host console so the user manager starts"
 
 
+_MANAGER_BUS_FIX = "log in again so the user manager starts, then list the user units"
+
+
 def _check_manager(prefix: str, list_fn: Callable[[str], list]) -> Check:
     try:
         found = list_fn(prefix)
+    except units.Unreachable as err:
+        return Check("user-manager", "fail", str(err), _MANAGER_BUS_FIX)
     except units.UnitsError as err:
         return Check(
             "user-manager",
             "fail",
             str(err),
-            "log in again so the user manager starts, then list the user units",
+            "fix `agents.unit_prefix` in the host config, then run `corral doctor` again",
         )
     return Check("user-manager", "ok", f"the user manager answers ({len(found)} units)", "")
 
@@ -179,7 +195,7 @@ def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = Non
 def run_checks(env: Env) -> list[Check]:
     """Every check, in report order. Pure over the seams in `env`."""
     return [
-        *_check_deps(env.dep_results),
+        *_check_deps(env.dep_results, env.deps_error),
         _check_accounts(env.account_problems),
         _check_settings(env.settings_error),
         _check_state_dirs(env.state_error),
@@ -193,11 +209,17 @@ def run_checks(env: Env) -> list[Check]:
 def exit_code(checks: Sequence[Check]) -> int:
     """0 ok or warn only, 1 at least one fail, 3 the manager bus is gone.
 
-    Only linger and the user manager fail on an unreachable bus, so their
-    failure alone selects 3.
+    Only an unreachable bus selects 3: a linger failure, or a user-manager
+    failure with the bus fix. A bad `agents.unit_prefix` is an ordinary
+    fail with exit 1.
     """
-    if any(c.status == "fail" and c.name in ("linger", "user-manager") for c in checks):
-        return UNREACHABLE
+    for check in checks:
+        if check.status != "fail":
+            continue
+        if check.name == "linger":
+            return UNREACHABLE
+        if check.name == "user-manager" and check.fix == _MANAGER_BUS_FIX:
+            return UNREACHABLE
     if any(c.status == "fail" for c in checks):
         return 1
     return OK
@@ -232,7 +254,8 @@ def check_state_dirs(env: Mapping[str, str] | None = None) -> str | None:
     """None when the state and config dirs exist and take a probe write.
 
     The probe goes through the one atomic-write helper and is removed
-    after, so a passing check leaves nothing behind.
+    after, so a passing check leaves nothing behind. The probe name carries
+    the pid so two concurrent doctors do not share it.
     """
     try:
         targets = (paths.state_dir(env), paths.config_dir(env))
@@ -241,9 +264,12 @@ def check_state_dirs(env: Mapping[str, str] | None = None) -> str | None:
     for target in targets:
         try:
             os.makedirs(target, exist_ok=True)
-            probe = os.path.join(target, ".doctor-probe")
+            probe = os.path.join(target, f".doctor-probe-{os.getpid()}")
             paths.atomic_write_text(probe, "ok")
-            os.unlink(probe)
+            try:
+                os.unlink(probe)
+            except FileNotFoundError:
+                pass
         except OSError as err:
             return f"{target} is not writable: {err}"
     return None
@@ -259,9 +285,28 @@ def _resolved_settings(
         return None, str(err)
 
 
+def _production_settings(
+    env: Mapping[str, str] | None = None,
+) -> tuple[settings.Resolved | None, str | None]:
+    """The live settings without ever raising on a deleted working directory."""
+    try:
+        start = os.getcwd()
+    except OSError as err:
+        return None, f"cannot determine the working directory: {err}"
+    return _resolved_settings(start, env)
+
+
 def check_settings(start: str, env: Mapping[str, str] | None = None) -> str | None:
     """None when the host config and the ops root's file resolve."""
     return _resolved_settings(start, env)[1]
+
+
+def load_dep_results() -> tuple[list[deps.Result], str | None]:
+    """(results, error): the dep probes and their load failure, gathered once."""
+    try:
+        return deps.check_all(deps.load()), None
+    except (tomllib.TOMLDecodeError, OSError, TypeError, KeyError, re.error) as err:
+        return [], str(err)
 
 
 def load_readers(config_dir: str | None = None) -> list[tuple[str, str, str]]:
@@ -295,7 +340,7 @@ def production_env() -> Env:
     Every fallible gathering degrades to report data: a broken host config
     or an unusable state dir is a failing row, never a traceback.
     """
-    resolved, settings_error = _resolved_settings(os.getcwd())
+    resolved, settings_error = _production_settings()
     if resolved is not None:
         prefix = str(resolved["agents.unit_prefix"])
         try:
@@ -320,8 +365,10 @@ def production_env() -> Env:
     except (paths.PathError, settings.SettingsError, registry.RegistryError) as err:
         registry_rows = ()
         registry_error = str(err)
+    dep_results, deps_error = load_dep_results()
     return Env(
-        dep_results=deps.check_all(deps.load()),
+        dep_results=dep_results,
+        deps_error=deps_error,
         account_problems=account_problems,
         settings_error=settings_error,
         state_error=check_state_dirs(),

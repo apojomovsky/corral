@@ -3,12 +3,15 @@
 import io
 import json
 import os
+import re
 import subprocess
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from corral import cli, deps, doctor, registry, units
 
@@ -126,6 +129,14 @@ class EachCheckFailingAlone(unittest.TestCase):
         checks = doctor.run_checks(env(dep_results=(deps.Result(entry, None, "missing"),)))
         found = [check for check in checks if check.name == "deps"]
         self.assertEqual([check.status for check in found], ["ok"])
+
+    def test_a_deps_load_error_is_a_failing_deps_row_with_exit_1(self):
+        checks = doctor.run_checks(env(deps_error="system_deps.toml: bad toml"))
+        failed = [check for check in checks if check.name == "deps"]
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertIn("bad toml", failed[0].detail)
+        self.assertTrue(failed[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
 
     def test_account_problems_fail(self):
         checks = doctor.run_checks(env(account_problems=("accounts.toml: boom",)))
@@ -272,7 +283,33 @@ class StateDirs(unittest.TestCase):
             {"CORRAL_STATE": blocked, "CORRAL_CONFIG": os.path.join(root, "config")}
         )
         self.assertIsNotNone(error)
-        self.assertIn(blocked, error or "")
+
+    def test_a_missing_probe_on_unlink_still_passes(self):
+        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        env_map = {
+            "CORRAL_STATE": os.path.join(root, "state"),
+            "CORRAL_CONFIG": os.path.join(root, "config"),
+        }
+        with mock.patch.object(doctor.os, "unlink", side_effect=FileNotFoundError("gone")):
+            self.assertIsNone(doctor.check_state_dirs(env_map))
+
+    def test_probe_names_carry_the_pid(self):
+        seen = []
+        real = doctor.paths.atomic_write_text
+
+        def spy(path, text):
+            seen.append(path)
+            return real(path, text)
+
+        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        env_map = {
+            "CORRAL_STATE": os.path.join(root, "state"),
+            "CORRAL_CONFIG": os.path.join(root, "config"),
+        }
+        with mock.patch.object(doctor.paths, "atomic_write_text", side_effect=spy):
+            self.assertIsNone(doctor.check_state_dirs(env_map))
+        self.assertTrue(seen)
+        self.assertTrue(all(str(os.getpid()) in path for path in seen))
 
 
 class SettingsResolution(unittest.TestCase):
@@ -293,6 +330,42 @@ class SettingsResolution(unittest.TestCase):
         config = tempfile.mkdtemp(prefix="corral-doctor-")
         self.write(root, "corral.toml", "[models.default]\nchain = ['pool/model']\n")
         self.assertIsNone(doctor.check_settings(root, {"CORRAL_CONFIG": config}))
+
+
+class ProductionGathering(unittest.TestCase):
+    def test_a_corrupt_packaged_toml_degrades_to_a_deps_error(self):
+        for error in (
+            tomllib.TOMLDecodeError("boom", "x=", 0),
+            OSError("gone"),
+            TypeError("bad entry"),
+            KeyError("probe"),
+        ):
+            with mock.patch.object(doctor.deps, "load", side_effect=error):
+                results, deps_error = doctor.load_dep_results()
+            self.assertEqual(results, [])
+            self.assertIsNotNone(deps_error)
+
+    def test_a_bad_probe_regex_degrades_to_a_deps_error(self):
+        with mock.patch.object(doctor.deps, "check_all", side_effect=re.error("unbalanced")):
+            results, deps_error = doctor.load_dep_results()
+        self.assertEqual(results, [])
+        self.assertIsNotNone(deps_error)
+
+    def test_a_deleted_working_directory_is_a_settings_failure(self):
+        here = os.getcwd()
+        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        os.chdir(root)
+        try:
+            os.rmdir(root)
+            resolved, error = doctor._production_settings()
+        finally:
+            os.chdir(here)
+        self.assertIsNone(resolved)
+        self.assertIsNotNone(error)
+        checks = doctor.run_checks(env(settings_error=error))
+        failed = [check for check in checks if check.name == "settings"]
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 1)
 
 
 class Command(unittest.TestCase):
@@ -344,6 +417,16 @@ class FailClosed(unittest.TestCase):
         failed = [check for check in checks if check.name == "user-manager"]
         self.assertEqual([check.status for check in failed], ["fail"])
         self.assertIn("bad prefix", failed[0].detail)
+
+    def test_an_invalid_prefix_names_the_setting_and_exits_1(self):
+        def list_fn(prefix):
+            raise units.UnitsError("unit prefix 'bad prefix!' must be letters")
+
+        checks = doctor.run_checks(env(list_fn=list_fn))
+        failed = [check for check in checks if check.name == "user-manager"]
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertIn("agents.unit_prefix", failed[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
 
     def test_a_reader_failure_without_names_keeps_the_bare_check_name(self):
         checks = doctor.run_checks(env(reader_errors=(("", "", "boom"),)))
