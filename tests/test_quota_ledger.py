@@ -126,6 +126,12 @@ class ReactiveMarks(unittest.TestCase):
         self.assertEqual(set(fresh["marks"]), {"provider-a"})
         self.assertIn("provider-a", ledger["marks"])
 
+    def test_prune_boundary_matches_active_mark(self):
+        ledger, _ = ql.post_mark(ql.empty(), "provider-a", T0)
+        self.assertIsNone(ql.active_mark(ledger, "provider-a", T0))
+        fresh, dropped = ql.prune(ledger, T0)
+        self.assertEqual((dropped, fresh["marks"]), (["provider-a"], {}))
+
     def test_prune_with_nothing_expired_drops_nothing(self):
         ledger, _ = ql.post_mark(ql.empty(), "provider-a", T0 + 60)
         fresh, dropped = ql.prune(ledger, T0)
