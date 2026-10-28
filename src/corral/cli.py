@@ -5,7 +5,7 @@ import os
 import sys
 from collections.abc import Sequence
 
-from corral import agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
+from corral import accounts, agentcli, coordcli, deps, launchcli, paths, reviewcli, settings
 from corral.github import ghcli
 
 # Exit codes are a public interface (AGENTS.md).
@@ -15,6 +15,11 @@ OK, NO, RACE, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 2, 3, 4, 75
 def cmd_deps(args: argparse.Namespace) -> int:
     text, ok = deps.report(deps.check_all(deps.load()))
     sys.stdout.write(text)
+    problems = accounts.check()
+    for problem in problems:
+        print(f"corral: {problem}", file=sys.stderr)
+    if problems:
+        return USAGE
     return OK if ok else NO
 
 
@@ -156,6 +161,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return OK if err.code == 0 else USAGE
     try:
         return args.func(args)
-    except paths.PathError as err:
+    except (paths.PathError, accounts.AccountsError) as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
