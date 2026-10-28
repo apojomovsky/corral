@@ -62,7 +62,7 @@ make install      # uv tool install
 | `corral prompts eject ROLE [--ops DIR] [--force]` | copy the built-in template to `.corral/prompts/` for editing; prints the path and refuses to overwrite without `--force` |
 | `corral prompts check [--ops DIR]` | validate every override's placeholders and report stale ejections; exit 1 when something is stale or invalid |
 | `corral launch REPO N (--prompt-file F \| --role ROLE) [--title T] [--model M] [--runtime R] [--runtime-config JSON] [--root PATH]` | start an agent on ticket N of a repo in its own worktree, as a transient unit; `--role` renders the built-in worker, reviewer or triage prompt (title from the board store or `--title`); exit 75 when every slot is taken, 2 when the ticket is already live |
-| `corral resume REPO N --message TEXT [--model M] [--root PATH]` | resume the ticket's newest runtime session in a new unit; exit 4 when there is no session to resume |
+| `corral resume REPO N --message TEXT [--model M] [--root PATH]` | resume the ticket's newest runtime session in a new unit; refused with exit 1 while the ticket carries the hold label (a human removes the label); exit 4 when there is no session to resume |
 | `corral stop REPO N [--root PATH]` | stop the ticket's live agents that its own log proves it started; exit 1 when none is live, exit 2 when a live unit the log does not prove ours is left running (named on stderr, never stopped) |
 | `corral tail REPO N [--last K] [--root PATH]` | show the ticket's agent activity, from its session file |
 | `corral quota [--json]` | the provider pool and its quota ledger: state, windows, marks and staleness |
