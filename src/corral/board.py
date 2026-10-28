@@ -55,11 +55,8 @@ QUEUED = "queued"
 SENT = "sent"
 DROPPED = "dropped"
 
-#: Tracker fields people own: always take the tracker's value.
-PEOPLE_FIELDS = ("title", "body", "labels", "priority", "state", "assignees")
-
-#: Tracker-visible fields corral owns: the tracker's value applies only
-#: when no queued outbox row exists for the field.
+#: Corral-owned fields: the only field names ``enqueue`` accepts. A tracker
+#: reading never originates a value for these; it only settles queued writes.
 AGENT_FIELDS = ("agent", "status")
 
 _BUSY_TIMEOUT_MS = 5000
