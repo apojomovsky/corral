@@ -128,7 +128,7 @@ def _git(args, cwd):
             env=gitenv.clean_env(),
             timeout=worktrees.GIT_TIMEOUT_S,
         )
-    except OSError as err:
+    except (OSError, subprocess.TimeoutExpired) as err:
         raise TakeoffError(f"cannot run git in {cwd}: {err}") from None
 
 

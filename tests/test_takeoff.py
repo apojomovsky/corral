@@ -648,6 +648,48 @@ class TakeoffCase(unittest.TestCase):
         self.assertIn("line06", found.detail)
         self.assertNotIn("line05", found.detail)
 
+    def test_a_stalled_local_git_is_a_usage_error_not_a_traceback(self):
+        boom = subprocess.TimeoutExpired(["git", "status"], 300)
+        with mock.patch.object(takeoff.subprocess, "run", side_effect=boom):
+            with self.assertRaises(takeoff.TakeoffError):
+                takeoff._git(["status"], self.work)
+
+    def test_an_invalid_timeout_setting_is_a_usage_error(self):
+        for bad in ("0", "-5"):
+            with self.subTest(value=bad):
+                self.write_ops(
+                    "[[repo]]\n"
+                    f'name = "{REPO}"\n'
+                    f'clone.path = "{self.main}"\n'
+                    f'clone.default_branch = "{MAIN}"\n'
+                    'checks.test = "make test"\n'
+                    f"checks.timeout_s = {bad}\n"
+                )
+                with self.assertRaises(takeoff.TakeoffError):
+                    self.gate()
+
+    def test_a_detached_head_fails_the_worktree_check(self):
+        self.git("checkout", "-q", "--detach", cwd=self.work)
+        result = self.gate()
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.status(result, "worktree"), "fail")
+
+    def test_a_command_that_cannot_run_fails_the_checks_row(self):
+        def broken(cmd, cwd):
+            raise RuntimeError("no shell")
+
+        result = self.gate(run_cmd=broken)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "fail")
+        self.assertIn("could not run", found.detail)
+
+    def test_a_leak_collection_failure_is_a_usage_error(self):
+        with mock.patch.object(
+            takeoff.leakcli, "collect", side_effect=takeoff.leakcli.CollectError("x")
+        ):
+            with self.assertRaises(takeoff.TakeoffError):
+                self.gate()
+
     def test_production_run_cmd_kills_a_hanging_command(self):
         with self.assertRaises(subprocess.TimeoutExpired):
             takeoff.production_run_cmd("sleep 30", self.work, timeout=1)
