@@ -72,6 +72,7 @@ def register(key, type_, default, help_):
 PROVIDERS = (
     "corral.admission",
     "corral.detect",
+    "corral.disk",
     "corral.hold",
     "corral.launch",
     "corral.prompts",

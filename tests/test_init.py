@@ -213,6 +213,11 @@ TAIL = """# Defaults: uncomment to override.
 # board.hold_label = "hold"  # label that holds a ticket for a human
 # board.ready = "ready"  # label that makes an issue eligible
 #
+# [disk]
+# disk.min_free_gb = 5  # free gigabytes under which the disk reads low
+# disk.min_free_pct = 10  # free-space percent under which the disk reads low
+# disk.session_retention_days = 14  # days before a finished ticket's session dir is a reclaim candidate
+#
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
 # git.commits.conventional = true  # enforce Conventional Commits
@@ -294,6 +299,11 @@ commits.conventional = false
 #
 # [board]
 # board.hold_label = "hold"  # label that holds a ticket for a human
+#
+# [disk]
+# disk.min_free_gb = 5  # free gigabytes under which the disk reads low
+# disk.min_free_pct = 10  # free-space percent under which the disk reads low
+# disk.session_retention_days = 14  # days before a finished ticket's session dir is a reclaim candidate
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template

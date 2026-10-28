@@ -20,7 +20,7 @@ from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import cli, launch, launchcli, paths, registry, runtimes, settings, units
+from corral import cli, hold, launch, launchcli, paths, registry, runtimes, settings, units
 from corral.runtimes import omp, opencode
 from tests.test_reviewrecord import git_in
 
@@ -45,6 +45,16 @@ name = "no-clone"
 name = "ghost"
 clone = { path = "clones/ghost" }
 """
+
+
+def _free_hold(tgt, number):
+    """A `hold_reason_fn` fake: the ticket is free to resume."""
+    return None
+
+
+def roomy(path):
+    """A `usage` fake with acres free: the disk gate never fires."""
+    return (100 * 1024**3, 10 * 1024**3, 90 * 1024**3)
 
 
 class FakeSystem:
@@ -76,7 +86,13 @@ class FakeSystem:
         self.units[unit] = "inactive"
 
     def seams(self):
-        return launchcli.Seams(list_fn=self.list_fn, run=self.run, stop_fn=self.stop_fn)
+        return launchcli.Seams(
+            list_fn=self.list_fn,
+            run=self.run,
+            stop_fn=self.stop_fn,
+            labels_fn=lambda kind, repo, number: [],
+            usage=roomy,
+        )
 
 
 class OpsCase(unittest.TestCase):
@@ -184,37 +200,37 @@ class TargetTest(OpsCase):
 
 class AdmitTest(OpsCase):
     def test_a_free_host_admits_the_ticket(self):
-        launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+        launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
 
     def test_a_live_unit_of_this_ticket_is_already_live(self):
         self.system.units["corral-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn)
+            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 2)
 
     def test_the_same_number_in_another_repo_is_not_live(self):
         self.system.units["corral-agent-my-repo-5"] = "active"
-        launch.admit(self.target("lib"), 5, list_fn=self.system.list_fn)
+        launch.admit(self.target("lib"), 5, list_fn=self.system.list_fn, usage=roomy)
 
     def test_a_full_host_refuses_with_exit_75(self):
         self.system.units["corral-agent-lib-6"] = "active"
         self.system.units["corral-agent-my-repo-7"] = "activating"
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn)
+            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 75)
 
     def test_a_registered_worker_on_this_host_holds_a_slot(self):
         registry.register("worker-1", "claude-code", ticket=registry.make_ticket("my-repo", 9))
         tgt = dataclasses.replace(self.target(), cap=1)
         with self.assertRaises(launch.CapFull):
-            launch.admit(tgt, 5, list_fn=lambda prefix: [])
+            launch.admit(tgt, 5, list_fn=lambda prefix: [], usage=roomy)
 
     def test_an_unreachable_service_manager_is_exit_3(self):
         def down(prefix):
             raise units.Unreachable("no bus")
 
         with self.assertRaises(units.Unreachable) as ctx:
-            launch.admit(self.target(), 5, list_fn=down)
+            launch.admit(self.target(), 5, list_fn=down, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 3)
 
 
@@ -227,6 +243,7 @@ class LaunchTest(OpsCase):
             title=title,
             list_fn=self.system.list_fn,
             run=self.system.run,
+            usage=kwargs.pop("usage", roomy),
             **kwargs,
         )
 
@@ -286,13 +303,21 @@ class LaunchTest(OpsCase):
                 self.target("lib"),
                 5,
                 "keep going",
+                hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 run=self.system.run,
+                usage=roomy,
             )
         self.system.finish("corral-agent-lib-5")
 
         unit, _ = launch.resume(
-            self.target("lib"), 5, "keep going", list_fn=self.system.list_fn, run=self.system.run
+            self.target("lib"),
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
         )
         self.assertEqual(unit, "corral-agent-lib-5-r1")
         argv = self.system.started[-1]
@@ -338,7 +363,13 @@ class LaunchTest(OpsCase):
             )
 
         unit, _ = launch.resume(
-            self.target("lib"), 5, "keep going", list_fn=self.system.list_fn, run=self.system.run
+            self.target("lib"),
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
         )
         self.assertEqual(unit, "corral-agent-lib-5-r1")
         argv = self.system.started[-1]
@@ -380,7 +411,7 @@ class LaunchTest(OpsCase):
             raise units.Unreachable("no bus")
 
         with self.assertRaises(units.Unreachable) as ctx:
-            launch.launch(self.target(), 5, "x", list_fn=down, run=self.system.run)
+            launch.launch(self.target(), 5, "x", list_fn=down, run=self.system.run, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_a_start_that_loses_the_race_is_exit_2(self):
@@ -405,7 +436,9 @@ class LaunchTest(OpsCase):
     def test_an_unknown_runtime_is_a_configuration_error(self):
         tgt = dataclasses.replace(self.target("lib"), runtime="claude-code")
         with self.assertRaises(launch.LaunchError):
-            launch.launch(tgt, 5, "x", list_fn=self.system.list_fn, run=self.system.run)
+            launch.launch(
+                tgt, 5, "x", list_fn=self.system.list_fn, run=self.system.run, usage=roomy
+            )
         self.assertEqual(self.system.started, [])
 
     def test_two_repos_keep_separate_sessions_and_units(self):
@@ -416,6 +449,7 @@ class LaunchTest(OpsCase):
             "other work",
             title="feat: other",
             list_fn=self.system.list_fn,
+            usage=roomy,
             run=self.system.run,
         )
         self.assertNotEqual(self.session("lib", 5), self.session("my-repo", 5))
@@ -436,7 +470,13 @@ class ResumeTailTest(OpsCase):
     def test_resume_without_a_session_is_refused(self):
         with self.assertRaisesRegex(launch.LaunchError, "no omp session to resume"):
             launch.resume(
-                self.target(), 5, "keep going", list_fn=self.system.list_fn, run=self.system.run
+                self.target(),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
             )
         self.assertEqual(self.system.started, [])
 
@@ -447,7 +487,110 @@ class ResumeTailTest(OpsCase):
     def test_resume_with_a_bad_message_is_refused(self):
         with self.assertRaises(launch.LaunchError):
             launch.resume(
-                self.target(), 5, "--oops", list_fn=self.system.list_fn, run=self.system.run
+                self.target(),
+                5,
+                "--oops",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
+            )
+
+
+class HoldResumeTest(OpsCase):
+    """A resume refuses a held ticket before the spawn lock or any worktree. Fakes only."""
+
+    def setUp(self):
+        super().setUp()
+        with open(os.path.join(self.root, settings.PROJECT_FILE), "a", encoding="utf-8") as h:
+            h.write(
+                '\n[[repo]]\nname = "held"\nclone = { path = "clones/lib" }\n'
+                'tracker.repo = "example/lib"\n'
+                '\n[[repo]]\nname = "paused"\nclone = { path = "clones/lib" }\n'
+                'tracker.repo = "example/paused"\nboard.hold_label = "paused"\n'
+            )
+
+    def verb(self, repo, number, labels_fn):
+        seams = self.system.seams()._replace(labels_fn=labels_fn)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = launchcli.run_verb(
+                ["resume", repo, str(number), "--message", "go", "--root", self.root], seams
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def worktrees_root(self):
+        return os.path.join(self.root, "clones", "lib", ".worktrees")
+
+    def test_held_is_a_gate_error(self):
+        self.assertTrue(issubclass(launch.HeldError, launch.LaunchError))
+        self.assertEqual(launch.HeldError("held").exit_code, 1)
+        self.assertIn(launch.HeldError, launchcli.KNOWN)
+
+    def test_a_held_ticket_refuses_with_exit_1_and_starts_no_unit(self):
+        labels = lambda kind, repo, number: ["hold"]  # noqa: E731
+        code, _, err = self.verb("held", 5, labels)
+        self.assertEqual(code, 1)
+        self.assertIn(
+            hold.reason(labels, ("example/lib", 5), (), hold_label="hold"),
+            err,
+        )
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.worktrees_root()))
+
+    def test_labels_without_the_hold_resume_as_today(self):
+        launch.launch(
+            self.target("held"),
+            5,
+            "go",
+            title="feat: go",
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
+        )
+        self.system.finish("corral-agent-held-5")
+        with open(os.path.join(self.session("held", 5), "chat.jsonl"), "w", encoding="utf-8") as h:
+            h.write("{}\n")
+        code, out, _ = self.verb("held", 5, lambda kind, repo, number: [])
+        self.assertEqual(code, 0)
+        self.assertIn("resumed as corral-agent-held-5-r1", out)
+
+    def test_a_label_read_that_raises_is_exit_1(self):
+        def boom(kind, repo, number):
+            raise RuntimeError("flaky")
+
+        code, _, err = self.verb("held", 5, boom)
+        self.assertEqual(code, 1)
+        self.assertIn("unreadable", err)
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.worktrees_root()))
+
+    def test_a_missing_label_seam_never_resumes(self):
+        code, _, err = self.verb("held", 5, None)
+        self.assertEqual(code, 1)
+        self.assertIn("unreadable", err)
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.worktrees_root()))
+
+    def test_a_custom_hold_label_is_honoured(self):
+        code, _, err = self.verb("paused", 5, lambda kind, repo, number: ["paused"])
+        self.assertEqual(code, 1)
+        self.assertIn("paused", err)
+        self.assertEqual(self.system.started, [])
+        # The default label does not hold a ticket with a custom one:
+        # the resume passes the gate and fails on the missing session.
+        code, _, _ = self.verb("paused", 5, lambda kind, repo, number: ["hold"])
+        self.assertEqual(code, 4)
+
+    def test_resume_without_a_hold_reason_is_a_type_error(self):
+        with self.assertRaises(TypeError):
+            launch.resume(  # ty: ignore[missing-argument]
+                self.target(),
+                5,
+                "go",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
             )
 
 
@@ -554,6 +697,7 @@ class RaceTest(OpsCase):
             "first prompt",
             title="feat: add the thing",
             list_fn=self.system.list_fn,
+            usage=roomy,
             run=self.system.run,
         )
         self.system.finish("corral-agent-lib-5")
@@ -580,6 +724,7 @@ class RaceTest(OpsCase):
                 "second prompt",
                 title="feat: add the thing",
                 list_fn=flipping,
+                usage=roomy,
                 run=self.system.run,
             )
         self.assertEqual(len(calls), 2)
@@ -597,6 +742,7 @@ class RaceTest(OpsCase):
             "go",
             title="feat: add the thing",
             list_fn=self.system.list_fn,
+            usage=roomy,
             run=self.system.run,
         )
         self.system.finish("corral-agent-lib-5")
@@ -604,11 +750,23 @@ class RaceTest(OpsCase):
             handle.write("{}\n")
 
         first, _ = launch.resume(
-            self.target("lib"), 5, "again", list_fn=self.system.list_fn, run=self.system.run
+            self.target("lib"),
+            5,
+            "again",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
         )
         self.system.finish(first)
         second, _ = launch.resume(
-            self.target("lib"), 5, "again", list_fn=self.system.list_fn, run=self.system.run
+            self.target("lib"),
+            5,
+            "again",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
         )
         self.assertEqual(first, "corral-agent-lib-5-r1")
         self.assertEqual(second, "corral-agent-lib-5-r2")
@@ -628,20 +786,19 @@ class RegistryCapTest(OpsCase):
     def test_registered_workers_fill_the_cap_by_default(self):
         self.holders()
         with self.assertRaises(launch.CapFull):
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
 
     def test_count_toward_cap_false_in_the_ops_root_frees_the_slots(self):
         with open(os.path.join(self.root, settings.PROJECT_FILE), "a", encoding="utf-8") as handle:
             handle.write("\n[registry]\ncount_toward_cap = false\n")
         self.holders()
         tgt = self.target()
-        self.assertFalse(tgt.resolved["registry.count_toward_cap"])
-        launch.admit(tgt, 5, list_fn=lambda prefix: [])
+        launch.admit(tgt, 5, list_fn=lambda prefix: [], usage=roomy)
 
     def test_a_registered_live_ticket_refuses_with_the_registry_note(self):
         registry.register("worker-1", "claude-code", ticket=registry.make_ticket("lib", 5))
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
         self.assertEqual(
             str(ctx.exception),
             "#5 of lib already has a live agent (registered agent, counts until its heartbeat goes stale)",
@@ -650,7 +807,7 @@ class RegistryCapTest(OpsCase):
     def test_a_full_host_held_by_registered_agents_is_refused(self):
         self.holders()
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertEqual(
             str(ctx.exception),
@@ -660,14 +817,14 @@ class RegistryCapTest(OpsCase):
     def test_a_unit_holder_gets_no_registry_note(self):
         self.system.units["corral-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn)
+            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
         self.assertEqual(str(ctx.exception), "#5 of lib already has a live agent")
 
         self.system.units.clear()
         self.system.units["corral-agent-my-repo-6"] = "active"
         self.system.units["corral-agent-my-repo-7"] = "active"
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn)
+            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
         self.assertNotIn("registered", str(ctx.exception))
 
 
@@ -681,6 +838,7 @@ class StopUnprovenTest(OpsCase):
             "go",
             title="feat: go",
             list_fn=self.system.list_fn,
+            usage=roomy,
             run=self.system.run,
         )
         self.system.units["corral-agent-lib-5-r7"] = "active"

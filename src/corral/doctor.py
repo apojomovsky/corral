@@ -58,6 +58,9 @@ class Env(NamedTuple):
     prompts_stale: Sequence[str] = ()
     #: The prompts check itself failed (usage or configuration error).
     prompts_error: str | None = None
+    #: The disk pressure (`ok`, `low`, `critical`, `unknown`), or None when
+    #: the caller has no reading: then the report carries no disk row.
+    disk: str | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -223,6 +226,40 @@ def _check_prompts(invalid: Sequence[str], stale_roles: Sequence[str], error: st
     return Check("prompts", "ok", "the role prompts are built-in or valid overrides", "")
 
 
+def _check_disk(pressure: str | None) -> list[Check]:
+    """The disk row, reusing the report's row shape. No reading, no row."""
+    if pressure is None:
+        return []
+    if pressure == "ok":
+        return [Check("disk", "ok", "disk pressure ok", "")]
+    if pressure == "low":
+        return [
+            Check(
+                "disk",
+                "warn",
+                "disk pressure low: free space is under a threshold",
+                "reclaim space: `corral disk` plans, `corral disk --apply` removes",
+            )
+        ]
+    if pressure == "critical":
+        return [
+            Check(
+                "disk",
+                "fail",
+                "disk pressure critical: free space is under half a threshold",
+                "reclaim space now: `corral disk` plans, `corral disk --apply` removes",
+            )
+        ]
+    return [
+        Check(
+            "disk",
+            "warn",
+            "disk pressure unknown: a filesystem could not be read",
+            "check the state, cache and sessions dirs, then run `corral doctor` again",
+        )
+    ]
+
+
 def run_checks(env: Env) -> list[Check]:
     """Every check, in report order. Pure over the seams in `env`."""
     return [
@@ -235,6 +272,7 @@ def run_checks(env: Env) -> list[Check]:
         *_check_readers(env.reader_errors),
         _check_registry(env.registry_rows, env.registry_error),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
+        *_check_disk(env.disk),
     ]
 
 
@@ -387,6 +425,30 @@ def load_prompts_state() -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
     return invalid, tuple(found.stale), None
 
 
+def load_disk_pressure(resolved) -> str:
+    """The live disk pressure, best effort: `unknown` when unreadable."""
+    from corral import disk as _disk
+
+    try:
+        readings = _disk.read(
+            [paths.state_dir(), paths.cache_dir(), paths.sessions_dir()],
+            usage=_disk.production_usage,
+        )
+        if resolved is None:
+            return _disk.pressure(
+                readings,
+                min_free_pct=settings.REGISTRY["disk.min_free_pct"].default,
+                min_free_gb=settings.REGISTRY["disk.min_free_gb"].default,
+            )
+        return _disk.pressure(
+            readings,
+            min_free_pct=resolved["disk.min_free_pct"],
+            min_free_gb=resolved["disk.min_free_gb"],
+        )
+    except Exception:  # noqa: BLE001 - a broken dir reads as unknown, never a traceback
+        return _disk.UNKNOWN
+
+
 def production_env() -> Env:
     """The live environment. Only the CLI calls this; tests never call this.
 
@@ -420,6 +482,7 @@ def production_env() -> Env:
         registry_error = str(err)
     dep_results, deps_error = load_dep_results()
     prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
+    disk_pressure = load_disk_pressure(resolved)
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,
@@ -436,6 +499,7 @@ def production_env() -> Env:
         prompts_invalid=prompts_invalid,
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
+        disk=disk_pressure,
     )
 
 

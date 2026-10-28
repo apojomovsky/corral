@@ -13,7 +13,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from corral import accounts, cli, launch, models, quota_ledger, quotacli, settings
-from tests.test_launch import OpsCase, TOML
+from tests.test_launch import OpsCase, TOML, roomy
 
 T0 = 1_800_000_000.0
 
@@ -446,6 +446,7 @@ class LaunchGate(OpsCase):
                 title="feat: add the thing",
                 list_fn=self.system.list_fn,
                 run=self.system.run,
+                usage=roomy,
                 pool_fn=self.pool,
                 ledger_fn=lambda: seen,
                 now_fn=lambda: T0,

@@ -24,6 +24,11 @@ clone = {{ path = "clones/lib" }}
 """
 
 
+def roomy(path):
+    """A `usage` fake with acres free: the disk gate never fires."""
+    return (100 * 1024**3, 10 * 1024**3, 90 * 1024**3)
+
+
 class HostCase(unittest.TestCase):
     """Two ops roots, a temp config/state tree, and a fake service manager."""
 
@@ -230,27 +235,27 @@ class AdmitAcrossProjectsTest(HostCase):
 
     def test_the_total_filled_by_one_project_leaves_the_other_its_floor(self):
         self.add_units("project-a-agent", 1, 2, 3)
-        launch.admit(self.target("project-b"), 9, list_fn=self.list_fn)
+        launch.admit(self.target("project-b"), 9, list_fn=self.list_fn, usage=roomy)
 
     def test_beyond_the_floor_nothing_more_is_admitted(self):
         self.add_units("project-a-agent", 1, 2, 3)
         self.add_units("project-b-agent", 4)
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-b"), 9, list_fn=self.list_fn)
+            launch.admit(self.target("project-b"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertIn("ceiling", str(ctx.exception))
 
     def test_a_project_at_its_ceiling_is_refused(self):
         self.add_units("project-a-agent", 1, 2, 3)
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-a at 3 of 3 ceiling", str(ctx.exception))
 
     def test_two_projects_units_count_into_one_total(self):
         self.add_units("project-a-agent", 1, 2)
         self.add_units("project-b-agent", 3)
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertIn("host full (3 of 3)", str(ctx.exception))
 
     def test_a_registry_ticket_counts_for_its_named_project(self):
@@ -258,22 +263,22 @@ class AdmitAcrossProjectsTest(HostCase):
             "worker-1", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn)
+            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
 
     def test_an_unnamed_registry_ticket_counts_for_the_launching_project(self):
         registry.register("worker-1", "claude-code", ticket=registry.make_ticket("lib", 7))
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn)
+            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
-        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn)
+        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn, usage=roomy)
 
     def test_a_foreign_registry_ticket_is_one_slot_not_two(self):
         self.write_project("project-a", ceiling=1)
         registry.register(
             "worker-1", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
-        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn)
+        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn, usage=roomy)
 
     def test_a_stale_holder_does_not_steal_a_tickets_attribution(self):
         old = time.time() - 10_000
@@ -287,44 +292,44 @@ class AdmitAcrossProjectsTest(HostCase):
             "worker-new", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn)
+            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
 
     def test_floors_above_the_total_are_rejected(self):
         self.write_project("project-a", ceiling=3, floor=2)
         self.write_project("project-b", ceiling=2, floor=2)
         with self.assertRaises(admission.LimitsError) as ctx:
-            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 4)
 
     def test_a_live_ticket_is_still_already_live_before_admission(self):
         self.add_units("project-a-agent", 1, 2, 3)
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target("project-a"), 2, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 2, list_fn=self.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 2)
 
     def test_a_differing_agents_cap_is_noted_not_an_error(self):
         self.make_root("project-a", cap=2)
         self.add_units("project-a-agent", 1, 2, 3)
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertIn("agents.cap 2", str(ctx.exception))
         self.assertIn("the ceiling wins", str(ctx.exception))
 
     def test_a_matching_agents_cap_carries_no_note(self):
         self.add_units("project-a-agent", 1, 2, 3)
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertNotIn("agents.cap", str(ctx.exception))
 
 
 class AdmitWithoutRegistrationTest(HostCase):
     def test_the_cap_stays_the_agents_cap(self):
         self.make_root("project-a", cap=2)
-        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn)
+        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn, usage=roomy)
         self.add_units("corral-agent-", 6, 7)
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target("project-a"), 5, list_fn=self.list_fn)
+            launch.admit(self.target("project-a"), 5, list_fn=self.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertIn("at 2 of 2 ceiling", str(ctx.exception))
 

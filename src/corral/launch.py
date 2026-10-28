@@ -11,9 +11,9 @@ Every subprocess and every listing goes through an injected seam:
 `stop_fn(unit)` stops one. `stop_fn` has no default. Only the CLI passes
 the production stop (see `corral.launchcli`).
 
-Errors carry the public exit code: LaunchError 4, CapFull 75. The units
-errors (UnitExists 2, Unreachable 3, UnitsError 4) pass through unchanged.
-
+Errors carry the public exit code: LaunchError 4, CapFull 75, HeldError 1.
+The units errors (UnitExists 2, Unreachable 3, UnitsError 4) pass through
+unchanged.
 A launch or resume writes nothing into the ticket's session until its
 second admission has passed, under the same spawn lock as the start. A
 launch that loses the race leaves the live agent's session as it was.
@@ -30,7 +30,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from corral import accounts, admission, models, paths, projects, quota_ledger
+from corral import accounts, admission, disk, models, paths, projects, quota_ledger
 from corral import registry, runtimes, settings, units, worktrees
 from corral.runtimes import tail as runtime_tail
 
@@ -59,6 +59,12 @@ class CapFull(LaunchError):
     """Every agent slot on this host is taken: try later (exit 75)."""
 
     exit_code = 75
+
+
+class HeldError(LaunchError):
+    """The ticket carries the hold label, or its labels are unreadable: no resume (exit 1)."""
+
+    exit_code = 1
 
 
 @dataclass(frozen=True)
@@ -198,15 +204,18 @@ def project_live_counts(registered, list_fn, cfg):
     return counts
 
 
-def admit(tgt, number, *, list_fn):
-    """Refuse a ticket that is already live, or a host with no free slot.
+def admit(tgt, number, *, list_fn, usage):
+    """Refuse a ticket that is already live, a critically low disk, or a host with no free slot.
 
     The decision comes from `admission.admit`: the project key is the
     registered name of the ops root, else the unit prefix on a host with
     no registration, and the limits are the registered floors and
     ceilings (a lone project's ceiling is its `agents.cap`). Raises
     units.UnitExists (exit 2) for the ticket, CapFull (exit 75) carrying
-    the verdict's reason when the host is full.
+    the verdict's reason when the host is full, or the disk refusal when
+    the pressure is critical (`low` and `unknown` never block, and a
+    forced start does not bypass the disk gate). `usage(path)` is the
+    required disk seam (no default).
     """
     registered = projects.load_all()
     cfg = registry.config(tgt.resolved)
@@ -221,6 +230,9 @@ def admit(tgt, number, *, list_fn):
         raise units.UnitExists(
             f"#{number} of {tgt.repo} already has a live agent {REGISTERED_NOTE}"
         )
+    refusal = disk.refusal_text(tgt.resolved, usage=usage)
+    if refusal is not None:
+        raise CapFull(refusal)
     entries = list(registered)
     if key not in {entry.name for entry in entries}:
         entries.append(
@@ -303,6 +315,7 @@ def launch(
     runtime_config=None,
     list_fn,
     run,
+    usage,
     git=worktrees.git,
     pool_fn=None,
     ledger_fn=None,
@@ -338,7 +351,7 @@ def launch(
     )
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn)
+        admit(tgt, number, list_fn=list_fn, usage=usage)
         workdir, branch = worktrees.ensure_worktree(
             tgt.clone,
             number,
@@ -353,7 +366,7 @@ def launch(
             _check_text(prompt, "prompt")
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn)
+        admit(tgt, number, list_fn=list_fn, usage=usage)
         _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
         unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
         command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
@@ -383,16 +396,24 @@ def resume(
     number,
     message,
     *,
+    hold_reason_fn,
     model=None,
     list_fn,
     run,
+    usage,
     git=worktrees.git,
 ):
     """Resume ticket `number`'s newest runtime session in a new unit. Returns `(unit, workdir)`.
 
     The runtime is the one the session recorded at launch. Raises LaunchError
-    when there is no session to resume.
+    when there is no session to resume, and HeldError when the ticket is
+    held for a human. `hold_reason_fn(tgt, number)` returns the hold text,
+    or None when the ticket is free to resume; it is required, and it runs
+    before the spawn lock is taken or any worktree is touched.
     """
+    reason = hold_reason_fn(tgt, number)
+    if reason is not None:
+        raise HeldError(reason)
     _check_text(message, "message")
     model = _check_model(model)
     session = _session(tgt, number)
@@ -402,7 +423,7 @@ def resume(
         raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} session to resume")
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn)
+        admit(tgt, number, list_fn=list_fn, usage=usage)
         workdir, _branch = worktrees.ensure_worktree(
             tgt.clone,
             number,
@@ -413,7 +434,7 @@ def resume(
         )
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn)
+        admit(tgt, number, list_fn=list_fn, usage=usage)
         unit = units.unit_name(tgt.prefix, tgt.repo, number, max(units.next_gen(session), 1))
         command = adapter.argv(
             session,
