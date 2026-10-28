@@ -245,7 +245,8 @@ def start(argv, session_dir, unit, run=default_run):
 
     The argv must carry `--unit=<unit>`, and the unit must be well formed.
     "already exists" or "already loaded" (any case) raises UnitExists (exit
-    2); any other failure raises UnitsError (exit 4).
+    2); a user manager that cannot be reached raises Unreachable (exit 3);
+    any other failure raises UnitsError (exit 4).
     """
     if not isinstance(unit, str) or not _WELL_FORMED.fullmatch(unit):
         raise UnitsError(f"unit name {unit!r} is not a well-formed agent unit name")
@@ -260,6 +261,8 @@ def start(argv, session_dir, unit, run=default_run):
         low = tail.lower()
         if "already exists" in low or "already loaded" in low:
             raise UnitExists(f"{unit}: {tail}")
+        if "failed to connect to bus" in low or "no medium found" in low:
+            raise Unreachable(f"cannot start {unit}: {tail}")
         raise UnitsError(f"cannot start {unit}: {tail}")
     try:
         with open(os.path.join(session_dir, UNITS_LOG), "a", encoding="utf-8") as handle:
