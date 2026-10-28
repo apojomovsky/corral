@@ -10,6 +10,7 @@ from corral import (
     agentcli,
     coordcli,
     deps,
+    doctor,
     gccli,
     launch,
     launchcli,
@@ -216,6 +217,7 @@ def build_parser() -> argparse.ArgumentParser:
     quotacli.add_parser(sub)
     snapshot.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
+    doctor.add_parser(sub, doctor.production_env)
     return parser
 
 
