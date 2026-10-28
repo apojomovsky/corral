@@ -239,6 +239,10 @@ TAIL = """# Defaults: uncomment to override.
 # registry.count_toward_cap = true  # live registered ticket workers take cap slots
 # registry.gone_s = 3600  # seconds without a heartbeat before an agent is dropped
 # registry.stale_s = 600  # seconds without a heartbeat before an agent reads stale
+#
+# [tracker]
+# tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
+# tracker.repo = ""  # tracker repository as owner/name (default: the clone's origin)
 """
 
 HEAD = """# corral.toml, written by `corral init`. Settings that differ
@@ -311,6 +315,10 @@ commits.conventional = false
 # registry.count_toward_cap = true  # live registered ticket workers take cap slots
 # registry.gone_s = 3600  # seconds without a heartbeat before an agent is dropped
 # registry.stale_s = 600  # seconds without a heartbeat before an agent reads stale
+#
+# [tracker]
+# tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
+# tracker.repo = ""  # tracker repository as owner/name (default: the clone's origin)
 """
 
 
