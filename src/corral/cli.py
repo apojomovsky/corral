@@ -10,6 +10,7 @@ from corral import (
     agentcli,
     coordcli,
     deps,
+    gccli,
     launchcli,
     paths,
     quotacli,
@@ -156,6 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base", default=None, help=base_help)
     p.set_defaults(func=cmd_budget)
     coordcli.add_parser(sub)
+    gccli.add_parser(sub)
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
