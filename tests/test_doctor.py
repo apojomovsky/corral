@@ -340,6 +340,7 @@ class ProductionGathering(unittest.TestCase):
             OSError("gone"),
             TypeError("bad entry"),
             KeyError("probe"),
+            UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"),
         ):
             with mock.patch.object(doctor.deps, "load", side_effect=error):
                 results, deps_error = doctor.load_dep_results()

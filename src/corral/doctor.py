@@ -305,7 +305,14 @@ def load_dep_results() -> tuple[list[deps.Result], str | None]:
     """(results, error): the dep probes and their load failure, gathered once."""
     try:
         return deps.check_all(deps.load()), None
-    except (tomllib.TOMLDecodeError, OSError, TypeError, KeyError, re.error) as err:
+    except (
+        tomllib.TOMLDecodeError,
+        UnicodeDecodeError,
+        OSError,
+        TypeError,
+        KeyError,
+        re.error,
+    ) as err:
         return [], str(err)
 
 
