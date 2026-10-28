@@ -43,7 +43,7 @@ make install      # uv tool install
 
 | Command | What it does |
 | --- | --- |
-| `corral deps` | check the host programs corral needs; print how to install what is missing |
+| `corral deps` | check the host programs and the accounts file; print how to install what is missing |
 | `corral paths [state\|config\|cache\|sessions] [--mkdir]` | the directories corral keeps on this host, after `CORRAL_*` and XDG overrides |
 | `corral config show [--origin] [--repo NAME] [--root PATH]` | every setting with its resolved value; `--origin` names the layer it came from and marks values clamped by a host limit |
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |

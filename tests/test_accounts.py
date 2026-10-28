@@ -4,9 +4,12 @@ Fake readers live here, in the test tree: nothing real, and no provider
 names beyond provider-a/provider-b.
 """
 
+import io
 import os
+import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest import mock
 
 from corral import accounts, cli, deps
@@ -15,17 +18,21 @@ from corral import accounts, cli, deps
 class OkReader:
     """A reader that reports one window."""
 
-    def read(self):
-        return accounts.Reading(
-            windows=(accounts.Window(id="weekly", used_fraction=0.1, resets_at=None),)
-        )
+    def read(self, now):
+        return accounts.Reading(windows={"weekly": accounts.Window(used_pct=10.0, resets_at=None)})
+
+    def parse_limit_error(self, text, now):
+        return None
 
 
 class FailingReader:
     """A reader whose read fails at call time (not a configuration error)."""
 
-    def read(self):
+    def read(self, now):
         raise accounts.ReaderError("provider-a: quota endpoint refused")
+
+    def parse_limit_error(self, text, now):
+        return None
 
 
 class BrokenInitReader:
@@ -170,8 +177,9 @@ reader = "tests.test_accounts:OkReader"
 class Readers(unittest.TestCase):
     def test_load_reader_builds_the_named_class(self):
         reader = accounts.load_reader("tests.test_accounts:OkReader")
-        reading = reader.read()
-        self.assertEqual(reading.windows[0].id, "weekly")
+        reading = reader.read(1700000000.0)
+        self.assertEqual(reading.windows["weekly"].used_pct, 10.0)
+        self.assertIsNone(reader.parse_limit_error("nope", 1700000000.0))
 
     def test_load_reader_rejects_an_entry_without_a_colon(self):
         with self.assertRaises(accounts.AccountsError):
@@ -192,7 +200,7 @@ class Readers(unittest.TestCase):
     def test_a_reader_error_is_not_a_configuration_error(self):
         reader = accounts.load_reader("tests.test_accounts:FailingReader")
         with self.assertRaises(accounts.ReaderError):
-            reader.read()
+            reader.read(1700000000.0)
 
     def test_check_imports_but_never_calls_read(self):
         self.assertEqual(accounts.check(config_with(OK_FILE)), [])
@@ -204,14 +212,60 @@ class Readers(unittest.TestCase):
         self.assertEqual(len(problems), 1)
         self.assertIn("provider-a", problems[0])
 
+    def test_a_module_that_raises_at_import_is_a_configuration_error(self):
+        name = "corral_boom_reader_for_test"
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, f"{name}.py"), "w", encoding="utf-8") as handle:
+            handle.write("raise RuntimeError('boom at import')\n")
+        sys.path.insert(0, directory)
+        try:
+            with self.assertRaises(accounts.AccountsError):
+                accounts.load_reader(f"{name}:Reader")
+            text = OK_FILE.replace("tests.test_accounts:OkReader", f"{name}:Reader")
+            problems = accounts.check(config_with(text))
+            self.assertEqual(len(problems), 1)
+            self.assertIn("provider-a", problems[0])
+        finally:
+            sys.path.remove(directory)
+            sys.modules.pop(name, None)
+
 
 class ExitCode(unittest.TestCase):
-    def test_a_configuration_error_exits_4(self):
-        with mock.patch.object(
-            deps, "load", side_effect=accounts.AccountsError("accounts.toml: bad")
-        ):
-            with mock.patch("sys.stderr", mock.Mock()):
-                self.assertEqual(cli.main(["deps"]), 4)
+    def run_deps(self, config_text):
+        outputs = {d.probe[0]: f"{d.name} 1.0 Linger=yes systemd 255" for d in deps.load()}
+        outputs["uv"] = "uv 0.13.5"
+
+        def probe(argv, paths):
+            return outputs.get(argv[0])
+
+        with tempfile.TemporaryDirectory(prefix="corral-accounts-") as directory:
+            write_config(directory, config_text)
+            out, err = io.StringIO(), io.StringIO()
+            with (
+                mock.patch.dict(os.environ, {"CORRAL_CONFIG": directory}),
+                mock.patch.object(deps, "run_probe", probe),
+                redirect_stdout(out),
+                mock.patch("sys.stderr", err),
+            ):
+                code = cli.main(["deps"])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_broken_accounts_file_fails_deps_with_exit_4(self):
+        text = OK_FILE + OK_FILE.replace("tests.test_accounts:OkReader", "x:y")
+        code, out, err = self.run_deps(text)
+        self.assertEqual(code, 4)
+        self.assertIn("provider-a", err)
+
+    def test_a_reader_that_does_not_import_fails_deps_with_exit_4(self):
+        text = OK_FILE.replace("tests.test_accounts:OkReader", "no.such.module:Reader")
+        code, out, err = self.run_deps(text)
+        self.assertEqual(code, 4)
+        self.assertIn("provider-a", err)
+
+    def test_a_good_accounts_file_keeps_deps_at_0(self):
+        code, out, err = self.run_deps(OK_FILE)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
 
 
 if __name__ == "__main__":

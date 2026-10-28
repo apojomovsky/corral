@@ -12,6 +12,7 @@ import importlib
 import os
 import re
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
@@ -37,24 +38,27 @@ class ReaderError(Exception):
 
 
 class Window(NamedTuple):
-    """One quota window: its id, used fraction, and reset epoch (either may be unknown)."""
+    """One quota window: its used percent (0..100) and reset epoch, if known."""
 
-    id: str
-    used_fraction: float | None
+    used_pct: float
     resets_at: float | None
 
 
 class Reading(NamedTuple):
-    """What one reader call saw: the provider's quota windows."""
+    """What one reader call saw: window id to usage."""
 
-    windows: tuple[Window, ...]
+    windows: Mapping[str, Window]
 
 
 class Reader(Protocol):
     """A quota reader: reports one provider's windows, or raises ReaderError."""
 
-    def read(self) -> Reading:
+    def read(self, now: float) -> Reading:
         """Current quota windows; raises ReaderError when unreadable."""
+        ...
+
+    def parse_limit_error(self, text: str, now: float) -> float | None:
+        """Epoch the text blocks this provider until, or None when it is not a limit error."""
         ...
 
 
@@ -155,7 +159,7 @@ def _resolve(entry: str, where: str) -> type:
         raise AccountsError(f"{where}: reader {entry!r} must look like module:Class")
     try:
         target: object = importlib.import_module(module_name)
-    except ImportError as err:
+    except Exception as err:
         raise AccountsError(f"{where}: reader {entry!r} does not import: {err}") from None
     for attr in attr_path.split("."):
         try:

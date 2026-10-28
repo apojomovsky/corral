@@ -15,6 +15,11 @@ OK, NO, RACE, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 2, 3, 4, 75
 def cmd_deps(args: argparse.Namespace) -> int:
     text, ok = deps.report(deps.check_all(deps.load()))
     sys.stdout.write(text)
+    problems = accounts.check()
+    for problem in problems:
+        print(f"corral: {problem}", file=sys.stderr)
+    if problems:
+        return USAGE
     return OK if ok else NO
 
 
