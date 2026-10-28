@@ -32,8 +32,9 @@ class SyncResult(NamedTuple):
 
 
 def _reading(item: iface.TrackerItem) -> board.Item:
-    """One tracker item as a store reading. Corral-owned fields stay
-    empty here: the upsert never originates them, it only settles queues."""
+    """One tracker item as a store reading. The tracker's ``agent`` and
+    ``status`` labels ride along so the upsert can settle queued writes;
+    the upsert never originates corral-owned values from them."""
     return board.Item(
         repo=item.repo,
         number=item.number,
@@ -48,6 +49,8 @@ def _reading(item: iface.TrackerItem) -> board.Item:
         url=item.url,
         tracker_updated_at=item.updated_at,
         from_fork=item.from_fork,
+        agent=item.agent,
+        status=item.status,
     )
 
 

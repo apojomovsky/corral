@@ -96,6 +96,7 @@ def sync_root(
     now,
     out,
     err,
+    push=False,
 ) -> int:
     """Sync each named repo entry (or every entry) and report. All seams
     injected; exit codes follow the module docstring."""
@@ -112,6 +113,7 @@ def sync_root(
         _err(f"unknown repo {unknown[0]!r} (not a [[repo]] entry in {root})", err)
         return USAGE
     results: dict = {}
+    mirror_ops: dict = {}
     for name in names or wanted:
         try:
             resolved = settings.load(root=root, repo=name)
@@ -155,19 +157,51 @@ def sync_root(
             "cursor": result.cursor,
             "errors": list(result.errors),
         }
+        mirror_ops[tracker_repo] = operators
         for line in result.errors:
             _err(line, err)
     seen = sum(row["seen"] for row in results.values())
     failed = sum(len(row["errors"]) for row in results.values())
+    pushed: dict | None = None
+    if push:
+        from corral import mirror
+
+        try:
+            outcome = mirror.push(store, tracker, operators=mirror_ops, now=now)
+        except board.StoreError as problem:
+            _err(str(problem), err)
+            return USAGE
+        pushed = {
+            "sent": outcome.sent,
+            "dropped": outcome.dropped,
+            "dirty": outcome.dirty,
+            "stopped": outcome.stopped,
+            "errors": list(outcome.errors),
+        }
+        for line in outcome.errors:
+            _err(line, err)
     if as_json:
-        out.write(json.dumps({"repos": results, "seen": seen}, indent=2, sort_keys=True))
+        doc: dict = {"repos": results, "seen": seen}
+        if pushed is not None:
+            doc["mirror"] = pushed
+        out.write(json.dumps(doc, indent=2, sort_keys=True))
         out.write("\n")
     else:
         for name, row in results.items():
             out.write(f"{name}: {row['seen']} applied, cursor {row['cursor'] or 'none'}\n")
-    if seen:
+        if pushed is not None:
+            out.write(
+                f"mirror: {pushed['sent']} sent,"
+                f" {pushed['dropped']} dropped,"
+                f" {pushed['dirty']} dirty\n"
+            )
+            if pushed["stopped"] is not None:
+                out.write(f"mirror: rate limited, retry after {pushed['stopped']:g}s\n")
+    landed = seen + (pushed["sent"] if pushed is not None else 0)
+    bad = failed + (len(pushed["errors"]) if pushed is not None else 0)
+    if landed:
         return OK
-    return UNREACHABLE if failed else NOTHING
+    return UNREACHABLE if bad else NOTHING
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
@@ -196,6 +230,7 @@ def cmd_sync(args: argparse.Namespace) -> int:
             now=time.time(),
             out=sys.stdout,
             err=sys.stderr,
+            push=args.push,
         )
 
 
@@ -225,4 +260,9 @@ def add_parser(sub) -> None:
         help="re-read the N rows verified least recently instead of the feed",
     )
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument(
+        "--push",
+        action="store_true",
+        help="run a mirror pass over the outbox after the sync",
+    )
     p.set_defaults(func=cmd_sync)

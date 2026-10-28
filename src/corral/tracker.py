@@ -20,6 +20,19 @@ class TrackerError(Exception):
     exit_code = 3
 
 
+class TrackerRateLimited(TrackerError):
+    """The tracker answered with a rate limit: stop the pass, retry later.
+
+    A subclass of ``TrackerError`` so callers that do not pace still fail
+    closed with exit code 3. ``retry_after`` is the seconds the answer
+    asked to wait before the next write.
+    """
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class TrackerItem(NamedTuple):
     repo: str  # "owner/name" as the tracker names it
     number: int
@@ -34,6 +47,8 @@ class TrackerItem(NamedTuple):
     url: str
     updated_at: float  # epoch seconds
     from_fork: bool
+    agent: str = ""  # derived from the agent:* label, else ""
+    status: str = ""  # derived from the status:* label, else ""
 
 
 class Tracker(Protocol):
@@ -56,6 +71,17 @@ class Tracker(Protocol):
 
     def items(self, repo: str) -> Iterator[TrackerItem]:
         """Every item, for a full resync."""
+        ...
+
+    def write(self, repo: str, number: int, field: str, value: str) -> None:
+        """Set one corral-owned field (``agent`` or ``status``) on an item.
+
+        ``value == ""`` clears the field. Anything outside the corral-owned
+        fields is refused with ``ValueError``. A failed call raises
+        ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
+        with the seconds to wait. Writing the same value twice leaves one
+        label behind: the write is idempotent.
+        """
         ...
 
 
