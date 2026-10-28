@@ -69,6 +69,7 @@ def register(key, type_, default, help_):
 #: first, so a file setting one of their keys never reads as unknown, and
 #: `config show` lists them. A test keeps this list complete.
 PROVIDERS = (
+    "corral.admission",
     "corral.hold",
     "corral.launch",
     "corral.quota",
