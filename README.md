@@ -52,6 +52,7 @@ make install      # uv tool install
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |
 | `corral prose [--verify]` | list the comment blocks a branch adds; `--verify` fails on ones that break the prose rules |
 | `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
+| `corral leakcheck [--base REF] [--body FILE] [--json] [--ops DIR]` | scan the commit messages, branch name, PR body and added diff lines in `<base>..HEAD` for private terms; exit 1 names each finding. Finding lines name the matched term, so keep this output on the ops side |
 | `corral gc [--repo PATH] [--apply] [--json]` | plan-only hygiene audit: landed, superseded and merged branches print as `git branch -d`; worktree cleanup and prune need `--apply`, branches are never deleted. `merged-pr` comes from the forge's PR index for the clone's origin repo, empty with a note when the forge is unreachable |
 | `corral gh-calls [--since D] [--by-shape] [--json]` | summary of the paced `gh` calls agents make: per caller and minute, throttled totals, GraphQL query shapes; `--since` takes `30m`, `1h`, `7d`; exit 4 on a bad `--since` |
 | `corral review record REPO N --commit SHA --verdict V --author ID` | a reviewer states its verdict on one commit of a ticket, once; a self-review is refused. The record is the review gate's proof |
@@ -81,6 +82,16 @@ chain = ["provider-a/model-x", "provider-b/model-y"]
 ```
 
 Every entry names a provider from the pool as `provider/model`; an unknown provider is a configuration error (exit 4), and an id starting with `-` is refused. The per-launch overlay carries each chain with exhausted providers removed, so a launch routes around quota that is gone; when a required role has no live provider left, the launch is refused with exit 75, naming the role and its earliest known reset.
+
+The ops root's `corral.toml` may also list private terms that must never reach the shared side:
+
+```toml
+[private]
+terms = ["a client name", "host-1.example.com"]
+patterns = ["acme-[0-9]+"]
+```
+
+`terms` are plain strings, `patterns` are regular expressions; both match case-insensitively. corral always adds the ops repository's own name and path, the host name and the home directory path. `[private]` lives in the ops root's file only: the host config and `[[repo]]` entries cannot set it. A bad pattern is a configuration error (exit 4), and `corral leakcheck` scans a branch's messages, branch name, body and added lines against the list.
 
 Exit codes: `0` success, `1` nothing to do or a gate said no, `2` race lost (the lease is held, or a generation is stale), `3` a remote or service unreachable, `4` usage error.
 

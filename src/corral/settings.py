@@ -22,6 +22,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from corral import paths
 
@@ -96,6 +97,14 @@ register("board.ready", str, "ready", "label that makes an issue eligible")
 register("agents.cap", int, 1, "this project's ceiling of live agents on the host")
 
 
+class Private(NamedTuple):
+    """The ``[private]`` lists from the ops root's corral.toml: plain terms
+    and regular expressions, both matched case-insensitively."""
+
+    terms: list[str]
+    patterns: list[str]
+
+
 @dataclass(frozen=True)
 class Value:
     value: object
@@ -110,6 +119,11 @@ class Resolved:
     #: From ``[models.<role>]`` tables in corral.toml; this is the one place
     #: that reads them.
     models: dict[str, list[str]] = field(default_factory=dict)
+    #: The project's private terms and patterns, from ``[private]`` in
+    #: corral.toml. Like ``[models]``, this is PROJECT-level only: the host
+    #: config and ``[[repo]]`` entries cannot set it, and read as unknown
+    #: settings there.
+    private: Private = field(default_factory=lambda: Private(terms=[], patterns=[]))
 
     def __getitem__(self, key):
         return self.values[key].value
@@ -170,6 +184,29 @@ def _check_models(raw, where):
     return chains
 
 
+def _check_private(raw, where):
+    """The ``[private]`` table as a Private. Shape and regex errors are exit 4."""
+    if not isinstance(raw, dict):
+        raise SettingsError(f"{where}: [private] must be a table of term and pattern lists")
+    for key in raw:
+        if key not in ("terms", "patterns"):
+            raise SettingsError(f"{where}: [private] has no key {key!r}")
+    checked = {}
+    for key in ("terms", "patterns"):
+        value = raw.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(e, str) and e for e in value):
+            raise SettingsError(f"{where}: [private] {key} must be a list of non-empty strings")
+        checked[key] = list(value)
+    for pattern in checked["patterns"]:
+        try:
+            re.compile(pattern, re.IGNORECASE)
+        except re.error as err:
+            raise SettingsError(
+                f"{where}: [private] pattern {pattern!r} is invalid: {err}"
+            ) from None
+    return Private(terms=checked["terms"], patterns=checked["patterns"])
+
+
 _INT = re.compile(r"-?[0-9]+")
 
 
@@ -227,6 +264,18 @@ def repo_names(root):
     return list(_repo_entries(project.get("repo", []), project_path))
 
 
+def private(root):
+    """The ``[private]`` terms and patterns in the ops root's corral.toml.
+
+    Empty when there is no root or no file. Shape and regex errors are
+    SettingsError (exit 4). The host config is never read: private terms
+    live on the ops side only, so only the ops root's file counts."""
+    if not root:
+        return Private(terms=[], patterns=[])
+    project_path = os.path.join(root, PROJECT_FILE)
+    return resolve(project=_load(project_path), env={}, project_name=project_path).private
+
+
 def find_root(start):
     """The nearest directory at or above `start` holding corral.toml, else None."""
     here = os.path.abspath(start)
@@ -263,6 +312,7 @@ def resolve(
 
     repos = project.pop("repo", [])
     chains = _check_models(project.pop("models", {}), project_name)
+    private = _check_private(project.pop("private", {}), project_name)
     for key, value in _flatten(project, project_name).items():
         result[key] = Value(_check(key, value, project_name), PROJECT)
     entries = _repo_entries(repos, project_name)
@@ -289,7 +339,7 @@ def resolve(
         current = result[key]
         if isinstance(current.value, int) and current.value > ceiling:
             result[key] = Value(ceiling, current.origin, clamped_from=current.value)
-    return Resolved(result, chains)
+    return Resolved(result, chains, private)
 
 
 def load(root=None, repo=None, env=None, flags=None):

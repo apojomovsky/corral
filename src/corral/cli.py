@@ -15,6 +15,7 @@ from corral import (
     init,
     launch,
     launchcli,
+    leakcli,
     mirrorcli,
     paths,
     projects,
@@ -225,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     quotacli.add_parser(sub)
     snapshot.add_parser(sub)
     syncli.add_parser(sub)
+    leakcli.add_parser(sub)
     mirrorcli.add_parser(sub)
     promptscli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
