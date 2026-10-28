@@ -6,6 +6,7 @@ import stat
 import tempfile
 import threading
 import unittest
+from unittest import mock
 from typing import Any
 
 from corral import board
@@ -230,6 +231,52 @@ class UpsertTest(TempStoreTest):
             raw.close()
         with self.assertRaises(board.StoreError):
             store.item("app", 7, now=2000.0)
+
+    def test_wrong_typed_stored_json_fails_closed(self):
+        for column, value in (("labels", '"x"'), ("assignees", "7"), ("extra", "[]")):
+            with self.subTest(column=column):
+                store = self.stored()
+                raw = sqlite3.connect(self.path)
+                try:
+                    raw.execute(
+                        f"UPDATE items SET {column}=? WHERE repo=? AND number=?",
+                        (value, "app", 7),
+                    )
+                    raw.commit()
+                finally:
+                    raw.close()
+                with self.assertRaises(board.StoreError):
+                    store.item("app", 7, now=2000.0)
+
+    def test_a_stale_reading_changes_no_people_field(self):
+        store = self.stored(title="Newer", labels=["ready"], tracker_updated_at=2000.0)
+        store.upsert_item(
+            reading(title="Older", labels=["other"], tracker_updated_at=1500.0),
+            operators=["alice"],
+            now=3000.0,
+        )
+        item, _ = store.item("app", 7, now=3000.0)
+        self.assertEqual((item.title, item.labels), ("Newer", ["ready"]))
+        self.assertEqual(item.fetched_at, 3000.0)
+
+    def test_open_fails_closed_without_wal(self):
+        real = board.sqlite3.connect
+
+        class NoWal:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def execute(self, sql, *args):
+                if sql.startswith("PRAGMA journal_mode"):
+                    return self._conn.execute("SELECT 'delete'")
+                return self._conn.execute(sql, *args)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        with mock.patch.object(board.sqlite3, "connect", lambda *a, **k: NoWal(real(*a, **k))):
+            with self.assertRaises(board.StoreError):
+                board.open_store(os.path.join(self.tmp.name, "nowal.sqlite"))
 
 
 class FreshnessTest(TempStoreTest):

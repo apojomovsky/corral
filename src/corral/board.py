@@ -290,6 +290,10 @@ class Store:
             extra = json.loads(row[15])
         except ValueError as err:
             raise StoreError(f"unusable item {repo}#{number}: corrupt JSON: {err}")
+        if not isinstance(labels, list) or not isinstance(assignees, list):
+            raise StoreError(f"unusable item {repo}#{number}: labels and assignees must be lists")
+        if not isinstance(extra, dict):
+            raise StoreError(f"unusable item {repo}#{number}: extra must be an object")
         return Item(
             repo=row[0],
             number=row[1],
@@ -298,15 +302,15 @@ class Store:
             body=row[4],
             state=row[5],
             author=row[6],
-            labels=labels if isinstance(labels, list) else [],
+            labels=labels,
             priority=row[8],
-            assignees=assignees if isinstance(assignees, list) else [],
+            assignees=assignees,
             url=row[10],
             tracker_updated_at=row[11],
             fetched_at=row[12],
             confidence=row[13],
             external=bool(row[14]),
-            extra=extra if isinstance(extra, dict) else {},
+            extra=extra,
             agent=holder.agent if holder else (queued_agent or ""),
             status=queued_status or "",
         )
@@ -664,7 +668,11 @@ def open_store(path=None):
                 f"board store {target} has schema version {version},"
                 f" supported {SCHEMA_VERSION}: failing closed"
             )
-        conn.execute("PRAGMA journal_mode=WAL")
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        if not mode or str(mode[0]).lower() != "wal":
+            raise StoreError(
+                f"board store {target}: WAL mode is not available here: failing closed"
+            )
     except Exception:
         store.close()
         raise
