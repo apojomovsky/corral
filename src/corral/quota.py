@@ -29,12 +29,21 @@ settings.register(
 
 
 def _windows_live(windows, now):
-    """Windows whose reset has not passed yet; a reset starts a fresh window."""
-    return {
-        window_id: entry
-        for window_id, entry in windows.items()
-        if entry.get("resets_at", now) > now
-    }
+    """Windows whose reset has not passed yet, or None when one is malformed.
+
+    A reset starts a fresh window; a window with no reset time stays live.
+    """
+    live = {}
+    for window_id, entry in windows.items():
+        if not isinstance(entry, dict):
+            return None
+        resets_at = entry.get("resets_at")
+        try:
+            if resets_at is None or float(resets_at) > now:
+                live[window_id] = entry
+        except (TypeError, ValueError):
+            return None
+    return live
 
 
 def provider_state(reading, mark, now, *, stale_after, low_pct):
@@ -62,6 +71,8 @@ def provider_state(reading, mark, now, *, stale_after, low_pct):
     if now - read_at > float(stale_after):
         return UNKNOWN
     live = _windows_live(windows, now)
+    if live is None:
+        return UNKNOWN
     try:
         if any(float(entry["used_pct"]) >= 100 for entry in live.values()):
             return EXHAUSTED
@@ -79,7 +90,7 @@ def role_state(chain, states, *, unknown_blocks=DEFAULT_UNKNOWN_BLOCKS):
     ``unknown`` provider passes unless ``unknown_blocks`` turns it blocking.
     """
     if not chain:
-        return UNKNOWN
+        return EXHAUSTED if unknown_blocks else UNKNOWN
     seen = [states.get(provider, UNKNOWN) for provider in chain]
     if any(state == OK for state in seen):
         return OK
@@ -135,14 +146,14 @@ def gate(
             states,
             unknown_blocks=unknown_blocks,
         )
-        for role, chain in (chains or {}).items()
+        for role, chain in {**dict.fromkeys(roles or (), ()), **(chains or {})}.items()
     }
     blocked = {
         role: {
             "state": roles_states[role],
             "providers": {
                 provider: states[provider]
-                for provider in [_chain_provider(entry) for entry in (chains or {})[role] or ()]
+                for provider in [_chain_provider(entry) for entry in (chains or {}).get(role) or ()]
             },
         }
         for role in roles or ()

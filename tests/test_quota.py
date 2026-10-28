@@ -165,6 +165,23 @@ class ProviderState(unittest.TestCase):
         )
 
 
+class MalformedWindows(unittest.TestCase):
+    def read(self, windows):
+        return quota.provider_state(
+            {"windows": windows, "read_at": T0}, None, T0, stale_after=STALE, low_pct=LOW
+        )
+
+    def test_a_non_dict_window_reads_unknown(self):
+        self.assertEqual(self.read({"session": 50}), "unknown")
+
+    def test_a_non_numeric_reset_reads_unknown(self):
+        self.assertEqual(self.read({"session": win(50.0, "soon")}), "unknown")
+
+    def test_a_window_without_a_reset_stays_live(self):
+        self.assertEqual(self.read({"session": {"used_pct": 100}}), "exhausted")
+        self.assertEqual(self.read({"session": win(100.0, None)}), "exhausted")
+
+
 class RoleState(unittest.TestCase):
     def test_an_empty_chain_is_unknown(self):
         self.assertEqual(quota.role_state([], {}), "unknown")
@@ -208,6 +225,21 @@ class RoleState(unittest.TestCase):
             quota.role_state(["a"], {"a": "unknown"}, unknown_blocks=True),
             "exhausted",
         )
+
+
+class EmptyChains(unittest.TestCase):
+    def verdict(self, chains, unknown_blocks):
+        return quota.gate(
+            ["default"], chains, ql.empty(), T0, stale_after=STALE, unknown_blocks=unknown_blocks
+        )
+
+    def test_empty_and_missing_chains_follow_unknown_blocks(self):
+        for chains in ({"default": []}, {}):
+            self.assertFalse(self.verdict(chains, False)["shut"])
+            self.assertTrue(self.verdict(chains, True)["shut"])
+
+    def test_an_empty_chain_role_state_follows_unknown_blocks(self):
+        self.assertEqual(quota.role_state([], {}, unknown_blocks=True), "exhausted")
 
 
 class Gate(unittest.TestCase):
