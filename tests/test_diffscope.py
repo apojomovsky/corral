@@ -373,12 +373,11 @@ class CallersUseTheResolverTest(unittest.TestCase):
     def test_review_show(self):
         from corral import cli, mergeup
 
-        with (
-            mock.patch.object(mergeup, "resolve_commit", return_value="a" * 40),
-            mock.patch.object(mergeup, "find_record", return_value=(None, "")) as find,
-        ):
-            self.quiet(cli.main, ["review", "show", "lib", "1"])
-        self.assertEqual(find.call_args.args[2], "origin/elsewhere")
+        with mock.patch.object(mergeup, "find_record", return_value=(None, "")) as find:
+            code = self.quiet(cli.main, ["review", "show", "lib", "1"])
+        # No --pr means no authoritative base: fail closed, never consult a local ref.
+        self.assertEqual(code, 1)
+        find.assert_not_called()
 
 
 if __name__ == "__main__":
