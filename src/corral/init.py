@@ -35,6 +35,7 @@ import difflib
 import json
 import os
 import re
+import stat
 import sys
 import tomllib
 from collections.abc import Callable
@@ -113,9 +114,14 @@ def resolve_root(path, git):
 
 
 def project_name(root, git):
-    """The registration and entry name: the origin slug's repo, else the dir."""
+    """The `[[repo]]` entry name: the origin slug's repo, else the dir."""
     slug = detect.origin_slug(root, git)
     return slug.split("/")[1] if slug else os.path.basename(root)
+
+
+def registration_name(root):
+    """The host registration name: the repository directory name."""
+    return os.path.basename(root)
 
 
 def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=()):
@@ -351,6 +357,50 @@ def _file_bytes(target):
         raise InitError(f"corral: cannot read {target}: {err}") from None
 
 
+def _hook_needs_chmod(target):
+    """True when an installed hook lost its executable bit (`OSError` is exit 4)."""
+    try:
+        return os.path.isfile(target) and stat.S_IMODE(os.stat(target).st_mode) != 0o755
+    except OSError as err:
+        raise InitError(f"corral: cannot stat {target}: {err}") from None
+
+
+def _expected_ceiling(root, git):
+    """The ceiling `uninit` expects: `agents.cap` from the repository's own
+    `[[repo]]` entry, else the setting default when the file is missing,
+    unparseable or silent on the cap."""
+    default = settings.REGISTRY["agents.cap"].default
+    if not isinstance(default, int) or isinstance(default, bool):
+        raise InitError("internal: agents.cap is not an int setting")
+    raw = _read_text(os.path.join(root, settings.PROJECT_FILE))
+    if raw is None:
+        return default
+    try:
+        data = tomllib.loads(raw)
+    except tomllib.TOMLDecodeError:
+        return default
+    entries = data.get("repo")
+    if not isinstance(entries, list):
+        return default
+    slug = detect.origin_slug(root, git)
+    entry_name = slug.split("/")[1] if slug else None
+    table = None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("name") == entry_name:
+            table = entry
+            break
+    if table is None:
+        if len(entries) == 1 and isinstance(entries[0], dict):
+            table = entries[0]
+        else:
+            return default
+    agents = table.get("agents")
+    cap = agents.get("cap") if isinstance(agents, dict) else None
+    if isinstance(cap, bool) or not isinstance(cap, int):
+        return default
+    return cap
+
+
 class Options(NamedTuple):
     """Parsed `corral init` flags."""
 
@@ -407,17 +457,17 @@ def _apply(root, inputs, opts, git):
     overlay_target = os.path.join(root, OVERLAY_FILE)
     overlay_missing = not os.path.isfile(overlay_target)
     found = detect.existing(root, git)
-    want_hooks = [] if found.hooks else [n for n in HOOK_FILES if n != "commit-msg" or conventional]
     hook_proc = git(["config", HOOKS_KEY], root)
     hooks_path_set = (
         _git_ok(hook_proc) and (getattr(hook_proc, "stdout", "") or "").strip() == HOOKS_DIR
     )
-    hook_targets = [os.path.join(root, HOOKS_DIR, name) for name in want_hooks]
     chained = [n for n in HOOK_FILES if n != "commit-msg" or conventional]
-    show_chain = found.hooks and not (
-        hooks_path_set
-        and all(_file_bytes(os.path.join(root, HOOKS_DIR, n)) == hook_template(n) for n in chained)
+    owned = hooks_path_set and all(
+        _file_bytes(os.path.join(root, HOOKS_DIR, n)) == hook_template(n) for n in chained
     )
+    want_hooks = [] if (found.hooks and not owned) else list(chained)
+    hook_targets = [os.path.join(root, HOOKS_DIR, name) for name in want_hooks]
+    show_chain = found.hooks and not owned
     for target, name in zip(hook_targets, want_hooks):
         try:
             with open(target, "rb") as handle:
@@ -428,8 +478,9 @@ def _apply(root, inputs, opts, git):
             raise InitError(f"corral: cannot read {target}: {err}") from None
         if installed is not None and installed != hook_template(name):
             raise InitError(f"{target} exists with different content: remove it or chain from it")
-    reg_target = os.path.join(projects.projects_dir(), f"{inputs.name}.toml")
-    reg_text = registration_text(inputs.name, os.path.realpath(root), cap)
+    reg_name = registration_name(root)
+    reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
+    reg_text = registration_text(reg_name, os.path.realpath(root), cap)
     reg_missing: bool | None = None
     if not opts.no_register:
         current_reg = _read_text(reg_target)
@@ -447,12 +498,14 @@ def _apply(root, inputs, opts, git):
             _registration_conflicts(
                 projects.projects_dir(),
                 reg_target,
-                inputs.name,
-                f"{inputs.name}-agent",
+                reg_name,
+                f"{reg_name}-agent",
                 os.path.realpath(root),
             )
     need_hooks = bool(hook_targets) and (
-        any(not os.path.isfile(t) for t in hook_targets) or not hooks_path_set
+        any(not os.path.isfile(t) for t in hook_targets)
+        or any(_hook_needs_chmod(t) for t in hook_targets)
+        or not hooks_path_set
     )
     changed = current != text or overlay_missing or need_hooks or reg_missing is True
     if not changed:
@@ -471,6 +524,8 @@ def _apply(root, inputs, opts, git):
         for target in hook_targets:
             if not os.path.isfile(target):
                 sys.stdout.write(f"would write {target}\n")
+            elif _hook_needs_chmod(target):
+                sys.stdout.write(f"would fix the mode of {target} to 0755\n")
         if hook_targets and not hooks_path_set:
             sys.stdout.write(f"would set core.hooksPath to {HOOKS_DIR}\n")
         if reg_missing is True:
@@ -495,6 +550,12 @@ def _apply(root, inputs, opts, git):
                 _write_text(target, hook_template(name).decode("utf-8"))
                 os.chmod(target, 0o755)
                 sys.stdout.write(f"wrote {target}\n")
+            elif _hook_needs_chmod(target):
+                try:
+                    os.chmod(target, 0o755)
+                except OSError as err:
+                    raise InitError(f"corral: cannot chmod {target}: {err}") from None
+                sys.stdout.write(f"fixed the mode of {target} to 0755\n")
         if not hooks_path_set:
             setter = git(["config", HOOKS_KEY, HOOKS_DIR], root)
             if not _git_ok(setter):
@@ -511,8 +572,8 @@ def _apply(root, inputs, opts, git):
         except projects.ProjectsError as err:
             raise InitError(str(err)) from None
         if not any(
-            p.name == inputs.name
-            and p.unit_prefix == f"{inputs.name}-agent"
+            p.name == reg_name
+            and p.unit_prefix == f"{reg_name}-agent"
             and p.root == os.path.normpath(os.path.realpath(root))
             and p.floor == 0
             and p.ceiling == cap
@@ -633,12 +694,9 @@ def _unapply(opts, remove, git):
                 removed.append(hooks_dir)
         else:
             kept.append((hooks_dir, "holds files `corral init` did not write"))
-    name = project_name(root, git)
-    reg_target = os.path.join(projects.projects_dir(), f"{name}.toml")
-    default_cap = settings.REGISTRY["agents.cap"].default
-    if not isinstance(default_cap, int) or isinstance(default_cap, bool):
-        raise InitError("internal: agents.cap is not an int setting")
-    expected = registration_text(name, os.path.realpath(root), default_cap)
+    reg_name = registration_name(root)
+    reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
+    expected = registration_text(reg_name, os.path.realpath(root), _expected_ceiling(root, git))
     reg_current = _read_text(reg_target)
     if reg_current is not None:
         if reg_current == expected:

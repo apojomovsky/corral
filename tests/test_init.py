@@ -681,6 +681,41 @@ class SlugCase(unittest.TestCase):
         self.assertTrue(inputs.test_command)
 
 
+class DirectoryNameCase(Fixture):
+    name = "mydir"
+
+    def add_origin(self, url="https://github.com/org/other.git"):
+        self.git("remote", "add", "origin", url)
+
+    def test_origin_slug_does_not_name_the_registration(self):
+        self.add_origin()
+        code, _, err = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, err)
+        reg = os.path.join(self.config_dir, "projects.d", "mydir.toml")
+        self.assertTrue(os.path.isfile(reg))
+        with open(reg, encoding="utf-8") as handle:
+            self.assertIn('name = "mydir"', handle.read())
+        with open(self.target(), encoding="utf-8") as handle:
+            self.assertIn('name = "other"', handle.read())
+        self.assertEqual([p.name for p in projects.load_all()], ["mydir"])
+
+    def test_two_clones_of_one_origin_register_as_two_projects(self):
+        url = "https://github.com/org/other.git"
+        self.add_origin(url)
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        sibling = os.path.join(os.path.dirname(self.root), "sibling")
+        os.makedirs(sibling)
+        env = clean_env()
+        for args in (["init", "-q", "-b", "main"], ["remote", "add", "origin", url]):
+            proc = subprocess.run(
+                ["git", *args], cwd=sibling, capture_output=True, text=True, env=env
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+        code, _, err = self.run_cli("--test-cmd", "make check", sibling)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(p.name for p in projects.load_all()), ["mydir", "sibling"])
+
+
 OVERLAY_GOLDEN = """# Agent overlay
 
 How corral's agents are driven. The project's `AGENTS.md` speaks to
@@ -796,6 +831,19 @@ class HooksCase(Fixture):
             self.assertIn(want, out)
         self.assertEqual(self.snapshot(), before)
         self.assertFalse(os.path.exists(os.path.join(self.config_dir, "projects.d")))
+
+    def test_rerun_repairs_hook_modes(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        target = os.path.join(self.root, ".githooks", "pre-push")
+        os.chmod(target, 0o644)
+        before = self.snapshot()
+        code, out, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"fixed the mode of {target}", out)
+        self.assertEqual(stat.S_IMODE(os.stat(target).st_mode), 0o755)
+        self.assertEqual(self.snapshot(), before)
+        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+        self.assertEqual(code, 1)
 
 
 class HooksExistingCase(Fixture):
@@ -1007,6 +1055,20 @@ class UninitCase(Fixture):
         self.assertTrue(os.path.isfile(self.reg_target()))
         self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks")))
         self.assertEqual(self.hooks_path(), "")
+
+    def test_cap_three_registration_round_trips_through_uninit(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)[0], 0)
+        self.assertTrue(os.path.isfile(self.reg_target()))
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_uninit_without_corral_toml_falls_back_to_the_default(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        os.remove(self.target())
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
 
     def test_foreign_hooks_are_kept(self):
         os.makedirs(os.path.join(self.root, ".githooks"), exist_ok=True)
