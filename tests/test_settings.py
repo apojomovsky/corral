@@ -133,6 +133,32 @@ class Errors(unittest.TestCase):
             with self.assertRaisesRegex(S.SettingsError, "appears twice"):
                 S.repo_names(root)
 
+    def test_repo_names_loads_provider_settings_first(self):
+        # A fresh interpreter has only the natively registered settings;
+        # repo_names must still accept a [[repo]] key another module owns.
+        import subprocess
+        import sys
+
+        with tempfile.TemporaryDirectory(prefix="corral-settings-") as root:
+            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+                handle.write('[[repo]]\nname = "a"\nclone.path = "main"\n')
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.path.insert(0, '.');"
+                    "from corral import settings;"
+                    "sys.stdout.write(','.join(settings.repo_names(sys.argv[1])))",
+                    root,
+                ],
+                cwd=repo_root,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout, "a")
+
     def test_a_setting_cannot_be_registered_twice_or_with_a_bad_default(self):
         with self.assertRaises(ValueError):
             S.register("agents.cap", int, 1, "again")
