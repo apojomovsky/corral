@@ -136,6 +136,12 @@ class BadFiles(unittest.TestCase):
         with self.assertRaises(accounts.AccountsError):
             accounts.providers(directory)
 
+    def test_a_singular_provider_table_is_a_configuration_error(self):
+        directory = config_with('[provider]\nname = "provider-a"\n')
+        with self.assertRaises(accounts.AccountsError):
+            accounts.providers(directory)
+        self.assertTrue(accounts.check(directory))
+
     def test_duplicate_names_are_a_configuration_error(self):
         text = """\
 [[provider]]
