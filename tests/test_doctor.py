@@ -283,6 +283,7 @@ class StateDirs(unittest.TestCase):
             {"CORRAL_STATE": blocked, "CORRAL_CONFIG": os.path.join(root, "config")}
         )
         self.assertIsNotNone(error)
+        self.assertIn(blocked, error or "")
 
     def test_a_missing_probe_on_unlink_still_passes(self):
         root = tempfile.mkdtemp(prefix="corral-doctor-")
