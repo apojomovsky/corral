@@ -17,7 +17,7 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
-from corral import launch, paths, runtimes, settings, units, worktrees
+from corral import launch, models, paths, runtimes, settings, units, worktrees
 
 OK, NOTHING, RACE, USAGE = 0, 1, 2, 4
 
@@ -42,6 +42,7 @@ def production_seams() -> Seams:
 #: Errors the verbs report as one line on stderr. Anything else is a bug.
 KNOWN = (
     launch.LaunchError,
+    models.Exhausted,
     units.UnitsError,
     worktrees.WorktreeError,
     runtimes.UnknownRuntime,
@@ -51,7 +52,7 @@ KNOWN = (
 
 
 def _exit_code(err):
-    if isinstance(err, (launch.LaunchError, units.UnitsError)):
+    if isinstance(err, (launch.LaunchError, models.Exhausted, units.UnitsError)):
         return err.exit_code
     return USAGE
 

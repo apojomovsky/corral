@@ -68,12 +68,12 @@ class Runtime(Protocol):
         """Write the per-launch config into `session_dir`, never a home config."""
         ...
 
-    def resume_handle(self, session_dir: str) -> str | None:
-        """The newest session file or id in `session_dir`, or None."""
+    def with_models(self, config: dict, chains: dict) -> dict:
+        """`config` with the live chains laid over it, for the per-launch overlay."""
         ...
 
-    def activity_file(self, session_dir: str) -> str | None:
-        """The file `tail` reads for this session's activity, or None."""
+    def resume_handle(self, session_dir: str) -> str | None:
+        """The newest session file or id in `session_dir`, or None."""
         ...
 
 

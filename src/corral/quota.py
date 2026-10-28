@@ -103,7 +103,7 @@ def role_state(chain, states, *, unknown_blocks=DEFAULT_UNKNOWN_BLOCKS):
     return UNKNOWN
 
 
-def _chain_provider(entry):
+def chain_provider(entry):
     """The provider of a chain entry: the part before ``provider/model``."""
     return str(entry).split("/", 1)[0]
 
@@ -128,7 +128,7 @@ def gate(
     readings = (ledger or {}).get("readings", {}) or {}
     marks = (ledger or {}).get("marks", {}) or {}
     providers = {
-        _chain_provider(entry) for chain in (chains or {}).values() for entry in chain or ()
+        chain_provider(entry) for chain in (chains or {}).values() for entry in chain or ()
     }
     states = {
         provider: provider_state(
@@ -142,7 +142,7 @@ def gate(
     }
     roles_states = {
         role: role_state(
-            [_chain_provider(entry) for entry in chain or ()],
+            [chain_provider(entry) for entry in chain or ()],
             states,
             unknown_blocks=unknown_blocks,
         )
@@ -153,7 +153,7 @@ def gate(
             "state": roles_states[role],
             "providers": {
                 provider: states[provider]
-                for provider in [_chain_provider(entry) for entry in (chains or {}).get(role) or ()]
+                for provider in [chain_provider(entry) for entry in (chains or {}).get(role) or ()]
             },
         }
         for role in roles or ()
