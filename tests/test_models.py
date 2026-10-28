@@ -5,7 +5,7 @@ import unittest
 
 from corral import accounts, launch, launchcli, models, quota, settings
 from corral.runtimes import omp, opencode
-from tests.test_launch import TOML, OpsCase
+from tests.test_launch import TOML, OpsCase, roomy
 
 T0 = 1_800_000_000.0
 STALE = 900.0
@@ -247,6 +247,7 @@ class LaunchModels(OpsCase):
             title="feat: add the thing",
             list_fn=self.system.list_fn,
             run=self.system.run,
+            usage=roomy,
             pool_fn=lambda: pool(*pool_names),
             ledger_fn=lambda: seen,
             now_fn=lambda: T0,

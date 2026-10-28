@@ -10,6 +10,7 @@ from corral import (
     agentcli,
     coordcli,
     deps,
+    diskcli,
     doctor,
     gccli,
     init,
@@ -218,6 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_budget)
     init.add_parser(sub)
     coordcli.add_parser(sub)
+    diskcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)

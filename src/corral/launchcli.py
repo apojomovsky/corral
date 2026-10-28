@@ -20,6 +20,7 @@ from typing import NamedTuple
 
 from corral import (
     admission,
+    disk,
     hold,
     launch,
     models,
@@ -63,6 +64,9 @@ class Seams(NamedTuple):
     #: None means there is no way to read labels: the resume refuses
     #: fail-closed, never as "no labels". Tests pass a fake.
     labels_fn: Callable | None = None
+    #: `usage(path) -> (total, used, free)` for the disk gate. None means
+    #: the production reader. Tests pass a fake.
+    usage: Callable | None = None
 
 
 def production_seams() -> Seams:
@@ -81,6 +85,7 @@ def production_seams() -> Seams:
         run=units.default_run,
         stop_fn=units.systemctl_stop,
         labels_fn=labels_fn,
+        usage=disk.production_usage,
     )
 
 
@@ -239,6 +244,7 @@ def cmd_launch(args, seams: Seams) -> int:
         runtime_config=config,
         list_fn=seams.list_fn,
         run=seams.run,
+        usage=seams.usage or disk.production_usage,
     )
     print(f"launched {unit} in {workdir}")
     return OK
@@ -272,6 +278,7 @@ def cmd_resume(args, seams: Seams) -> int:
         model=args.model,
         list_fn=seams.list_fn,
         run=seams.run,
+        usage=seams.usage or disk.production_usage,
     )
     print(f"resumed as {unit} in {workdir}")
     return OK
