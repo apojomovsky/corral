@@ -49,6 +49,7 @@ class Env(NamedTuple):
     list_fn: Callable[[str], list]
     reader_errors: Sequence[tuple[str, str, str]]
     registry_rows: Sequence[tuple[Mapping, str]]
+    registry_error: str | None = None
 
 
 def _check_deps(results: Sequence[deps.Result]) -> list[Check]:
@@ -95,7 +96,7 @@ def _check_linger(user: str, run: Callable[[Sequence[str]], object]) -> Check:
     argv = ["loginctl", "show-user", user, "--property=Linger"]
     try:
         proc = run(argv)
-    except OSError as err:
+    except (OSError, subprocess.SubprocessError) as err:
         return Check("linger", "fail", f"loginctl cannot be reached: {err}", _linger_fix())
     if getattr(proc, "returncode", 1) != 0:
         err = (getattr(proc, "stderr", "") or "").strip()
@@ -119,7 +120,7 @@ def _linger_fix() -> str:
 def _check_manager(prefix: str, list_fn: Callable[[str], list]) -> Check:
     try:
         found = list_fn(prefix)
-    except units.Unreachable as err:
+    except units.UnitsError as err:
         return Check(
             "user-manager",
             "fail",
@@ -132,18 +133,28 @@ def _check_manager(prefix: str, list_fn: Callable[[str], list]) -> Check:
 def _check_readers(errors: Sequence[tuple[str, str, str]]) -> list[Check]:
     if not errors:
         return [Check("quota-readers", "ok", "every configured reader loads", "")]
-    return [
-        Check(
-            f"quota-readers:{provider or entry}",
+    named = []
+    for provider, entry, error in errors:
+        name = provider or entry
+        named.append(
+            Check(
+                f"quota-readers:{name}" if name else "quota-readers",
+                "fail",
+                error,
+                "correct the reader entry in accounts.toml (see `corral deps`)",
+            )
+        )
+    return named
+
+
+def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = None) -> Check:
+    if error is not None:
+        return Check(
+            "registry",
             "fail",
             error,
-            "correct the reader entry in accounts.toml (see `corral deps`)",
+            "make the state dir usable, then run `corral doctor` again",
         )
-        for provider, entry, error in errors
-    ]
-
-
-def _check_registry(rows: Sequence[tuple[Mapping, str]]) -> Check:
     counts = {"live": 0, "stale": 0, "finished": 0}
     unticketed = 0
     for entry, state in rows:
@@ -175,7 +186,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_linger(env.user, env.run),
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_readers(env.reader_errors),
-        _check_registry(env.registry_rows),
+        _check_registry(env.registry_rows, env.registry_error),
     ]
 
 
@@ -238,20 +249,26 @@ def check_state_dirs(env: Mapping[str, str] | None = None) -> str | None:
     return None
 
 
+def _resolved_settings(
+    start: str, env: Mapping[str, str] | None = None
+) -> tuple[settings.Resolved | None, str | None]:
+    """(resolved, error): the settings and their failure, resolved once."""
+    try:
+        return settings.load(root=settings.find_root(start), env=env), None
+    except (settings.SettingsError, paths.PathError) as err:
+        return None, str(err)
+
+
 def check_settings(start: str, env: Mapping[str, str] | None = None) -> str | None:
     """None when the host config and the ops root's file resolve."""
-    try:
-        settings.load(root=settings.find_root(start), env=env)
-    except (settings.SettingsError, paths.PathError) as err:
-        return str(err)
-    return None
+    return _resolved_settings(start, env)[1]
 
 
 def load_readers(config_dir: str | None = None) -> list[tuple[str, str, str]]:
     """(provider, entry, error) for every reader that does not load."""
     try:
         found = accounts.providers(config_dir)
-    except accounts.AccountsError as err:
+    except (accounts.AccountsError, paths.PathError) as err:
         return [("", "", str(err))]
     errors = []
     for provider in found:
@@ -273,30 +290,48 @@ def production_list_fn(prefix: str) -> list:
 
 
 def production_env() -> Env:
-    """The live environment. Only the CLI calls this; tests never call this."""
-    root = settings.find_root(os.getcwd())
+    """The live environment. Only the CLI calls this; tests never call this.
+
+    Every fallible gathering degrades to report data: a broken host config
+    or an unusable state dir is a failing row, never a traceback.
+    """
+    resolved, settings_error = _resolved_settings(os.getcwd())
+    if resolved is not None:
+        prefix = str(resolved["agents.unit_prefix"])
+        try:
+            registry_cfg = registry.config(resolved)
+        except settings.SettingsError as err:
+            settings_error = str(err)
+            registry_cfg = registry.default_config()
+    else:
+        prefix = str(settings.REGISTRY["agents.unit_prefix"].default)
+        registry_cfg = registry.default_config()
     try:
-        resolved = settings.load(root=root)
-        settings_error: str | None = None
-    except (settings.SettingsError, paths.PathError) as err:
-        resolved = None
-        settings_error = str(err)
-    prefix = (
-        resolved["agents.unit_prefix"]
-        if resolved is not None
-        else settings.REGISTRY["agents.unit_prefix"].default
-    )
+        account_problems = accounts.check()
+    except (paths.PathError, accounts.AccountsError) as err:
+        account_problems = [str(err)]
+    try:
+        user = getpass.getuser()
+    except (OSError, KeyError):
+        user = "unknown"
+    try:
+        registry_rows = registry.visible(time.time(), cfg=registry_cfg)
+        registry_error = None
+    except (paths.PathError, settings.SettingsError, registry.RegistryError) as err:
+        registry_rows = ()
+        registry_error = str(err)
     return Env(
         dep_results=deps.check_all(deps.load()),
-        account_problems=accounts.check(),
+        account_problems=account_problems,
         settings_error=settings_error,
         state_error=check_state_dirs(),
-        user=getpass.getuser(),
-        unit_prefix=str(prefix),
+        user=user,
+        unit_prefix=prefix,
         run=production_run,
         list_fn=production_list_fn,
         reader_errors=load_readers(),
-        registry_rows=registry.visible(time.time()),
+        registry_rows=registry_rows,
+        registry_error=registry_error,
     )
 
 

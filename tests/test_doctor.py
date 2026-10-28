@@ -3,10 +3,12 @@
 import io
 import json
 import os
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
+from typing import Any
 
 from corral import cli, deps, doctor, registry, units
 
@@ -37,7 +39,7 @@ def live_entry(ticket=True):
 
 
 def env(**overrides):
-    fields = {
+    fields: dict[str, Any] = {
         "dep_results": (dep("git"),),
         "account_problems": (),
         "settings_error": None,
@@ -322,6 +324,55 @@ class Command(unittest.TestCase):
         args = cli.build_parser().parse_args(["doctor", "--json"])
         self.assertTrue(args.json)
         self.assertIs(args.func.func, doctor.cmd_doctor)
+
+
+class FailClosed(unittest.TestCase):
+    def test_a_hung_loginctl_fails_with_exit_3(self):
+        def run(argv):
+            raise subprocess.TimeoutExpired(argv, 10)
+
+        checks = doctor.run_checks(env(run=run))
+        failed = [check for check in checks if check.name == "linger"]
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 3)
+
+    def test_an_invalid_prefix_is_a_failing_row_not_a_crash(self):
+        def list_fn(prefix):
+            raise units.UnitsError("unit prefix 'bad prefix!' must be letters")
+
+        checks = doctor.run_checks(env(list_fn=list_fn))
+        failed = [check for check in checks if check.name == "user-manager"]
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertIn("bad prefix", failed[0].detail)
+
+    def test_a_reader_failure_without_names_keeps_the_bare_check_name(self):
+        checks = doctor.run_checks(env(reader_errors=(("", "", "boom"),)))
+        failed = [check for check in checks if "quota-readers" in check.name]
+        self.assertEqual([check.name for check in failed], ["quota-readers"])
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_a_registry_listing_failure_fails(self):
+        checks = doctor.run_checks(env(registry_error="state is gone"))
+        found = [check for check in checks if check.name == "registry"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertIn("gone", found[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_combined_failures_prefer_exit_3_when_the_bus_is_gone(self):
+        checks = doctor.run_checks(
+            env(
+                account_problems=("boom",),
+                run=fake_run(error=OSError("no bus")),
+            )
+        )
+        self.assertEqual(doctor.exit_code(checks), 3)
+
+    def test_exit_codes_agree_with_the_cli(self):
+        self.assertEqual(
+            (doctor.OK, doctor.UNREACHABLE, doctor.USAGE),
+            (cli.OK, cli.UNREACHABLE, cli.USAGE),
+        )
 
 
 if __name__ == "__main__":
