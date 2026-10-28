@@ -149,6 +149,16 @@ def db_path():
     return os.path.join(paths.state_dir(), DB_NAME)
 
 
+#: The tracker cursor table, created by a fresh database and by the v1 to v2
+#: migration alike: one definition.
+_CURSORS_DDL = """
+    CREATE TABLE IF NOT EXISTS cursors(
+        repo TEXT NOT NULL, name TEXT NOT NULL,
+        value TEXT NOT NULL,
+        PRIMARY KEY(repo, name))
+"""
+
+
 def _migrate(conn):
     """Create the schema forward from an empty database, in one place."""
     conn.executescript(
@@ -183,25 +193,15 @@ def _migrate(conn):
             attempts INTEGER NOT NULL DEFAULT 0,
             state TEXT NOT NULL DEFAULT 'queued',
             reason TEXT NOT NULL DEFAULT '');
-        CREATE TABLE IF NOT EXISTS cursors(
-            repo TEXT NOT NULL, name TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY(repo, name));
         """
     )
+    conn.execute(_CURSORS_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _migrate_1_to_2(conn):
     """Forward a version-1 database: add the tracker cursor table."""
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS cursors(
-            repo TEXT NOT NULL, name TEXT NOT NULL,
-            value TEXT NOT NULL,
-            PRIMARY KEY(repo, name))
-        """
-    )
+    conn.execute(_CURSORS_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 

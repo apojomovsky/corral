@@ -581,6 +581,29 @@ class OpenTest(unittest.TestCase):
                 self.assertEqual(store.get_cursor("app", "tracker"), "cursor-2")
                 self.assertIsNone(store.get_cursor("other", "tracker"))
 
+    def test_a_migrated_cursors_table_matches_a_fresh_one(self):
+        def cursors_sql(path):
+            conn = sqlite3.connect(path)
+            try:
+                row = conn.execute("SELECT sql FROM sqlite_master WHERE name='cursors'").fetchone()
+            finally:
+                conn.close()
+            return row[0] if row else None
+
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+            fresh = os.path.join(tmp, "fresh.sqlite")
+            board.open_store(fresh).close()
+            migrated = os.path.join(tmp, "migrated.sqlite")
+            board.open_store(migrated).close()
+            conn = sqlite3.connect(migrated)
+            conn.execute("DROP TABLE cursors")
+            conn.execute("PRAGMA user_version=1")
+            conn.commit()
+            conn.close()
+            board.open_store(migrated).close()
+            self.assertIsNotNone(cursors_sql(fresh))
+            self.assertEqual(cursors_sql(fresh), cursors_sql(migrated))
+
     def test_unknown_version_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
