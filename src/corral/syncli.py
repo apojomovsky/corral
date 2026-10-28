@@ -158,10 +158,13 @@ def sync_root(
             "seen": result.items_seen,
             "cursor": result.cursor,
             "errors": list(result.errors),
+            "conflicts": list(result.conflicts),
         }
         mirror_ops[tracker_repo] = operators
         for line in result.errors:
             _err(line, err)
+        for line in result.conflicts:
+            _err(f"claim conflict: {line} (corral wins)", err)
     seen = sum(row["seen"] for row in results.values())
     failed = sum(len(row["errors"]) for row in results.values())
     pushed: dict | None = None

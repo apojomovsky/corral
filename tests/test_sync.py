@@ -224,5 +224,101 @@ class AuditTest(StoreCase):
         self.assertEqual(result, sync.SyncResult(0, None, ()))
 
 
+class ResyncAdoptionTest(StoreCase):
+    def test_resync_on_empty_store_adopts_claim(self):
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "agent-1")
+        self.assertEqual(row.confidence, board.CONFIRMED)
+        self.assertEqual(self.store.outbox_rows(), [])
+
+    def test_adopted_claim_uses_recovery_epoch(self):
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        with self.assertRaises(board.Claimed):
+            self.store.release(REPO, 1, "agent-1", 3, now=T0 + 1)
+        self.store.release(REPO, 1, "agent-1", int(T0), now=T0 + 1)
+        row, _ = self.store.item(REPO, 1, now=T0 + 1)
+        self.assertEqual(row.agent, "")
+
+    def test_incremental_sync_never_adopts(self):
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        result = sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "")
+
+    def test_audit_never_adopts(self):
+        self.stored(1)
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        result = sync.audit_repo(self.store, fake, REPO, operators=["alice"], now=T0, limit=10)
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "")
+
+    def test_existing_claim_untouched_and_reported(self):
+        self.stored(1)
+        claim = self.store.claim(REPO, 1, "agent-1", "host-1", now=T0 - 50)
+        fake = FakeTracker([reading(number=1, agent="agent-2", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.conflicts, (f"{REPO}#1: store=agent-1 tracker=agent-2",))
+        self.store.release(REPO, 1, "agent-1", claim.epoch, now=T0 + 1)
+
+    def test_matching_claim_reports_no_conflict(self):
+        self.stored(1)
+        self.store.claim(REPO, 1, "agent-1", "host-1", now=T0 - 50)
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "agent-1")
+
+    def test_queued_agent_write_blocks_adoption(self):
+        self.stored(1)
+        self.store.enqueue(REPO, 1, "agent", "agent-9", now=T0)
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "agent-9")
+
+    def test_sent_agent_write_blocks_adoption(self):
+        self.stored(1)
+        row = self.store.enqueue(REPO, 1, "agent", "agent-9", now=T0 - 50)
+        self.store.mark_sent(row.id)
+        fake = FakeTracker([reading(number=1, agent="agent-1", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.conflicts, ())
+        held, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(held.agent, "")
+        self.assertEqual(len(self.store.outbox_rows(state=board.SENT)), 1)
+
+    def test_external_and_closed_items_are_not_adopted(self):
+        self.stored(1, author="mallory")
+        self.stored(2, state="closed")
+        fake = FakeTracker(
+            [
+                reading(number=1, author="mallory", agent="agent-1", updated_at=T0),
+                reading(number=2, state="closed", agent="agent-2", updated_at=T0),
+            ]
+        )
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.conflicts, ())
+        for number in (1, 2):
+            row, _ = self.store.item(REPO, number, now=T0)
+            self.assertEqual(row.agent, "")
+
+    def test_empty_tracker_agent_adopts_nothing(self):
+        fake = FakeTracker([reading(number=1, updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "")
+
+
 if __name__ == "__main__":
     unittest.main()
