@@ -19,9 +19,11 @@ originates a value for those. It only settles queued writes: a reading
 that echoes a queued value marks it ``sent`` and the row turns
 ``confirmed``; a fresher reading showing a different value drops the
 queued write with reason ``overridden`` (a person won); a stale reading
-(older than the queued write) settles nothing. Rebuilding claims from
-tracker readings after a lost store belongs to the later sync slice,
-not here.
+(older than the queued write) settles nothing. A lost store rebuilds its
+claims in the full resync path only: ``Store.adopt_claim`` takes the
+tracker's agent into an empty row, with an unknown host and a recovery
+epoch. The tracker's in-flight status is never recovered: the schema has
+no place to store it.
 
 External items are read-only. An item is external when its author is
 not in ``operators`` or it comes from a fork, and an item stays
@@ -615,6 +617,42 @@ class Store:
                 "UPDATE items SET confidence=? WHERE repo=? AND number=?",
                 (PENDING, repo, number),
             )
+
+    def adopt_claim(self, repo, number, agent, *, epoch, now):
+        """Adopt the tracker's claim into a row with no local claim state.
+        One transaction: the insert happens only when no claim row exists
+        and no agent write is queued or sent for the item. The host is
+        unknown after a lost store, so it stays empty; the caller passes a
+        recovery epoch (``int(now)``), strictly higher than any
+        counter-based epoch a previous store handed out, so a stale
+        holder's release is refused. Nothing is enqueued: the tracker
+        already shows the claim, and confidence stays as the upsert left
+        it. Returns False, never raises, when a claim row exists, the
+        item is unknown, external or closed, or an agent write is already
+        queued or sent."""
+        with _txn(self._conn):
+            row = self._row(repo, number)
+            if row is None or row[5] != "open" or row[14] or not agent:
+                return False
+            held = self._conn.execute(
+                "SELECT agent FROM claims WHERE repo=? AND number=?",
+                (repo, number),
+            ).fetchone()
+            if held is not None:
+                return False
+            busy = self._conn.execute(
+                "SELECT 1 FROM outbox WHERE repo=? AND number=? AND field='agent'"
+                " AND state IN (?, ?) LIMIT 1",
+                (repo, number, QUEUED, SENT),
+            ).fetchone()
+            if busy is not None:
+                return False
+            self._conn.execute(
+                "INSERT INTO claims(repo, number, agent, host, epoch, claimed_at)"
+                " VALUES(?, ?, ?, '', ?, ?)",
+                (repo, number, agent, epoch, now),
+            )
+            return True
 
     def enqueue(self, repo, number, field, value, *, now):
         """Queue one coordination write and mark the item pending. Only

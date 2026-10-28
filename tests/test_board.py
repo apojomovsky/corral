@@ -427,6 +427,58 @@ class ClaimTest(TempStoreTest):
         self.assertEqual(len(losses), 1)
 
 
+class AdoptClaimTest(TempStoreTest):
+    def test_adopt_stores_tracker_agent_with_unknown_host(self):
+        store = self.stored()
+        self.assertTrue(store.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0))
+        item, _ = store.item("app", 7, now=1800000100.0)
+        self.assertEqual(item.agent, "agent-1")
+        self.assertEqual(item.confidence, board.CONFIRMED)
+
+    def test_adopt_uses_given_epoch_and_enqueues_nothing(self):
+        store = self.stored()
+        store.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0)
+        before = store.outbox_rows()
+        self.assertEqual(before, [])
+        claim = store.claim("app", 7, "agent-1", "host-1", now=1800000101.0)
+        self.assertEqual(claim.epoch, 1800000100)
+        self.assertEqual(claim.host, "")
+
+    def test_adopt_refused_when_claim_row_exists(self):
+        store = self.stored()
+        store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        self.assertFalse(store.adopt_claim("app", 7, "agent-2", epoch=1800000100, now=1800000100.0))
+        item, _ = store.item("app", 7, now=1800000100.0)
+        self.assertEqual(item.agent, "agent-1")
+
+    def test_adopt_refused_after_release_clears_holder(self):
+        store = self.stored()
+        claim = store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        store.release("app", 7, "agent-1", claim.epoch, now=1200.0)
+        self.assertFalse(store.adopt_claim("app", 7, "agent-2", epoch=1800000100, now=1800000100.0))
+
+    def test_adopt_refused_for_external_closed_and_unknown(self):
+        store = self.stored(author="mallory")
+        self.assertFalse(store.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0))
+        closed = self.stored(state="closed")
+        self.assertFalse(
+            closed.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0)
+        )
+        fresh = self.open()
+        self.assertFalse(fresh.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0))
+
+    def test_adopt_refused_while_agent_write_queued(self):
+        store = self.stored()
+        store.enqueue("app", 7, "agent", "agent-9", now=1500.0)
+        self.assertFalse(store.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0))
+
+    def test_adopt_refused_while_agent_write_sent(self):
+        store = self.stored()
+        row = store.enqueue("app", 7, "agent", "agent-9", now=1500.0)
+        store.mark_sent(row.id)
+        self.assertFalse(store.adopt_claim("app", 7, "agent-1", epoch=1800000100, now=1800000100.0))
+
+
 class EnqueueTest(TempStoreTest):
     def test_enqueue_marks_pending(self):
         store = self.stored()

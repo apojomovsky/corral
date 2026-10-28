@@ -29,6 +29,7 @@ class SyncResult(NamedTuple):
     items_seen: int  # store rows touched: applied readings, plus absent marks on resync
     cursor: str | None  # the feed position after the run, None when untouched
     errors: tuple[str, ...]  # one line per failed tracker call; "" never appears
+    conflicts: tuple[str, ...] = ()  # resync-only: "repo#N: store=A tracker=B" where corral wins
 
 
 def _reading(item: iface.TrackerItem) -> board.Item:
@@ -98,11 +99,20 @@ def resync_repo(
 
     A listing that fails halfway keeps what was applied and marks
     nothing absent: an incomplete listing proves nothing missing.
+
+    This is the only path that rebuilds claims: when the tracker shows
+    an agent and the store holds no claim and no queued or sent agent
+    write for the item, the claim is adopted with a recovery epoch. A
+    stored claim naming a different agent with nothing queued is a
+    conflict between hosts: the store wins, and the item is reported in
+    ``conflicts`` instead. Incremental sync and audit never adopt.
     """
     seen = 0
     listed: set[int] = set()
     stamps: list[float] = []
     errors: list[str] = []
+    conflicts: list[str] = []
+    shown: list[tuple[str, int, str]] = []  # tracker-reported claims, decided below
     try:
         walked: Iterator[iface.TrackerItem] = tracker.items(repo)
         for item in walked:
@@ -110,8 +120,30 @@ def resync_repo(
             seen += 1
             listed.add(item.number)
             stamps.append(item.updated_at)
+            if item.agent:
+                shown.append((item.repo, item.number, item.agent))
     except iface.TrackerError as err:
         errors.append(f"{repo}: {err}")
+    # Adoptions are decided after the walk: each upsert settles queued
+    # writes (a fresher tracker value drops an overridden queue), so only
+    # now does the outbox show which items corral already spoke for. A
+    # queued or sent agent write blocks adoption; a stored claim naming a
+    # different agent is a conflict corral wins instead. Adoptions enqueue
+    # nothing, so one snapshot covers every item.
+    spoken = {
+        (row.repo, row.number)
+        for row in store.outbox_rows()
+        if row.field == "agent" and row.state in (board.QUEUED, board.SENT)
+    }
+    for shown_repo, shown_number, shown_agent in shown:
+        if (shown_repo, shown_number) in spoken:
+            continue
+        stored, _ = store.item(shown_repo, shown_number, now=now)
+        holder = stored.agent if stored is not None else ""
+        if not holder:
+            store.adopt_claim(shown_repo, shown_number, shown_agent, epoch=int(now), now=now)
+        elif holder != shown_agent:
+            conflicts.append(f"{shown_repo}#{shown_number}: store={holder} tracker={shown_agent}")
     if not errors:
         absent = 0
         for row in store.items(repo=repo):
@@ -121,7 +153,7 @@ def resync_repo(
         seen += absent
     cursor = iface.format_cursor(max(stamps)) if stamps else store.get_cursor(repo, CURSOR_NAME)
     _store_cursor(store, repo, cursor)
-    return SyncResult(seen, cursor, tuple(errors))
+    return SyncResult(seen, cursor, tuple(errors), tuple(conflicts))
 
 
 def audit_repo(
