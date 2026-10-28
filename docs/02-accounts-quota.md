@@ -1,6 +1,6 @@
 # 02: accounts, models and quota
 
-Status: proposed. Milestone 1, step 3.
+Status: approved 2026-10-28. Milestone 1, step 3.
 
 corral names no provider. A provider's quota format is the one thing every deployment does differently, so it sits behind a reader that the host installs. corral owns what is the same everywhere: the account pool, the ledger, reactive marks, the gate over a model chain, and the overlay that keeps an exhausted provider out of a launch.
 
@@ -16,7 +16,7 @@ cooldown = "1h"                     # how long a rate-limit mark blocks, unless 
 stale_after = "15m"                 # a reading older than this is stale
 ```
 
-`corral deps` and the doctor check that the file parses, that provider names are unique, and that each reader imports.
+The file lists providers and how to read their usage. Logins and credentials stay with each runtime and the reader's own call-time lookup; corral stores none of them. `corral deps` and the doctor check that the file parses, that provider names are unique, and that each reader imports.
 
 ## Readers
 
@@ -45,7 +45,7 @@ class Window(NamedTuple):
 One file in the host state dir, `quota.json`, shared by every project. Atomic writes under one lock.
 
 - `readings`: provider to windows and `read_at`.
-- `marks`: provider to `until`, `reason`, `source`. A mark only moves later, never earlier.
+- `marks`: provider to `until`, `reason`, `source`. A mark posted automatically only moves later, never earlier. An operator releases one explicitly with `corral quota unmark`.
 
 The ledger is data. The decisions below are pure functions over it.
 
@@ -53,6 +53,7 @@ The ledger is data. The decisions below are pure functions over it.
 
 A provider is `ok`, `low` (a window at or above the `quota.low_pct` setting), `exhausted` (a window at 100, or an active mark), or `unknown` (no reading, or a stale one, and no mark).
 
+- **Settings are host-level.** `quota.low_pct` and `quota.unknown_blocks` live in the host config, because the ledger is shared: two projects must not disagree about whether an unknown provider blocks.
 - **A mark always blocks.** An exhausted window blocks until its reset.
 - **`unknown` does not block.** A dead reader must not stop the fleet. It shows in `corral quota` and in the doctor, and a reactive mark still blocks. A setting, `quota.unknown_blocks`, turns that around for a host that prefers certainty. Default `false`.
 - **A role passes when any provider on its chain passes.** The gate is evaluated per project over that project's own chains, against the shared ledger, so a project whose chains avoid an exhausted provider keeps running.
@@ -73,7 +74,8 @@ corral checks every chain entry against the pool. An unknown provider is a confi
 - `corral quota [--json]`: one view of the pool and the ledger.
 - `corral quota refresh [provider]`: run the readers, record the result.
 - `corral quota mark <provider> [--until T] [--reason R]`: a manual or session-posted mark.
-- Library: `corral.quota.gate(...)`, per the design doc, section 2.
+- `corral quota unmark <provider> [--reason R]`: release a mark early, for a bad reading or a fat-fingered `--until`.
+- Library: `corral.quota.gate(...)`, named in the design doc's contract section; its signature is fixed in slice 3.
 
 ## Not in this step
 
