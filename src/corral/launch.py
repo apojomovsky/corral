@@ -25,6 +25,7 @@ is live at all.
 """
 
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass
@@ -145,11 +146,19 @@ def _check_model(model):
     return model
 
 
-def _ticket_owners(counted, names):
-    """``{(repo, number): project}`` for counted tickets naming a registered project."""
+def _ticket_owners(counted, names, cfg):
+    """``{(repo, number): project}`` for counted tickets naming a registered project.
+
+    Only live entries of this host attribute a ticket, the same entries
+    `registry.counted_tickets` counts: a stale or finished holder of the
+    same ticket cannot steal its attribution.
+    """
     owners = {}
-    for entry in registry.load_all():
+    host = socket.gethostname()
+    for entry, state in registry.visible(time.time(), cfg, host=host):
         held = registry.ticket_of(entry)
+        if state != registry.LIVE or entry.get("host") != host:
+            continue
         if held is None or held not in counted or held in owners:
             continue
         ticket = entry.get("ticket") or {}
@@ -173,7 +182,7 @@ def admission_state(registered, list_fn, cfg, key, own=()):
         for repo, number in units.live_tickets(project.unit_prefix, list_fn(project.unit_prefix)):
             live.add((project.name, repo, number))
     counted = registry.counted_tickets(cfg=cfg)
-    owners = _ticket_owners(counted, names) if counted else {}
+    owners = _ticket_owners(counted, names, cfg) if counted else {}
     for repo, number in counted:
         live.add((owners.get((repo, number)) or key, repo, number))
     return live
@@ -227,9 +236,7 @@ def admit(tgt, number, *, list_fn):
     verdict = admission.admit(
         admission.Request(project=key, repo=tgt.repo, ticket=number, kind="start"),
         admission.State(
-            live=sorted(
-                admission_state(registered, list_fn, cfg, key, own=from_units | from_registry)
-            )
+            live=sorted(admission_state(registered, list_fn, cfg, key, own=from_units))
         ),
         decided,
     )

@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -266,6 +267,28 @@ class AdmitAcrossProjectsTest(HostCase):
             launch.admit(self.target("project-b"), 8, list_fn=self.list_fn)
         self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
         launch.admit(self.target("project-a"), 5, list_fn=self.list_fn)
+
+    def test_a_foreign_registry_ticket_is_one_slot_not_two(self):
+        self.write_project("project-a", ceiling=1)
+        registry.register(
+            "worker-1", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
+        )
+        launch.admit(self.target("project-a"), 5, list_fn=self.list_fn)
+
+    def test_a_stale_holder_does_not_steal_a_tickets_attribution(self):
+        old = time.time() - 10_000
+        registry.register(
+            "worker-old",
+            "claude-code",
+            ticket=registry.make_ticket("lib", 7, project="project-a"),
+            now=old,
+        )
+        registry.register(
+            "worker-new", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
+        )
+        with self.assertRaises(launch.CapFull) as ctx:
+            launch.admit(self.target("project-b"), 8, list_fn=self.list_fn)
+        self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
 
     def test_floors_above_the_total_are_rejected(self):
         self.write_project("project-a", ceiling=3, floor=2)

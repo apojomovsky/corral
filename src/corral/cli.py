@@ -181,7 +181,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("name", nargs="?", choices=list(PATHS), help="print only this one")
     p.add_argument("--mkdir", action="store_true", help="create the directories first")
     p.set_defaults(func=cmd_paths)
-    p = sub.add_parser("projects", help="the registered projects and their live agents")
+    p = sub.add_parser(
+        "projects",
+        help="the registered projects and their live agents (counted with the host registry settings)",
+    )
     p.add_argument("--json", action="store_true", help="print the stable document")
     p.set_defaults(func=cmd_projects)
     from corral.diffscope import BASE_HELP
