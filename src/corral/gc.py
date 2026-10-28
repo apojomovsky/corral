@@ -242,6 +242,25 @@ def _outside_count(repo, ref, base, run):
         return None
 
 
+def _refs_outside_count(path, base, run):
+    """Commits any ref in `path` holds outside `base`; None when uncountable (keep)."""
+    proc = run(["rev-list", "--count", "--all", "--not", base], cwd=path)
+    if proc.returncode != 0:
+        return None
+    try:
+        return int(proc.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _stash_empty(path, run):
+    """True when `path` holds no stash entries; None when git cannot tell (keep)."""
+    proc = run(["stash", "list"], cwd=path)
+    if proc.returncode != 0:
+        return None
+    return not proc.stdout.strip()
+
+
 def _scan_root(root_real, known):
     """`(dangling, refused)` under the worktree root.
 
@@ -260,7 +279,7 @@ def _scan_root(root_real, known):
         if not os.path.isdir(full) and not os.path.islink(full):
             continue
         real = os.path.realpath(full)
-        if os.path.commonpath([real, root_real]) != root_real:
+        if not worktrees._inside(real, root_real):
             refused.append(full)
             continue
         if real in known or any(k.startswith(real + os.sep) for k in known):
@@ -305,8 +324,9 @@ def _dangling_row(repo, base, path, run):
 
     Removable only with proof: an empty directory, a lone dangling
     `.git` pointer with nothing beside it, or a still-valid checkout
-    that is clean and holds nothing outside the base. Anything else is
-    kept: untracked content git cannot account for.
+    that is clean, holds no commit outside the base on any ref, and
+    holds no stash entries. Anything else is kept: untracked content
+    or hidden refs git cannot account for.
     """
     try:
         entries = sorted(os.listdir(path))
@@ -321,9 +341,19 @@ def _dangling_row(repo, base, path, run):
         head = run(["rev-parse", "--verify", "-q", "HEAD"], cwd=path)
         if head.returncode == 0 and head.stdout.strip():
             outside = _outside_count(path, "HEAD", base, run)
-            if outside == 0:
-                return DanglingRow(path, True, f"clean, nothing outside {base}")
-            return DanglingRow(path, False, "holds commits outside the base")
+            if outside != 0:
+                return DanglingRow(path, False, "holds commits outside the base")
+            stash = _stash_empty(path, run)
+            if stash is None:
+                return DanglingRow(path, False, "cannot read stash")
+            if not stash:
+                return DanglingRow(path, False, "has stashed changes")
+            refs_outside = _refs_outside_count(path, base, run)
+            if refs_outside is None:
+                return DanglingRow(path, False, "cannot count commits outside the base")
+            if refs_outside:
+                return DanglingRow(path, False, "holds commits outside the base")
+            return DanglingRow(path, True, f"clean, nothing outside {base}")
         return DanglingRow(path, False, "cannot resolve HEAD")
     gitfile = os.path.join(path, ".git")
     if entries == [".git"] and os.path.isfile(gitfile) and not os.path.islink(gitfile):
@@ -363,7 +393,7 @@ def plan(repo, *, pr_index, root, base=None, run=git, forge_note=None):
         if os.path.realpath(path) == main:
             rows.append(RegisteredRow(path, branch, None, False, "main checkout"))
             continue
-        if os.path.commonpath([os.path.realpath(path), real_root]) != real_root:
+        if not worktrees._inside(os.path.realpath(path), real_root):
             rows.append(
                 RegisteredRow(
                     path, branch, categories.get(branch), False, "outside the worktree root"
@@ -508,7 +538,7 @@ def apply(repo, *, pr_index, root, remove, base=None, run=git, forge_note=None):
     for row in checked.registered:
         if not row.planned:
             continue
-        if os.path.commonpath([os.path.realpath(row.path), checked.root]) != checked.root:
+        if not worktrees._inside(os.path.realpath(row.path), checked.root):
             result.kept.append((row.path, "escapes the worktree root"))
             continue
         fresh = _registered_row(
@@ -531,7 +561,7 @@ def apply(repo, *, pr_index, root, remove, base=None, run=git, forge_note=None):
     for row in checked.dangling:
         if not row.planned:
             continue
-        if os.path.commonpath([os.path.realpath(row.path), checked.root]) != checked.root:
+        if not worktrees._inside(os.path.realpath(row.path), checked.root):
             result.kept.append((row.path, "escapes the worktree root"))
             continue
         fresh = _dangling_row(checked.repo, checked.base, row.path, run)

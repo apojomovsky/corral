@@ -2,10 +2,16 @@
 
 Every fixture is a real temp git repo (local only, no network, no real
 clones, no gh). The forge and removal seams are fakes; a guard test pins
-that both stay required arguments with no default.
+that both stay required arguments with no default. The real removal seam
+is parked behind `_REAL_PRODUCTION_REMOVE` and replaced at module level
+with `_forbidden_remove`, so any test reaching it by accident fails;
+`_run_gc` patches in a contained fake, and exactly one test named
+`test_real_production_remove_contained_to_temp_dir` exercises the real
+seam, only against temp dirs.
 """
 
 import argparse
+import dataclasses
 import inspect
 import io
 import json
@@ -15,6 +21,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from collections.abc import Callable
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -22,6 +29,18 @@ from corral import diffscope, gc, gccli, worktrees
 from corral.gitenv import clean_env
 
 BASE = "master"
+
+_REAL_PRODUCTION_REMOVE = gccli.production_remove
+
+
+def _forbidden_remove(repo: str, root_real: str) -> Callable[[str], None]:
+    def remove(path: str) -> None:
+        raise AssertionError("tests must not reach the real removal seam")
+
+    return remove
+
+
+gccli.production_remove = _forbidden_remove  # ty: ignore[invalid-assignment]
 
 
 def _scrub_git_env(test):
@@ -410,7 +429,22 @@ class GcTest(unittest.TestCase):
         base.update(overrides)
         return argparse.Namespace(**base)
 
-    def _run_gc(self, args):
+    def _run_gc(self, args, removed=None):
+        if removed is None:
+            removed = []
+        root = os.path.realpath(self.repo.worktrees_root())
+
+        def fake_factory(repo, root_real):
+            def remove(path):
+                real = os.path.realpath(path)
+                assert real != root and real.startswith(root + os.sep), (
+                    f"fake removal escapes the root: {path}"
+                )
+                removed.append(path)
+                shutil.rmtree(path, ignore_errors=True)
+
+            return remove
+
         out = io.StringIO()
         with redirect_stdout(out):
             with mock.patch.dict(os.environ, {"BASE_REF": BASE}):
@@ -418,7 +452,8 @@ class GcTest(unittest.TestCase):
                     gccli.settings, "load", return_value={"git.worktrees": ".worktrees/"}
                 ):
                     with mock.patch.object(gccli.settings, "find_root", return_value=None):
-                        code = gccli.cmd_gc(args)
+                        with mock.patch.object(gccli, "production_remove", new=fake_factory):
+                            code = gccli.cmd_gc(args)
         return code, out.getvalue()
 
     def test_nothing_to_do_on_a_fresh_repo(self):
@@ -453,8 +488,10 @@ class GcTest(unittest.TestCase):
 
     def test_apply_removes_dangling_through_the_verb(self):
         path = self._dangling()
-        code, _ = self._run_gc(self._args(apply=True))
+        removed = []
+        code, _ = self._run_gc(self._args(apply=True), removed=removed)
         self.assertEqual(code, 0)
+        self.assertEqual(removed, [path])
         self.assertFalse(os.path.exists(path))
 
     def test_registered_escape_between_plan_and_apply_is_kept(self):
@@ -489,18 +526,127 @@ class GcTest(unittest.TestCase):
 
     def test_json_apply_stdout_is_one_document(self):
         path = self._dangling()
-        code, out = self._run_gc(self._args(json=True, apply=True))
+        removed = []
+        code, out = self._run_gc(self._args(json=True, apply=True), removed=removed)
         self.assertEqual(code, 0)
         body = json.loads(out)
         self.assertEqual(body["applied"]["removed"], [path])
+        self.assertEqual(removed, [path])
         self.assertFalse(os.path.exists(path))
 
     def test_repo_subdir_resolves_to_toplevel(self):
         path = self._dangling()
         sub = os.path.join(self.repo.path, "sub")
         os.makedirs(sub)
-        code, _ = self._run_gc(self._args(repo=sub, apply=True))
+        removed = []
+        code, _ = self._run_gc(self._args(repo=sub, apply=True), removed=removed)
         self.assertEqual(code, 0)
+        self.assertEqual(removed, [path])
+        self.assertFalse(os.path.exists(path))
+
+    def test_no_test_reaches_a_real_removal(self):
+        self.assertIs(gccli.production_remove, _forbidden_remove)
+
+    def test_real_production_remove_contained_to_temp_dir(self):
+        root_real = worktrees.root(self.repo.path, ".worktrees/")
+        os.makedirs(root_real, exist_ok=True)
+        remove = _REAL_PRODUCTION_REMOVE(self.repo.path, root_real)
+        outside = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, outside, True)
+        with self.assertRaises(gc.GcError):
+            remove(outside)
+        with self.assertRaises(gc.GcError):
+            remove(root_real)
+        self.assertTrue(os.path.isdir(outside))
+        target = os.path.join(root_real, "gone")
+        os.makedirs(target)
+        with open(os.path.join(target, ".git"), "w", encoding="utf-8") as handle:
+            handle.write("gitdir: /nonexistent/admin/worktrees/gone\n")
+        remove(target)
+        self.assertFalse(os.path.exists(target))
+
+    def test_candidate_equal_to_root_is_kept(self):
+        plan = gc.plan(self.repo.path, base=BASE, pr_index={}, root=".worktrees/")
+        row = gc.DanglingRow(plan.root, True, "pretend planned")
+        with mock.patch.object(gc, "plan", return_value=dataclasses.replace(plan, dangling=[row])):
+            removed = []
+            _, result = gc.apply(
+                self.repo.path,
+                base=BASE,
+                pr_index={},
+                root=".worktrees/",
+                remove=removed.append,
+            )
+        self.assertEqual(removed, [])
+        kept = dict(result.kept)
+        self.assertIn(plan.root, kept)
+        self.assertIn("escapes", kept[plan.root])
+
+    def _standalone(self, name="solo"):
+        """A standalone checkout under the worktree root, unknown to git."""
+        path = os.path.join(self.repo.worktrees_root(), name)
+        os.makedirs(path, exist_ok=True)
+        for args in (
+            ("init", "-q", "-b", BASE),
+            ("config", "user.name", "t"),
+            ("config", "user.email", "t@t"),
+        ):
+            proc = self.repo.git(*args, cwd=path)
+            assert proc.returncode == 0, proc.stderr
+        with open(os.path.join(path, "solo.txt"), "w", encoding="utf-8") as handle:
+            handle.write("solo\n")
+        self.assertEqual(self.repo.git("add", "-A", cwd=path).returncode, 0)
+        self.assertEqual(self.repo.git("commit", "-q", "-m", "solo base", cwd=path).returncode, 0)
+        return path
+
+    def test_standalone_checkout_with_unique_branch_is_kept(self):
+        path = self._standalone()
+        self.repo.git("checkout", "-q", "-b", "unique-work", cwd=path)
+        with open(os.path.join(path, "unique.txt"), "w", encoding="utf-8") as handle:
+            handle.write("unique\n")
+        self.repo.git("add", "-A", cwd=path)
+        self.repo.git("commit", "-q", "-m", "unique work", cwd=path)
+        self.repo.git("checkout", "-q", BASE, cwd=path)
+        plan = gc.plan(self.repo.path, base=BASE, pr_index={}, root=".worktrees/")
+        rows = {d.path: d for d in plan.dangling}
+        self.assertIn(path, rows)
+        self.assertFalse(rows[path].planned)
+        self.assertIn("outside the base", rows[path].reason)
+        removed = []
+        gc.apply(self.repo.path, base=BASE, pr_index={}, root=".worktrees/", remove=removed.append)
+        self.assertEqual(removed, [])
+        proc = self.repo.git("rev-parse", "--verify", "-q", "unique-work", cwd=path)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_standalone_checkout_with_stash_is_kept(self):
+        path = self._standalone()
+        with open(os.path.join(path, "solo.txt"), "a", encoding="utf-8") as handle:
+            handle.write("more\n")
+        proc = self.repo.git("stash", "push", "-q", "-m", "wink", cwd=path)
+        assert proc.returncode == 0, proc.stderr
+        plan = gc.plan(self.repo.path, base=BASE, pr_index={}, root=".worktrees/")
+        rows = {d.path: d for d in plan.dangling}
+        self.assertIn(path, rows)
+        self.assertFalse(rows[path].planned)
+        self.assertIn("stash", rows[path].reason)
+        removed = []
+        gc.apply(self.repo.path, base=BASE, pr_index={}, root=".worktrees/", remove=removed.append)
+        proc = self.repo.git("stash", "list", cwd=path)
+        self.assertIn("wink", proc.stdout)
+
+    def test_standalone_clean_checkout_is_still_planned(self):
+        path = self._standalone()
+        plan = gc.plan(self.repo.path, base=BASE, pr_index={}, root=".worktrees/")
+        rows = {d.path: d for d in plan.dangling}
+        self.assertTrue(rows[path].planned)
+        removed = []
+        _, result = gc.apply(
+            self.repo.path, base=BASE, pr_index={}, root=".worktrees/", remove=removed.append
+        )
+        self.assertEqual(removed, [path])
+        self.assertIn(path, result.removed)
+        for entry in removed:
+            shutil.rmtree(entry, ignore_errors=True)
         self.assertFalse(os.path.exists(path))
 
     def test_bad_settings_is_usage_error(self):
