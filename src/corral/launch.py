@@ -25,12 +25,13 @@ is live at all.
 """
 
 import os
+import socket
 import sys
 import time
 from dataclasses import dataclass
 
-from corral import accounts, models, paths, quota_ledger, registry, runtimes, settings, units
-from corral import worktrees
+from corral import accounts, admission, models, paths, projects, quota_ledger
+from corral import registry, runtimes, settings, units, worktrees
 from corral.runtimes import tail as runtime_tail
 
 #: The run time limit handed to the runtime, in seconds for the unit's
@@ -145,33 +146,108 @@ def _check_model(model):
     return model
 
 
-def _live(tgt, list_fn):
-    """(from_units, from_registry): the tickets live as units, and as counted registered agents."""
-    from_units = units.live_tickets(tgt.prefix, list_fn(tgt.prefix))
-    from_registry = registry.counted_tickets(cfg=registry.config(tgt.resolved)) - from_units
-    return from_units, from_registry
+def _ticket_owners(counted, names, cfg):
+    """``{(repo, number): project}`` for counted tickets naming a registered project.
+
+    Only live entries of this host attribute a ticket, the same entries
+    `registry.counted_tickets` counts: a stale or finished holder of the
+    same ticket cannot steal its attribution.
+    """
+    owners = {}
+    host = socket.gethostname()
+    for entry, state in registry.visible(time.time(), cfg, host=host):
+        held = registry.ticket_of(entry)
+        if state != registry.LIVE or entry.get("host") != host:
+            continue
+        if held is None or held not in counted or held in owners:
+            continue
+        ticket = entry.get("ticket") or {}
+        if ticket.get("project") in names:
+            owners[held] = ticket["project"]
+    return owners
+
+
+def admission_state(registered, list_fn, cfg, key, own=()):
+    """``{(project, repo, number)}`` live triples across every project.
+
+    Units count for the project whose prefix names them; registry tickets
+    count for the registered project their ticket names, else for `key`,
+    the project asking. `own` is the launching prefix's unit and registry
+    tickets: with no registration every live ticket counts for `key`,
+    today's single-project behaviour.
+    """
+    names = {project.name for project in registered}
+    live = {(key, repo, number) for repo, number in own}
+    for project in registered:
+        for repo, number in units.live_tickets(project.unit_prefix, list_fn(project.unit_prefix)):
+            live.add((project.name, repo, number))
+    counted = registry.counted_tickets(cfg=cfg)
+    owners = _ticket_owners(counted, names, cfg) if counted else {}
+    for repo, number in counted:
+        live.add((owners.get((repo, number)) or key, repo, number))
+    return live
+
+
+def project_live_counts(registered, list_fn, cfg):
+    """``{name: live}`` per registered project, from the admission state."""
+    state = admission_state(registered, list_fn, cfg, "")
+    counts = {project.name: 0 for project in registered}
+    for project, _repo, _number in state:
+        if project in counts:
+            counts[project] += 1
+    return counts
 
 
 def admit(tgt, number, *, list_fn):
     """Refuse a ticket that is already live, or a host with no free slot.
 
-    Live means a live unit of this prefix (`list_fn(prefix)`) or a live
-    registered worker on this host that holds the ticket, counted under the
-    target's own resolved registry settings. Raises units.UnitExists (exit
-    2) for the ticket, CapFull (exit 75) when the live count has reached
-    the cap. A live agent that is only registered says so in the message.
+    The decision comes from `admission.admit`: the project key is the
+    registered name of the ops root, else the unit prefix on a host with
+    no registration, and the limits are the registered floors and
+    ceilings (a lone project's ceiling is its `agents.cap`). Raises
+    units.UnitExists (exit 2) for the ticket, CapFull (exit 75) carrying
+    the verdict's reason when the host is full.
     """
-    from_units, from_registry = _live(tgt, list_fn)
-    live = from_units | from_registry
+    registered = projects.load_all()
+    cfg = registry.config(tgt.resolved)
+    project = projects.for_root(tgt.root, registered)
+    key = project.name if project is not None else tgt.prefix
+    own_prefix = project.unit_prefix if project is not None else tgt.prefix
+    from_units = set(units.live_tickets(own_prefix, list_fn(own_prefix)))
+    from_registry = registry.counted_tickets(cfg=cfg) - from_units
     if (tgt.repo, number) in from_units:
         raise units.UnitExists(f"#{number} of {tgt.repo} already has a live agent")
     if (tgt.repo, number) in from_registry:
         raise units.UnitExists(
             f"#{number} of {tgt.repo} already has a live agent {REGISTERED_NOTE}"
         )
-    if len(live) >= tgt.cap:
-        note = f" {REGISTERED_NOTE}" if from_registry else ""
-        raise CapFull(f"{len(live)} of {tgt.cap} agent slots are taken{note}: try later")
+    entries = list(registered)
+    if key not in {entry.name for entry in entries}:
+        entries.append(
+            projects.Project(
+                name=key, unit_prefix=own_prefix, root=tgt.root or "", floor=0, ceiling=tgt.cap
+            )
+        )
+    decided = projects.limits(
+        entries,
+        total_cap=tgt.resolved["admission.total_cap"],
+        repo_cap=tgt.resolved["admission.repo_cap"],
+    )
+    verdict = admission.admit(
+        admission.Request(project=key, repo=tgt.repo, ticket=number, kind="start"),
+        admission.State(
+            live=sorted(admission_state(registered, list_fn, cfg, key, own=from_units))
+        ),
+        decided,
+    )
+    if not verdict.allowed:
+        note = ""
+        if project is not None and tgt.cap != project.ceiling:
+            note = (
+                f" (note: agents.cap {tgt.cap} differs from the registered "
+                f"ceiling {project.ceiling}; the ceiling wins)"
+            )
+        raise CapFull(verdict.reason + note)
 
 
 def unproven(tgt, number, *, list_fn):

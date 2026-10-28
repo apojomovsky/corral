@@ -493,7 +493,7 @@ class CliTest(OpsCase):
         self.system.units["corral-agent-my-repo-7"] = "active"
         code, _, err = self.verb("launch", "lib", "5", "--prompt-file", pf)
         self.assertEqual(code, 75)
-        self.assertIn("slots", err)
+        self.assertIn("at 2 of 2 ceiling", err)
 
         self.system.units.clear()
         self.system.units["corral-agent-lib-5"] = "active"
@@ -647,13 +647,14 @@ class RegistryCapTest(OpsCase):
             "#5 of lib already has a live agent (registered agent, counts until its heartbeat goes stale)",
         )
 
-    def test_a_full_host_held_by_registered_agents_names_them(self):
+    def test_a_full_host_held_by_registered_agents_is_refused(self):
         self.holders()
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target(), 5, list_fn=lambda prefix: [])
+        self.assertEqual(ctx.exception.exit_code, 75)
         self.assertEqual(
             str(ctx.exception),
-            "2 of 2 agent slots are taken (registered agent, counts until its heartbeat goes stale): try later",
+            "start corral-agent- lib#5 refused: corral-agent- at 2 of 2 ceiling",
         )
 
     def test_a_unit_holder_gets_no_registry_note(self):
