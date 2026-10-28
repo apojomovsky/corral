@@ -54,6 +54,7 @@ class ChainsSetting(unittest.TestCase):
             {"models": {"default": ["a/x"]}},
             {"models": {"default": {}}},
             {"models": {"default": {"chain": "a/x"}}},
+            {"models": {"default": {"chain": []}}},
             {"models": {"default": {"chain": [1]}}},
             {"models": {"default": {"chain": [""]}}},
             {"models": {"default": {"chain": ["a/x"], "other": 1}}},

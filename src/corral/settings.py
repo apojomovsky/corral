@@ -154,8 +154,10 @@ def _check_models(raw, where):
         if not isinstance(table, dict) or set(table) != {"chain"}:
             raise SettingsError(f"{where}: [models.{role}] must hold exactly a chain list")
         chain = table["chain"]
-        if not isinstance(chain, list):
-            raise SettingsError(f"{where}: [models.{role}] chain must be a list of model ids")
+        if not isinstance(chain, list) or not chain:
+            raise SettingsError(
+                f"{where}: [models.{role}] chain must be a non-empty list of model ids"
+            )
         for entry in chain:
             if not isinstance(entry, str) or not entry:
                 raise SettingsError(
