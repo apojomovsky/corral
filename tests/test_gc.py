@@ -25,8 +25,9 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import diffscope, gc, gccli, worktrees
+from corral import diffscope, forge, gc, gccli, worktrees
 from corral.gitenv import clean_env
+from tests.test_forge import FakeForge, make_pr
 
 BASE = "master"
 
@@ -414,13 +415,52 @@ class GcTest(unittest.TestCase):
             base=BASE,
             pr_index=gccli.empty_pr_index(),
             root=".worktrees/",
-            forge_note=gccli.EMPTY_FORGE_NOTE,
+            forge_note=gccli.NO_ORIGIN_NOTE,
         )
         cats = {a.branch.name: a.category for a in plan.audits}
         self.assertNotEqual(cats["shipped"], gc.MERGED_PR)
         self.assertIn("merged-pr never fires", gc.format_plan(plan))
         body = json.loads(gccli.plan_json(plan))
         self.assertIn("merged-pr never fires", body["forge_note"])
+
+    def test_live_pr_index_without_origin_is_empty(self):
+        index, note = gccli.live_pr_index(self.repo.path)
+        self.assertEqual(index, {})
+        self.assertIn("merged-pr never fires", note)
+
+    def test_live_pr_index_reads_origin_through_the_forge(self):
+        self.repo.git("remote", "add", "origin", "git@github.com:acme/lib.git")
+        fake = FakeForge(
+            pulls=[make_pr(head_ref="shipped", state="merged")],
+            index={"shipped": "merged"},
+        )
+        index, note = gccli.live_pr_index(self.repo.path, _forge=fake)
+        self.assertEqual(index, {"shipped": "merged"})
+        self.assertIsNone(note)
+        self.assertEqual(fake.requested, [("acme/lib",)])
+
+    def test_live_pr_index_falls_back_when_the_forge_is_down(self):
+        self.repo.git("remote", "add", "origin", "git@github.com:acme/lib.git")
+
+        class Down:
+            def pr_index(self, repo):
+                raise forge.ForgeError("down")
+
+        index, note = gccli.live_pr_index(self.repo.path, _forge=Down())
+        self.assertEqual(index, {})
+        self.assertIn("merged-pr never fires", note)
+
+    def test_merged_branch_from_the_forge_fires_through_the_verb(self):
+        self.repo.checkout("shipped", new=True)
+        self.repo.write("s.txt", "s\n")
+        self.repo.git("add", "-A")
+        self.repo.commit("shipped work")
+        self.repo.checkout(BASE)
+        with mock.patch.object(gccli, "live_pr_index", return_value=({"shipped": "merged"}, None)):
+            code, out = self._run_gc(self._args(json=True))
+        self.assertEqual(code, 0)
+        cats = {b["name"]: b["category"] for b in json.loads(out)["branches"]}
+        self.assertEqual(cats["shipped"], gc.MERGED_PR)
 
     # -- exit codes via the verb ----------------------------------------------
 
