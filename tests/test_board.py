@@ -373,8 +373,11 @@ class ClaimTest(TempStoreTest):
         before = store.outbox_rows()
         store.release("app", 7, "agent-1", claim.epoch, now=1300.0)
         self.assertEqual(store.outbox_rows(), before)
+        # The claim write stays queued until the mirror pass drops it as
+        # external: an empty tracker reading never settles a queue.
         item, _ = store.item("app", 7, now=1300.0)
-        self.assertEqual(item.confidence, board.CONFIRMED)
+        self.assertEqual(item.confidence, board.PENDING)
+        self.assertEqual(len(store.queued_writes()), 1)
         with self.assertRaises(board.Claimed) as ctx:
             store.release("app", 7, "agent-1", claim.epoch, now=1301.0)
         self.assertIn("nobody", str(ctx.exception))
@@ -390,8 +393,11 @@ class ClaimTest(TempStoreTest):
         before = store.outbox_rows()
         store.release("app", 7, "agent-1", claim.epoch, now=1300.0)
         self.assertEqual(store.outbox_rows(), before)
+        # The claim write stays queued until the mirror pass drops it as
+        # closed: an empty tracker reading never settles a queue.
         item, _ = store.item("app", 7, now=1300.0)
-        self.assertEqual(item.confidence, board.CONFIRMED)
+        self.assertEqual(item.confidence, board.PENDING)
+        self.assertEqual(len(store.queued_writes()), 1)
 
     def test_racing_claims_one_wins(self):
         store = self.stored()
