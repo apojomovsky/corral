@@ -11,16 +11,17 @@ Coordination writes go to an outbox the mirror pass pushes later.
 Claims are store transactions: one ``BEGIN IMMEDIATE`` decides the race
 with zero tracker calls.
 
-Field ownership decides conflicts. People win the fields they own
+Field ownership decides conflicts. People own their fields
 (title, body, labels, priority, closing, their own assignments): a
-tracker reading always overwrites those. corral wins the agent fields
-(the claim, in-flight status, the agent): a tracker reading applies to
-those only when no ``queued`` outbox row exists for the field. A queued
-write the tracker echoes is ``sent`` and the row turns ``confirmed``; a
-queued write the tracker contradicts with a fresher value is
-``dropped`` with reason ``overridden`` (a person won); a stale tracker
-reading (older than the queued write) settles nothing and overwrites
-nothing for that field.
+tracker reading always overwrites those. corral owns the agent fields
+(the claim, in-flight status, the agent): a tracker reading never
+originates a value for those. It only settles queued writes: a reading
+that echoes a queued value marks it ``sent`` and the row turns
+``confirmed``; a fresher reading showing a different value drops the
+queued write with reason ``overridden`` (a person won); a stale reading
+(older than the queued write) settles nothing. Rebuilding claims from
+tracker readings after a lost store belongs to the later sync slice,
+not here.
 
 External items are read-only. An item is external when its author is
 not in ``operators`` or it comes from a fork, and an item stays
@@ -290,8 +291,8 @@ class Store:
             labels = json.loads(row[7])
             assignees = json.loads(row[9])
             extra = json.loads(row[15])
-        except ValueError:
-            labels, assignees, extra = [], [], {}
+        except ValueError as err:
+            raise StoreError(f"unusable item {repo}#{number}: corrupt JSON: {err}")
         return Item(
             repo=row[0],
             number=row[1],
@@ -398,10 +399,10 @@ class Store:
 
     def upsert_item(self, item, *, operators, now):
         """Apply a tracker reading. People-owned fields always take the
-        tracker's value; corral-owned fields only when no queued outbox
-        row exists for the field. A fresh tracker value echoing a queued
-        write marks it sent, a fresh different value drops it as
-        overridden, and a stale reading settles nothing."""
+        tracker's value. Corral-owned fields are never originated here:
+        the reading only settles queued writes. A fresh tracker value
+        echoing a queued write marks it sent, a fresh different value
+        drops it as overridden, and a stale reading settles nothing."""
         with _txn(self._conn):
             stored = self._row(item.repo, item.number)
             external = bool(
@@ -529,7 +530,9 @@ class Store:
 
     def release(self, repo, number, agent, epoch, *, now):
         """Release a held claim. Only the holder with the matching epoch
-        can release; anyone else gets ``Claimed``."""
+        can release; anyone else gets ``Claimed``. The claim row is
+        always cleared so claims never strand; on a closed or external
+        item nothing is enqueued and the item is not marked pending."""
         with _txn(self._conn):
             row = self._row(repo, number)
             if row is None:
@@ -545,6 +548,9 @@ class Store:
                 "UPDATE claims SET agent='', host='', claimed_at=? WHERE repo=? AND number=?",
                 (now, repo, number),
             )
+            if row[5] != "open" or row[14]:
+                self._set_confidence(repo, number)
+                return
             self._conn.execute(
                 "INSERT INTO outbox(repo, number, field, value, created_at,"
                 " attempts, state, reason) VALUES(?, ?, ?, ?, ?, 0, ?, '')",
@@ -556,9 +562,12 @@ class Store:
             )
 
     def enqueue(self, repo, number, field, value, *, now):
-        """Queue one coordination write and mark the item pending.
-        Refused for external items."""
+        """Queue one coordination write and mark the item pending. Only
+        corral-owned fields (``AGENT_FIELDS``) are queued; anything else
+        is a caller bug. Refused for external items."""
         with _txn(self._conn):
+            if field not in AGENT_FIELDS:
+                raise StoreError(f"unknown coordination field {field!r}")
             self._require_writable(repo, number)
             cur = self._conn.execute(
                 "INSERT INTO outbox(repo, number, field, value, created_at,"
@@ -626,7 +635,8 @@ class Store:
 
 
 def open_store(path=None):
-    """Open the board store, creating it owner-only when missing. A newer
+    """Open the board store, creating it owner-only when missing, and
+    tightening a pre-existing file to owner-only on every open. A newer
     or unknown schema version, or a corrupt file, fails closed with
     ``StoreError`` instead of being recreated."""
     target = path if path is not None else db_path()
@@ -636,7 +646,7 @@ def open_store(path=None):
     if not os.path.exists(target):
         fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
-        os.chmod(target, 0o600)
+    os.chmod(target, 0o600)
     try:
         conn = sqlite3.connect(target, timeout=_BUSY_TIMEOUT_MS / 1000)
     except sqlite3.Error as err:

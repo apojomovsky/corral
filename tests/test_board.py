@@ -157,6 +157,29 @@ class UpsertTest(TempStoreTest):
         self.assertEqual(item.confidence, board.PENDING)
         self.assertEqual(item.agent, "bob-agent")
 
+    def test_tracker_reading_never_originates_agent(self):
+        store = self.stored()
+        store.upsert_item(
+            reading(agent="someone", tracker_updated_at=2000.0),
+            operators=["alice"],
+            now=2000.0,
+        )
+        item, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(item.agent, "")
+
+    def test_tracker_reading_never_displaces_a_claim(self):
+        store = self.stored()
+        store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        for row in store.queued_writes():
+            store.mark_sent(row.id)
+        store.upsert_item(
+            reading(agent="someone-else", tracker_updated_at=2000.0),
+            operators=["alice"],
+            now=2000.0,
+        )
+        item, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(item.agent, "agent-1")
+
     def test_external_never_becomes_non_external(self):
         store = self.stored(author="mallory")
         item, _ = store.item("app", 7, now=1000.0)
@@ -193,6 +216,20 @@ class UpsertTest(TempStoreTest):
         self.assertEqual(len(store.items(state="open")), 2)
         self.assertEqual(len(store.items(label="ready")), 2)
         self.assertEqual(len(store.items(repo="app", state="closed")), 1)
+
+    def test_corrupt_stored_json_fails_closed(self):
+        store = self.stored()
+        raw = sqlite3.connect(self.path)
+        try:
+            raw.execute(
+                "UPDATE items SET labels=? WHERE repo=? AND number=?",
+                ("{{{broken", "app", 7),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        with self.assertRaises(board.StoreError):
+            store.item("app", 7, now=2000.0)
 
 
 class FreshnessTest(TempStoreTest):
@@ -276,6 +313,39 @@ class ClaimTest(TempStoreTest):
         with self.assertRaises(board.Claimed):
             store.release("app", 7, "agent-1", claim.epoch + 1, now=1101.0)
 
+    def test_release_on_external_clears_claim_and_enqueues_nothing(self):
+        store = self.stored()
+        claim = store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        store.upsert_item(
+            reading(author="mallory", tracker_updated_at=1200.0),
+            operators=["alice"],
+            now=1200.0,
+        )
+        item, _ = store.item("app", 7, now=1200.0)
+        self.assertTrue(item.external)
+        before = store.outbox_rows()
+        store.release("app", 7, "agent-1", claim.epoch, now=1300.0)
+        self.assertEqual(store.outbox_rows(), before)
+        item, _ = store.item("app", 7, now=1300.0)
+        self.assertEqual(item.confidence, board.CONFIRMED)
+        with self.assertRaises(board.Claimed) as ctx:
+            store.release("app", 7, "agent-1", claim.epoch, now=1301.0)
+        self.assertIn("nobody", str(ctx.exception))
+
+    def test_release_on_closed_clears_claim_and_enqueues_nothing(self):
+        store = self.stored()
+        claim = store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        store.upsert_item(
+            reading(state="closed", tracker_updated_at=1200.0),
+            operators=["alice"],
+            now=1200.0,
+        )
+        before = store.outbox_rows()
+        store.release("app", 7, "agent-1", claim.epoch, now=1300.0)
+        self.assertEqual(store.outbox_rows(), before)
+        item, _ = store.item("app", 7, now=1300.0)
+        self.assertEqual(item.confidence, board.CONFIRMED)
+
     def test_racing_claims_one_wins(self):
         store = self.stored()
         barrier = threading.Barrier(2)
@@ -313,6 +383,12 @@ class EnqueueTest(TempStoreTest):
         self.assertEqual(row.state, board.QUEUED)
         item, _ = store.item("app", 7, now=1500.0)
         self.assertEqual(item.confidence, board.PENDING)
+
+    def test_enqueue_rejects_unknown_field(self):
+        store = self.stored()
+        with self.assertRaises(board.StoreError):
+            store.enqueue("app", 7, "title", "New", now=1500.0)
+        self.assertEqual(store.queued_writes(), [])
 
     def test_enqueue_refused_for_external(self):
         store = self.stored(author="mallory")
@@ -368,6 +444,16 @@ class OpenTest(unittest.TestCase):
                     del os.environ["CORRAL_STATE"]
                 else:
                     os.environ["CORRAL_STATE"] = old
+
+    def test_preexisting_loose_file_tightened_on_open(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            with board.open_store(path):
+                pass
+            os.chmod(path, 0o644)
+            with board.open_store(path):
+                pass
+            self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_newer_schema_fails_closed(self):
         with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
