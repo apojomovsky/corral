@@ -27,6 +27,7 @@ from corral import (
     settings,
     snapshot,
     syncli,
+    takeoffcli,
     units,
 )
 from corral.github import ghcli
@@ -229,6 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_parser(sub)
     syncli.add_parser(sub)
     leakcli.add_parser(sub)
+    takeoffcli.add_parser(sub)
     mirrorcli.add_parser(sub)
     promptscli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())

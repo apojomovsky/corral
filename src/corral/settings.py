@@ -80,6 +80,7 @@ PROVIDERS = (
     "corral.registry",
     "corral.runtimes",
     "corral.sync",
+    "corral.takeoff",
     "corral.units",
 )
 
@@ -258,6 +259,7 @@ def _repo_entries(repos, project_name):
 def repo_names(root):
     """Names of the ``[[repo]]`` entries in the ops root's corral.toml,
     in file order. Empty when there is no root or no file."""
+    _load_providers()
     if not root:
         return []
     project_path = os.path.join(root, PROJECT_FILE)

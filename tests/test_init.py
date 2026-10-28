@@ -213,6 +213,10 @@ TAIL = """# Defaults: uncomment to override.
 # board.hold_label = "hold"  # label that holds a ticket for a human
 # board.ready = "ready"  # label that makes an issue eligible
 #
+# [checks]
+# checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
+# checks.takeoff = []  # takeoff gate commands, run in order in the worktree
+#
 # [disk]
 # disk.min_free_gb = 5  # free gigabytes under which the disk reads low
 # disk.min_free_pct = 10  # free-space percent under which the disk reads low
@@ -236,6 +240,9 @@ TAIL = """# Defaults: uncomment to override.
 # registry.count_toward_cap = true  # live registered ticket workers take cap slots
 # registry.gone_s = 3600  # seconds without a heartbeat before an agent is dropped
 # registry.stale_s = 600  # seconds without a heartbeat before an agent reads stale
+#
+# [review]
+# review.required = true  # takeoff needs an approving review record for the head
 #
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
@@ -300,6 +307,10 @@ commits.conventional = false
 # [board]
 # board.hold_label = "hold"  # label that holds a ticket for a human
 #
+# [checks]
+# checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
+# checks.takeoff = []  # takeoff gate commands, run in order in the worktree
+#
 # [disk]
 # disk.min_free_gb = 5  # free gigabytes under which the disk reads low
 # disk.min_free_pct = 10  # free-space percent under which the disk reads low
@@ -322,6 +333,9 @@ commits.conventional = false
 # registry.count_toward_cap = true  # live registered ticket workers take cap slots
 # registry.gone_s = 3600  # seconds without a heartbeat before an agent is dropped
 # registry.stale_s = 600  # seconds without a heartbeat before an agent reads stale
+#
+# [review]
+# review.required = true  # takeoff needs an approving review record for the head
 #
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
