@@ -34,7 +34,7 @@ class RepoCase(unittest.TestCase):
         host = mock.patch.object(leakcli, "_hostname", return_value="host-1.example.com")
         host.start()
         self.addCleanup(host.stop)
-        home = mock.patch.object(leakcli, "_homedir", return_value="/home/someone")
+        home = mock.patch.object(leakcli, "_homedir", return_value="/users/someone")
         home.start()
         self.addCleanup(home.stop)
         self.repo = os.path.join(self.tmp, "clone")
@@ -199,6 +199,42 @@ class VerbTest(RepoCase):
         self.assertEqual(code, 1)
         self.assertIn("diff work.txt:2", out)
         self.assertNotIn("built-ins", err)
+
+    def test_an_undecodable_body_file_is_exit_4(self):
+        ops = self.make_ops('[private]\nterms = ["Acme Client"]\n')
+        body = os.path.join(self.tmp, "body.md")
+        with open(body, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8")
+        code, _, err = self.run_cli("--ops", ops, "--base", self.base, "--body", body)
+        self.assertEqual(code, 4, err)
+        self.assertIn("cannot read body file", err)
+
+    def test_a_bad_base_ref_is_exit_4(self):
+        ops = self.make_ops('[private]\nterms = ["Acme Client"]\n')
+        code, _, err = self.run_cli("--ops", ops, "--base", "no-such-ref")
+        self.assertEqual(code, 4, err)
+
+    def test_an_ops_dir_without_corral_toml_is_exit_4(self):
+        empty = os.path.join(self.tmp, "empty-ops")
+        os.makedirs(empty)
+        code, _, err = self.run_cli("--ops", empty, "--base", self.base)
+        self.assertEqual(code, 4, err)
+
+    def test_two_registrations_for_one_clone_are_ambiguous(self):
+        from corral import projects
+
+        self.make_registered('[private]\nterms = ["Acme Client"]\n')
+        other = os.path.join(self.tmp, "ops2")
+        os.makedirs(other)
+        with open(os.path.join(other, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(f'[[repo]]\nname = "app"\nclone.path = "{self.repo}"\n')
+        with open(
+            os.path.join(projects.projects_dir(), "other.toml"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(f'name = "other"\nunit_prefix = "other-agent"\nroot = "{other}"\n')
+        code, _, err = self.run_cli("--base", self.base)
+        self.assertEqual(code, 4, err)
+        self.assertIn("ambiguous", err)
 
     def test_a_worktree_subdirectory_resolves_the_registered_ops_root(self):
         self.make_registered('[private]\nterms = ["Acme Client"]\n')

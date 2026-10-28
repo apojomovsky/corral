@@ -48,7 +48,7 @@ class TermsTest(unittest.TestCase):
             with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
                 handle.write('[private]\nterms = ["Acme Client"]\npatterns = ["acme-[0-9]+"]\n')
             found = leakguard.terms(
-                ops, host="host-1.example.com", home="/home/someone", ops_name="ops-root"
+                ops, host="host-1.example.com", home="/users/someone", ops_name="ops-root"
             )
         kinds = [(term.kind, term.text, term.source) for term in found]
         self.assertIn(("term", "Acme Client", "corral.toml"), kinds)
@@ -61,7 +61,7 @@ class TermsTest(unittest.TestCase):
             found = leakguard.terms(
                 ops,
                 host="host-1.example.com",
-                home="/home/someone",
+                home="/users/someone",
                 ops_name=os.path.basename(ops),
             )
         by_source = {term.source for term in found}
@@ -75,12 +75,12 @@ class TermsTest(unittest.TestCase):
         self.assertEqual(found, [])
 
     def test_without_an_ops_root_only_host_and_home_apply(self):
-        found = leakguard.terms(None, host="host-1.example.com", home="/home/someone", ops_name="")
+        found = leakguard.terms(None, host="host-1.example.com", home="/users/someone", ops_name="")
         self.assertEqual(
             [(term.text, term.source) for term in found],
             [
                 ("host-1.example.com", "host name"),
-                ("/home/someone", "home directory"),
+                ("/users/someone", "home directory"),
             ],
         )
 
@@ -89,7 +89,7 @@ class TermsTest(unittest.TestCase):
             with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
                 handle.write('[private]\npatterns = ["acme-([0-9]+"]\n')
             with self.assertRaisesRegex(settings.SettingsError, r"acme-\(\[0-9\]\+"):
-                leakguard.terms(ops, host="host-1", home="/home/someone", ops_name="ops")
+                leakguard.terms(ops, host="host-1", home="/users/someone", ops_name="ops")
 
 
 class TargetsTest(unittest.TestCase):
@@ -116,6 +116,11 @@ class TargetsTest(unittest.TestCase):
         )
         (hit,) = leakguard.check_diff(diff, terms(TERM))
         self.assertEqual(hit.where, "diff src/a.py:2")
+
+    def test_added_lines_without_a_path_header_still_flag(self):
+        diff = "@@ -0,0 +1,2 @@\n+fine\n+Acme Client plans\n"
+        found = leakguard.check_diff(diff, [leakguard.Term("term", "Acme Client", "corral.toml")])
+        self.assertEqual([f.where for f in found], ["diff unknown:2"])
 
     def test_the_diff_ignores_context_removed_and_header_lines(self):
         diff = (

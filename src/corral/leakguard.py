@@ -204,11 +204,11 @@ def check_diff(unified, terms):
                 path = _diff_path(raw[4:])
         elif raw.startswith("+"):
             content = raw[1:]
-            if path is not None:
-                for term, start in _line_matches(content, compiled):
-                    found.append(
-                        Finding(term, f"diff {path}:{lineno}", lineno, start + 1, _excerpt(content))
-                    )
+            shown = path if path is not None else "unknown"
+            for term, start in _line_matches(content, compiled):
+                found.append(
+                    Finding(term, f"diff {shown}:{lineno}", lineno, start + 1, _excerpt(content))
+                )
             lineno += 1
         elif raw.startswith(" "):
             lineno += 1

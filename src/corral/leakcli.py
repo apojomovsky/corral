@@ -63,8 +63,9 @@ def collect(base, cwd, *, git=_git, body_file=None):
         try:
             with open(body_file, encoding="utf-8") as handle:
                 body = handle.read()
-        except OSError as err:
-            raise CollectError(f"cannot read body file {body_file}: {err.strerror}") from None
+        except (OSError, UnicodeDecodeError) as err:
+            reason = getattr(err, "strerror", None) or str(err)
+            raise CollectError(f"cannot read body file {body_file}: {reason}") from None
     return messages, branch, proc.stdout, body
 
 
@@ -115,6 +116,7 @@ def find_ops_root(cwd, flag=None):
         candidates.add(os.path.realpath(main_checkout))
     registered = projects.load_all()
     errors = []
+    matches: list[str] = []
     for project in registered:
         try:
             names = settings.repo_names(project.root)
@@ -131,8 +133,15 @@ def find_ops_root(cwd, flag=None):
                 continue
             if not os.path.isabs(path):
                 path = os.path.normpath(os.path.join(project.root, path))
-            if os.path.realpath(path) in candidates:
-                return project.root
+            if os.path.realpath(path) in candidates and project.root not in matches:
+                matches.append(project.root)
+    if len(matches) > 1:
+        raise CollectError(
+            "this clone matches several registered ops roots, so which terms guard it is "
+            f"ambiguous: {', '.join(matches)}; pass --ops DIR"
+        )
+    if matches:
+        return matches[0]
     if errors:
         raise errors[0]
     return None
