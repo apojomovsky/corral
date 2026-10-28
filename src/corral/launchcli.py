@@ -17,18 +17,35 @@ import sys
 from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
-from corral import admission, launch, models, paths, projects, runtimes, settings, units
+from corral import admission, launch, models, paths, projects, prompts, runtimes, settings, units
 from corral import worktrees
+
+
+def _production_board(repo, number):
+    """The board store's item for the ticket, or None. Only the CLI builds this."""
+    import time
+
+    from corral import board
+
+    try:
+        with board.open_store() as store:
+            found, _ = store.item(repo, number, now=time.time())
+            return found
+    except board.StoreError:
+        return None
+
 
 OK, NOTHING, RACE, USAGE = 0, 1, 2, 4
 
 
 class Seams(NamedTuple):
-    """The subprocess seams the verbs use: a listing, a start and a stop."""
+    """The subprocess seams the verbs use: a listing, a start, a stop, and the board."""
 
     list_fn: Callable[[str], list]
     run: Callable[..., object]
     stop_fn: Callable[[str], object]
+    #: The board store's item for `(repo, number)`, or None. Read-only; tests pass a fake.
+    board_fn: Callable | None = None
 
 
 def production_seams() -> Seams:
@@ -46,6 +63,7 @@ KNOWN = (
     launch.LaunchError,
     models.Exhausted,
     projects.ProjectsError,
+    prompts.PromptsError,
     units.UnitsError,
     worktrees.WorktreeError,
     runtimes.UnknownRuntime,
@@ -62,6 +80,7 @@ def _exit_code(err):
             launch.LaunchError,
             models.Exhausted,
             projects.ProjectsError,
+            prompts.PromptsError,
             units.UnitsError,
         ),
     ):
@@ -106,16 +125,88 @@ def _read_config(path):
     return config
 
 
+def _board_title(args, tgt, seams):
+    """The ticket title: the board store's item wins, else `--title`.
+
+    An item that is missing, unreadable, or untitled falls through to the
+    flag; with neither, the error names the flag.
+    """
+    board_fn = seams.board_fn or _production_board
+    found = board_fn(tgt.repo, args.number)
+    title = (found.title if found is not None else "") or args.title
+    if not title:
+        raise launch.LaunchError(
+            f"role {args.role} needs a title: no item {tgt.repo}#{args.number}"
+            " in the board store and --title was not given"
+        )
+    if not isinstance(title, str):
+        raise launch.LaunchError("title must be a string")
+    return title
+
+
+def _overlay_text(tgt):
+    """The ops root's `agents.overlay.md`, or "" when it is absent."""
+    if not tgt.root:
+        return ""
+    path = os.path.join(tgt.root, "agents.overlay.md")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as err:
+        raise launch.LaunchError(f"cannot read the agent overlay: {err}") from None
+
+
+def _role_prompt(args, tgt, seams):
+    """A `(workdir, branch) -> text` renderer for the role prompt, and its title.
+
+    `launch` calls the renderer with the worktree and branch it just made,
+    so the prompt names the values the agent actually gets.
+    """
+    title = _board_title(args, tgt, seams)
+    agents_md = os.path.join(tgt.clone, "AGENTS.md")
+    base = {
+        "issue": str(args.number),
+        "title": title,
+        "checks.test": tgt.resolved["checks.test"],
+        "overlay": _overlay_text(tgt),
+        "project_agents_md": agents_md if os.path.isfile(agents_md) else "AGENTS.md (none found)",
+    }
+
+    # Validate every placeholder and the override before launch makes a
+    # worktree: a bad override must not leave a stray branch behind.
+    try:
+        prompts.render(args.role, {**base, "worktree": "-", "branch": "-"}, ops_root=tgt.root)
+    except prompts.PromptsError as err:
+        raise launch.LaunchError(str(err)) from None
+
+    def render_prompt(workdir, branch):
+        try:
+            return prompts.render(
+                args.role, {**base, "worktree": workdir, "branch": branch}, ops_root=tgt.root
+            )
+        except prompts.PromptsError as err:
+            raise launch.LaunchError(str(err)) from None
+
+    return render_prompt, title
+
+
 def cmd_launch(args, seams: Seams) -> int:
-    prompt = _read_prompt(args.prompt_file)
+    if bool(args.prompt_file) == bool(args.role):
+        raise launch.LaunchError("pass exactly one of --role and --prompt-file")
     config = _read_config(args.runtime_config)
     flags = {"agents.runtime": args.runtime} if args.runtime else None
     tgt = _target(args, flags)
+    if args.role:
+        prompt, title = _role_prompt(args, tgt, seams)
+    else:
+        prompt, title = _read_prompt(args.prompt_file), args.title
     unit, workdir = launch.launch(
         tgt,
         args.number,
         prompt,
-        title=args.title,
+        title=title,
         model=args.model,
         runtime_config=config,
         list_fn=seams.list_fn,
@@ -190,7 +281,13 @@ def add_parser(sub, seams: Seams) -> None:
     """Register launch, resume, stop and tail on the top-level subparsers."""
     p = sub.add_parser("launch", help="start an agent on a ticket in its own worktree")
     _common(p)
-    p.add_argument("--prompt-file", required=True, help="the prompt the agent starts with")
+    p.add_argument("--prompt-file", default=None, help="the prompt the agent starts with")
+    p.add_argument(
+        "--role",
+        default=None,
+        choices=list(prompts.ROLES),
+        help="render the built-in role prompt instead of reading --prompt-file",
+    )
     p.add_argument("--title", default=None, help="the ticket title, to name a new branch")
     p.add_argument("--model", default=None, help="the model the runtime should use")
     p.add_argument("--runtime", default=None, help="the runtime (default: agents.runtime)")

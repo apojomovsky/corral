@@ -78,6 +78,7 @@ class AllOk(unittest.TestCase):
                 "user-manager",
                 "quota-readers",
                 "registry",
+                "prompts",
             ],
         )
         self.assertEqual(doctor.exit_code(checks), 0)
@@ -97,6 +98,7 @@ class AllOk(unittest.TestCase):
                 "user-manager": "ok",
                 "quota-readers": "ok",
                 "registry": "warn",
+                "prompts": "ok",
             },
         )
         self.assertEqual(doctor.exit_code(checks), 0)

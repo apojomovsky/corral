@@ -18,6 +18,7 @@ from corral import (
     mirrorcli,
     paths,
     projects,
+    promptscli,
     quotacli,
     registry,
     reviewcli,
@@ -225,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     snapshot.add_parser(sub)
     syncli.add_parser(sub)
     mirrorcli.add_parser(sub)
+    promptscli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
     doctor.add_parser(sub, doctor.production_env)
     return parser

@@ -218,6 +218,11 @@ TAIL = """# Defaults: uncomment to override.
 # git.commits.conventional = true  # enforce Conventional Commits
 # git.worktrees = ".worktrees/"  # worktree root, relative to the clone
 #
+# [prompts]
+# prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
+# prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
+# prompts.worker = ""  # override file for the worker prompt (relative to the ops root)
+#
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
@@ -293,6 +298,11 @@ commits.conventional = false
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
 # git.worktrees = ".worktrees/"  # worktree root, relative to the clone
+#
+# [prompts]
+# prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
+# prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
+# prompts.worker = ""  # override file for the worker prompt (relative to the ops root)
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low

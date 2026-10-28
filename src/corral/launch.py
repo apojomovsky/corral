@@ -315,8 +315,14 @@ def launch(
     a slot. The worktree is made under the same lock, as its module asks.
     The project's model chains are validated and re-routed before anything
     is made; an exhausted chain refuses the launch.
+
+    `prompt` is the text, or a `(workdir, branch) -> text` callable rendered
+    after the worktree is made, so the rendered prompt names the worktree
+    and branch the agent actually gets.
     """
-    _check_text(prompt, "prompt")
+    factory = prompt if callable(prompt) else None
+    if factory is None:
+        _check_text(prompt, "prompt")
     model = _check_model(model)
     if title is not None and not isinstance(title, str):
         raise LaunchError("title must be a string")
@@ -333,7 +339,7 @@ def launch(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn)
-        workdir, _branch = worktrees.ensure_worktree(
+        workdir, branch = worktrees.ensure_worktree(
             tgt.clone,
             number,
             default_branch=tgt.default_branch,
@@ -342,6 +348,9 @@ def launch(
             title=title,
             git=git,
         )
+        if factory is not None:
+            prompt = factory(workdir, branch)
+            _check_text(prompt, "prompt")
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn)
