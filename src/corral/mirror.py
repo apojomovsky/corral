@@ -44,15 +44,21 @@ def push(
 
     ``operators`` maps tracker repos to their operator logins (or is one
     shared list): a write to an item that is external under them is
-    dropped, in defence of the store's own refusal. ``limit`` caps how
-    many queued rows the pass takes; the rest wait for the next pass.
+    dropped, in defence of the store's own refusal. A mapping also scopes
+    the pass: queued writes of repos it does not name stay queued,
+    untouched. ``limit`` caps how many rows the pass takes; the rest wait
+    for the next pass.
     """
     sent = dropped = dirty = 0
     errors: list[str] = []
     stopped: float | None = None
     halted = False
 
-    rows = store.queued_writes(limit)
+    rows = store.queued_writes()
+    if isinstance(operators, dict):
+        rows = [row for row in rows if row.repo in operators]
+    if limit is not None:
+        rows = rows[:limit]
     by_item: dict[tuple[str, int], list] = {}
     for row in rows:
         by_item.setdefault((row.repo, row.number), []).append(row)

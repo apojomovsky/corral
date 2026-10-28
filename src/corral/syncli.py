@@ -5,7 +5,9 @@ Runs the incremental feed for the ops root's repositories (each
 origin), with ``--resync`` for a full rebuild and ``--audit N`` for
 the rolling re-read of the N rows verified least recently. Exit codes:
 0 synced, 1 nothing changed, 3 tracker unreachable, 4 usage or
-configuration error.
+configuration error. Partial failures with something synced are still 0;
+with ``--push`` a sync phase that failed and synced nothing is still 3,
+even when the mirror pass sent a write.
 """
 
 import argparse
@@ -199,6 +201,8 @@ def sync_root(
                 out.write(f"mirror: rate limited, retry after {pushed['stopped']:g}s\n")
     landed = seen + (pushed["sent"] if pushed is not None else 0)
     bad = failed + (len(pushed["errors"]) if pushed is not None else 0)
+    if failed and not seen:
+        return UNREACHABLE
     if landed:
         return OK
     return UNREACHABLE if bad else NOTHING

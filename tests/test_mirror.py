@@ -326,6 +326,19 @@ class PushTest(unittest.TestCase):
         self.assertEqual(rows[second.id].state, board.SENT)
         self.assertEqual(result.dropped, 1)
 
+    def test_a_mapping_of_operators_scopes_the_pass(self):
+        store = self.open()
+        self.seed(store, 8, repo="other/lib")
+        mine = store.enqueue("app", 7, "agent", "agent-1", now=1500.0)
+        theirs = store.enqueue("other/lib", 8, "agent", "agent-2", now=1500.0)
+        fake = MirrorTracker()
+        result = mirror.push(store, fake, operators={"app": ["alice"]}, now=1600.0, limit=1)
+        self.assertEqual(fake.writes, [("app", 7, "agent", "agent-1")])
+        self.assertEqual(result.sent, 1)
+        rows = {row.id: row for row in store.outbox_rows()}
+        self.assertEqual(rows[mine.id].state, board.SENT)
+        self.assertEqual(rows[theirs.id].state, board.QUEUED)
+
     def test_external_item_drops_without_writing(self):
         store = self.open()
         store.enqueue("app", 7, "agent", "agent-1", now=1500.0)
@@ -566,6 +579,45 @@ class SyncPushTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertEqual(fake.writes, [(REPO, 1, "agent", "agent-1")])
+
+    def test_a_failed_sync_phase_wins_over_a_sent_write(self):
+        from tests.test_syncli import git_ok
+
+        self.store.upsert_item(
+            board.Item(
+                repo=REPO,
+                number=1,
+                title="Title",
+                state="open",
+                author="alice",
+                tracker_updated_at=T0 - 100,
+            ),
+            operators=["alice"],
+            now=T0 - 100,
+        )
+        self.store.enqueue(REPO, 1, "agent", "agent-1", now=T0 - 50)
+
+        class FeedDown(MirrorTracker):
+            def changes(self, repo, cursor):
+                raise tracker.TrackerError("feed down")
+
+        fake = FeedDown()
+        code = syncli.sync_root(
+            self.root,
+            [],
+            resync=False,
+            audit=None,
+            as_json=False,
+            tracker=fake,
+            store=self.store,
+            git=git_ok(),
+            now=T0,
+            out=self.out,
+            err=self.err,
+            push=True,
+        )
+        self.assertEqual(fake.writes, [(REPO, 1, "agent", "agent-1")])
+        self.assertEqual(code, 3)
 
 
 if __name__ == "__main__":
