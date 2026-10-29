@@ -566,6 +566,42 @@ class SecondCloneCase(OpsFixture):
         self.assertIn("corral.toml", err)
 
 
+class ResolverErrorsCase(OpsFixture):
+    """A broken ops `corral.toml` fails `init` and `uninit` closed (exit 4), changing nothing."""
+
+    def setUp(self):
+        super().setUp()
+        code, _, _ = self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", self.clone)
+        self.assertEqual(code, 0)
+        self.toml_path = os.path.join(self.ops, "corral.toml")
+
+    def append(self, text):
+        with open(self.toml_path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def check_both_fail_closed(self):
+        before_clone = self.clone_snapshot()
+        before_toml = self.ops_toml()
+        hooks = self.hooks_path()
+        code, _, err = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
+        )
+        self.assertEqual(code, 4, err)
+        code, _, err = self.run_cli("uninit", "--ops", self.ops, self.clone)
+        self.assertEqual(code, 4, err)
+        self.assertEqual(self.clone_snapshot(), before_clone)
+        self.assertEqual(self.ops_toml(), before_toml)
+        self.assertEqual(self.hooks_path(), hooks)
+
+    def test_undecodable_toml_is_exit_4_and_changes_nothing(self):
+        self.append("[[repo\nbroken = \n")
+        self.check_both_fail_closed()
+
+    def test_two_entries_sharing_one_clone_path_are_exit_4_and_change_nothing(self):
+        self.append(f'\n[[repo]]\nname = "twin"\nclone.path = "{self.clone}"\n')
+        self.check_both_fail_closed()
+
+
 class UninitOpsCase(OpsFixture):
     def init(self, *extra):
         code, out, _ = self.run_cli(
