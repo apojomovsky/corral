@@ -4,7 +4,7 @@ An opinionated core for running fleets of headless coding agents on Linux hosts.
 
 You bring the projects: a board, the rules for which ticket is ready, the prompts. corral keeps the agents in one pen. It launches them as systemd user units, keeps their sessions, routes their models, watches the provider quota every project shares, caps how many run at once, and cleans up after them without losing work.
 
-Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; the review records and the takeoff ritual (`make pre-pr-check`). Not yet: hosts beyond one, a dashboard API, `corral new`.
+Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: hosts beyond one, a dashboard API, `corral new`.
 
 ## Opinions
 
@@ -44,16 +44,24 @@ make install      # uv tool install
 From a checkout to a first agent in the inline layout:
 
 ```bash
-make install                            # corral on your PATH
-corral deps                             # host check; prints how to install what is missing
-corral init                             # run in a project clone; writes corral.toml and hooks
-corral doctor                           # read-only health report
-corral quota                            # the provider pool; needs one reader (see below)
-corral launch myproj 12 --role worker  # first agent, in its own worktree
-corral tail myproj 12                  # what the agent is doing
-corral tail myproj 12 --last 20        # only the last lines
-corral stop myproj 12                  # stop it again
-corral gc                               # hygiene audit; branches print as git branch -d
+make install                                  # corral on your PATH
+corral deps                                   # host check; prints how to install what is missing
+corral init                                   # in a project clone; --test-cmd CMD when it finds no suite
+corral doctor                                 # read-only health report
+corral quota                                  # the provider pool; needs one reader (see below)
+corral launch REPO N --role worker --title T  # REPO is the [[repo]] name init registered
+corral tail REPO N                            # what the agent is doing
+corral tail REPO N --last 20                  # only the last lines
+corral stop REPO N                            # stop it again
+corral gc                                     # hygiene audit; branches print as git branch -d
+```
+
+`init` derives `REPO` from the clone; `--title T` names the ticket when the board store has none. `init` writes `corral.toml` with the detected settings; give it one model chain naming the pool provider:
+
+```toml
+# corral.toml, in the project clone
+[models.default]
+chain = ["provider-a/model-x"]
 ```
 
 The host pool needs one provider with a reader, the only provider-specific code (entry points are described in [`docs/02-accounts-quota.md`](docs/02-accounts-quota.md), "Readers"):
@@ -103,6 +111,7 @@ reader = "my_tools.quota:ProviderA"
 | **Review** | |
 | `corral review record REPO N --commit SHA --verdict V --author ID` | a reviewer states its verdict on one commit of a ticket, once; a self-review is refused. The record is the review gate's proof |
 | `corral review show REPO N --pr P [--commit SHA] [--head SHA] [--forge-repo owner/name] [--json]` | the record a commit has, or inherits across a clean merge-up of the PR base, taken from the forge (`--forge-repo` defaults to the clone's origin); the commit must be the PR head. Exit 0 only for `approve` or `approve-with-findings`, 1 for none, a `block`, or no authoritative base, 3 when the forge is unreachable |
+| `corral takeoff [--body FILE] [--test] [--json] [--ops DIR] [PATH]` | the project-level gate before a PR: the remote base, the ticket worktree, the commit rules, the body link and review record, the leak guard, the review record on the head commit, and the `checks.takeoff` commands; exit 1 names each failure with its fix, 3 when the remote cannot be read. Without `--body` the body check is skipped |
 | `corral prose [--verify]` | list the comment blocks a branch adds; `--verify` fails on ones that break the prose rules |
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |
 | `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
@@ -124,6 +133,8 @@ patterns = ["acme-[0-9]+"]
 ```
 
 `terms` are plain strings, `patterns` are regular expressions; both match case-insensitively. corral always adds the ops repository's own name and path, the host name and the home directory path. `[private]` lives in the ops root's file only: the host config and `[[repo]]` entries cannot set it. A bad pattern is a configuration error (exit 4), and `corral leakcheck` scans a branch's messages, branch name, body and added lines against the list.
+
+`corral takeoff` gates a worktree on eight checks: the remote base (read fresh with `git ls-remote`, never from a local tracking ref), the ticket worktree (under the `git.worktrees` root, on a `git.branch` ticket branch, clean, merged up with the base), the commit rules (`git.commits.conventional`), the em-dash rule (`checks.no_em_dash`), the PR body link and review record, the leak guard, the approving review record on the head commit (`review.required`), and the `checks.takeoff` commands (`checks.test` by default, `--test` adds it when it is not already listed; a command that runs past `checks.timeout_s`, 1800 seconds by default, fails the check). Each check reports `ok`, `FAIL` (with its fix line) or `skipped`; rows that echo repository content are scrubbed with the leak guard's terms, so takeoff output never names a private term and is safe to paste into a PR.
 
 Exit codes: `0` success, `1` nothing to do or a gate said no, `2` race lost or already running, `3` GitHub, systemd or a host unreachable, `4` configuration or usage error, `75` no free slot (try later).
 

@@ -686,13 +686,17 @@ _REF_TOKEN = r"(?:%s#\d+|#\d+)" % _REPO_TOKEN
 _REF_LIST = r"(?:%s(?:[ \t]*(?:,|and|&)?[ \t]*%s)*)" % (_REF_TOKEN, _REF_TOKEN)
 
 
-def _body_text_outside_code(body: str) -> str:
+def body_text_outside_code(body: str) -> str:
     """Body lines outside fenced blocks with inline code spans stripped."""
     import re as _re
 
     return "\n".join(
         _re.sub(r"(`+).*?\1", "", line) for line, outside in _split_outside_fences(body) if outside
     )
+
+
+#: The pre-public name, kept working for the callers inside this module.
+_body_text_outside_code = body_text_outside_code
 
 
 def _parse_ref_segment(segment: str, default_repo: str | None) -> list[tuple[str | None, int]]:

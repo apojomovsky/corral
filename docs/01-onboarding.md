@@ -83,6 +83,7 @@ Everything a project might reasonably do differently is a named setting with a d
 | `board.labels` | `needs-triage`, `needs-decision`, `priority:*` | names only; the meanings are corral's |
 | `checks.test` | detected (see 3) | the command the agent and takeoff run |
 | `checks.takeoff` | `[checks.test]` | any list of commands; each must exit 0 |
+| `checks.timeout_s` | `1800` | seconds before a takeoff command is killed |
 | `agents.cap` | 1 | this project's ceiling on the host |
 | `agents.runtime` | `omp` | or `opencode` |
 | `models.*` | roles and fallback chains | must name providers from the host's accounts |
