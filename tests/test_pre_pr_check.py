@@ -47,6 +47,13 @@ class Body(unittest.TestCase):
         self.assertTrue(any("## Review" in f for f in found))
 
 
+class Template(unittest.TestCase):
+    def test_the_rendered_template_passes_the_body_check(self):
+        path = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
+        body = path.read_text(encoding="utf-8").replace("#N", "#81")
+        self.assertEqual(check.check_body(body, "docs/81-release-readiness"), [])
+
+
 class Tree(unittest.TestCase):
     """A main clone with origin/master and a ticket worktree under .worktrees/."""
 
