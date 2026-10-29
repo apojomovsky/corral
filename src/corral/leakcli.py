@@ -119,22 +119,15 @@ def find_ops_root(cwd, flag=None):
     matches: list[str] = []
     for project in registered:
         try:
-            names = settings.repo_names(project.root)
+            covered = any(
+                settings.covering_repo(project.root, candidate) is not None
+                for candidate in candidates
+            )
         except settings.SettingsError as err:
             errors.append(err)
             continue
-        for name in names:
-            try:
-                path = settings.load(root=project.root, repo=name)["clone.path"]
-            except settings.SettingsError as err:
-                errors.append(err)
-                continue
-            if not path:
-                continue
-            if not os.path.isabs(path):
-                path = os.path.normpath(os.path.join(project.root, path))
-            if os.path.realpath(path) in candidates and project.root not in matches:
-                matches.append(project.root)
+        if covered and project.root not in matches:
+            matches.append(project.root)
     if len(matches) > 1:
         raise CollectError(
             "this clone matches several registered ops roots, so which terms guard it is "

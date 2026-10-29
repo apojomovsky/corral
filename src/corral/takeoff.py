@@ -154,28 +154,11 @@ def _ticket_repo(ops_root, main_clone):
     """
     if ops_root is not None:
         try:
-            names = settings.repo_names(ops_root)
-        except settings.SettingsError:
-            names = []
-        matched = []
-        for name in names:
-            try:
-                clone_path = settings.load(root=ops_root, repo=name)["clone.path"]
-            except settings.SettingsError:
-                continue
-            if not clone_path or not isinstance(clone_path, str):
-                continue
-            if not os.path.isabs(clone_path):
-                clone_path = os.path.normpath(os.path.join(ops_root, clone_path))
-            if os.path.realpath(clone_path) == main_clone:
-                matched.append(name)
-        if len(matched) > 1:
-            raise TakeoffError(
-                "several [[repo]] entries match this clone "
-                f"({', '.join(matched)}): give each entry a distinct clone.path"
-            )
-        if matched:
-            return matched[0], True
+            name = settings.covering_repo(ops_root, main_clone)
+        except settings.SettingsError as err:
+            raise TakeoffError(str(err)) from None
+        if name is not None:
+            return name, True
     return os.path.basename(main_clone), False
 
 

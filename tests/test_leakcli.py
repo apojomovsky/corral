@@ -249,6 +249,26 @@ class VerbTest(RepoCase):
         self.assertEqual(code, 1)
         self.assertIn("diff work.txt:2", out)
 
+    def test_relative_clone_path_in_registration_resolves_from_foreign_cwd(self):
+        from corral import projects
+
+        ops = self.make_ops(
+            '[[repo]]\nname = "app"\nclone.path = "../clone"\n\n[private]\nterms = ["Acme Client"]\n'
+        )
+        directory = projects.projects_dir()
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "demo.toml"), "w", encoding="utf-8") as handle:
+            handle.write(f'name = "demo"\nunit_prefix = "demo-agent"\nroot = "{ops}"\n')
+        foreign = os.path.join(self.tmp, "elsewhere", "deep")
+        os.makedirs(foreign)
+        previous = os.getcwd()
+        os.chdir(foreign)
+        try:
+            found = leakcli.find_ops_root(self.repo)
+        finally:
+            os.chdir(previous)
+        self.assertEqual(os.path.realpath(found), os.path.realpath(ops))
+
 
 if __name__ == "__main__":
     unittest.main()

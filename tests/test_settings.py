@@ -295,5 +295,71 @@ class ConfigShow(unittest.TestCase):
         self.assertIn("needs an ops root", err.getvalue())
 
 
+class CoveringRepo(unittest.TestCase):
+    """`covering_repo`: which `[[repo]]` entry covers a clone directory."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.ops = os.path.join(self.tmp, "ops")
+        self.clone = os.path.join(self.tmp, "clone")
+        # Nested, so a relative clone.path resolved against the working
+        # directory lands somewhere else: only the ops root is correct.
+        self.foreign = os.path.join(self.tmp, "elsewhere", "deep")
+        os.makedirs(self.ops)
+        os.makedirs(self.clone)
+        os.makedirs(self.foreign)
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+
+    def write_ops(self, text):
+        with open(os.path.join(self.ops, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_relative_clone_path_resolves_from_any_working_directory(self):
+        self.write_ops('[[repo]]\nname = "app"\nclone.path = "../clone"\n')
+        for cwd in (self.ops, self.clone, self.foreign):
+            os.chdir(cwd)
+            self.assertEqual(S.covering_repo(self.ops, self.clone), "app", cwd)
+
+    def test_absolute_clone_path_matches_real_path(self):
+        self.write_ops(f'[[repo]]\nname = "app"\nclone.path = "{self.clone}"\n')
+        os.chdir(self.foreign)
+        self.assertEqual(S.covering_repo(self.ops, self.clone), "app")
+
+    def test_no_covering_entry_is_none(self):
+        os.makedirs(os.path.join(self.tmp, "other"))
+        self.write_ops('[[repo]]\nname = "app"\nclone.path = "../other"\n')
+        os.chdir(self.foreign)
+        self.assertIsNone(S.covering_repo(self.ops, self.clone))
+
+    def test_missing_file_and_missing_root_are_none(self):
+        os.chdir(self.foreign)
+        self.assertIsNone(S.covering_repo(self.ops, self.clone))
+        self.assertIsNone(S.covering_repo(None, self.clone))
+
+    def test_subdirectory_is_not_covered(self):
+        self.write_ops('[[repo]]\nname = "app"\nclone.path = "../clone"\n')
+        os.chdir(self.foreign)
+        self.assertIsNone(S.covering_repo(self.ops, os.path.join(self.clone, "sub")))
+
+    def test_two_entries_sharing_a_clone_are_an_error(self):
+        self.write_ops(
+            '[[repo]]\nname = "a"\nclone.path = "../clone"\n'
+            '[[repo]]\nname = "b"\nclone.path = "../clone"\n'
+        )
+        os.chdir(self.foreign)
+        with self.assertRaisesRegex(S.SettingsError, "distinct clone.path"):
+            S.covering_repo(self.ops, self.clone)
+
+    def test_entry_without_clone_path_is_skipped(self):
+        self.write_ops(
+            '[[repo]]\nname = "plain"\n[[repo]]\nname = "app"\nclone.path = "../clone"\n'
+        )
+        os.chdir(self.foreign)
+        self.assertEqual(S.covering_repo(self.ops, self.clone), "app")
+
+
 if __name__ == "__main__":
     unittest.main()
