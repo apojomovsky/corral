@@ -36,6 +36,8 @@ def table_tokens(section):
     """Every `corral <name>` token in a Commands-table Command cell."""
     found = set()
     for line in section.splitlines():
+        if not line.startswith("|"):
+            continue
         cells = re.split(r"(?<!\\)\|", line)
         if len(cells) < 3 or "corral " not in cells[1]:
             continue
@@ -58,6 +60,15 @@ class Table(unittest.TestCase):
             "| Command | What it does |\n"
             "| --- | --- |\n"
             "| `corral deps` | check the host programs, and the `corral quota` ledger |\n"
+        )
+
+    def test_a_prose_line_after_the_table_is_not_a_row(self):
+        section = (
+            "| Command | What it does |\n"
+            "| --- | --- |\n"
+            "| `corral deps` | check the host programs |\n"
+            "\n"
+            "Compare a | b with `corral nosuchverb` | x for details.\n"
         )
         self.assertEqual(table_tokens(section), {"deps"})
 
