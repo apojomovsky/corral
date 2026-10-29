@@ -870,5 +870,31 @@ class NoEmDashInCodeCase(unittest.TestCase):
                     self.assertNotIn(literal, line, f"{name}:{lineno} carries a literal em-dash")
 
 
+class TicketRepoRelativePath(unittest.TestCase):
+    """`_ticket_repo` with a relative `clone.path`: the ops root wins from any cwd."""
+
+    def test_relative_clone_path_matches_from_a_foreign_working_directory(self):
+        tmp = tempfile.TemporaryDirectory(prefix="corral-ticket-repo-")
+        self.addCleanup(tmp.cleanup)
+        root = os.path.realpath(tmp.name)
+        ops = os.path.join(root, "ops")
+        clone = os.path.join(root, "clone")
+        # Nested, so a relative clone.path resolved against the working
+        # directory lands somewhere else: only the ops root is correct.
+        foreign = os.path.join(root, "elsewhere", "deep")
+        os.makedirs(ops)
+        os.makedirs(clone)
+        os.makedirs(foreign)
+        with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\nclone.path = "../clone"\n')
+        previous = os.getcwd()
+        os.chdir(foreign)
+        try:
+            self.assertEqual(takeoff._ticket_repo(ops, os.path.realpath(clone)), ("app", True))
+            self.assertEqual(takeoff._ticket_repo(None, os.path.realpath(clone)), ("clone", False))
+        finally:
+            os.chdir(previous)
+
+
 if __name__ == "__main__":
     unittest.main()
