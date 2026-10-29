@@ -61,6 +61,7 @@ class Table(unittest.TestCase):
             "| --- | --- |\n"
             "| `corral deps` | check the host programs, and the `corral quota` ledger |\n"
         )
+        self.assertEqual(table_tokens(section), {"deps"})
 
     def test_a_prose_line_after_the_table_is_not_a_row(self):
         section = (
