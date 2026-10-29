@@ -313,36 +313,6 @@ def ops_hooks_dir(ops_root, entry_name):
     return os.path.join(os.path.realpath(ops_root), OPS_HOOKS_PARENT, entry_name)
 
 
-def split_entry_name(ops_root, clone_root):
-    """The `[[repo]]` name already registered for this clone, else None.
-
-    Matches on `clone.path` against the clone's real path: the stored name
-    survives a later remote change, where live detection would drift. One
-    lookup shared by split `init` (refuse a second entry for the same
-    clone) and split `uninit` (find this clone's hooks after a rename).
-    """
-    raw = _read_text(os.path.join(ops_root, settings.PROJECT_FILE))
-    if raw is None:
-        return None
-    try:
-        data = tomllib.loads(raw)
-    except tomllib.TOMLDecodeError:
-        return None
-    entries = data.get("repo")
-    if not isinstance(entries, list):
-        return None
-    want = os.path.realpath(clone_root)
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        clone = entry.get("clone")
-        path = clone.get("path") if isinstance(clone, dict) else None
-        if isinstance(path, str) and os.path.realpath(path) == want:
-            name = entry.get("name")
-            return name if isinstance(name, str) else None
-    return None
-
-
 def hooks_state(hooks_dir, wanted):
     """`(missing, fixable, blocked)` hook files under `hooks_dir`.
 
@@ -767,7 +737,10 @@ def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, op
     """
     toml_target = os.path.join(ops_root, settings.PROJECT_FILE)
     if split:
-        stored = split_entry_name(ops_root, clone_root)
+        try:
+            stored = settings.covering_repo(ops_root, clone_root)
+        except settings.SettingsError as err:
+            raise InitError(str(err)) from None
         if stored is not None and stored != inputs.name:
             raise InitError(
                 f"this clone is already registered as {stored!r} in {toml_target}:"
@@ -1070,7 +1043,12 @@ def _unapply(opts, remove, git):
         ops_root = resolve_existing_ops_root(candidate, git)
         split = os.path.realpath(ops_root) != os.path.realpath(clone_root)
     if split:
-        entry_name = split_entry_name(ops_root, clone_root) or project_name(clone_root, git)
+        try:
+            entry_name = settings.covering_repo(ops_root, clone_root) or project_name(
+                clone_root, git
+            )
+        except settings.SettingsError as err:
+            raise InitError(str(err)) from None
         hooks_dir = ops_hooks_dir(ops_root, entry_name)
         want_hooks = hooks_dir
     else:

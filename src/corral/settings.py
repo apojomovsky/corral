@@ -267,6 +267,38 @@ def repo_names(root):
     return list(_repo_entries(project.get("repo", []), project_path))
 
 
+def covering_repo(root, clone):
+    """The `[[repo]]` entry name whose `clone.path` covers `clone`, else None.
+
+    A relative `clone.path` resolves against the ops root, and the match
+    compares real paths, so the answer never depends on the working
+    directory. Several entries covering the same clone are a SettingsError:
+    the entry name keys hooks and ticket records, so it must stay
+    unambiguous.
+    """
+    _load_providers()
+    if not root:
+        return None
+    project_path = os.path.join(root, PROJECT_FILE)
+    entries = _repo_entries(_load(project_path).get("repo", []), project_path)
+    want = os.path.realpath(clone)
+    matched = []
+    for name, values in entries.items():
+        path = values.get("clone.path")
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(root, path))
+        if os.path.realpath(path) == want:
+            matched.append(name)
+    if len(matched) > 1:
+        raise SettingsError(
+            f"{project_path}: several [[repo]] entries match this clone "
+            f"({', '.join(matched)}): give each entry a distinct clone.path"
+        )
+    return matched[0] if matched else None
+
+
 def private(root):
     """The ``[private]`` terms and patterns in the ops root's corral.toml.
 

@@ -131,6 +131,16 @@ class OpsFixture(unittest.TestCase):
         with open(os.path.join(self.ops, "corral.toml"), encoding="utf-8") as handle:
             return handle.read()
 
+    def make_clone_path_relative(self):
+        """Rewrite the ops corral.toml's clone.path as ops-relative."""
+        target = os.path.join(self.ops, "corral.toml")
+        with open(target, encoding="utf-8") as handle:
+            text = handle.read()
+        absolute = os.path.realpath(self.clone)
+        self.assertIn(absolute, text)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(text.replace(absolute, os.path.relpath(absolute, self.ops)))
+
 
 class FreshOpsCase(OpsFixture):
     def test_golden_toml_overlay_hooks_and_registration(self):
@@ -472,6 +482,29 @@ class OpsErrorsCase(OpsFixture):
         self.assertIn("already registered as 'proj'", err)
         self.assertEqual(self.ops_toml(), before)
 
+    def test_init_refuses_second_name_with_relative_clone_path_from_foreign_cwd(self):
+        self.assertEqual(
+            self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", self.clone)[0], 0
+        )
+        self.git("remote", "add", "origin", "https://github.com/owner/renamed.git")
+        self.make_clone_path_relative()
+        # Nested, so a relative clone.path resolved against the working
+        # directory lands somewhere else: only the ops root is correct.
+        foreign = os.path.join(self.work, "foreign", "deep")
+        os.makedirs(foreign)
+        previous = os.getcwd()
+        os.chdir(foreign)
+        try:
+            before = self.ops_toml()
+            code, _, err = self.run_cli(
+                "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
+            )
+        finally:
+            os.chdir(previous)
+        self.assertEqual(code, 4)
+        self.assertIn("already registered as 'proj'", err)
+        self.assertEqual(self.ops_toml(), before)
+
 
 class SecondCloneCase(OpsFixture):
     def setUp(self):
@@ -531,6 +564,42 @@ class SecondCloneCase(OpsFixture):
         code, _, err = self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", sibling)
         self.assertEqual(code, 4)
         self.assertIn("corral.toml", err)
+
+
+class ResolverErrorsCase(OpsFixture):
+    """A broken ops `corral.toml` fails `init` and `uninit` closed (exit 4), changing nothing."""
+
+    def setUp(self):
+        super().setUp()
+        code, _, _ = self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", self.clone)
+        self.assertEqual(code, 0)
+        self.toml_path = os.path.join(self.ops, "corral.toml")
+
+    def append(self, text):
+        with open(self.toml_path, "a", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def check_both_fail_closed(self):
+        before_clone = self.clone_snapshot()
+        before_toml = self.ops_toml()
+        hooks = self.hooks_path()
+        code, _, err = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
+        )
+        self.assertEqual(code, 4, err)
+        code, _, err = self.run_cli("uninit", "--ops", self.ops, self.clone)
+        self.assertEqual(code, 4, err)
+        self.assertEqual(self.clone_snapshot(), before_clone)
+        self.assertEqual(self.ops_toml(), before_toml)
+        self.assertEqual(self.hooks_path(), hooks)
+
+    def test_undecodable_toml_is_exit_4_and_changes_nothing(self):
+        self.append("[[repo\nbroken = \n")
+        self.check_both_fail_closed()
+
+    def test_two_entries_sharing_one_clone_path_are_exit_4_and_change_nothing(self):
+        self.append(f'\n[[repo]]\nname = "twin"\nclone.path = "{self.clone}"\n')
+        self.check_both_fail_closed()
 
 
 class UninitOpsCase(OpsFixture):
@@ -637,6 +706,26 @@ class UninitOpsCase(OpsFixture):
         self.init()
         self.git("remote", "add", "origin", "https://github.com/owner/renamed.git")
         code, out, _ = self.uninit("--ops", self.ops, self.clone)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "proj")))
+        self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "renamed")))
+        self.assertEqual(self.hooks_path(), "")
+        self.assertEqual(self.status(), "")
+
+    def test_uninit_finds_hooks_with_relative_clone_path_from_foreign_cwd(self):
+        self.init()
+        self.git("remote", "add", "origin", "https://github.com/owner/renamed.git")
+        self.make_clone_path_relative()
+        # Nested, so a relative clone.path resolved against the working
+        # directory lands somewhere else: only the ops root is correct.
+        foreign = os.path.join(self.work, "foreign", "deep")
+        os.makedirs(foreign)
+        previous = os.getcwd()
+        os.chdir(foreign)
+        try:
+            code, out, _ = self.uninit("--ops", self.ops, self.clone)
+        finally:
+            os.chdir(previous)
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "proj")))
         self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "renamed")))
