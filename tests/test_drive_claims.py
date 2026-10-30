@@ -84,7 +84,7 @@ def drive_pass(
         "ledger": {},
         "read_labels": lambda kind, repo, number: [],
         "hold_label": "hold",
-        "tracker": fake_tracker,
+        "tracker_factory": (lambda repo: fake_tracker) if fake_tracker is not None else None,
         "operators": dict(operators) if isinstance(operators, dict) else list(operators),
         "launcher": launcher,
         "host": "host-1",

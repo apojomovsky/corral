@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import NamedTuple
 
 from corral import paths
+from corral.trackers import VARIANTS
 
 DEFAULT = "default"
 HOST = "host"
@@ -374,6 +375,18 @@ def _load(path):
         raise SettingsError(f"{path}: {err}") from None
 
 
+def _check_variant(value, where):
+    """A ``tracker.variant`` value as given, else a naming ``SettingsError``.
+
+    The one validator for the variant, used for every ``[[repo]]`` entry
+    and for the resolved value (so an environment or flag typo fails the
+    same way as a file typo instead of silently running label mode).
+    """
+    if value not in VARIANTS:
+        raise SettingsError(f"{where}: tracker.variant {value!r} must be one of {sorted(VARIANTS)}")
+    return value
+
+
 def _repo_entries(repos, project_name):
     """``({name: {dotted key: checked value}}, {name: BoardConfig | None})``
     for each ``[[repo]]`` entry, in file order. The one validation of entry
@@ -398,6 +411,10 @@ def _repo_entries(repos, project_name):
             entry[dotted] = value
         boards[name] = _check_board(concepts or None, where)
         entries[name] = {k: _check(k, v, where) for k, v in _flatten(entry, where).items()}
+        _check_variant(
+            entries[name].get("tracker.variant", REGISTRY["tracker.variant"].default),
+            where,
+        )
     return entries, boards
 
 
@@ -510,6 +527,8 @@ def resolve(
     for key, value in (flags or {}).items():
         if value is not None:
             result[key] = Value(_check(key, value, "flag"), FLAG)
+    if repo is not None:
+        _check_variant(result["tracker.variant"].value, f"{project_name} [[repo]] {repo}")
 
     for key, ceiling in _flatten(limits, f"{host_name} [limits]").items():
         setting = REGISTRY.get(key)

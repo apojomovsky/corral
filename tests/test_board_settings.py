@@ -167,6 +167,31 @@ class ScalarCoexistence(unittest.TestCase):
             resolve(project=project(documented_board(frobnicate=1)), repo="app")
 
 
+class VariantValidation(unittest.TestCase):
+    def test_a_typo_names_the_repo_and_the_key(self):
+        with self.assertRaisesRegex(settings.SettingsError, "app.*tracker\\.variant.*bord"):
+            resolve(project=project(board=None, variant="bord"), repo="app")
+
+    def test_every_entry_is_checked_not_only_the_selected_one(self):
+        other = {"name": "other", "tracker": {"variant": "carrier-pigeon"}}
+        mine = {"name": "app", "tracker": {"variant": "labels"}}
+        with self.assertRaisesRegex(settings.SettingsError, "other.*tracker\\.variant"):
+            resolve(project={"repo": [mine, other]}, repo="app")
+
+    def test_an_env_override_typo_is_rejected(self):
+        with self.assertRaisesRegex(settings.SettingsError, "app.*tracker\\.variant"):
+            resolve(
+                project=project(board=None, variant="labels"),
+                repo="app",
+                env={"CORRAL_TRACKER_VARIANT": "bord"},
+            )
+
+    def test_both_variants_resolve(self):
+        for variant in ("labels", "board"):
+            resolved = resolve(project=project(board=None, variant=variant), repo="app")
+            self.assertEqual(resolved["tracker.variant"], variant)
+
+
 class TableErrors(unittest.TestCase):
     def test_a_board_that_is_not_a_table_is_an_error(self):
         for raw in ("Agent", 3, ["Agent"]):
