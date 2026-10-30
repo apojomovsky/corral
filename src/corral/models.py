@@ -185,3 +185,11 @@ def primary(chains, role=DEFAULT_ROLE):
     if not chain:
         raise ModelsError(f"no model for role {role!r}: its chain is empty or missing")
     return chain[0]
+
+
+def bare_id(entry):
+    """The model id without its provider prefix: the part after the first `/`.
+
+    A bare id with no slash passes through unchanged.
+    """
+    return str(entry).split("/", 1)[-1]
