@@ -205,7 +205,7 @@ def _all_failed(doc):
     """Whether every readable section failed: nothing at all could be read."""
     return all(
         isinstance(doc.get(section), dict) and set(doc[section]) == {"error"}
-        for section in ("agents", "quota", "capacity", "disk")
+        for section in ("agents", "quota", "capacity", "disk", "drive")
     )
 
 

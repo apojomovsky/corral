@@ -6,12 +6,14 @@ journal, pause file and day counter live in temporary directories,
 never the real state dir. No tracker, no network, no subprocess.
 """
 
+import errno
 import fcntl
 import io
 import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from corral import admission, drive, snapshot
 from corral import projects as projects_mod
@@ -132,6 +134,28 @@ class JournalTest(unittest.TestCase):
         self.assertEqual(end["started"], 1)
         self.assertEqual(end["released"], 0)
         self.assertEqual(end["gave_up"], 0)
+
+    def test_no_launcher_journals_no_start_rows(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            launcher=None,
+            **self.paths,
+        )
+        self.assertEqual(code, 0)
+        entries = journal_lines(self.paths["journal_path"])
+        self.assertEqual([entry for entry in entries if entry["event"] == "start"], [])
+        end = entries[-1]
+        self.assertEqual(end["event"], "pass_end")
+        self.assertEqual(end["started"], 0)
 
 
 class PauseTest(unittest.TestCase):
@@ -429,6 +453,22 @@ class DriveStatusTest(unittest.TestCase):
             handle.write("not json at all\n")
         with self.assertRaises(drive.JournalError):
             self.status()
+
+    def test_pass_end_without_exit_is_a_section_error_not_a_crash(self):
+        os.makedirs(os.path.dirname(self.paths["journal_path"]), exist_ok=True)
+        with open(self.paths["journal_path"], "w", encoding="utf-8") as handle:
+            handle.write('{"event": "pass_start", "at": 1}\n')
+            handle.write('{"event": "pass_end", "at": 2}\n')
+        with self.assertRaises(drive.JournalError):
+            self.status()
+
+    def test_pass_end_with_non_int_exit_is_a_section_error(self):
+        os.makedirs(os.path.dirname(self.paths["journal_path"]), exist_ok=True)
+        with open(self.paths["journal_path"], "w", encoding="utf-8") as handle:
+            handle.write('{"event": "pass_start", "at": 1}\n')
+            handle.write('{"event": "pass_end", "at": 2, "exit": "zero"}\n')
+        with self.assertRaises(drive.JournalError):
+            self.status()
         try:
             self.status()
         except drive.JournalError as err:
@@ -486,6 +526,43 @@ class DriveStatusTest(unittest.TestCase):
             fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
             self.assertTrue(self.status()["lock_held"])
         self.assertFalse(self.status()["lock_held"])
+
+
+class CheckLockTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-check-lock-")
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "drive.lock")
+        with open(self.path, "w", encoding="utf-8"):
+            pass
+
+    def test_unexpected_flock_error_still_closes_the_fd(self):
+        real_close = os.close
+
+        def broken(_fd, _op):
+            raise RuntimeError("flock exploded")
+
+        with (
+            mock.patch.object(drive, "_flock", side_effect=broken),
+            mock.patch("os.close", side_effect=real_close, autospec=True) as closed,
+        ):
+            with self.assertRaises(RuntimeError):
+                drive.check_lock(self.path)
+        self.assertEqual(closed.call_count, 1)
+
+    def test_non_contention_flock_error_closes_the_fd_and_raises(self):
+        real_close = os.close
+
+        def broken(_fd, _op):
+            raise OSError(errno.EINTR, "interrupted")
+
+        with (
+            mock.patch.object(drive, "_flock", side_effect=broken),
+            mock.patch("os.close", side_effect=real_close, autospec=True) as closed,
+        ):
+            with self.assertRaises(OSError):
+                drive.check_lock(self.path)
+        self.assertEqual(closed.call_count, 1)
 
 
 class DriveSettingsTest(unittest.TestCase):

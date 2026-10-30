@@ -533,13 +533,14 @@ def check_lock(path):
     except FileNotFoundError:
         return False
     try:
-        _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as err:
+        try:
+            _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as err:
+            if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                return True
+            raise
+    finally:
         os.close(fd)
-        if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-            return True
-        raise
-    os.close(fd)
     return False
 
 
@@ -572,6 +573,12 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
             raise JournalError(
                 f"drive journal {journal_path} line {lineno} is not a drive entry"
             ) from None
+        if data["event"] == "pass_end":
+            exit_code = data.get("exit")
+            if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+                raise JournalError(
+                    f"drive journal {journal_path} line {lineno} pass_end has no exit"
+                ) from None
         entries.append(data)
     starts = [index for index, item in enumerate(entries) if item["event"] == "pass_start"]
     if not starts:
@@ -1158,22 +1165,24 @@ def _claim_and_launch(
 ):
     """Claim each proceeding candidate, launch each claim.
 
-    Returns (rows, started, blocked): the verdict rows to print, the
-    launched count, and whether a launch failed because the service
-    manager was unreachable. Only `start` claims and launches, minting
-    a fresh id with `mint_agent`; any other proceeding kind is left
-    unclaimed with a skip line, since its scheduling belongs to a later
-    ticket. A lost race (exit 2 from the store) becomes a skip naming
-    the holder and the pass moves on; a launch through `launcher`
+    Returns (rows, started, blocked, launched): the verdict rows to
+    print, the launched count, whether a launch failed because the
+    service manager was unreachable, and the (project, repo, number) of
+    every row the launcher actually launched. Only `start` claims and
+    launches, minting a fresh id with `mint_agent`; any other proceeding
+    kind is left unclaimed with a skip line, since its scheduling belongs
+    to a later ticket. A lost race (exit 2 from the store) becomes a skip
+    naming the holder and the pass moves on; a launch through `launcher`
     appends the unit or the failure to the row's reason. With no
-    `launcher` the pass stops after claiming and records that. When
-    `start_budget` is not None, at most that many starts launch; further
-    starts become `cap` skips naming `day_cap`, and each launch spends
-    one from the local budget.
+    `launcher` the pass stops after claiming and records that, so no row
+    counts as launched. When `start_budget` is not None, at most that
+    many starts launch; further starts become `cap` skips naming
+    `day_cap`, and each launch spends one from the local budget.
     """
-    rows = []
+    rows: list = []
     started = 0
     blocked = False
+    launched: set = set()
     for gated in gated_rows:
         if gated.verdict == "skip":
             rows.append(gated)
@@ -1306,6 +1315,7 @@ def _claim_and_launch(
                     code="",
                 )
             )
+            launched.add((gated.project, gated.repo, gated.number))
             started += 1
             if start_budget is not None:
                 start_budget -= 1
@@ -1321,7 +1331,7 @@ def _claim_and_launch(
                 code=code,
             )
         )
-    return rows, started, blocked
+    return rows, started, blocked, launched
 
 
 def _local_repo(root, repo):
@@ -1636,7 +1646,7 @@ def _launching_pass(
         except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=err)
             return finish(USAGE)
-    final_rows, started, blocked = _claim_and_launch(
+    final_rows, started, blocked, launched = _claim_and_launch(
         store,
         gated_rows,
         tracker=tracker,
@@ -1650,7 +1660,8 @@ def _launching_pass(
     )
     for row in final_rows:
         ref = f"{row.repo}#{row.number}"
-        if row.verdict == "skip":
+        key = (row.project, row.repo, row.number)
+        if row.verdict == "skip" or key not in launched:
             note(
                 {
                     "event": "skip",

@@ -421,6 +421,32 @@ class CliExits(unittest.TestCase):
             self.assertEqual(cli.main(["snapshot", "--json"]), 3)
         self.assertEqual(out.getvalue(), "")
 
+    def test_only_drive_healthy_exits_zero(self):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch("corral.registry.visible", side_effect=OSError("gone")),
+            mock.patch("corral.accounts.providers", side_effect=OSError("gone")),
+            mock.patch(
+                "corral.settings.load",
+                return_value={
+                    "admission.total_cap": 4,
+                    "admission.repo_cap": 1,
+                    "registry.count_toward_cap": True,
+                    "registry.stale_s": 600,
+                    "registry.gone_s": 3600,
+                    "quota.low_pct": 80,
+                    "drive.max_starts_per_day": 50,
+                },
+            ),
+            mock.patch("corral.drive.drive_status", return_value={"last_exit": 0}),
+            mock.patch("corral.paths.cache_dir", side_effect=OSError("gone")),
+            mock.patch("socket.gethostname", return_value=HOST),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            self.assertEqual(cli.main(["snapshot", "--json"]), 0)
+        self.assertEqual(json.loads(out.getvalue())["drive"], {"last_exit": 0})
+
 
 if __name__ == "__main__":
     unittest.main()
