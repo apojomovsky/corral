@@ -26,7 +26,7 @@ import importlib.util
 import math
 import os
 import sys
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
@@ -54,7 +54,12 @@ class LinkedPull:
 
 @dataclass(frozen=True)
 class TicketRow:
-    """One ticket as the policy sees it: frozen plain data from the store."""
+    """One ticket as the policy sees it: frozen plain data from the store.
+
+    `extra` carries the board concepts (priority, area, pool, blocked-by
+    refs and the like); it defaults to None and reads as {} so label-only
+    rows are unchanged.
+    """
 
     repo: str
     number: int
@@ -66,6 +71,14 @@ class TicketRow:
     status: str = ""
     external: bool = False
     pulls: tuple = ()
+    extra: Mapping[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        extra = self.extra
+        if isinstance(extra, Mapping):
+            object.__setattr__(self, "extra", dict(extra))
+        else:
+            object.__setattr__(self, "extra", {})
 
 
 @dataclass(frozen=True)
@@ -87,6 +100,8 @@ def row_from_item(item: board.Item) -> TicketRow:
     """The policy view of one board store item. Pure."""
     # pulls stays empty here; the reviewer-scheduling pass (ticket 6 of
     # docs/04-dispatch-loop.md) populates it from linked pull requests.
+    # Board concepts ride along in extra, copied on read so no two rows
+    # share one dict; a missing value reads as carrying nothing.
     return TicketRow(
         repo=item.repo,
         number=item.number,
@@ -98,6 +113,7 @@ def row_from_item(item: board.Item) -> TicketRow:
         status=item.status,
         external=item.external,
         pulls=(),
+        extra=dict(item.extra) if isinstance(item.extra, dict) else {},
     )
 
 
