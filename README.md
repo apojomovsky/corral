@@ -13,8 +13,8 @@ corral makes these choices for you, and does not try to support the alternatives
 - **Linux only.** Every agent is a transient `systemd --user` unit. macOS, Windows, containers-as-agents and other init systems are not supported as agent hosts.
 - **GitHub, behind two interfaces.** Tickets and claims (the tracker) and pull requests (the forge) each go through one interface. Today each has exactly one implementation: GitHub, through `gh`. Other providers are not supported, but adding one means writing an adapter, not redesigning corral.
 - **One ticket, one worktree, one branch.** Agents never share a checkout.
-- **Headless runtimes.** omp and opencode, one major version of each at a time.
-- **Your home config is yours.** Every launch gets its own config overlay. corral reads `~/.omp/` and `~/.config/opencode/` and never writes them.
+- **Headless runtimes.** omp, opencode and muse, one major version of each at a time.
+- **Your home config is yours.** Every launch gets its own config overlay. corral reads `~/.omp/`, `~/.config/opencode/`, `~/.config/muse/` and `~/.local/share/muse/sessions/` and never writes them.
 - **One pool per host.** All projects on a host share one cap, one quota ledger and one GitHub rate budget, so one project cannot starve another without the others noticing.
 - **Proof before removal.** corral deletes a branch, worktree, cache or session only once it can show nothing is lost.
 - **Network-agnostic.** Across hosts, corral sees `host:port` and a token. LAN, Tailscale or anything else that gives each host an address will do.

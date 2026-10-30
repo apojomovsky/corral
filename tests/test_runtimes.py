@@ -396,7 +396,8 @@ class RuntimeSetting(unittest.TestCase):
     def test_the_agents_runtime_setting_is_registered_by_the_runtimes_package(self):
         setting = settings.REGISTRY["agents.runtime"]
         self.assertEqual(setting.default, rt.DEFAULT_RUNTIME)
-        self.assertIn("omp or opencode", setting.help)
+        for name in rt.NAMES:
+            self.assertIn(name, setting.help)
         self.assertIn("corral.runtimes", settings.PROVIDERS)
 
 
