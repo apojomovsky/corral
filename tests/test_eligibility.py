@@ -81,6 +81,36 @@ class TypesTest(unittest.TestCase):
         rows = eligibility.rows_from_items([item(number=7), item(number=9)])
         self.assertEqual([row.number for row in rows], [7, 9])
 
+    def test_ticket_row_defaults_extra_to_empty(self):
+        self.assertEqual(eligibility.TicketRow(repo="app", number=7).extra, {})
+        self.assertEqual(eligibility.TicketRow(repo="app", number=7, extra=None).extra, {})
+
+    def test_ticket_row_copies_extra(self):
+        extra = {"pool": "dispatch"}
+        row = eligibility.TicketRow(repo="app", number=7, extra=extra)
+        self.assertEqual(row.extra, {"pool": "dispatch"})
+        self.assertIsNot(row.extra, extra)
+        extra["pool"] = "review"
+        self.assertEqual(row.extra, {"pool": "dispatch"})
+
+    def test_row_from_item_carries_board_concepts(self):
+        row = eligibility.row_from_item(
+            item(priority="low", extra={"priority": "urgent", "pool": "dispatch"})
+        )
+        self.assertEqual(row.extra, {"priority": "urgent", "pool": "dispatch"})
+        self.assertEqual(row.priority, "urgent")
+
+    def test_row_from_item_copies_extra(self):
+        extra = {"pool": "dispatch"}
+        row = eligibility.row_from_item(item(extra=extra))
+        self.assertEqual(row.extra, {"pool": "dispatch"})
+        self.assertIsNot(row.extra, extra)
+        extra["pool"] = "review"
+        self.assertEqual(row.extra, {"pool": "dispatch"})
+
+    def test_row_from_item_normalizes_missing_extra(self):
+        self.assertEqual(eligibility.row_from_item(item(extra=None)).extra, {})
+
     def test_request_kinds_are_the_four_dispatch_kinds(self):
         self.assertEqual(sorted(eligibility.KINDS), ["fix", "resume", "review", "start"])
 
@@ -242,6 +272,18 @@ class PureCallTest(unittest.TestCase):
             project="blue", entry="stub:eligible", func=lambda rows, *, now: []
         )
         self.assertEqual(policy.eligible([], now=2000.0), [])
+
+    def test_the_policy_sees_board_concepts(self):
+        seen = {}
+
+        def func(rows, *, now):
+            seen["rows"] = rows
+            return []
+
+        policy = eligibility.LoadedPolicy(project="blue", entry="stub:eligible", func=func)
+        rows = eligibility.rows_from_items([item(extra={"pool": "dispatch"})])
+        self.assertEqual(policy.eligible(rows, now=2000.0), [])
+        self.assertEqual(seen["rows"][0].extra, {"pool": "dispatch"})
 
     def test_a_non_list_return_names_the_project_and_entry(self):
         for found in ({"app": 7}, "app:7", None):
