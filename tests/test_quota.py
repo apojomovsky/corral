@@ -2,7 +2,7 @@
 
 import unittest
 
-from corral import quota, quota_ledger as ql, settings
+from corral import accounts, quota, quota_ledger as ql, settings
 
 T0 = 1_800_000_000.0
 STALE = 900.0
@@ -385,6 +385,41 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(verdict["states"], {"provider-a": "exhausted"})
         self.assertEqual(verdict["roles"], {"default": "exhausted"})
         self.assertEqual(verdict["blocked"]["default"]["providers"], {"provider-a": "exhausted"})
+
+
+def provider(name, stale_after_s):
+    return accounts.Provider(name=name, reader="pkg:Reader", stale_after_s=stale_after_s)
+
+
+class StaleAfterForTest(unittest.TestCase):
+    def test_minimum_over_the_chained_pool_providers(self):
+        pool = [provider("a", 3600.0), provider("tired", 60.0)]
+        self.assertEqual(quota.stale_after_for({"worker": ["tired/model", "a/model"]}, pool), 60.0)
+
+    def test_unchained_pool_providers_do_not_tighten_the_bound(self):
+        pool = [provider("a", 3600.0), provider("other", 30.0)]
+        self.assertEqual(quota.stale_after_for({"worker": ["a/model"]}, pool), 3600.0)
+
+    def test_missing_pool_falls_back_to_the_default(self):
+        self.assertEqual(
+            quota.stale_after_for({"worker": ["a/model"]}, []),
+            accounts.DEFAULT_STALE_AFTER_S,
+        )
+        self.assertEqual(
+            quota.stale_after_for({"worker": ["a/model"]}, None),
+            accounts.DEFAULT_STALE_AFTER_S,
+        )
+
+    def test_a_provider_without_a_numeric_bound_is_ignored(self):
+        pool = [provider("a", "soon")]
+        self.assertEqual(
+            quota.stale_after_for({"worker": ["a/model"]}, pool),
+            accounts.DEFAULT_STALE_AFTER_S,
+        )
+
+    def test_empty_chains_use_the_default(self):
+        pool = [provider("a", 60.0)]
+        self.assertEqual(quota.stale_after_for({}, pool), accounts.DEFAULT_STALE_AFTER_S)
 
 
 class QuotaSettings(unittest.TestCase):

@@ -7,7 +7,7 @@ provider on its chain passes, and the gate refuses a launch only while a
 required role has no passing provider.
 """
 
-from corral import settings
+from corral import accounts, settings
 
 OK = "ok"
 LOW = "low"
@@ -106,6 +106,28 @@ def role_state(chain, states, *, unknown_blocks=DEFAULT_UNKNOWN_BLOCKS):
 def chain_provider(entry):
     """The provider of a chain entry: the part before ``provider/model``."""
     return str(entry).split("/", 1)[0]
+
+
+def stale_after_for(chains, pool) -> float:
+    """The freshness bound for `chains`: the strictest of its providers.
+
+    The minimum ``stale_after_s`` over the account-pool providers the
+    chains name; the default bound when no chained provider names one.
+    The one shared helper for this fact: the launch path and the drive
+    pass both resolve their bound here.
+    """
+    wanted = {chain_provider(entry) for chain in (chains or {}).values() for entry in chain or ()}
+    bounds = []
+    for provider in pool or ():
+        if getattr(provider, "name", provider) not in wanted:
+            continue
+        bound = getattr(provider, "stale_after_s", None)
+        if isinstance(bound, bool) or not isinstance(bound, (int, float)):
+            continue
+        bounds.append(float(bound))
+    if not bounds:
+        return float(accounts.DEFAULT_STALE_AFTER_S)
+    return min(bounds)
 
 
 def gate(

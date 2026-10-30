@@ -1,8 +1,10 @@
-"""The drive skeleton: lock, read-only `--plan`, candidate table. Fakes only.
+"""The drive pass: lock, read-only gating, the candidate table. Fakes only.
 
 The lock is a real `flock`, but only over files inside temporary
-directories, and the store is a temporary board store. No tracker, no
-network, no subprocess, no real state dir.
+directories; the store is a temporary board store; policies are stub
+modules written to a temporary directory; every host read (projects,
+live state, limits, quotas, ledger, labels) is injected plain data.
+No tracker, no network, no subprocess, no real state dir.
 """
 
 import argparse
@@ -13,8 +15,10 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
-from corral import board, drive
+from corral import admission, board, drive, launch, quota_ledger
+from corral import projects as projects_mod
 
 
 def stored(path, items):
@@ -43,22 +47,154 @@ def stored(path, items):
     return store
 
 
-class CandidatesTest(unittest.TestCase):
-    def test_open_items_become_no_policy_candidates_in_order(self):
-        rows = drive.candidates(
-            [
-                board.Item(repo="app", number=9, state="open"),
-                board.Item(repo="app", number=3, state="closed"),
-                board.Item(repo="app", number=7, state="open"),
-            ]
-        )
-        self.assertEqual(
-            [(row.repo, row.number, row.verdict) for row in rows],
-            [("app", 7, "no policy"), ("app", 9, "no policy")],
-        )
+def policy_source(wants):
+    """A stub policy module naming the given `(repo, number, kind)` wants."""
+    lines = [
+        "def eligible(rows, *, now):",
+        "    from corral.eligibility import StartRequest",
+        "    return [",
+    ]
+    for repo, number, kind in wants:
+        lines.append(f"        StartRequest({repo!r}, {number!r}, {kind!r}),")
+    lines.append("    ]")
+    return "\n".join(lines) + "\n"
 
-    def test_no_open_items_means_no_candidates(self):
-        self.assertEqual(drive.candidates([board.Item(repo="app", number=1, state="closed")]), [])
+
+def project_named(name, entry=None, root=None):
+    """A registered project, optionally naming a policy entry."""
+    return projects_mod.Project(
+        name=name,
+        unit_prefix=name + "-agent",
+        root=root or os.path.join(tempfile.gettempdir(), "corral-drive-ops", name),
+        eligibility=entry,
+    )
+
+
+def hermetic_pass(store, lock_path, out, err, plan=True, found=(), policy_dir=None, **fields):
+    """`run_pass` with every host read injected: no outside world."""
+    if policy_dir is not None and found:
+        entries = []
+        for name, wants in found:
+            path = os.path.join(policy_dir, name + ".py")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(policy_source(wants))
+            entries.append(project_named(name, path + ":eligible"))
+        found = entries
+    values = {
+        "plan": plan,
+        "store": store,
+        "lock_path": lock_path,
+        "out": out,
+        "err": err,
+        "now": 2000.0,
+        "projects_fn": lambda: list(found),
+        "live": frozenset(),
+        "limits": admission.Limits(total=4),
+        "quotas": {},
+        "ledger": {},
+        "read_labels": lambda kind, repo, number: [],
+        "hold_label": "hold",
+    }
+    values.update(fields)
+    return drive.run_pass(**values)
+
+
+class RenderTest(unittest.TestCase):
+    def test_rows_print_with_verdict_and_reason_plus_summary(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+                drive.Candidate(
+                    project="red",
+                    repo="app",
+                    number=9,
+                    kind="start",
+                    verdict="skip",
+                    reason="held",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("blue app#7: start (fresh)", text)
+        self.assertIn("red app#9: skip (held)", text)
+        self.assertTrue(text.splitlines()[-1].startswith("plan:"))
+        self.assertIn("2 candidate(s)", text)
+        self.assertIn("would start 1", text)
+
+    def test_rows_without_a_project_print_bare(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="skip",
+                    reason="withdrawn by this pass",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("app#7: skip (withdrawn by this pass)", text)
+
+    def test_summary_counts_each_proceeding_kind_separately(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=1,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=2,
+                    kind="resume",
+                    verdict="resume",
+                    reason="back",
+                ),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=3,
+                    kind="review",
+                    verdict="review",
+                    reason="slot",
+                ),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=4,
+                    kind="fix",
+                    verdict="fix",
+                    reason="round",
+                ),
+                drive.Candidate(
+                    project="red",
+                    repo="app",
+                    number=5,
+                    kind="resume",
+                    verdict="skip",
+                    reason="held",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("5 candidate(s)", text)
+        self.assertIn("would start 1", text)
+        self.assertIn("would resume 1", text)
+        self.assertIn("would review 1", text)
+        self.assertIn("would fix 1", text)
 
 
 class PlanTest(unittest.TestCase):
@@ -67,35 +203,45 @@ class PlanTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
-    def run_pass(self, store, plan=True):
+    def run_pass(self, store, plan=True, found=(), **fields):
         out, err = io.StringIO(), io.StringIO()
-        code = drive.run_pass(plan=plan, store=store, lock_path=self.lock, out=out, err=err)
+        code = hermetic_pass(
+            store, self.lock, out, err, plan=plan, found=found, policy_dir=self.policies, **fields
+        )
         return code, out.getvalue(), err.getvalue()
 
-    def test_plan_prints_verdict_rows_and_exits_zero(self):
+    def test_plan_prints_gated_verdict_rows_and_exits_zero(self):
         store = stored(self.db, [("app", 7, "open"), ("app", 9, "closed"), ("api", 2, "open")])
+        self.addCleanup(store.close)
+        code, out, err = self.run_pass(store, found=[("blue", [("app", 7, "start")])])
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("app#7: start", out)
+        self.assertNotIn("app#9", out)
+        self.assertNotIn("api#2", out)
+        self.assertIn("would start 1", out)
+
+    def test_plan_with_no_projects_prints_an_empty_table(self):
+        store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         code, out, err = self.run_pass(store)
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertIn("api#2: no policy", out)
-        self.assertIn("app#7: no policy", out)
-        self.assertNotIn("#9", out)
-        self.assertLess(out.index("api#2"), out.index("app#7"))
+        self.assertNotIn("app#7", out)
+        self.assertIn("0 candidate(s)", out)
 
     def test_plan_leaves_store_and_outbox_untouched(self):
         store = stored(self.db, [("app", 7, "open")])
         store.enqueue("app", 7, "status", "working", now=1500.0)
-        before_rows = [
-            (row.repo, row.number, row.field, row.value, row.state) for row in store.outbox_rows()
-        ]
         store.close()
         with open(self.db, "rb") as handle:
             before_bytes = handle.read()
         store = board.open_store(self.db)
         self.addCleanup(store.close)
-        code, _, _ = self.run_pass(store)
+        code, _, _ = self.run_pass(store, found=[("blue", [("app", 7, "start")])])
         self.assertEqual(code, 0)
         store.close()
         with open(self.db, "rb") as handle:
@@ -103,11 +249,7 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(before_bytes, after_bytes)
         store = board.open_store(self.db)
         self.addCleanup(store.close)
-        after_rows = [
-            (row.repo, row.number, row.field, row.value, row.state) for row in store.outbox_rows()
-        ]
-        self.assertEqual(before_rows, after_rows)
-        self.assertEqual(len(after_rows), 1)
+        self.assertEqual(len(store.outbox_rows()), 1)
 
     def test_plan_on_empty_store_exits_zero(self):
         store = board.open_store(self.db)
@@ -121,18 +263,18 @@ class PlanTest(unittest.TestCase):
         self.addCleanup(store.close)
         with open(self.lock, "w") as holder:
             fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
-            code, out, err = self.run_pass(store, plan=True)
+            code, out, err = self.run_pass(store, found=[("blue", [("app", 7, "start")])])
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertIn("app#7: no policy", out)
+        self.assertIn("app#7: start", out)
 
     def test_non_plan_pass_takes_and_releases_the_lock(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        code, out, err = self.run_pass(store, plan=False)
+        code, out, err = self.run_pass(store, plan=False, found=[("blue", [("app", 7, "start")])])
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertIn("app#7: no policy", out)
+        self.assertIn("app#7: start", out)
         with open(self.lock, "r") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
 
@@ -152,12 +294,12 @@ class PlanTest(unittest.TestCase):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         out, err = io.StringIO(), io.StringIO()
-        code = drive.run_pass(
+        code = hermetic_pass(
+            store,
+            os.path.join(blocker, "drive.lock"),
+            out,
+            err,
             plan=False,
-            store=store,
-            lock_path=os.path.join(blocker, "drive.lock"),
-            out=out,
-            err=err,
         )
         self.assertEqual(code, 4)
         self.assertIn("corral drive:", err.getvalue())
@@ -174,7 +316,7 @@ class PlanTest(unittest.TestCase):
             raw.close()
         store = board.open_store(self.db)
         self.addCleanup(store.close)
-        code, _, err = self.run_pass(store, plan=True)
+        code, _, err = self.run_pass(store)
         self.assertEqual(code, 4)
         self.assertIn("corral drive:", err)
 
@@ -184,21 +326,21 @@ class PlanTest(unittest.TestCase):
                 raise sqlite3.OperationalError("boom")
 
         out, err = io.StringIO(), io.StringIO()
-        code = drive.run_pass(plan=True, store=BrokenStore(), lock_path=self.lock, out=out, err=err)
+        code = hermetic_pass(BrokenStore(), self.lock, out, err)
         self.assertEqual(code, 4)
         self.assertIn("corral drive:", err.getvalue())
 
     def test_plan_summary_says_plan(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        code, out, _ = self.run_pass(store, plan=True)
+        code, out, _ = self.run_pass(store, found=[("blue", [("app", 7, "start")])])
         self.assertEqual(code, 0)
         self.assertTrue(out.splitlines()[-1].startswith("plan:"), out)
 
     def test_locking_pass_summary_says_pass(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        code, out, _ = self.run_pass(store, plan=False)
+        code, out, _ = self.run_pass(store, plan=False, found=[("blue", [("app", 7, "start")])])
         self.assertEqual(code, 0)
         self.assertTrue(out.splitlines()[-1].startswith("pass:"), out)
 
@@ -218,6 +360,53 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("corral drive:", err)
         self.assertNotIn("already running", err)
+
+    def test_unreadable_live_state_is_exit_three(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        env = dict(
+            kept,
+            CORRAL_CONFIG=os.path.join(self.tmp.name, "config"),
+            CORRAL_STATE=os.path.join(self.tmp.name, "state"),
+        )
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("unit listing unreachable")
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(launch, "admission_state", broken),
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            code = hermetic_pass(store, self.lock, out, err, projects_fn=lambda: [], live=None)
+        self.assertEqual(code, 3)
+        self.assertIn("cannot read live state", err.getvalue())
+
+    def test_corrupt_ledger_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with mock.patch.object(
+            quota_ledger,
+            "load",
+            side_effect=quota_ledger.LedgerError("quota ledger is corrupt"),
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            code = hermetic_pass(store, self.lock, out, err, projects_fn=lambda: [], ledger=None)
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err.getvalue())
+
+    def test_project_registry_load_failure_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+
+        def broken():
+            raise projects_mod.ProjectsError("projects.d/blue.toml: boom")
+
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(store, self.lock, out, err, projects_fn=broken)
+        self.assertEqual(code, 4)
+        self.assertIn("blue.toml", err.getvalue())
 
 
 class LockPathTest(unittest.TestCase):
