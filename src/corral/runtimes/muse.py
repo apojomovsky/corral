@@ -192,11 +192,15 @@ def record_session_id(session_dir, session_id):
 
 
 def resume_handle(session_dir):
-    """The recorded muse session id, or None when nothing was recorded."""
+    """The recorded muse session id, or None when nothing was recorded.
+
+    Undecodable bytes also mean no handle: a corrupt record refuses
+    the resume instead of crashing it.
+    """
     try:
         with open(os.path.join(session_dir, SESSION_ID_FILE), encoding="utf-8") as handle:
             return handle.read().strip() or None
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 

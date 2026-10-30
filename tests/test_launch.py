@@ -542,6 +542,35 @@ class MuseSessionTest(OpsCase):
             )
         self.assertEqual(len(self.system.started), 1)
 
+    def test_a_failed_start_removes_only_the_recorded_session_id(self):
+        self.system.fail = "Failed to connect to bus: no medium found"
+        with self.assertRaises(units.Unreachable) as ctx:
+            launch.launch(
+                self.target("lib", "muse"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        session = self.session("lib", 5)
+        self.assertFalse(os.path.exists(os.path.join(session, "muse_session_id")))
+        self.assertTrue(os.path.exists(os.path.join(session, "prompt.md")))
+        self.assertTrue(os.path.exists(os.path.join(session, "muse.json")))
+        self.assertEqual(runtimes.recorded(session), "muse")
+        with self.assertRaisesRegex(launch.LaunchError, "no muse session to resume"):
+            launch.resume(
+                self.target("lib"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
+            )
+
     def test_tail_without_an_out_log_is_refused(self):
         launch.launch(
             self.target("lib", "muse"),

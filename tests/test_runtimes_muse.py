@@ -214,6 +214,11 @@ class RecordAndResume(SessionCase):
             handle.write("  \n")
         self.assertIsNone(muse.RUNTIME.resume_handle(self.sdir))
 
+    def test_undecodable_bytes_mean_no_handle(self):
+        with open(os.path.join(self.sdir, "muse_session_id"), "wb") as handle:
+            handle.write(b"\xff\xfe\x00bad\n")
+        self.assertIsNone(muse.RUNTIME.resume_handle(self.sdir))
+
     def test_the_handle_needs_no_exported_session_tree(self):
         muse.record_session_id(self.sdir, SESSION_ID)
         self.assertEqual(muse.RUNTIME.resume_handle(self.sdir), SESSION_ID)
