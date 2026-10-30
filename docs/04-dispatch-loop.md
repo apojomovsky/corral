@@ -166,14 +166,22 @@ epoch are the fencing tokens a future multi-host loop needs.
   next candidate. Never steal, never retry in the same pass.
 - Tracker outage (exit 3 from sync or mirror): abort the sync or mirror
   step only, keep prior rows and the old cursor, and continue the pass
-  on store data. Claims and launches keep working while the tracker is
-  down, per the board design; only PR creation and merges wait. The
-  outage is recorded in the logbook and the pass exit is 0 with errors
-  noted, unless nothing at all could be read, which is exit 3 like
-  `snapshot`.
+  on store data. Rows within the staleness bound keep their normal
+  paths; only PR creation and merges wait. But the staleness rule below
+  takes precedence over this outage rule: a claim or merge-precondition
+  path that needs a live re-read past the bound must still attempt it,
+  and when that live check itself fails, the claim path fails closed
+  (skip with reason "tracker unreachable, row stale") instead of
+  claiming from the stale row. Local-only bookkeeping (registry and
+  unit liveness, hygiene, journal, snapshot) continues through the
+  outage. The outage is recorded in the logbook and the pass exit is 0
+  with errors noted, unless nothing at all could be read, which is
+  exit 3 like `snapshot`.
 - Stale rows: paths that decide (claim, merge preconditions) re-read
   live past the staleness bound, per the board design. The loop never
-  claims from a row older than the bound without a live check.
+  claims from a row older than the bound without a live check, and a
+  live check that fails for any reason (including a tracker outage)
+  skips the claim rather than using the stale row.
 
 Orphaned claims are recovered, not adopted, by the loop. Adoption from
 tracker labels happens only in the full resync path (`sync.resync_repo`
@@ -181,9 +189,12 @@ via `Store.adopt_claim`), never in a drive pass. Each pass instead
 releases claims that are provably dead: the store names an agent, and
 the registry shows no live or stale entry for that agent id, and no
 live unit exists for the ticket, and the claim is older than twice
-`registry.gone_s`. Release bumps the epoch so a late heartbeat cannot
-revive it, and writes a logbook line. The worktree and branch stay
-untouched: release abandons the schedule, never the work, so no proof
+`registry.gone_s`. Release clears the holder (`agent`/`host`) and
+leaves `epoch` untouched, per the `Store.release` contract; the next
+`claim` mints `epoch+1`, which fences a stale holder still acting on
+the old epoch. The release writes a logbook line. The worktree and
+branch stay untouched: release abandons the schedule, never the work,
+so no proof
 rule is triggered. Anything less certain (a stale-but-present agent, a
 live unit with no heartbeat) is left for the stuck handling in
 section 5.
@@ -286,7 +297,8 @@ The future multi-host loop (per `00-design.md` section 4) needs,
 without this doc designing it: claims carrying host plus epoch (kept),
 peer-acked claims before launch, the cap split across peers, and one
 peer owning the tracker feed duty. The loop leaves those hooks by
-recording host and epoch on every claim, fencing releases by epoch,
+recording host and epoch on every claim, leaving the epoch for the
+next claim to mint after a release (which fences the stale holder),
 and never deciding from a row it has not freshness-checked. When
 multi-host lands, the per-pass order in section 3 stays; only the
 claim step gains the ack roundtrip.
@@ -302,6 +314,7 @@ is tested through the seam its production code already injects:
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
+| Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |
 | Admission ordering, floor through a full total, ceiling and repo cap skips | pure `admission.admit` over constructed state |
 | Quota refusal skips one project, not the pass | fake ledger readings plus project chains |
 | Hold and unreadable labels skip; `needs-decision` skips | fake `read_labels` |
@@ -341,7 +354,8 @@ the modules named.
    outage keeps cursor and continues on store data; mirror backlog
    drains on the next healthy pass.
 5. Orphan recovery. Criteria: the section 4 dead-claim rule releases
-   with epoch bump and logbook line; stale-but-present agents and live
+   (holder cleared, epoch left for the next claim to mint) with a
+   logbook line; stale-but-present agents and live
    units are left alone; adoption still happens only in resync.
 6. Reviewer scheduling and fix rounds. Criteria: reviewer starts only
    for PR-ready rows with author check intact; fix round resumes when
