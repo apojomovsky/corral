@@ -10,6 +10,7 @@ error. No GitHub, no network, no service control in this module.
 
 import argparse
 import json
+import os
 import shutil
 import socket
 import sys
@@ -258,12 +259,72 @@ def _show(doc):
         _err(f"disk: {disk.get('error', 'unreadable') if isinstance(disk, dict) else 'unreadable'}")
 
 
+def _settings_root(start):
+    """The ops root owning `start`, or None when no project claims it.
+
+    The nearest directory above `start` holding `corral.toml` wins; else
+    the registered project whose root or clone holds `start`. A broken
+    registration or project file is skipped, never fatal: the caller
+    falls back to the host defaults.
+    """
+    from corral import projects, settings
+
+    root = settings.find_root(start)
+    if root is not None:
+        return root
+    want = os.path.realpath(start)
+    try:
+        registered = projects.load_all()
+    except projects.ProjectsError:
+        return None
+    for project in registered:
+        if _covers(project.root, want):
+            return project.root
+    return None
+
+
+def _covers(root, want):
+    """Whether the project at `root` holds the path `want`.
+
+    A project holds its root, and any path under a clone its
+    `[[repo]]` entries cover. Clone matching goes through
+    `settings.covering_repo`, the one place that maps a clone to its
+    entry; a file that reads broken holds nothing.
+    """
+    from corral import settings
+
+    real_root = os.path.realpath(root)
+    if want == real_root or _below(want, real_root):
+        return True
+    here = want
+    while True:
+        try:
+            if settings.covering_repo(root, here) is not None:
+                return True
+        except settings.SettingsError:
+            return False
+        parent = os.path.dirname(here)
+        if parent == here:
+            return False
+        here = parent
+
+
+def _below(path, parent):
+    """Whether real path `path` lies strictly below real path `parent`."""
+    if path == parent:
+        return False
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:
+        return False
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     """Run the `snapshot` verb."""
     from corral import accounts, admission, paths, quota_ledger, quotacli, registry, settings
 
     try:
-        resolved = settings.load()
+        resolved = settings.load(root=_settings_root(os.getcwd()))
         cfg = registry.config(resolved)
         plain = {
             "admission.total_cap": resolved["admission.total_cap"],
