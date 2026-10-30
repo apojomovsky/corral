@@ -444,7 +444,7 @@ class RestartPassTest(unittest.TestCase):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         claimed(store, "app", 7, at=OLD)
-        for _ in range(2):
+        for step in range(2):
             out, err = io.StringIO(), io.StringIO()
             code = stuck_pass(
                 store,
@@ -455,6 +455,7 @@ class RestartPassTest(unittest.TestCase):
                 stop_unit=FakeStop(),
                 restarter=FakeLauncher(),
                 restarts_path=self.budget,
+                now=NOW + step * 10.0,
             )
             self.assertEqual(code, 0)
         stamps = drive.load_restarts(self.budget)["app#7"]
@@ -705,6 +706,472 @@ class ProductionStuckInputsTest(unittest.TestCase):
             },
         )
         self.assertEqual(stale_s, STALE_S)
+
+
+def external_row(store, repo, number):
+    """An open row whose author is not an operator: external, read-only."""
+    store.upsert_item(
+        board.Item(
+            repo=repo,
+            number=number,
+            kind="issue",
+            title=f"Title {number}",
+            body="Body",
+            state="open",
+            author="mallory",
+            labels=[],
+            priority="",
+            assignees=[],
+            url=f"https://example.com/{repo}/{number}",
+            tracker_updated_at=1000.0,
+            extra={},
+        ),
+        operators=["operator"],
+        now=1000.0,
+    )
+
+
+class RefreshClaimTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-refresh-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+
+    def test_refresh_advances_claimed_at_and_keeps_agent_and_epoch(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        found = store.refresh_claim("app", 7, AGENT, made.epoch, now=NOW)
+        self.assertEqual((found.agent, found.epoch, found.claimed_at), (AGENT, made.epoch, NOW))
+        live = store.claim_of("app", 7)
+        self.assertIsNotNone(live)
+        assert live is not None
+        self.assertEqual((live.agent, live.epoch, live.claimed_at), (AGENT, made.epoch, NOW))
+
+    def test_refresh_twice_keeps_the_epoch_stable(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        store.refresh_claim("app", 7, AGENT, made.epoch, now=NOW)
+        found = store.refresh_claim("app", 7, AGENT, made.epoch, now=NOW + 10.0)
+        self.assertEqual(found.epoch, made.epoch)
+        self.assertEqual(found.claimed_at, NOW + 10.0)
+
+    def test_refresh_with_another_agent_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        with self.assertRaises(board.Claimed):
+            store.refresh_claim("app", 7, "manual-9", made.epoch, now=NOW)
+
+    def test_refresh_with_another_epoch_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        with self.assertRaises(board.Claimed):
+            store.refresh_claim("app", 7, AGENT, made.epoch + 1, now=NOW)
+
+    def test_refresh_with_no_claim_row_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with self.assertRaises(board.Claimed):
+            store.refresh_claim("app", 7, AGENT, 1, now=NOW)
+
+    def test_refresh_after_a_release_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        store.release("app", 7, AGENT, made.epoch, now=NOW)
+        with self.assertRaises(board.Claimed):
+            store.refresh_claim("app", 7, AGENT, made.epoch, now=NOW)
+
+    def test_refresh_of_an_unknown_item_fails(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with self.assertRaises(board.StoreError):
+            store.refresh_claim("app", 999, AGENT, 1, now=NOW)
+
+    def test_refresh_of_a_closed_item_fails(self):
+        store = stored(self.db, [("app", 7, "closed")])
+        self.addCleanup(store.close)
+        with self.assertRaises(board.StoreError):
+            store.refresh_claim("app", 7, AGENT, 1, now=NOW)
+
+    def test_refresh_of_an_external_item_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        external_row(store, "app", 8)
+        with self.assertRaises(board.ExternalItem):
+            store.refresh_claim("app", 8, AGENT, 1, now=NOW)
+
+
+class RefreshRegressionTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-refresh-pass-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+
+    def test_repeated_restarts_reach_the_budget_then_give_up_never_orphaned(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        stop, launcher = FakeStop(), FakeLauncher()
+        texts = []
+        for index, now in enumerate([NOW + step * 3000.0 for step in range(4)]):
+            out, err = io.StringIO(), io.StringIO()
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                agent_states={},
+                stop_unit=stop,
+                restarter=launcher,
+                restarts_path=self.budget,
+                fake_tracker=fake,
+                now=now,
+            )
+            self.assertEqual(code, 0)
+            texts.append(out.getvalue())
+            if index < 3:
+                found = store.claim_of("app", 7)
+                self.assertIsNotNone(found)
+                assert found is not None
+                self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+        self.assertEqual(len(launcher.calls), 3)
+        for text in texts:
+            self.assertNotIn("released dead claim", text)
+        self.assertIn("gave up", texts[-1])
+        self.assertIsNone(store.claim_of("app", 7))
+        comments = [call for call in fake.calls if call[0] == "comment"]
+        self.assertEqual(len(comments), 1)
+        self.assertIn(("add_label", "app", 7, NEEDS_DECISION), fake.calls)
+
+    def test_failing_launches_keep_the_claim_without_orphaning_or_spending(self):
+        from corral import units
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = units.Unreachable("no bus")
+        stop = FakeStop()
+        for now in (NOW, NOW + 3000.0, NOW + 8000.0):
+            out, err = io.StringIO(), io.StringIO()
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                agent_states={},
+                stop_unit=stop,
+                restarter=launcher,
+                restarts_path=self.budget,
+                now=now,
+            )
+            self.assertEqual(code, 0)
+            self.assertIn("claim kept", out.getvalue())
+            self.assertNotIn("released dead claim", out.getvalue())
+            found = store.claim_of("app", 7)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+        self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_past_the_budget_give_up_needs_no_working_launcher(self):
+        from corral import units
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = units.Unreachable("no bus")
+        stop = FakeStop()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+            fake_tracker=fake,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("gave up", out.getvalue())
+        self.assertIsNone(store.claim_of("app", 7))
+
+
+class BudgetSaveTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-budget-save-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+
+    def test_a_failing_save_aborts_the_restart_and_keeps_the_claim(self):
+        from unittest import mock
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(drive, "save_restarts", side_effect=OSError("disk gone")):
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                agent_states={},
+                stop_unit=stop,
+                restarter=launcher,
+                restarts_path=self.budget,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("claim kept", out.getvalue())
+        self.assertIn("restart budget", err.getvalue())
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
+        self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_a_failed_launch_rolls_the_stamp_back(self):
+        from corral import units
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = units.Unreachable("no bus")
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("claim kept", out.getvalue())
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        launcher.errors.pop(("app", 7))
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=launcher,
+            restarts_path=self.budget,
+            now=NOW + 10.0,
+        )
+        self.assertEqual(code, 0)
+        stamps = drive.load_restarts(self.budget)["app#7"]
+        self.assertEqual(len(stamps), 1)
+
+    def test_a_failed_stop_rolls_the_stamp_back(self):
+        from corral import units
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stop = FakeStop()
+        stop.errors[("app", 7)] = units.UnitsError("no bus")
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("claim kept", out.getvalue())
+        self.assertEqual(drive.load_restarts(self.budget), {})
+
+
+class GiveUpOrderTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-giveup-order-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+
+    def run_give_up(self, store, fake):
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+            fake_tracker=fake,
+        )
+        return code, out.getvalue()
+
+    def test_the_label_goes_first_then_the_comment(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        code, text = self.run_give_up(store, fake)
+        self.assertEqual(code, 0)
+        self.assertIn("gave up", text)
+        writes = [call for call in fake.calls if call[0] in ("add_label", "comment")]
+        self.assertEqual([call[0] for call in writes], ["add_label", "comment"])
+
+    def test_a_label_failure_posts_no_comment_and_keeps_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        fake.label_errors[("app", 7)] = iface.TrackerError("offline")
+        code, text = self.run_give_up(store, fake)
+        self.assertEqual(code, 0)
+        self.assertIn("claim kept", text)
+        self.assertEqual([call for call in fake.calls if call[0] == "comment"], [])
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
+
+    def test_a_comment_failure_retries_without_posting_twice(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        fake.comment_errors[("app", 7)] = iface.TrackerError("offline")
+        code, text = self.run_give_up(store, fake)
+        self.assertEqual(code, 0)
+        self.assertIn("claim kept", text)
+        labels = [call for call in fake.calls if call[0] == "add_label"]
+        self.assertEqual(labels, [("add_label", "app", 7, NEEDS_DECISION)])
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
+        del fake.comment_errors[("app", 7)]
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+            fake_tracker=fake,
+            now=NOW + 10.0,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("gave up", out.getvalue())
+        comments = [call for call in fake.calls if call[0] == "comment"]
+        self.assertEqual(len(comments), 2)
+        self.assertEqual(comments[0][3], comments[1][3])
+        self.assertIsNone(store.claim_of("app", 7))
+
+
+class StuckErrorBranchTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-branches-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+
+    def run_stuck(self, store, **over):
+        values = {
+            "agent_states": {},
+            "stop_unit": FakeStop(),
+            "restarter": FakeLauncher(),
+            "restarts_path": self.budget,
+        }
+        values.update(over)
+        stop, launcher = values["stop_unit"], values["restarter"]
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(store, self.lock, out, err, **values)
+        return code, out.getvalue(), stop, launcher
+
+    def test_a_refresh_race_leaves_the_row_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        store.refresh_claim = lambda *args, **kwargs: (_ for _ in ()).throw(
+            board.Claimed("item app#7 is claimed by drive-host-1-19999-acme--app-7")
+        )
+        code, text, stop, launcher = self.run_stuck(store)
+        self.assertEqual(code, 0)
+        self.assertIn("restart raced a re-claim, left held", text)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
+
+    def test_a_refresh_refusal_leaves_the_row_held(self):
+        for problem in (
+            board.ExternalItem("item app#7 is external: read-only"),
+            board.StoreError("item app#7 is not open"),
+        ):
+            store = stored(self.db, [("app", 7, "open")])
+            self.addCleanup(store.close)
+            claimed(store, "app", 7)
+
+            def refused(*args, problem=problem, **kwargs):
+                raise problem
+
+            store.refresh_claim = refused
+            code, text, stop, launcher = self.run_stuck(store)
+            self.assertEqual(code, 0)
+            self.assertIn("restart claim refused", text)
+            self.assertEqual(stop.calls, [])
+            self.assertEqual(launcher.calls, [])
+            row, _ = store.item("app", 7, now=NOW)
+            self.assertEqual(row.agent, AGENT)
+
+    def test_a_give_up_release_race_leaves_the_row_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        original = store.release
+
+        def racy(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7) and agent == made.agent:
+                original(repo, number, agent, epoch, now=now)
+                store.claim(repo, number, "drive-host-1-19999-acme--app-7", HOST, now=now)
+            return original(repo, number, agent, epoch, now=now)
+
+        store.release = racy  # type: ignore[method-assign]
+        code, text, _stop, _launcher = self.run_stuck(store, fake_tracker=fake)
+        self.assertEqual(code, 0)
+        self.assertIn("give-up release raced a re-claim, left held", text)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, "drive-host-1-19999-acme--app-7")
 
 
 if __name__ == "__main__":

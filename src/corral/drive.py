@@ -1054,11 +1054,18 @@ def handle_stuck(
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
-    foreign claims are never touched. A stuck row restarts (stop through
-    the stop seam, launch again on the same claim and epoch reusing the
-    identical agent id) while the restart budget allows it; past the
-    budget the loop posts through the decision-write seam, then releases.
-    A failed decision write keeps the claim for a later pass, and only
+    foreign claims are never touched. A stuck row refreshes its claim
+    heartbeat on every restart attempt (success or failure) before any
+    stop or launch, so the orphan rule defers to stuck handling and a
+    failing ticket can no longer escape into a fresh agent id. The
+    budget stamp is written before the stop-plus-launch and rolled back
+    when the stop or launch fails, so only a completed stop-plus-launch
+    consumes the budget; a stamp the pass cannot persist aborts the
+    restart and keeps the claim. While the budget allows it the row
+    restarts (stop through the stop seam, launch again on the same
+    claim and epoch reusing the identical agent id); past the budget
+    the loop posts through the decision-write seam, then releases. A
+    failed decision write keeps the claim for a later pass, and only
     stop-plus-launch restarts are recorded, so resumes never consume the
     budget. Store errors propagate to the caller, like orphans.
     """
@@ -1111,30 +1118,51 @@ def handle_stuck(
             print(f"{ref}: stuck but the stop or launch seam is missing, left held", file=out)
             continue
         try:
-            store.claim(claim.repo, claim.number, claim.agent, host, now=now)
+            claim = store.refresh_claim(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
         except board.Claimed:
             print(f"{ref}: restart raced a re-claim, left held", file=out)
             continue
         except (board.ExternalItem, board.StoreError) as problem:
             print(f"{ref}: restart claim refused ({problem}), left held", file=out)
             continue
+        had = key in budgets
+        budgets[key] = record_restart(stamps, now=now)
+        if restarts_path is not None:
+            try:
+                save_restarts(restarts_path, budgets)
+            except OSError as problem:
+                if had:
+                    budgets[key] = stamps
+                else:
+                    budgets.pop(key, None)
+                print(f"corral drive: cannot save the restart budget: {problem}", file=err)
+                print(f"{ref}: restart budget save failed ({problem}), claim kept", file=out)
+                continue
+
+        def unrecord():
+            if had:
+                budgets[key] = stamps
+            else:
+                budgets.pop(key, None)
+            if restarts_path is not None:
+                try:
+                    save_restarts(restarts_path, budgets)
+                except OSError as problem:
+                    print(f"corral drive: cannot save the restart budget: {problem}", file=err)
+
         try:
             stop_unit(claim.repo, claim.number)
         except Exception as problem:
+            unrecord()
             print(f"{ref}: restart stop failed ({problem}), claim kept", file=out)
             continue
         title = item.title if item.title else ref
         try:
             unit = launch(project, claim.repo, claim.number, "start", claim.agent, title, now=now)
         except Exception as problem:
+            unrecord()
             print(f"{ref}: restart launch failed ({problem}), claim kept", file=out)
             continue
-        budgets[key] = record_restart(stamps, now=now)
-        if restarts_path is not None:
-            try:
-                save_restarts(restarts_path, budgets)
-            except OSError as problem:
-                print(f"corral drive: cannot save the restart budget: {problem}", file=err)
         print(
             f"{ref}: restarted {unit} with the same agent id"
             f" (restart {len(budgets[key])} of {RESTART_BUDGET} in 24h)",
@@ -1145,11 +1173,15 @@ def handle_stuck(
 
 
 def give_up(store, claim, tracker, *, observed, restarts, now, out):
-    """Post the give-up comment and label, then release the claim.
+    """Post the give-up label and comment, then release the claim.
 
-    A failed decision write or a lost release race keeps the claim for a
-    later pass. With no tracker the give-up is deferred, never released
-    blind. One row only; the caller decides which rows give up.
+    The idempotent label goes first, then the comment: a comment
+    failure keeps the claim with the label already in place, so the
+    retry cannot duplicate a comment that was never posted, and a
+    label failure posts nothing at all. A failed decision write or a
+    lost release race keeps the claim for a later pass. With no tracker
+    the give-up is deferred, never released blind. One row only; the
+    caller decides which rows give up.
     """
     ref = f"{claim.repo}#{claim.number}"
     if tracker is None:
@@ -1158,6 +1190,7 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out):
         )
         return
     try:
+        tracker.add_label(claim.repo, claim.number, NEEDS_DECISION)
         tracker.comment(
             claim.repo,
             claim.number,
@@ -1165,7 +1198,6 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out):
                 claim.repo, claim.number, claim.agent, observed=observed, restarts=restarts
             ),
         )
-        tracker.add_label(claim.repo, claim.number, NEEDS_DECISION)
     except iface.TrackerError as problem:
         print(f"{ref}: give-up write failed ({problem}), claim kept", file=out)
         return
