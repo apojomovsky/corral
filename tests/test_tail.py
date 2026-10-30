@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from corral.runtimes import tail
 
@@ -139,6 +140,107 @@ class Show(unittest.TestCase):
         out = io.StringIO()
         tail.show(path, out=out)
         self.assertEqual(out.getvalue(), "   omp says\n   opencode says\n")
+
+
+def mline(payload_type, payload=None, sequence=1):
+    return json.dumps(
+        {"payload_type": payload_type, "payload": payload or {}, "sequence": sequence}
+    )
+
+
+class RenderMuse(unittest.TestCase):
+    def test_a_started_run_shows_the_prompt(self):
+        line = mline("run.lifecycle.started", {"prompt": "Do the thing."})
+        self.assertEqual(tail.render(line), ["   Do the thing."])
+
+    def test_a_started_run_without_a_prompt_shows_nothing(self):
+        for payload in ({}, {"prompt": "  "}, {"prompt": None}, {"prompt": 5}):
+            with self.subTest(payload=payload):
+                self.assertEqual(tail.render(mline("run.lifecycle.started", payload)), [])
+
+    def test_output_deltas_show_text_as_one_line(self):
+        line = mline("run.output.delta", {"text": "Working\non it."})
+        self.assertEqual(tail.render(line), ["   Working on it."])
+
+    def test_a_completed_run_shows_its_final_text(self):
+        line = mline(
+            "run.terminal.completed",
+            {"terminal": "completed", "reason": "done", "text": "All green."},
+        )
+        self.assertEqual(tail.render(line), ["   All green."])
+
+    def test_a_completed_run_without_text_shows_nothing(self):
+        line = mline("run.terminal.completed", {"terminal": "completed", "reason": "done"})
+        self.assertEqual(tail.render(line), [])
+
+    def test_usage_task_reconciliation_and_link_records_show_nothing(self):
+        quiet = [
+            mline("run.usage", {"calls": 2, "allowance": None}),
+            mline("task.lifecycle.proposed", {}),
+            mline("task.lifecycle.scheduled", {}),
+            mline("task.lifecycle.started", {}),
+            mline("task.lifecycle.completed", {}),
+            mline("task.lifecycle.failed", {}),
+            mline("reconciliation.done", {}),
+            mline("session.run.linked", {}),
+            mline("task.stream.linked", {}),
+        ]
+        for line in quiet:
+            with self.subTest(line=line):
+                self.assertEqual(tail.render(line), [])
+
+    def test_tool_results_are_skipped_until_their_shape_lands(self):
+        line = mline(
+            "tool.result",
+            {"tool_name": "bash", "correlation_facts": {"outcome": "ok"}},
+        )
+        self.assertEqual(tail.render(line), [])
+
+    def test_a_listed_type_without_a_usable_key_is_skipped(self):
+        with mock.patch.dict(tail._MUSE_TEXT, {"run.test.nokey": None}):
+            self.assertEqual(tail.render(mline("run.test.nokey", {"text": "hi"})), [])
+
+    def test_unknown_payload_types_and_bad_lines_show_nothing(self):
+        lines = [
+            mline("run.something.new", {"text": "hi"}),
+            json.dumps({"payload_type": None, "payload": {}}),
+            json.dumps({"payload": {"text": "hi"}}),
+            json.dumps({"payload_type": "run.output.delta", "payload": {"text": 5}}),
+            json.dumps({"payload_type": "run.output.delta", "payload": "odd"}),
+            "not json",
+            "",
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertEqual(tail.render(line), [])
+
+    def test_long_muse_text_is_cut(self):
+        line = mline("run.output.delta", {"text": "y" * 500})
+        self.assertLessEqual(len(tail.render(line)[0]), 3 + tail.WIDTH)
+
+
+class ShowMuse(unittest.TestCase):
+    def path(self, *lines, tail_text=""):
+        handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
+        handle.write("".join(line + "\n" for line in lines) + tail_text)
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_muse_lines_read_through_one_file_with_the_other_formats(self):
+        path = self.path(
+            mline("run.lifecycle.started", {"prompt": "Do the thing."}),
+            mline("run.output.delta", {"text": "Working on it."}),
+            entry("assistant", {"type": "text", "text": "omp says"}),
+            event("text", {"text": "opencode says"}),
+            mline("run.terminal.completed", {"terminal": "completed", "text": "Done."}),
+        )
+        out = io.StringIO()
+        tail.show(path, out=out)
+        self.assertEqual(
+            out.getvalue(),
+            "   Do the thing.\n   Working on it.\n   omp says\n   opencode says\n   Done.\n",
+        )
 
 
 class NonStringText(unittest.TestCase):

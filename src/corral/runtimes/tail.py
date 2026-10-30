@@ -1,10 +1,12 @@
 """An agent's live activity, from its session file, in one line per step.
 
-Two event formats are read, told apart by their shape: omp's session `.jsonl`
-(assistant messages with tool calls and text) and opencode's `--format json`
-events (a `part` with a tool use or text). Each shows the agent's tool calls
-with their intent or description, and what it says. Thinking, tool output,
-steps and the prompt are left out.
+Three event formats are read, told apart by their shape: omp's session
+`.jsonl` (assistant messages with tool calls and text), opencode's
+`--format json` events (a `part` with a tool use or text), and muse's
+`--json` stream (records with a `payload_type` and a `payload`). Each
+shows the agent's tool calls with their intent or description, and what
+it says. Thinking, tool output, steps and the prompt are left out, except
+that a muse run header shows the prompt that started the run.
 """
 
 import json
@@ -36,6 +38,8 @@ def render(line):
         return []
     if isinstance(entry.get("part"), dict):
         return _render_event(entry)
+    if isinstance(entry.get("payload_type"), str):
+        return _render_muse(entry)
     message = _dict(entry.get("message"))
     if message.get("role") != "assistant":
         return []
@@ -62,6 +66,35 @@ def _render_event(entry):
     if entry.get("type") == "text" and _text(part.get("text")):
         return ["   " + _one_line(part["text"])]
     return []
+
+
+#: Muse `--json` records shown as the agent's visible text, with the
+#: payload key holding that text. One table, so a listed type always has
+#: its key: a type with no usable key shows nothing instead of throwing.
+_MUSE_TEXT = {
+    "run.lifecycle.started": "prompt",
+    "run.output.delta": "text",
+    "run.terminal.completed": "text",
+}
+
+
+def _render_muse(entry):
+    """One muse `--json` stream record.
+
+    The run header shows the starting prompt, a delta and the terminal
+    record show their text. Usage, subagent roster noise, reconciliation
+    and link records show nothing. `tool.result` also shows nothing: its
+    render rule waits on the first real tool call fixture. Anything else
+    is skipped, so unknown record types never misrender.
+    """
+    key = _MUSE_TEXT.get(entry["payload_type"])
+    if key is None:
+        return []
+    payload = _dict(entry.get("payload"))
+    text = _text(payload.get(key))
+    if text is None:
+        return []
+    return ["   " + _one_line(text)]
 
 
 def show(path, last=None, out=None, offset=0):
