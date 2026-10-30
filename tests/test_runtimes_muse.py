@@ -544,5 +544,115 @@ class Registration(unittest.TestCase):
         self.assertEqual(rt.DEFAULT_RUNTIME, "omp")
 
 
+#: (returncode, stderr, stream) cut from the observed exit-2 usage lines
+#: in the design: a bad `--session-id`, an unknown `-c` key, `--prompt-file`
+#: with positional text, and a meta-only flag under a non-meta provider.
+USAGE_CASES = (
+    (2, "muse: invalid --session-id 'abc': expected a UUID", ""),
+    (2, "muse: refusing run: unknown key 'bogus.key'", ""),
+    (2, "muse: --prompt-file cannot be used with inline prompt text", ""),
+    (2, "muse: --model requires --provider meta or local", ""),
+    (
+        2,
+        "muse: refusing run: unknown key 'bogus.key'",
+        '{"payload_type": "run.lifecycle.started", "payload": {}}',
+    ),
+)
+
+#: (name, returncode, stderr, stream) with no learned wording: a clean run,
+#: stderr noise, a usage line under another exit, and one representative
+#: failure per provider category of the design (auth, quota, rate limit,
+#: network). The provider lines carry the obvious keywords on purpose: a
+#: classifier that guesses from keywords must still fail these.
+UNKNOWN_CASES = (
+    (
+        "success",
+        0,
+        "",
+        '{"payload_type": "run.terminal.completed",'
+        ' "payload": {"terminal": "completed", "reason": "done"}}',
+    ),
+    (
+        "stderr noise on a clean run",
+        0,
+        "Linux sandbox notice: user namespaces are restricted\n"
+        "workspace trust: trusted source=run-flag",
+        "",
+    ),
+    (
+        "usage wording under another exit",
+        1,
+        "muse: refusing run: unknown key 'bogus.key'",
+        "",
+    ),
+    ("usage wording with no exit", None, "muse: --model requires --provider meta or local", ""),
+    ("usage wording with no stderr", 2, None, ""),
+    (
+        "auth failure",
+        1,
+        "muse: auth failed: credentials expired, run the login flow to continue",
+        "",
+    ),
+    (
+        "quota exhaustion",
+        1,
+        "muse: quota exhausted: the weekly allowance is at 100 percent",
+        "",
+    ),
+    (
+        "rate limit",
+        2,
+        "muse: rate limited: too many requests, retry in a minute",
+        "",
+    ),
+    (
+        "network failure",
+        1,
+        "muse: network unreachable: connection refused",
+        "",
+    ),
+)
+
+
+class ClassifyUsage(unittest.TestCase):
+    def test_each_observed_usage_line_classifies_as_usage(self):
+        for returncode, stderr, stream in USAGE_CASES:
+            with self.subTest(stderr=stderr):
+                self.assertEqual(muse.classify(returncode, stderr, stream), "usage")
+
+    def test_a_usage_line_with_a_trailing_newline_still_classifies(self):
+        returncode, stderr, stream = USAGE_CASES[0]
+        self.assertEqual(muse.classify(returncode, stderr + "\n", stream), "usage")
+
+
+#: The provider failure categories of the design, one unknown case each.
+_PROVIDER_NAMES = ("auth failure", "quota exhaustion", "rate limit", "network failure")
+
+
+class ClassifyUnknown(unittest.TestCase):
+    def test_everything_without_a_learned_wording_classifies_as_unknown(self):
+        for name, returncode, stderr, stream in UNKNOWN_CASES:
+            with self.subTest(name=name):
+                self.assertEqual(muse.classify(returncode, stderr, stream), "unknown")
+
+    def test_each_provider_category_classifies_as_unknown(self):
+        provider = [case for case in UNKNOWN_CASES if case[0] in _PROVIDER_NAMES]
+        self.assertEqual(len(provider), len(_PROVIDER_NAMES))
+        for name, returncode, stderr, stream in provider:
+            with self.subTest(name=name):
+                self.assertEqual(muse.classify(returncode, stderr, stream), "unknown")
+
+
+class ClassifyMarksNothing(unittest.TestCase):
+    def test_unknown_reaches_no_mark(self):
+        self.assertNotIn("unknown", muse.MARK_CATEGORIES)
+
+    def test_no_classify_result_reaches_a_mark(self):
+        results = {muse.classify(code, err, stream) for code, err, stream in USAGE_CASES}
+        results |= {muse.classify(code, err, stream) for _, code, err, stream in UNKNOWN_CASES}
+        self.assertLessEqual(results, {"usage", "unknown"})
+        self.assertEqual(results & set(muse.MARK_CATEGORIES), set())
+
+
 if __name__ == "__main__":
     unittest.main()
