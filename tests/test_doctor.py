@@ -132,6 +132,17 @@ class EachCheckFailingAlone(unittest.TestCase):
         found = [check for check in checks if check.name == "deps"]
         self.assertEqual([check.status for check in found], ["ok"])
 
+    def test_a_muse_major_bump_is_a_failing_deps_row_with_the_cutover_hint(self):
+        entry = next(d for d in deps.load() if d.name == "muse")
+        result = deps.check(entry, lambda argv, paths: "muse 2.0.1\n")
+        self.assertFalse(result.ok)
+        checks = doctor.run_checks(env(dep_results=(result,)))
+        failed = [check for check in checks if check.name == "deps:muse"]
+        self.assertEqual([check.status for check in failed], ["fail"])
+        self.assertIn("below 2", failed[0].detail)
+        self.assertIn("Muse Code installation instructions", failed[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
     def test_a_deps_load_error_is_a_failing_deps_row_with_exit_1(self):
         checks = doctor.run_checks(env(deps_error="system_deps.toml: bad toml"))
         failed = [check for check in checks if check.name == "deps"]

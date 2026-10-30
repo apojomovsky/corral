@@ -85,6 +85,15 @@ paths = ["~/.opencode/bin/opencode"]
 install = "curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.32"
 
 [[dep]]
+name = "muse"
+why = "agent runtime (major 1 until the cutover to 2)"
+probe = ["muse", "--version"]
+min = "1.4"
+below = "2"
+paths = ["~/.local/bin/muse"]
+install = "see the Muse Code installation instructions"
+
+[[dep]]
 name = "tailscale"
 why = "multi-host only: any network that gives each host an address works"
 probe = ["tailscale", "version"]
