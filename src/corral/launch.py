@@ -31,7 +31,7 @@ import time
 from dataclasses import dataclass
 
 from corral import accounts, admission, disk, models, paths, projects, quota, quota_ledger
-from corral import registry, runtimes, settings, units, worktrees
+from corral import prompts, registry, runtimes, settings, units, worktrees
 from corral.runtimes import muse
 from corral.runtimes import tail as runtime_tail
 
@@ -45,6 +45,12 @@ REGISTERED_NOTE = "(registered agent, counts until its heartbeat goes stale)"
 
 #: The unit's environment entry that names the agent, read by the agent's hooks.
 AGENT_ID_VAR = "CORRAL_AGENT_ID"
+
+#: Launch runtimes to registry runtimes. The runtime adapters and the
+#: registry name one runtime differently; unknown names pass through and
+#: the registry refuses them, so a new adapter without a mapping here is
+#: a loud error, never a silent rename.
+_RUNTIME_NAMES = {"muse": "claude-code"}
 
 settings.register("clone.path", str, "", "the repository's main clone (relative to the ops root)")
 settings.register("clone.default_branch", str, "main", "the default branch of the clone")
@@ -111,7 +117,7 @@ def target(root, repo, env=None, flags=None):
         repo=repo,
         clone=clone,
         default_branch=resolved["clone.default_branch"],
-        prefix=resolved["agents.unit_prefix"],
+        prefix=projects.unit_prefix(root, resolved),
         runtime=resolved["agents.runtime"],
         cap=resolved["agents.cap"],
         branch_template=resolved["git.branch"],
@@ -222,7 +228,7 @@ def admit(tgt, number, *, list_fn, usage):
     cfg = registry.config(tgt.resolved)
     project = projects.for_root(tgt.root, registered)
     key = project.name if project is not None else tgt.prefix
-    own_prefix = project.unit_prefix if project is not None else tgt.prefix
+    own_prefix = tgt.prefix
     from_units = set(units.live_tickets(own_prefix, list_fn(own_prefix)))
     from_registry = registry.counted_tickets(cfg=cfg) - from_units
     if (tgt.repo, number) in from_units:
@@ -301,6 +307,70 @@ def _model_chains(tgt, pool, ledger, now):
     )
 
 
+def _close_previous(tgt, number, list_fn):
+    """Mark done the registry entries of this ticket's earlier generations.
+
+    Only entries whose units are no longer live are closed: a unit still
+    live keeps its entry, and admission still refuses the ticket for it.
+    Unknown or already finished ids are skipped, so a session logged
+    before launch wrote registry entries relaunches cleanly. Returns the
+    units closed.
+    """
+    logged = units.started_units(_session(tgt, number))
+    if not logged:
+        return []
+    live = {name for name, active, _sub in list_fn(tgt.prefix) if active in units.LIVE_STATES}
+    closed = []
+    for unit in logged:
+        if unit in live:
+            continue
+        try:
+            registry.done(unit)
+        except registry.RegistryError:
+            continue
+        except OSError as err:
+            raise LaunchError(f"cannot close the previous agent {unit}: {err}") from None
+        else:
+            closed.append(unit)
+    return closed
+
+
+def _register_started(tgt, unit, number, model):
+    """Register the unit before it starts, so agent list and snapshot show it.
+
+    The ticket names the registered project of the ops root, so the
+    agent counts for the same project its unit prefix counts for.
+    Raises LaunchError naming the unit when the registry cannot record
+    it; the unit is not running yet.
+    """
+    project = projects.for_root(tgt.root)
+    ticket = registry.make_ticket(tgt.repo, number, project.name if project is not None else None)
+    try:
+        registry.register(
+            unit,
+            _RUNTIME_NAMES.get(tgt.runtime, tgt.runtime),
+            ticket=ticket,
+            model=model,
+        )
+    except (registry.RegistryError, OSError) as err:
+        raise LaunchError(f"cannot register the agent {unit}: {err}") from None
+
+
+def _close_never_started(unit):
+    """Best-effort close of an entry whose unit never started.
+
+    The start failed after the entry was registered; without this the
+    entry would hold the ticket until its heartbeat goes stale. A close
+    failure warns on stderr; the original start error still propagates.
+    """
+    try:
+        registry.done(unit)
+    except registry.RegistryError:
+        pass
+    except OSError as err:
+        print(f"corral: cannot close the never-started agent {unit}: {err}", file=sys.stderr)
+
+
 def launch(
     tgt,
     number,
@@ -323,11 +393,15 @@ def launch(
     and once right before the unit starts, so two launches never race on
     a slot. The worktree is made under the same lock, as its module asks.
     The project's model chains are validated and re-routed before anything
-    is made; an exhausted chain refuses the launch.
+    is made; an exhausted chain refuses the launch. Earlier generations'
+    registry entries are closed first, and the unit is registered before
+    it starts (a failed start closes the entry again), so agent list and
+    snapshot show it while it runs and never without it.
 
     `prompt` is the text, or a `(workdir, branch) -> text` callable rendered
     after the worktree is made, so the rendered prompt names the worktree
-    and branch the agent actually gets.
+    and branch the agent actually gets. Either form gets the registry
+    heartbeat instructions appended before it is written.
     """
     factory = prompt if callable(prompt) else None
     if factory is None:
@@ -345,6 +419,7 @@ def launch(
         (ledger_fn or quota_ledger.load)(),
         (now_fn or time.time)(),
     )
+    _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
@@ -363,6 +438,7 @@ def launch(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
+        prompt = prompts.with_heartbeat(prompt)
         session_id = _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
@@ -384,10 +460,17 @@ def launch(
             argv = units.unit_argv(
                 unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
             )
+        except Exception:
+            if session_id is not None:
+                _drop_session_id(session)
+            raise
+        _register_started(tgt, unit, number, model)
+        try:
             units.start(argv, session, unit, run=run)
         except Exception:
             if session_id is not None:
                 _drop_session_id(session)
+            _close_never_started(unit)
             raise
     return unit, workdir
 
@@ -459,6 +542,7 @@ def resume(
     handle = adapter.resume_handle(session)
     if handle is None:
         raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} session to resume")
+    _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
@@ -492,7 +576,12 @@ def resume(
         argv = units.unit_argv(
             unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
         )
-        units.start(argv, session, unit, run=run)
+        _register_started(tgt, unit, number, model)
+        try:
+            units.start(argv, session, unit, run=run)
+        except Exception:
+            _close_never_started(unit)
+            raise
     return unit, workdir
 
 
@@ -500,9 +589,12 @@ def stop(tgt, number, *, list_fn, stop_fn):
     """Stop every live unit of ticket `number` that its session's log proves it started.
 
     Returns the unit names stopped, possibly none. `list_fn` and `stop_fn`
-    are required; see `units.stop`.
+    are required; see `units.stop`. A stopped unit's registry entry is
+    marked done, so the ticket is startable again at once; an entry the
+    registry does not know is left alone. Every stopped unit is closed
+    even when one close fails; the failures raise once at the end.
     """
-    return units.stop(
+    stopped = units.stop(
         tgt.prefix,
         tgt.repo,
         number,
@@ -510,6 +602,17 @@ def stop(tgt, number, *, list_fn, stop_fn):
         list_fn=list_fn,
         stop_fn=stop_fn,
     )
+    failed = []
+    for unit in stopped:
+        try:
+            registry.done(unit)
+        except registry.RegistryError:
+            continue
+        except OSError as err:
+            failed.append(f"{unit}: {err}")
+    if failed:
+        raise LaunchError("stopped but cannot close the registry entries: " + "; ".join(failed))
+    return stopped
 
 
 def _tail_text(path):

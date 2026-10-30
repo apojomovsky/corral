@@ -263,7 +263,9 @@ class LaunchTest(OpsCase):
 
         session = self.session("lib", 5)
         with open(os.path.join(session, "prompt.md"), encoding="utf-8") as h:
-            self.assertEqual(h.read(), "do the thing")
+            text = h.read()
+        self.assertTrue(text.startswith("do the thing\n\n"))
+        self.assertIn("corral agent heartbeat", text)
         self.assertEqual(runtimes.recorded(session), runtime)
         self.assertEqual(units.started_units(session), [unit])
 
@@ -271,7 +273,8 @@ class LaunchTest(OpsCase):
         self.assertIn(f"--unit={unit}", argv)
         self.assertIn(f"--setenv=CORRAL_AGENT_ID={unit}", argv)
         self.assertIn(f"--working-directory={workdir}", argv)
-        self.assertIn("do the thing", argv)
+        self.assertTrue(any(item.startswith("do the thing\n\n") for item in argv))
+        self.assertTrue(any("corral agent heartbeat" in item for item in argv))
         return session
 
     def test_launch_resume_tail_and_stop_an_omp_agent(self):
