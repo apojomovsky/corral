@@ -13,20 +13,45 @@ fetched fresh from the remote and verified present in the clone: a local
 tracking ref is never trusted. The remote read (`ls_remote`) and the
 check runner (`run_cmd`) are injected seams with no default, so tests use
 fakes and temp repositories; the CLI wires the real ones. Every other git
-call here is a local verb. Exit codes: 0 every check ok or skipped,
-1 a check failed, 3 the remote is unreachable, 4 usage or configuration.
+call here is a local verb.
+
+The commands step runs under a host-level lock, so two worktrees on one
+host never run the full suite at once: a second takeoff waits for the
+lock up to `checks.suite_lock_timeout_s` (resolved once per run), then
+gives up with exit 75. The lock is an advisory `flock` on
+`takeoff-suite.lock` inside `paths.state_dir()`; the kernel releases it
+when the holder dies, so a dead holder leaves nothing to reap. A takeoff
+with no commands to run never takes the lock.
+
+Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
+is unreachable, 4 usage or configuration, 75 the suite lock stayed held
+past the wait.
 """
 
+import contextlib
+import errno
+import fcntl
 import functools
 import importlib.machinery
 import importlib.util
 import os
 import re
 import subprocess
-
+import time
+from collections.abc import Callable
 from typing import NamedTuple
 
-from corral import detect, gitenv, leakcli, leakguard, mergeup, reviewrecord, settings, worktrees
+from corral import (
+    detect,
+    gitenv,
+    leakcli,
+    leakguard,
+    mergeup,
+    paths,
+    reviewrecord,
+    settings,
+    worktrees,
+)
 from corral.github import gh
 
 #: The version stamped on every `--json` document.
@@ -39,6 +64,12 @@ OK, FAIL, SKIPPED = "ok", "fail", "skipped"
 EM_DASH = chr(0x2014)
 settings.register("checks.takeoff", list, [], "takeoff gate commands, run in order in the worktree")
 settings.register("checks.timeout_s", int, 1800, "seconds before a takeoff command is killed")
+settings.register(
+    "checks.suite_lock_timeout_s",
+    int,
+    3600,
+    "seconds a second takeoff waits for the full-suite lock before giving up (exit 75)",
+)
 
 settings.register(
     "checks.no_em_dash", bool, True, "takeoff refuses added lines and bodies with an em-dash"
@@ -437,8 +468,93 @@ def _expired_tail(err):
     return "\n".join(((out or "") + (errs or "")).splitlines()[-20:])
 
 
-def _check_commands(commands, test_command, with_test, toplevel, run_cmd, scrub, timeout_s):
-    """Each configured takeoff command exits 0, with the tail shown on failure."""
+#: The full-suite lock file inside the state dir.
+SUITE_LOCK_NAME = "takeoff-suite.lock"
+
+#: Seconds between lock retries while another takeoff holds the suite lock.
+SUITE_LOCK_POLL_S = 1.0
+
+
+class SuiteBusy(Exception):
+    """The suite lock stayed held past the wait (exit 75, try later)."""
+
+    exit_code = 75
+
+
+def suite_lock_path():
+    """The host-level full-suite lock file: inside the state dir.
+
+    The only path join for it (AGENTS.md, "One fact, one place").
+    """
+    return os.path.join(paths.state_dir(), SUITE_LOCK_NAME)
+
+
+#: The lock seams: production locks with fcntl, waits on the monotonic
+#: clock and sleeps between retries; tests assign fakes.
+_flock: Callable[[int, int], None] = fcntl.flock
+_sleep: Callable[[float], None] = time.sleep
+_monotonic: Callable[[], float] = time.monotonic
+
+
+@contextlib.contextmanager
+def suite_lock(path, timeout_s):
+    """Hold an exclusive flock on `path`, waiting up to `timeout_s` seconds.
+
+    The first try is immediate; while another takeoff holds the lock the
+    wait retries every SUITE_LOCK_POLL_S. Contention past the deadline
+    raises SuiteBusy; setup and unexpected lock failures raise
+    TakeoffError. The kernel releases the lock when the holder dies, so a
+    dead holder is already reclaimed when the next waiter tries.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as err:
+            raise TakeoffError(f"cannot set up the suite lock: {err}") from None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as err:
+        raise TakeoffError(f"cannot open the suite lock {path}: {err}") from None
+    deadline = _monotonic() + timeout_s
+    try:
+        while True:
+            try:
+                _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise TakeoffError(f"cannot lock {path}: {err}") from None
+            if _monotonic() >= deadline:
+                raise SuiteBusy(
+                    f"another takeoff holds the full-suite lock ({path}): "
+                    f"waited {timeout_s}s, run takeoff again later"
+                )
+            _sleep(SUITE_LOCK_POLL_S)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _check_commands(
+    commands,
+    test_command,
+    with_test,
+    toplevel,
+    run_cmd,
+    scrub,
+    timeout_s,
+    *,
+    lock_path,
+    lock_timeout_s,
+):
+    """Each configured takeoff command exits 0, with the tail shown on failure.
+
+    The commands run under the host-level suite lock, so two worktrees on
+    one host never run the full suite at once; when the lock stays held
+    past `lock_timeout_s` the wait raises SuiteBusy instead of returning
+    a row. A takeoff with nothing to run returns ok without the lock.
+    """
     if not isinstance(commands, list) or any(not isinstance(c, str) for c in commands):
         raise TakeoffError("checks.takeoff must be a list of command strings")
     # The default is [checks.test] when it is set, else empty; --test adds
@@ -448,50 +564,53 @@ def _check_commands(commands, test_command, with_test, toplevel, run_cmd, scrub,
         wanted.append(test_command)
     if not wanted:
         return Check("checks", OK, "no takeoff commands configured", "")
-    for cmd in wanted:
-        try:
-            proc = run_cmd(cmd, toplevel)
-        except subprocess.TimeoutExpired as err:
-            tail = _expired_tail(err)
-            detail = f"`{cmd}` exceeded checks.timeout_s ({timeout_s}s)"
-            if tail.strip():
-                detail += f":\n{tail}"
-            return Check(
-                "checks",
-                FAIL,
-                scrub(detail),
-                f"raise checks.timeout_s or fix the hang: run `{cmd}` in the worktree",
-            )
-        except Exception as err:
-            return Check(
-                "checks",
-                FAIL,
-                f"`{cmd}` could not run: {err}",
-                f"run `{cmd}` in the worktree and fix what it reports",
-            )
-        if proc is None or getattr(proc, "returncode", 1) != 0:
-            code = getattr(proc, "returncode", "?")
-            text = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
-            tail = "\n".join(text.splitlines()[-20:])
-            detail = f"`{cmd}` exited {code}"
-            if tail.strip():
-                detail += f":\n{tail}"
-            return Check(
-                "checks",
-                FAIL,
-                scrub(detail),
-                f"run `{cmd}` in the worktree and fix what it reports",
-            )
+    with suite_lock(lock_path, lock_timeout_s):
+        for cmd in wanted:
+            try:
+                proc = run_cmd(cmd, toplevel)
+            except subprocess.TimeoutExpired as err:
+                tail = _expired_tail(err)
+                detail = f"`{cmd}` exceeded checks.timeout_s ({timeout_s}s)"
+                if tail.strip():
+                    detail += f":\n{tail}"
+                return Check(
+                    "checks",
+                    FAIL,
+                    scrub(detail),
+                    f"raise checks.timeout_s or fix the hang: run `{cmd}` in the worktree",
+                )
+            except Exception as err:
+                return Check(
+                    "checks",
+                    FAIL,
+                    f"`{cmd}` could not run: {err}",
+                    f"run `{cmd}` in the worktree and fix what it reports",
+                )
+            if proc is None or getattr(proc, "returncode", 1) != 0:
+                code = getattr(proc, "returncode", "?")
+                text = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
+                tail = "\n".join(text.splitlines()[-20:])
+                detail = f"`{cmd}` exited {code}"
+                if tail.strip():
+                    detail += f":\n{tail}"
+                return Check(
+                    "checks",
+                    FAIL,
+                    scrub(detail),
+                    f"run `{cmd}` in the worktree and fix what it reports",
+                )
     return Check("checks", OK, "; ".join(f"`{c}`" for c in wanted) if wanted else "", "")
 
 
 def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remote, run_cmd):
-    """Run the takeoff gate over `path`; returns a Result (exit 3 only early).
+    """Run the takeoff gate over `path`; returns a Result.
 
     `ls_remote(branch, cwd)` returns the remote base SHA or raises
     LsRemoteError; `run_cmd(cmd, cwd)` runs one takeoff command. Both are
     required: no default may silently answer for the remote or the suite.
-    Usage and configuration problems raise TakeoffError (exit 4).
+    Usage and configuration problems raise TakeoffError (exit 4). Exit 3
+    returns before any check row, when the remote is unreadable; exit 75
+    returns the rows so far with the suite wait as the failing checks row.
     """
     if ls_remote is None or run_cmd is None:
         raise TypeError("run_takeoff needs ls_remote and run_cmd seams")
@@ -555,19 +674,39 @@ def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remot
     timeout_s = resolved["checks.timeout_s"]
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
         raise TakeoffError("checks.timeout_s must be a positive number of seconds")
+    lock_timeout_s = resolved["checks.suite_lock_timeout_s"]
+    if (
+        isinstance(lock_timeout_s, bool)
+        or not isinstance(lock_timeout_s, int)
+        or lock_timeout_s <= 0
+    ):
+        raise TakeoffError("checks.suite_lock_timeout_s must be a positive number of seconds")
     if run_cmd is production_run_cmd:
         run_cmd = functools.partial(production_run_cmd, timeout=timeout_s)
-    checks.append(
-        _check_commands(
-            resolved["checks.takeoff"],
-            resolved["checks.test"],
-            with_test,
-            toplevel,
-            run_cmd,
-            scrub,
-            timeout_s,
+    try:
+        checks.append(
+            _check_commands(
+                resolved["checks.takeoff"],
+                resolved["checks.test"],
+                with_test,
+                toplevel,
+                run_cmd,
+                scrub,
+                timeout_s,
+                lock_path=suite_lock_path(),
+                lock_timeout_s=lock_timeout_s,
+            )
         )
-    )
+    except SuiteBusy as busy:
+        checks.append(
+            Check(
+                "checks",
+                FAIL,
+                scrub(str(busy)),
+                "wait for the other takeoff to finish, then run takeoff again",
+            )
+        )
+        return Result(base, checks, 75)
     if any(check.status == FAIL for check in checks):
         return Result(base, checks, 1)
     return Result(base, checks, 0)
