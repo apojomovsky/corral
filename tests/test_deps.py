@@ -114,6 +114,13 @@ class MuseTripwire(unittest.TestCase):
         r = deps.check(self.entry(), fake({"muse": "muse 1.4.0\n"}))
         self.assertTrue(r.ok)
 
+    def test_old_1x_output_fails_with_the_min_floor(self):
+        entry = self.entry()
+        self.assertEqual(entry.min, "1.4")
+        r = deps.check(entry, fake({"muse": "muse 1.0\n"}))
+        self.assertFalse(r.ok)
+        self.assertIn("needs 1.4 or later", r.problem or "")
+
     def test_canned_2x_output_fails_with_the_cutover_hint(self):
         entry = self.entry()
         self.assertEqual(entry.below, "2")
