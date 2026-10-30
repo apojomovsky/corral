@@ -12,7 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, units
+from corral import board, drive, registry, settings, units
+from corral import projects as projects_mod
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_tracker import FakeTracker, reading
@@ -203,6 +204,40 @@ class ReleaseOrphansTest(unittest.TestCase):
             self.assertEqual(row.agent, want)
 
 
+class ProductionOrphanInputsTest(unittest.TestCase):
+    def test_live_and_stale_entries_count_as_present(self):
+        registered = [
+            projects_mod.Project(name="blue", unit_prefix="blue-agent-", root="/tmp/ops-blue"),
+            projects_mod.Project(name="green", unit_prefix="green-agent-", root="/tmp/ops-green"),
+        ]
+        entries = [
+            ({"id": "live-1"}, registry.LIVE),
+            ({"id": "stale-1"}, registry.STALE),
+            ({"id": "finished-1"}, registry.FINISHED),
+            ({"id": "gone-1"}, registry.GONE),
+        ]
+        listings = {
+            "blue-agent-": [
+                ("blue-agent-app-7", "active", ""),
+                ("blue-agent-app-8", "inactive", ""),
+            ],
+            "green-agent-": [("green-agent-app-9", "active", "")],
+        }
+        with (
+            mock.patch.object(drive.registry, "config", return_value={"gone_s": GONE_S}),
+            mock.patch.object(drive.registry, "visible", return_value=entries),
+            mock.patch.object(
+                drive.units,
+                "list_units",
+                side_effect=lambda prefix, run=None: listings[prefix],
+            ),
+        ):
+            present, tickets, gone_s = drive.production_orphan_inputs(registered, now=NOW)
+        self.assertEqual(present, {"live-1", "stale-1"})
+        self.assertEqual(tickets, {("app", 7), ("app", 9)})
+        self.assertEqual(gone_s, GONE_S)
+
+
 class OrphanPassTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="corral-orphan-pass-")
@@ -285,6 +320,38 @@ class OrphanPassTest(unittest.TestCase):
         row, _ = store.item("app", 7, now=NOW)
         self.assertEqual(row.agent, AGENT)
         self.assertEqual(len(launcher.calls), 1)
+
+    def test_bad_registry_settings_yields_exit_4(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            drive,
+            "production_orphan_inputs",
+            side_effect=settings.SettingsError("bad registry"),
+        ):
+            code = drive_pass(store, self.lock, out, err, now=NOW, gone_s=None)
+        self.assertEqual(code, 4)
+        self.assertIn("bad registry", err.getvalue())
+
+    def test_a_store_error_skips_recovery_and_keeps_rows_held(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 9, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        claimed(store, "app", 9)
+
+        def failing(repo, number, agent, epoch, *, now):
+            raise board.StoreError("boom")
+
+        store.release = failing  # type: ignore[method-assign]
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(store, self.lock, out, err, now=NOW, **orphan_kwargs())
+        self.assertEqual(code, 0)
+        self.assertIn("orphan recovery skipped", err.getvalue())
+        for number in (7, 9):
+            row, _ = store.item("app", number, now=NOW)
+            self.assertEqual(row.agent, AGENT)
 
     def test_the_pass_never_adopts_a_tracker_shown_claim(self):
         store = stored(self.db, [("app", 7, "open")])
