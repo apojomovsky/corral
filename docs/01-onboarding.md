@@ -84,6 +84,7 @@ Everything a project might reasonably do differently is a named setting with a d
 | `checks.test` | detected (see 3) | the command the agent and takeoff run |
 | `checks.takeoff` | `[checks.test]` | any list of commands; each must exit 0 |
 | `checks.timeout_s` | `1800` | seconds before a takeoff command is killed |
+| `checks.suite_lock_timeout_s` | `3600` | seconds a second takeoff waits for the full-suite lock before giving up (exit 75) |
 | `agents.cap` | 1 | this project's ceiling on the host |
 | `agents.runtime` | `omp` | or `opencode` or `muse` |
 | `models.*` | roles and fallback chains | must name providers from the host's accounts |
