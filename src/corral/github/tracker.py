@@ -66,6 +66,26 @@ def _fail(text):
     return iface.TrackerError(f"unusable tracker answer: {text}")
 
 
+def milestone_of(payload) -> str | None:
+    """The milestone title of an issues-endpoint object, else ``None``.
+
+    A missing or null milestone reads as ``None``; anything short of a
+    title string is a ``TrackerError``, never a guess. Pure, so the
+    board reader shares it with this module's own parse.
+    """
+    if not isinstance(payload, dict):
+        raise _fail(f"item is not an object: {payload!r}")
+    milestone = payload.get("milestone")
+    if milestone is None:
+        return None
+    if not isinstance(milestone, dict):
+        raise _fail(f"bad milestone {milestone!r}")
+    title = milestone.get("title")
+    if not isinstance(title, str) or not title:
+        raise _fail(f"bad milestone {milestone!r}")
+    return title
+
+
 def _parse_updated(text):
     """Epoch seconds for an ``updated_at`` value, else ``TrackerError``."""
     if not isinstance(text, str):
@@ -218,13 +238,23 @@ class GithubTracker:
             page += 1
 
     def item(self, repo: str, number: int) -> iface.TrackerItem:
+        found, _ = self.read_issue(repo, number)
+        return found
+
+    def read_issue(self, repo: str, number: int) -> tuple[iface.TrackerItem, str | None]:
+        """One issue plus its milestone title, fresh from the REST endpoint.
+
+        The milestone rides along because the board reader overlays it as
+        a concept; the plain ``item`` path keeps ignoring it. A missing
+        or null milestone reads as ``None``.
+        """
         try:
             payload = json.loads(self._get(f"repos/{repo}/issues/{number}"))
         except iface.TrackerError:
             raise
         except Exception as err:
             raise _fail(f"item {repo}#{number} is not JSON: {err}") from err
-        return self._parse(repo, payload)
+        return self._parse(repo, payload), milestone_of(payload)
 
     def changes(self, repo: str, cursor: str | None) -> tuple[list[iface.TrackerItem], str]:
         """Items updated since ``cursor``, and the cursor of the newest
