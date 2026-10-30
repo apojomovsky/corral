@@ -34,6 +34,29 @@ ALLOWED = frozenset(
     }
 )
 
+#: Appended by `corral.launch` to every prompt it starts, whatever the
+#: role or prompt file. It names the registry id, the heartbeat, and
+#: done, so every launched agent stays live in the registry while its
+#: unit runs. One template, not a copy in each role file.
+HEARTBEAT = """## Registry heartbeat
+
+Your unit is registered in the host agent registry under the id in
+`$CORRAL_AGENT_ID`, set in your environment. About every five minutes,
+run:
+
+```
+corral agent heartbeat "$CORRAL_AGENT_ID" --note "what you are doing now"
+```
+
+so the host keeps listing you as live. When your work is done, run
+`corral agent done "$CORRAL_AGENT_ID"` once, before you write your summary."""
+
+
+def with_heartbeat(text):
+    """`text` with the registry heartbeat instructions appended."""
+    return text.rstrip() + "\n\n" + HEARTBEAT + "\n"
+
+
 #: The ejected override directory inside the ops root.
 PROMPTS_DIR = os.path.join(".corral", "prompts")
 
