@@ -85,7 +85,7 @@ Everything a project might reasonably do differently is a named setting with a d
 | `checks.takeoff` | `[checks.test]` | any list of commands; each must exit 0 |
 | `checks.timeout_s` | `1800` | seconds before a takeoff command is killed |
 | `agents.cap` | 1 | this project's ceiling on the host |
-| `agents.runtime` | `omp` | or `opencode` |
+| `agents.runtime` | `omp` | or `opencode` or `muse` |
 | `models.*` | roles and fallback chains | must name providers from the host's accounts |
 | `prompts.<role>` | built-in templates | override with a file (see 4) |
 

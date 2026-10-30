@@ -6,6 +6,7 @@ import unittest
 from typing import Any
 
 from corral import board, tracker
+from corral.github import gh as ghmod
 from corral.github import tracker as ghtracker
 
 T0 = calendar.timegm((2026, 10, 28, 12, 0, 0, 0, 0, 0))
@@ -74,6 +75,8 @@ class FakeTracker:
         self.item_errors = {}
         self.items_break_after = None
         self.write_errors = {}
+        self.comment_errors = {}
+        self.label_errors = {}
         self.calls = []
 
     def add(self, item):
@@ -119,6 +122,18 @@ class FakeTracker:
         self.calls.append(("write", repo, number, field, value))
         if (repo, number) in self.write_errors:
             raise self.write_errors[(repo, number)]
+
+    def comment(self, repo, number, body):
+        """Record one decision comment; programmed errors raise."""
+        self.calls.append(("comment", repo, number, body))
+        if (repo, number) in self.comment_errors:
+            raise self.comment_errors[(repo, number)]
+
+    def add_label(self, repo, number, label):
+        """Record one decision label; programmed errors raise."""
+        self.calls.append(("add_label", repo, number, label))
+        if (repo, number) in self.label_errors:
+            raise self.label_errors[(repo, number)]
 
 
 def reading(repo="acme/app", number=7, **over: Any):
@@ -344,6 +359,82 @@ class PaginationTest(unittest.TestCase):
             [item_payload(3)],
         )
         self.assertEqual([item.number for item in self.adapter.items("acme/app")], [1, 2, 3])
+
+
+class DecisionRecordTest(unittest.TestCase):
+    """The fake Tracker records both decision-seam calls."""
+
+    def test_comment_and_label_are_recorded(self):
+        fake = FakeTracker()
+        fake.comment("acme/app", 7, "Which shape should this take?")
+        fake.add_label("acme/app", 7, "needs-decision")
+        self.assertIn(
+            ("comment", "acme/app", 7, "Which shape should this take?"),
+            fake.calls,
+        )
+        self.assertIn(("add_label", "acme/app", 7, "needs-decision"), fake.calls)
+
+    def test_scripted_comment_error_raises(self):
+        fake = FakeTracker()
+        fake.comment_errors[("acme/app", 7)] = tracker.TrackerError("down")
+        with self.assertRaises(tracker.TrackerError):
+            fake.comment("acme/app", 7, "body")
+
+    def test_scripted_label_error_raises(self):
+        fake = FakeTracker()
+        fake.label_errors[("acme/app", 7)] = tracker.TrackerError("down")
+        with self.assertRaises(tracker.TrackerError):
+            fake.add_label("acme/app", 7, "needs-decision")
+
+
+class DecisionAdapterTest(unittest.TestCase):
+    """The GitHub adapter posts one comment and one label through `gh`."""
+
+    def setUp(self):
+        self.calls = []
+        self.error = None
+
+        def run(args):
+            self.calls.append(list(args))
+            if self.error is not None:
+                raise self.error
+            return ""
+
+        self.adapter = ghtracker.GithubTracker(run)
+
+    def test_comment_posts_one_comment(self):
+        self.adapter.comment("acme/app", 7, "Which shape should this take?")
+        self.assertEqual(len(self.calls), 1)
+        posted = self.calls[0]
+        self.assertIn("POST", posted)
+        self.assertIn("repos/acme/app/issues/7/comments", posted)
+        self.assertIn("body=Which shape should this take?", posted)
+
+    def test_add_label_posts_needs_decision(self):
+        self.adapter.add_label("acme/app", 7, "needs-decision")
+        self.assertEqual(len(self.calls), 1)
+        posted = self.calls[0]
+        self.assertIn("POST", posted)
+        self.assertIn("repos/acme/app/issues/7/labels", posted)
+        self.assertIn("labels[]=needs-decision", posted)
+
+    def test_add_label_refuses_any_other_name(self):
+        with self.assertRaises(ValueError):
+            self.adapter.add_label("acme/app", 7, "ready")
+        self.assertEqual(self.calls, [])
+
+    def test_comment_failure_is_a_tracker_error(self):
+        self.error = RuntimeError("connection refused")
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.comment("acme/app", 7, "body")
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_label_rate_limit_maps_to_tracker_rate_limited(self):
+        self.error = ghmod.GhError("unavailable", "API rate limit exceeded, retry after 62s")
+        with self.assertRaises(tracker.TrackerRateLimited) as ctx:
+            self.adapter.add_label("acme/app", 7, "needs-decision")
+        self.assertEqual(ctx.exception.retry_after, 62.0)
 
 
 if __name__ == "__main__":

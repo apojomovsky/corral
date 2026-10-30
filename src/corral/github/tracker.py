@@ -24,6 +24,11 @@ _PRIORITY_PREFIX = "priority:"
 #: are pruned on the next write of that field.
 _FIELD_PREFIX = {"agent": "agent:", "status": "status:"}
 
+#: The only people-owned label the adapter ever adds. The decision
+#: protocol holds a ticket for a human with this label; the adapter
+#: exposes no general label write, so any other name is refused.
+NEEDS_DECISION = "needs-decision"
+
 
 def priority_of(names) -> str:
     """The highest-ranked ``priority:*`` suffix in ``names``, else ``""``.
@@ -258,6 +263,50 @@ class GithubTracker:
         except Exception as err:
             raise self._write_error(err) from err
         return _parse_names(payload, "labels")
+
+    def comment(self, repo: str, number: int, body: str) -> None:
+        """Post one decision-protocol comment through the issues endpoint.
+
+        The loop's own question only; there is no general comment edit.
+        A failed call raises ``TrackerError`` through ``_write_error``.
+        """
+        try:
+            self._run(
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repo}/issues/{number}/comments",
+                    "-f",
+                    f"body={body}",
+                ]
+            )
+        except Exception as err:
+            raise self._write_error(err) from err
+
+    def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add the one decision label through the issues-labels endpoint.
+
+        Only ``NEEDS_DECISION`` is accepted; there is no general label
+        write, so any other name is refused with ``ValueError`` and no
+        ``gh`` call runs. A failed call raises ``TrackerError`` through
+        ``_write_error``.
+        """
+        if label != NEEDS_DECISION:
+            raise ValueError(f"refusing to add non-decision label {label!r}")
+        try:
+            self._run(
+                [
+                    "api",
+                    "--method",
+                    "POST",
+                    f"repos/{repo}/issues/{number}/labels",
+                    "-f",
+                    f"labels[]={label}",
+                ]
+            )
+        except Exception as err:
+            raise self._write_error(err) from err
 
     def write(self, repo: str, number: int, field: str, value: str) -> None:
         """Set one corral-owned field through the issues-labels endpoint.

@@ -495,6 +495,15 @@ class EnqueueTest(TempStoreTest):
             store.enqueue("app", 7, "title", "New", now=1500.0)
         self.assertEqual(store.queued_writes(), [])
 
+    def test_enqueue_refuses_decision_writes(self):
+        store = self.stored()
+        self.assertEqual(board.AGENT_FIELDS, ("agent", "status"))
+        with self.assertRaises(board.StoreError):
+            store.enqueue("app", 7, "comment", "hello", now=1500.0)
+        with self.assertRaises(board.StoreError):
+            store.enqueue("app", 7, "needs-decision", "", now=1500.0)
+        self.assertEqual(store.queued_writes(), [])
+
     def test_enqueue_refused_for_external(self):
         store = self.stored(author="mallory")
         with self.assertRaises(board.ExternalItem):
