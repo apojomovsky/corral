@@ -125,6 +125,8 @@ chain = ["provider-a/model-x", "provider-b/model-y"]
 
 Every entry names a provider from the pool as `provider/model`; an unknown provider is a configuration error (exit 4), and an id starting with `-` is refused. The per-launch overlay carries each chain with exhausted providers removed, so a launch routes around quota that is gone; when a required role has no live provider left, the launch is refused with exit 75, naming the role and its earliest known reset.
 
+A `[[repo]]` entry whose project coordinates through hosted board fields sets `tracker.variant = "board"` (default `"labels"`) and maps its board in a `[repo.board]` table: the board owner plus the board number (or node id), the corral-owned text fields, the people-owned columns, and a `priority_map` of board option ids to ranks. Unknown concept keys are a configuration error (exit 4); the option ids are opaque and display names are comments only. Details: [`docs/07-board-fields.md`](docs/07-board-fields.md).
+
 The ops root's `corral.toml` may also list private terms that must never reach the shared side:
 
 ```toml
