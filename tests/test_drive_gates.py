@@ -657,24 +657,19 @@ class PassWiringTest(unittest.TestCase):
         self.assertIn("quota", out)
         self.assertIn("app#5: start", out)
 
-    def test_the_pass_writes_nothing_even_off_plan(self):
+    def test_the_non_plan_pass_claims_its_candidate(self):
         store = stored(self.db, [("app", 7, "open")])
         store.enqueue("app", 7, "status", "working", now=1500.0)
-        store.close()
-        with open(self.db, "rb") as handle:
-            before = handle.read()
-        store = board.open_store(self.db)
         self.addCleanup(store.close)
         entry = self.write_policy("blue_policy", [("app", 7, "start")])
         code, out, err = self.run_pass(store, [self.project("blue", entry)], plan=False)
         self.assertEqual(code, 0)
         self.assertIn("pass: 1 candidate(s)", out)
-        store.close()
-        with open(self.db, "rb") as handle:
-            self.assertEqual(handle.read(), before)
-        store = board.open_store(self.db)
-        self.addCleanup(store.close)
-        self.assertEqual(len(store.outbox_rows()), 1)
+        self.assertIn("app#7: start", out)
+        self.assertIn("launch skipped (no launcher)", out)
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertTrue(row.agent.startswith(drive.MANAGED_PREFIX))
+        self.assertEqual(len(store.outbox_rows()), 2)
 
     def test_host_defaults_resolve_without_touching_the_real_dirs(self):
         store = stored(self.db, [("app", 7, "open")])
