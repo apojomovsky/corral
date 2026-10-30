@@ -52,6 +52,8 @@ def _read_config(session_dir):
 
     A corrupt file, an unreadable one, or a non-object raises ValueError
     naming the file, so a launch never silently runs on the wrong config.
+    Each launch caller converts ValueError to its own error with `from None`
+    for one-line CLI output; the file detail survives inside the message text.
     """
     path = os.path.join(session_dir, CONFIG_NAME)
     try:
@@ -81,17 +83,6 @@ def _model_of(config, session_dir):
         return model or None
     path = os.path.join(session_dir, CONFIG_NAME)
     raise ValueError(f"cannot parse {path}: want model to be a non-empty string")
-
-
-def _config_model(session_dir):
-    """The configured model in the session dir, or None when there is none.
-
-    Only a missing or empty model means no model: anything else unreadable
-    raises ValueError, so a launch never silently runs on the wrong model.
-    Each launch caller converts ValueError to its own error; the file
-    error stays chained underneath.
-    """
-    return _model_of(_read_config(session_dir), session_dir)
 
 
 def _encode_value(value):
