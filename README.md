@@ -68,10 +68,13 @@ The host pool needs one provider with a reader, the only provider-specific code 
 
 ```toml
 # ~/.config/corral/accounts.toml
+reader_path = ["~/ops-root/readers"]
 [[provider]]
 name = "provider-a"
 reader = "my_tools.quota:ProviderA"
 ```
+
+Each `reader_path` entry is an absolute directory (after `~` and environment expansion) holding reader modules; corral puts the entries on `sys.path` only while a reader loads. A missing or relative entry fails `corral deps` and the doctor, naming the entry.
 
 ## Commands
 
@@ -91,7 +94,7 @@ reader = "my_tools.quota:ProviderA"
 | `corral tail REPO N [--last K] [--root PATH]` | show the ticket's agent activity, from its session file |
 | `corral agent register\|heartbeat\|done\|list` | the host's agent registry: any agent, from any runtime, reports itself; a ticket is `--repo` and `--number` (optional `--project`); exit 4 on a heartbeat means the agent was dropped and registers again |
 | `corral projects [--json]` | the registered projects with their prefix, root, floor, ceiling and live agents, counted with the host registry settings (a per-project `registry.*` override applies to launch admission only) |
-| `corral drive [--plan]` | run one dispatch pass over the board store: the pass holds the single-instance lock (exit 2 when another pass holds it) and changes nothing yet; exit 3 when live host state cannot be read, 4 when the store, the lock setup, a project or its settings cannot be read; `--plan` never takes the lock and always prints the candidate table |
+| `corral drive [--plan]` | run one dispatch pass over the board store: sync the rows from the tracker, claim proceeding tickets through the store, launch workers through the launch path, then mirror the outbox; the pass holds the single-instance lock (exit 2 when another pass holds it); exit 3 on a tracker outage, when nothing synced, or when launches are blocked and nothing started, 4 when the store, the lock setup, a project or its settings cannot be read; `--plan` never takes the lock and changes nothing |
 | `corral prompts show ROLE [--ops DIR]` | print the effective role prompt template (override or built-in), unrendered |
 | `corral prompts eject ROLE [--ops DIR] [--force]` | copy the built-in template to `.corral/prompts/` for editing; prints the path and refuses to overwrite without `--force` |
 | `corral prompts check [--ops DIR]` | validate every override's placeholders and report stale ejections; exit 1 when something is stale or invalid |
@@ -116,7 +119,7 @@ reader = "my_tools.quota:ProviderA"
 | `corral prose [--verify]` | list the comment blocks a branch adds; `--verify` fails on ones that break the prose rules |
 | `corral push [branch]` | push, verify the remote ref, retry once; the retry skips the suite the hook already passed |
 | `corral budget` | the review dispatch block: one question, scope, and a time budget derived from the diff |
-Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project. `corral config show` lists every setting. A `[[repo]]` entry sets `clone.path` (the repository's main clone, relative to the ops root) and `clone.default_branch` (default `main`), which `corral launch` needs. A project registers with a file per host in `~/.config/corral/projects.d/<name>.toml`, naming its `unit_prefix`, its ops `root`, its guaranteed `floor` of slots (default 0) and its `ceiling` of slots (default none): with the host total full, a project below its floor still starts, and a project at its ceiling does not. An optional `eligibility` entry (`module:function` or `path/to/policy.py:function`) names the policy the dispatch pass asks for startable tickets; without it the pass skips the project. A relative policy path resolves against the project's registered ops `root`, never the caller's working directory. With no registration `agents.cap` is the project's ceiling; with one the registry ceiling wins, and a differing `agents.cap` is reported in the refusal, not an error. The provider pool lives beside the host config in `accounts.toml`: one `[[provider]]` entry per provider, naming its quota reader; a missing file means an empty pool. A project declares its model chains in the same `corral.toml`:
+Settings layer as built-in defaults, then the host config (`~/.config/corral/config.toml`), then the ops root's `corral.toml` (its `[[repo]]` entry wins for that repository), then `CORRAL_*` environment variables, then flags. The host config's `[limits]` table caps numeric settings for every project. `corral config show` lists every setting. A `[[repo]]` entry sets `clone.path` (the repository's main clone, relative to the ops root) and `clone.default_branch` (default `main`), which `corral launch` needs. A project registers with a file per host in `~/.config/corral/projects.d/<name>.toml`, naming its `unit_prefix`, its ops `root`, its guaranteed `floor` of slots (default 0) and its `ceiling` of slots (default none): with the host total full, a project below its floor still starts, and a project at its ceiling does not. An optional `eligibility` entry (`module:function` or `path/to/policy.py:function`) names the policy the dispatch pass asks for startable tickets; without it the pass skips the project. A relative policy path resolves against the project's registered ops `root`, never the caller's working directory. With no registration `agents.cap` is the project's ceiling; with one the registry ceiling wins, and a differing `agents.cap` is reported in the refusal, not an error. The provider pool lives beside the host config in `accounts.toml`: one `[[provider]]` entry per provider, naming its quota reader, plus an optional top-level `reader_path` list of the absolute directories the readers live in; a missing file means an empty pool. A project declares its model chains in the same `corral.toml`:
 
 ```toml
 [models.default]

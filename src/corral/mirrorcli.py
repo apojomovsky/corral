@@ -50,18 +50,13 @@ def mirror_root(
         _err(f"unknown repo {unknown[0]!r} (not a [[repo]] entry in {root})", err)
         return USAGE
     if operators is None:
+        entries, problem = syncli.repo_operators(root, names or wanted, git)
+        if problem is not None:
+            _err(problem, err)
+            return USAGE
         operators = {}
-        for name in names or wanted:
-            try:
-                resolved = settings.load(root=root, repo=name)
-            except settings.SettingsError as problem:
-                _err(str(problem), err)
-                return USAGE
-            tracker_repo, problem = syncli._tracker_repo(root, name, resolved, git)
-            if problem is not None:
-                _err(problem, err)
-                return USAGE
-            operators[tracker_repo] = syncli._operators(resolved["tracker.operators"], tracker_repo)
+        for _name, (tracker_repo, ops) in entries.items():
+            operators[tracker_repo] = ops
     try:
         result = mirror.push(store, tracker, operators=operators, now=now, limit=limit)
     except board.StoreError as problem:

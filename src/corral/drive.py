@@ -1,16 +1,19 @@
 """`corral drive`: one dispatch pass over the board store.
 
-Each pass joins every registered project's eligibility requests to the
-store rows, runs the section 3 gate order over the candidates, and
-prints the verdict table. The pass only reads: nothing is synced,
-claimed, enqueued, started, mirrored or journaled (claims and the
-launch handoff land in a later ticket). The non-plan pass holds the
-single-instance lock (exit 2 when another pass holds it). `--plan` is
-the dry run: it never takes the lock.
+Each pass syncs the board store from the tracker, joins every
+registered project's eligibility requests to the store rows, runs the
+section 3 gate order over the candidates, claims the proceeding ones
+through the store transaction, hands the starts to the existing launch
+path, drains the mirror backlog, and prints the verdict table.
+`--plan` is the dry run: it holds no lock and writes nothing, running
+no sync, claim, mirror or launch. The non-plan pass holds the
+single-instance lock (exit 2 when another pass holds it).
 
-Exit codes: 0 completed, 2 another pass holds the lock, 3 live host
-state (units or the registry) could not be read, 4 the store could not
-be read, the lock could not be set up, or a project failed to load.
+Exit codes: 0 completed, 2 another pass holds the lock, 3 the tracker
+or live host state (units or the registry) could not be reached, 4 the
+store could not be read, the lock could not be set up, or a project
+failed to load. A full host that starts nothing routine is still 0:
+saturation is routine dispatch state, not an error.
 """
 
 import argparse
@@ -18,6 +21,7 @@ import contextlib
 import errno
 import fcntl
 import os
+import socket
 import sqlite3
 import sys
 import time
@@ -28,17 +32,24 @@ from corral import (
     accounts,
     admission,
     board,
+    disk,
     eligibility,
     hold,
     launch,
+    mirror,
     paths,
     projects,
+    prompts,
     quota,
     quota_ledger,
     registry,
     settings,
+    sync,
     units,
+    worktrees,
 )
+from corral import syncli
+from corral import tracker as iface
 from corral.eligibility import StartRequest, TicketRow
 from corral.github.tracker import NEEDS_DECISION, PRIORITIES
 
@@ -63,6 +74,19 @@ KIND_GROUP = {"resume": 0, "fix": 0, "start": 1, "review": 1}
 def is_managed_agent(agent) -> bool:
     """Whether `agent` is an id this loop minted. Pure."""
     return isinstance(agent, str) and agent.startswith(MANAGED_PREFIX)
+
+
+def mint_agent(repo, number, *, host, now) -> str:
+    """One fresh agent id for (`repo`, `number`). Pure.
+
+    Opaque to every reader except debugging: only `is_managed_agent`
+    parses it, and only for the prefix. The repo slash becomes a double
+    dash so the id itself never contains one, and a host slash becomes a
+    dash. `Claim.epoch` stays the fencing token, never this id.
+    """
+    owner = str(host).replace("/", "-") if host else "host"
+    ticket = str(repo).replace("/", "--")
+    return f"{MANAGED_PREFIX}{owner}-{int(now)}-{ticket}-{number}"
 
 
 def priority_rank(priority) -> int:
@@ -426,8 +450,11 @@ def _store_labels(store, now):
 #: The proceeding kinds the summary counts after starts, in order.
 SUMMARY_KINDS = ("resume", "fix", "review")
 
+#: The past tense each proceeding kind takes in a non-plan summary.
+PAST = {"resume": "resumed", "fix": "fixed", "review": "reviewed"}
 
-def render(rows, *, label):
+
+def render(rows, *, label, plan=True):
     """The candidate table plus the summary line under `label`.
 
     Each row names its project, so two projects requesting the same
@@ -441,21 +468,21 @@ def render(rows, *, label):
         lines.append(f"{head}{row.repo}#{row.number}: {row.verdict} ({row.reason})")
     proceeding = [row for row in rows if row.verdict != "skip"]
     starts = sum(1 for row in proceeding if row.kind == "start")
-    summary = f"{label}: {len(rows)} candidate(s), would start {starts}"
+    started = "would start" if plan else "started"
+    summary = f"{label}: {len(rows)} candidate(s), {started} {starts}"
     for kind in SUMMARY_KINDS:
         count = sum(1 for row in proceeding if row.kind == kind)
         if count:
-            summary += f", would {kind} {count}"
+            summary += f", would {kind} {count}" if plan else f", {PAST[kind]} {count}"
     lines.append(summary)
     return "\n".join(lines) + "\n"
 
 
-def _pass(
+def _read_inputs(
     store,
     out,
     err,
     *,
-    label,
     now,
     projects_fn,
     live,
@@ -465,62 +492,97 @@ def _pass(
     read_labels,
     hold_label,
     pool,
-) -> int:
-    """One read-only pass: join eligibility to store rows, gate, print.
+):
+    """Shared setup for both passes: rows, projects, live state, ledger, limits.
 
-    Nothing is synced, claimed, enqueued, started, mirrored or journaled.
-    A project whose policy or quota settings fail is skipped with one
-    error line; the pass still gates every other project and exits 4.
+    Returns ((items, registered, live_set, limits, hold_label,
+    read_labels, ledger_data, quota_for, pool), None) on success, or
+    (None, exit code) when the pass cannot proceed. A project whose
+    policy or quota settings fail is not fatal here; that surfaces per
+    project in `_gate_all`.
     """
     try:
         items = store.items()
     except board.StoreError as problem:
         print(f"corral drive: {problem}", file=err)
-        return USAGE
+        return None, USAGE
     except sqlite3.Error as problem:
         print(f"corral drive: cannot read the store: {problem}", file=err)
-        return USAGE
+        return None, USAGE
     try:
         registered = (projects_fn or projects.load_all)()
     except projects.ProjectsError as problem:
         print(f"corral drive: {problem}", file=err)
-        return USAGE
+        return None, USAGE
     try:
         live_set = set(live) if live is not None else _default_live(registered)
     except settings.SettingsError as problem:
         print(f"corral drive: {problem}", file=err)
-        return USAGE
+        return None, USAGE
     except Exception as problem:
         print(f"corral drive: cannot read live state: {problem}", file=err)
-        return UNREACHABLE
+        return None, UNREACHABLE
     try:
         ledger_data = ledger if ledger is not None else quota_ledger.load()
     except quota_ledger.LedgerError as problem:
         print(f"corral drive: {problem}", file=err)
-        return USAGE
+        return None, USAGE
     if limits is None or hold_label is None:
         try:
             default_limits, default_hold_label = _default_host_inputs(registered)
         except (settings.SettingsError, admission.LimitsError) as problem:
             print(f"corral drive: {problem}", file=err)
-            return USAGE
+            return None, USAGE
         if limits is None:
             limits = default_limits
         if hold_label is None:
             hold_label = default_hold_label
     if read_labels is None:
         read_labels = _store_labels(store, now)
-
-    rows = eligibility.rows_from_items(items)
-    by_key = {(row.repo, row.number): row for row in rows}
-    waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     quota_for = dict(quotas) if quotas is not None else {}
     if pool is None and any(project.name not in quota_for for project in registered):
         try:
             pool = accounts.providers()
         except accounts.AccountsError as problem:
             print(f"corral drive: {problem}", file=err)
-            return USAGE
+            return None, USAGE
+    return (
+        items,
+        registered,
+        live_set,
+        limits,
+        hold_label,
+        read_labels,
+        ledger_data,
+        quota_for,
+        pool,
+    ), None
+
+
+def _gate_all(
+    items,
+    registered,
+    out,
+    *,
+    now,
+    live_set,
+    limits,
+    quota_for,
+    pool,
+    ledger_data,
+    read_labels,
+    hold_label,
+):
+    """Eligibility plus the section 3 gate order over every candidate.
+
+    Returns (gated_rows, problems): one `Gated` per candidate in section
+    3 order, and one error line per project whose policy or quota
+    settings failed. A project with no eligibility entry prints its
+    logbook line to `out`. Nothing is written.
+    """
+    rows = eligibility.rows_from_items(items)
+    by_key = {(row.repo, row.number): row for row in rows}
+    waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     problems = []
     candidates = []
     for project in registered:
@@ -600,6 +662,71 @@ def _pass(
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
+    return gated_rows, problems
+
+
+def _pass(
+    store,
+    out,
+    err,
+    *,
+    label,
+    now,
+    projects_fn,
+    live,
+    limits,
+    quotas,
+    ledger,
+    read_labels,
+    hold_label,
+    pool,
+) -> int:
+    """One read-only pass: join eligibility to store rows, gate, print.
+
+    Nothing is synced, claimed, enqueued, started, mirrored or journaled.
+    A project whose policy or quota settings fail is skipped with one
+    error line; the pass still gates every other project and exits 4.
+    """
+    ctx, fatal = _read_inputs(
+        store,
+        out,
+        err,
+        now=now,
+        projects_fn=projects_fn,
+        live=live,
+        limits=limits,
+        quotas=quotas,
+        ledger=ledger,
+        read_labels=read_labels,
+        hold_label=hold_label,
+        pool=pool,
+    )
+    if fatal is not None:
+        return fatal
+    (
+        items,
+        registered,
+        live_set,
+        limits,
+        hold_label,
+        read_labels,
+        ledger_data,
+        quota_for,
+        pool,
+    ) = ctx
+    gated_rows, problems = _gate_all(
+        items,
+        registered,
+        out,
+        now=now,
+        live_set=live_set,
+        limits=limits,
+        quota_for=quota_for,
+        pool=pool,
+        ledger_data=ledger_data,
+        read_labels=read_labels,
+        hold_label=hold_label,
+    )
     table = [
         Candidate(
             project=gated.project,
@@ -615,6 +742,473 @@ def _pass(
     for problem in problems:
         print(problem, file=err)
     return USAGE if problems else OK
+
+
+def production_operators(registered, git):
+    """`{tracker_repo: operators}` across every registered project's root.
+
+    Resolves through the shared helper, the same way sync and mirror
+    do, so the pass's sync, freshness re-reads and mirror agree with
+    both CLIs on which authors are internal. Returns (mapping, None),
+    or (None, problem) on the first configuration error.
+    """
+    mapping = {}
+    for project in registered:
+        try:
+            names = settings.repo_names(project.root)
+        except settings.SettingsError as err:
+            return None, str(err)
+        entries, problem = syncli.repo_operators(project.root, names, git)
+        if problem is not None:
+            return None, problem
+        for _name, (tracker_repo, ops) in entries.items():
+            mapping.setdefault(tracker_repo, ops)
+    return mapping, None
+
+
+def sync_all(store, tracker, *, operators, now):
+    """Sync every repo with cached rows from the tracker.
+
+    Returns (seen, errors): the rows applied and one line per failed
+    repo. A failed repo keeps its rows and its cursor (that is
+    `sync_repo`'s contract) and the pass moves on to the next repo.
+    With no tracker there is nothing to sync from: no rows move and no
+    errors are reported.
+    """
+    if tracker is None:
+        return 0, []
+    seen = 0
+    errors = []
+    for repo in sorted({item.repo for item in store.items()}):
+        result = sync.sync_repo(
+            store,
+            tracker,
+            repo,
+            operators=list(mirror._ops_for(operators, repo)),
+            now=now,
+            cursor=store.get_cursor(repo, sync.CURSOR_NAME),
+        )
+        seen += result.items_seen
+        errors.extend(result.errors)
+    return seen, errors
+
+
+def refresh_row(store, tracker, repo, number, *, operators, now, stale_after):
+    """The row to decide from: cached when fresh, live-checked when stale.
+
+    Returns (item, None) on the row to use, or (None, reason) when a
+    stale row could not be re-read live, or when the store itself could
+    not be read: the claim path fails closed instead of deciding from
+    the stale row. With no tracker there is no live check to run, so
+    the cached row stands.
+    """
+    ref = f"{repo}#{number}"
+    try:
+        found, fresh = store.item(repo, number, now=now, max_age=stale_after)
+    except board.StoreError as err:
+        return None, f"{ref}: store unreadable, claim refused ({err})"
+    if fresh or tracker is None:
+        return found, None
+    try:
+        live = tracker.item(repo, number)
+    except iface.TrackerError as err:
+        return None, f"{ref}: tracker unreachable, row stale, claim refused ({err})"
+    try:
+        store.upsert_item(
+            sync._reading(live),
+            operators=list(mirror._ops_for(operators, repo)),
+            now=now,
+        )
+    except board.StoreError as err:
+        return None, f"{ref}: store unreadable, claim refused ({err})"
+    try:
+        found, _ = store.item(repo, number, now=now)
+    except board.StoreError as err:
+        return None, f"{ref}: store unreadable, claim refused ({err})"
+    if found is None:
+        return None, f"{ref}: no store row, skipped as withdrawn"
+    return found, None
+
+
+def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, now, stale_after):
+    """Claim each proceeding candidate, launch each claim.
+
+    Returns (rows, started, blocked): the verdict rows to print, the
+    launched count, and whether a launch failed because the service
+    manager was unreachable. Only `start` claims and launches, minting
+    a fresh id with `mint_agent`; any other proceeding kind is left
+    unclaimed with a skip line, since its scheduling belongs to a later
+    ticket. A lost race (exit 2 from the store) becomes a skip naming
+    the holder and the pass moves on; a launch through `launcher`
+    appends the unit or the failure to the row's reason. With no
+    `launcher` the pass stops after claiming and records that.
+    """
+    rows = []
+    started = 0
+    blocked = False
+    for gated in gated_rows:
+        if gated.verdict == "skip":
+            rows.append(gated)
+            continue
+        ref = f"{gated.repo}#{gated.number}"
+        if gated.kind != "start":
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict="skip",
+                    reason=(
+                        f"{ref}: {gated.kind} handoff is owned by a later ticket, left unclaimed"
+                    ),
+                    code="claim",
+                )
+            )
+            continue
+        fresh, problem = refresh_row(
+            store,
+            tracker,
+            gated.repo,
+            gated.number,
+            operators=operators,
+            now=now,
+            stale_after=stale_after,
+        )
+        if problem is not None:
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict="skip",
+                    reason=problem,
+                    code="claim",
+                )
+            )
+            continue
+        agent = mint_agent(gated.repo, gated.number, host=host, now=now)
+        try:
+            store.claim(gated.repo, gated.number, agent, host, now=now)
+        except board.Claimed:
+            current, _ = store.item(gated.repo, gated.number, now=now)
+            seen = current.agent if current is not None else ""
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict="skip",
+                    reason=f"{ref}: race lost to `{seen}`, the pass moves on",
+                    code="claim",
+                )
+            )
+            continue
+        except (board.ExternalItem, board.StoreError) as err:
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict="skip",
+                    reason=f"{ref}: claim refused ({err})",
+                    code="claim",
+                )
+            )
+            continue
+        if launcher is None:
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict=gated.verdict,
+                    reason=f"{gated.reason}; launch skipped (no launcher)",
+                    code=gated.code,
+                )
+            )
+            continue
+        title = fresh.title if fresh is not None and fresh.title else ref
+        try:
+            unit = launcher(
+                gated.project,
+                gated.repo,
+                gated.number,
+                gated.kind,
+                agent,
+                title,
+                now=now,
+            )
+        except units.UnitExists as err:
+            note = f"{gated.reason}; race lost, already live ({err})"
+            code = "launch"
+        except units.Unreachable as err:
+            blocked = True
+            note = f"{gated.reason}; not started: {err}"
+            code = "launch"
+        except Exception as err:
+            note = f"{gated.reason}; not started: {err}"
+            code = "launch"
+        else:
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict=gated.kind,
+                    reason=f"{gated.reason}; started {unit}",
+                    code="",
+                )
+            )
+            started += 1
+            continue
+        rows.append(
+            Gated(
+                project=gated.project,
+                repo=gated.repo,
+                number=gated.number,
+                kind=gated.kind,
+                verdict="skip",
+                reason=note,
+                code=code,
+            )
+        )
+    return rows, started, blocked
+
+
+def _local_repo(root, repo):
+    """The `[[repo]]` entry name behind tracker repo `repo`.
+
+    Only the entry whose resolved tracker repo names it wins: an entry
+    name that merely equals `repo` is not a mapping, and a reported
+    problem is surfaced, never masked. Anything else is a `LaunchError`
+    naming the root and the repo.
+    """
+    for name in settings.repo_names(root):
+        try:
+            resolved = settings.load(root=root, repo=name)
+        except settings.SettingsError as err:
+            raise launch.LaunchError(str(err)) from None
+        tracker_repo, problem = syncli._tracker_repo(root, name, resolved, worktrees.git)
+        if problem is not None:
+            raise launch.LaunchError(problem)
+        if tracker_repo == repo:
+            return name
+    raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
+
+
+def _overlay_text(root):
+    """The ops root's `agents.overlay.md`, or "" when it is absent."""
+    path = os.path.join(root, "agents.overlay.md")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read()
+    except OSError as err:
+        raise launch.LaunchError(f"cannot read the agent overlay: {err}") from None
+
+
+def _worker_prompt(root, tgt, number, title):
+    """A `(workdir, branch) -> text` renderer for the worker role.
+
+    Validated before the launch makes anything, so a bad override never
+    leaves a stray branch behind. The heartbeat lines go on in
+    `launch.launch`, not here.
+    """
+    agents_md = os.path.join(tgt.clone, "AGENTS.md")
+    base = {
+        "issue": str(number),
+        "title": title,
+        "checks.test": tgt.resolved["checks.test"],
+        "overlay": _overlay_text(root),
+        "project_agents_md": (agents_md if os.path.isfile(agents_md) else "AGENTS.md (none found)"),
+    }
+    try:
+        prompts.render("worker", {**base, "worktree": "-", "branch": "-"}, ops_root=root)
+    except prompts.PromptsError as err:
+        raise launch.LaunchError(str(err)) from None
+
+    def render_prompt(workdir, branch):
+        try:
+            return prompts.render(
+                "worker", {**base, "worktree": workdir, "branch": branch}, ops_root=root
+            )
+        except prompts.PromptsError as err:
+            raise launch.LaunchError(str(err)) from None
+
+    return render_prompt
+
+
+def production_launcher(registered):
+    """The launch handoff over the existing launch path.
+
+    Returns `launch_one(project, repo, number, kind, agent, title, *,
+    now)`: the unit name of the started agent. Only `start` launches;
+    any other kind stays with a later ticket. The target resolves from
+    the project's ops root, the prompt renders the worker role with the
+    board title, and the unit starts through `launch.launch` with the
+    production seams. Failures raise with the public exit code.
+    """
+
+    def launch_one(project, repo, number, kind, agent, title, *, now):
+        _ = (agent, now)
+        if kind != "start":
+            raise launch.LaunchError(
+                f"{repo}#{number}: {kind} handoff is owned by a later ticket, claim kept"
+            )
+        entry = next((item for item in registered if item.name == project), None)
+        if entry is None:
+            raise launch.LaunchError(f"unknown project {project!r} for {repo}#{number}")
+        local = _local_repo(entry.root, repo)
+        tgt = launch.target(entry.root, local)
+        factory = _worker_prompt(entry.root, tgt, number, title)
+        unit, _ = launch.launch(
+            tgt,
+            number,
+            factory,
+            title=title,
+            list_fn=lambda prefix: units.list_units(prefix, run=units.default_run),
+            run=units.default_run,
+            usage=disk.production_usage,
+        )
+        return unit
+
+    return launch_one
+
+
+def _launching_pass(
+    store,
+    out,
+    err,
+    *,
+    now,
+    projects_fn,
+    live,
+    limits,
+    quotas,
+    ledger,
+    read_labels,
+    hold_label,
+    pool,
+    tracker,
+    operators,
+    launcher,
+    host,
+    stale_after,
+) -> int:
+    """One claiming pass: sync, gate, claim, launch, mirror, print.
+
+    A tracker outage aborts the sync step only: prior rows and the old
+    cursor stand, and the pass continues on store data. A claim whose
+    stale row cannot be re-read live fails closed instead. The mirror
+    drains whatever the outbox holds, old backlog and new claims alike;
+    what it cannot push stays queued for the next healthy pass. A pass
+    that synced nothing at all exits 3; a pass that launched nothing
+    because the service manager was unreachable does too.
+    """
+    try:
+        seen, sync_errors = sync_all(store, tracker, operators=operators, now=now)
+    except board.StoreError as problem:
+        print(f"corral drive: {problem}", file=err)
+        return USAGE
+    except sqlite3.Error as problem:
+        print(f"corral drive: cannot read the store: {problem}", file=err)
+        return USAGE
+    for line in sync_errors:
+        print(f"corral drive: {line}", file=err)
+    ctx, fatal = _read_inputs(
+        store,
+        out,
+        err,
+        now=now,
+        projects_fn=projects_fn,
+        live=live,
+        limits=limits,
+        quotas=quotas,
+        ledger=ledger,
+        read_labels=read_labels,
+        hold_label=hold_label,
+        pool=pool,
+    )
+    if fatal is not None:
+        return fatal
+    (
+        _items,
+        registered,
+        live_set,
+        limits,
+        hold_label,
+        read_labels,
+        ledger_data,
+        quota_for,
+        pool,
+    ) = ctx
+    gated_rows, problems = _gate_all(
+        _items,
+        registered,
+        out,
+        now=now,
+        live_set=live_set,
+        limits=limits,
+        quota_for=quota_for,
+        pool=pool,
+        ledger_data=ledger_data,
+        read_labels=read_labels,
+        hold_label=hold_label,
+    )
+    if host is None:
+        host = socket.gethostname()
+    if stale_after is None and tracker is not None:
+        try:
+            stale_after = settings.load(root=None)["board.item_max_age_s"]
+        except settings.SettingsError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
+    final_rows, started, blocked = _claim_and_launch(
+        store,
+        gated_rows,
+        tracker=tracker,
+        operators=operators,
+        launcher=launcher,
+        host=host,
+        now=now,
+        stale_after=stale_after,
+    )
+    if tracker is not None:
+        try:
+            outcome = mirror.push(store, tracker, operators=operators, now=now)
+        except board.StoreError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
+        for line in outcome.errors:
+            print(f"corral drive: {line}", file=err)
+    table = [
+        Candidate(
+            project=gated.project,
+            repo=gated.repo,
+            number=gated.number,
+            kind=gated.kind,
+            verdict=gated.verdict,
+            reason=gated.reason,
+        )
+        for gated in final_rows
+    ]
+    out.write(render(table, label="pass", plan=False))
+    for problem in problems:
+        print(problem, file=err)
+    if problems:
+        return USAGE
+    if sync_errors and seen == 0:
+        return UNREACHABLE
+    if blocked and started == 0:
+        return UNREACHABLE
+    return OK
 
 
 def run_pass(
@@ -633,16 +1227,27 @@ def run_pass(
     read_labels=None,
     hold_label=None,
     pool=None,
+    tracker=None,
+    operators=None,
+    launcher=None,
+    host=None,
+    stale_after=None,
 ) -> int:
-    """One pass: join eligibility to store rows, gate, print, write nothing.
+    """One pass: gate and print, or sync, claim, launch, mirror and print.
 
-    Only the non-plan pass takes the drive lock; `--plan` never does.
-    `now` defaults to the wall clock; every other None means the host
-    default (registered projects, live units and registry, host limits,
-    per-project quota inputs, the shared ledger, store-backed labels,
-    the configured hold label, the account pool), so tests inject plain
-    data or fakes at those seams and production reads the host. Returns
-    the exit code.
+    `--plan` holds no lock and writes nothing: no sync, claim, mirror
+    or launch, whatever seams are passed. The non-plan pass takes the
+    drive lock and claims through the store transaction, then launches
+    through `launcher` (the existing launch path in production; with
+    no launcher the pass stops after claiming and records that) and
+    drains the mirror backlog through `tracker`. `tracker` is the injected
+    tracker double; with none there is no sync, no freshness re-read
+    and no mirror. `operators` maps tracker repos to operator logins for
+    the sync and mirror steps; `host` names this host on its claims;
+    `stale_after` bounds the cached rows a claim may use without a live
+    re-read. `now` defaults to the wall clock; every other None means
+    the host default, so tests inject plain data or fakes at those
+    seams and production reads the host. Returns the exit code.
     """
     moment = time.time() if now is None else now
     args = {
@@ -660,7 +1265,17 @@ def run_pass(
         return _pass(store, out, err, label="plan", **args)
     try:
         with drive_lock(lock_path):
-            return _pass(store, out, err, label="pass", **args)
+            return _launching_pass(
+                store,
+                out,
+                err,
+                tracker=tracker,
+                operators=operators,
+                launcher=launcher,
+                host=host,
+                stale_after=stale_after,
+                **args,
+            )
     except LockHeld as held:
         print(f"corral drive: {held}", file=err)
         return RACE
@@ -676,12 +1291,33 @@ def cmd_drive(args: argparse.Namespace) -> int:
         print(f"corral drive: {problem}", file=sys.stderr)
         return USAGE
     with store:
+        if args.plan:
+            return run_pass(
+                plan=True,
+                store=store,
+                lock_path=lock_path(),
+                out=sys.stdout,
+                err=sys.stderr,
+            )
+        try:
+            registered = projects.load_all()
+        except projects.ProjectsError as problem:
+            print(f"corral drive: {problem}", file=sys.stderr)
+            return USAGE
+        operators, problem = production_operators(registered, syncli._git)
+        if problem is not None:
+            print(f"corral drive: {problem}", file=sys.stderr)
+            return USAGE
         return run_pass(
-            plan=args.plan,
+            plan=False,
             store=store,
             lock_path=lock_path(),
             out=sys.stdout,
             err=sys.stderr,
+            projects_fn=lambda: registered,
+            tracker=syncli._production_tracker(),
+            operators=operators,
+            launcher=production_launcher(registered),
         )
 
 
