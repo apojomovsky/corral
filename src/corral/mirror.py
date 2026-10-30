@@ -96,6 +96,10 @@ def push(
         for row in kept:
             try:
                 tracker.write(repo, number, row.field, row.value)
+            except iface.UnknownOption as err:
+                store.mark_dropped(row.id, "unknown-option")
+                dropped += 1
+                errors.append(f"{repo}#{number}: {err}")
             except iface.TrackerRateLimited as err:
                 store.mark_dirty(row.id, str(err))
                 dirty += 1
