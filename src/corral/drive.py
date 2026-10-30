@@ -135,7 +135,8 @@ def order(entries: Sequence[GateInput]) -> list[GateInput]:
 class QuotaSource:
     """One project's quota input for the gate: its model chains plus the
     thresholds the gate judges the shared ledger by. Plain data; the pass
-    resolves each project's entry from its own settings.
+    resolves each project's entry from its own settings and the account
+    pool, through the shared freshness helper.
     """
 
     chains: dict = field(default_factory=dict)
@@ -316,8 +317,10 @@ class LockError(Exception):
 class Candidate:
     """One row of the candidate table: what the pass would consider."""
 
+    project: str
     repo: str
     number: int
+    kind: str
     verdict: str
     reason: str
 
@@ -384,11 +387,17 @@ def _default_host_inputs(registered):
     )
 
 
-def _project_quota(project):
-    """One project's quota input from its own settings file."""
+def _project_quota(project, pool):
+    """One project's quota input from its own settings file and the pool.
+
+    The freshness bound comes from the shared helper over the pool
+    providers the project's chains name, never a second resolver.
+    """
     resolved = settings.load(root=project.root)
+    chains = dict(resolved.models)
     return QuotaSource(
-        chains=dict(resolved.models),
+        chains=chains,
+        stale_after=quota.stale_after_for(chains, pool),
         low_pct=resolved["quota.low_pct"],
         unknown_blocks=resolved["quota.unknown_blocks"],
     )
@@ -397,13 +406,15 @@ def _project_quota(project):
 def _store_labels(store, now):
     """A `read_labels` seam over cached store rows: reads, never a tracker.
 
-    Linked pulls have no rows yet (the reviewer pass populates them), so
-    only issue reads happen; a missing row fails closed as unreadable.
+    Only issue rows exist in the store (the reviewer pass has not
+    populated linked pulls yet), so a pull read fails closed as
+    unreadable, like a missing row: the hold gate skips instead of
+    passing a ticket whose pull labels it could not see.
     """
 
     def read(kind, repo, number):
         if kind != "issue":
-            return []
+            raise board.StoreError(f"unknown item {repo}#{number}: no pull rows in the store")
         found, _ = store.item(repo, number, now=now)
         if found is None:
             raise board.StoreError(f"unknown item {repo}#{number}")
@@ -412,10 +423,30 @@ def _store_labels(store, now):
     return read
 
 
-def render(rows, *, label, started):
-    """The candidate table plus the summary line under `label`."""
-    lines = [f"{row.repo}#{row.number}: {row.verdict} ({row.reason})" for row in rows]
-    lines.append(f"{label}: {len(rows)} candidate(s), would start {started}")
+#: The proceeding kinds the summary counts after starts, in order.
+SUMMARY_KINDS = ("resume", "fix", "review")
+
+
+def render(rows, *, label):
+    """The candidate table plus the summary line under `label`.
+
+    Each row names its project, so two projects requesting the same
+    ticket print distinguishable lines. The summary counts only
+    proceeding `start` rows as starts; other proceeding kinds are named
+    separately, and skipped rows count toward no kind.
+    """
+    lines = []
+    for row in rows:
+        head = f"{row.project} " if row.project else ""
+        lines.append(f"{head}{row.repo}#{row.number}: {row.verdict} ({row.reason})")
+    proceeding = [row for row in rows if row.verdict != "skip"]
+    starts = sum(1 for row in proceeding if row.kind == "start")
+    summary = f"{label}: {len(rows)} candidate(s), would start {starts}"
+    for kind in SUMMARY_KINDS:
+        count = sum(1 for row in proceeding if row.kind == kind)
+        if count:
+            summary += f", would {kind} {count}"
+    lines.append(summary)
     return "\n".join(lines) + "\n"
 
 
@@ -433,6 +464,7 @@ def _pass(
     ledger,
     read_labels,
     hold_label,
+    pool,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
@@ -483,12 +515,18 @@ def _pass(
     by_key = {(row.repo, row.number): row for row in rows}
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     quota_for = dict(quotas) if quotas is not None else {}
+    if pool is None and any(project.name not in quota_for for project in registered):
+        try:
+            pool = accounts.providers()
+        except accounts.AccountsError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
     problems = []
     candidates = []
     for project in registered:
         if project.name not in quota_for:
             try:
-                quota_for[project.name] = _project_quota(project)
+                quota_for[project.name] = _project_quota(project, pool)
             except settings.SettingsError as problem:
                 problems.append(f"corral drive: {problem}")
                 continue
@@ -529,7 +567,7 @@ def _pass(
     stop_starts = False
     gated_rows = []
     for candidate in order(candidates):
-        if candidate.request is not None:
+        if candidate.request is not None and candidate.row is not None:
             holder_now = candidate.row.agent if candidate.row is not None else ""
             if (
                 stop_starts
@@ -563,11 +601,17 @@ def _pass(
             stop_starts = True
         gated_rows.append(verdict)
     table = [
-        Candidate(repo=gated.repo, number=gated.number, verdict=gated.verdict, reason=gated.reason)
+        Candidate(
+            project=gated.project,
+            repo=gated.repo,
+            number=gated.number,
+            kind=gated.kind,
+            verdict=gated.verdict,
+            reason=gated.reason,
+        )
         for gated in gated_rows
     ]
-    started = sum(1 for gated in gated_rows if gated.verdict != "skip")
-    out.write(render(table, label=label, started=started))
+    out.write(render(table, label=label))
     for problem in problems:
         print(problem, file=err)
     return USAGE if problems else OK
@@ -588,6 +632,7 @@ def run_pass(
     ledger=None,
     read_labels=None,
     hold_label=None,
+    pool=None,
 ) -> int:
     """One pass: join eligibility to store rows, gate, print, write nothing.
 
@@ -595,8 +640,9 @@ def run_pass(
     `now` defaults to the wall clock; every other None means the host
     default (registered projects, live units and registry, host limits,
     per-project quota inputs, the shared ledger, store-backed labels,
-    the configured hold label), so tests inject plain data or fakes at
-    those seams and production reads the host. Returns the exit code.
+    the configured hold label, the account pool), so tests inject plain
+    data or fakes at those seams and production reads the host. Returns
+    the exit code.
     """
     moment = time.time() if now is None else now
     args = {
@@ -608,6 +654,7 @@ def run_pass(
         "ledger": ledger,
         "read_labels": read_labels,
         "hold_label": hold_label,
+        "pool": pool,
     }
     if plan:
         return _pass(store, out, err, label="plan", **args)

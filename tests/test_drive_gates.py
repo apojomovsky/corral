@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, drive, projects
+from corral import accounts, admission, board, drive, projects
 from corral.eligibility import LinkedPull, StartRequest, TicketRow
 from tests.test_drive import policy_source, stored
 
@@ -401,6 +401,53 @@ class QuotaGateTest(unittest.TestCase):
         self.assertEqual((gated.verdict, gated.code), ("start", ""))
 
 
+class ProjectQuotaTest(unittest.TestCase):
+    def test_project_quota_uses_the_chained_provider_bound(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-quota-pool-"))
+        root = os.path.join(tmp, "ops", "blue")
+        os.makedirs(root)
+        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[models.default]\nchain = ["tired/model"]\n')
+        project = projects.Project(name="blue", unit_prefix="blue-agent", root=root)
+        pool = [accounts.Provider(name="tired", reader="pkg:Reader", stale_after_s=60.0)]
+        source = drive._project_quota(project, pool)
+        self.assertEqual(source.chains, {"default": ["tired/model"]})
+        self.assertEqual(source.stale_after, 60.0)
+
+    def test_project_quota_ignores_unchained_pool_providers(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-quota-pool-"))
+        root = os.path.join(tmp, "ops", "blue")
+        os.makedirs(root)
+        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[models.default]\nchain = ["fresh/model"]\n')
+        project = projects.Project(name="blue", unit_prefix="blue-agent", root=root)
+        pool = [
+            accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0),
+            accounts.Provider(name="other", reader="pkg:Reader", stale_after_s=30.0),
+        ]
+        self.assertEqual(drive._project_quota(project, pool).stale_after, 3600.0)
+
+
+class StoreLabelsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-labels-"))
+        self.db = os.path.join(self.tmp, "board.sqlite")
+
+    def test_a_pull_read_fails_closed(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with self.assertRaises(board.StoreError):
+            drive._store_labels(store, 2000.0)("pr", "app", 12)
+
+    def test_a_row_with_a_linked_pull_skips_as_unreadable(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        candidate = entry(row_=drive_row_with_pulls(row(), (("app", 12),)))
+        gated = gate(candidate, read_labels=drive._store_labels(store, 2000.0))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "hold"))
+        self.assertIn("unreadable", gated.reason)
+
+
 class PassWiringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-gates-"))
@@ -466,6 +513,20 @@ class PassWiringTest(unittest.TestCase):
         self.assertIn("would start 0", out)
         self.assertNotIn("app#7: start", out)
 
+    def test_an_unreadable_accounts_file_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        with mock.patch.object(
+            accounts,
+            "providers",
+            side_effect=accounts.AccountsError("accounts.toml: boom"),
+        ):
+            code, _, err = self.run_pass(store, [self.project("blue", entry)], quotas={}, pool=None)
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err)
+        self.assertIn("accounts.toml", err)
+
     def test_a_bad_entry_is_exit_four_naming_project_and_entry(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -513,6 +574,43 @@ class PassWiringTest(unittest.TestCase):
         self.assertIn("app#2: skip", out)
         self.assertIn("new starts stop here", out)
         self.assertIn("app#5: start", out)
+
+    def test_a_resume_without_a_store_row_skips_as_row_under_a_full_total(self):
+        store = board.open_store(self.db)
+        self.addCleanup(store.close)
+        store.upsert_item(
+            board.Item(
+                repo="app",
+                number=1,
+                kind="issue",
+                title="Title 1",
+                body="Body",
+                state="open",
+                author="operator",
+                labels=[],
+                priority="high",
+                assignees=[],
+                url="https://example.com/app/1",
+                tracker_updated_at=1000.0,
+                extra={},
+            ),
+            operators=["operator"],
+            now=1000.0,
+        )
+        store.claim("app", 1, "drive-host-1-x", "host-1", now=1500.0)
+        blue = self.write_policy("blue_policy", [("app", 1, "fix"), ("app", 9, "resume")])
+        code, out, _ = self.run_pass(
+            store,
+            [self.project("blue", blue)],
+            live=frozenset({("blue", "app", 1)}),
+            limits=admission.Limits(total=1, projects={"blue": {"floor": 0, "ceiling": None}}),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#1: skip", out)
+        self.assertIn("host full", out)
+        self.assertIn("app#9: skip", out)
+        self.assertIn("no store row", out)
+        self.assertNotIn("new starts stop here", out)
 
     def test_a_project_ceiling_skips_and_the_pass_continues(self):
         store = stored(self.db, [("app", 2, "open"), ("app", 5, "open")])

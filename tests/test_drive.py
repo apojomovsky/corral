@@ -15,8 +15,9 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
-from corral import admission, board, drive
+from corral import admission, board, drive, launch, quota_ledger
 from corral import projects as projects_mod
 
 
@@ -102,17 +103,98 @@ class RenderTest(unittest.TestCase):
     def test_rows_print_with_verdict_and_reason_plus_summary(self):
         text = drive.render(
             [
-                drive.Candidate(repo="app", number=7, verdict="start", reason="fresh"),
-                drive.Candidate(repo="app", number=9, verdict="skip", reason="held"),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+                drive.Candidate(
+                    project="red",
+                    repo="app",
+                    number=9,
+                    kind="start",
+                    verdict="skip",
+                    reason="held",
+                ),
             ],
             label="plan",
-            started=1,
         )
-        self.assertIn("app#7: start (fresh)", text)
-        self.assertIn("app#9: skip (held)", text)
+        self.assertIn("blue app#7: start (fresh)", text)
+        self.assertIn("red app#9: skip (held)", text)
         self.assertTrue(text.splitlines()[-1].startswith("plan:"))
         self.assertIn("2 candidate(s)", text)
         self.assertIn("would start 1", text)
+
+    def test_rows_without_a_project_print_bare(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="skip",
+                    reason="withdrawn by this pass",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("app#7: skip (withdrawn by this pass)", text)
+
+    def test_summary_counts_each_proceeding_kind_separately(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=1,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=2,
+                    kind="resume",
+                    verdict="resume",
+                    reason="back",
+                ),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=3,
+                    kind="review",
+                    verdict="review",
+                    reason="slot",
+                ),
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=4,
+                    kind="fix",
+                    verdict="fix",
+                    reason="round",
+                ),
+                drive.Candidate(
+                    project="red",
+                    repo="app",
+                    number=5,
+                    kind="resume",
+                    verdict="skip",
+                    reason="held",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("5 candidate(s)", text)
+        self.assertIn("would start 1", text)
+        self.assertIn("would resume 1", text)
+        self.assertIn("would review 1", text)
+        self.assertIn("would fix 1", text)
 
 
 class PlanTest(unittest.TestCase):
@@ -278,6 +360,53 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("corral drive:", err)
         self.assertNotIn("already running", err)
+
+    def test_unreadable_live_state_is_exit_three(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        env = dict(
+            kept,
+            CORRAL_CONFIG=os.path.join(self.tmp.name, "config"),
+            CORRAL_STATE=os.path.join(self.tmp.name, "state"),
+        )
+
+        def broken(*args, **kwargs):
+            raise RuntimeError("unit listing unreachable")
+
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch.object(launch, "admission_state", broken),
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            code = hermetic_pass(store, self.lock, out, err, projects_fn=lambda: [], live=None)
+        self.assertEqual(code, 3)
+        self.assertIn("cannot read live state", err.getvalue())
+
+    def test_corrupt_ledger_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with mock.patch.object(
+            quota_ledger,
+            "load",
+            side_effect=quota_ledger.LedgerError("quota ledger is corrupt"),
+        ):
+            out, err = io.StringIO(), io.StringIO()
+            code = hermetic_pass(store, self.lock, out, err, projects_fn=lambda: [], ledger=None)
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err.getvalue())
+
+    def test_project_registry_load_failure_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+
+        def broken():
+            raise projects_mod.ProjectsError("projects.d/blue.toml: boom")
+
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(store, self.lock, out, err, projects_fn=broken)
+        self.assertEqual(code, 4)
+        self.assertIn("blue.toml", err.getvalue())
 
 
 class LockPathTest(unittest.TestCase):
