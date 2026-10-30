@@ -240,6 +240,7 @@ class ExitCode(unittest.TestCase):
     def run_deps(self, config_text):
         outputs = {d.probe[0]: f"{d.name} 1.0 Linger=yes systemd 255" for d in deps.load()}
         outputs["uv"] = "uv 0.13.5"
+        outputs["muse"] = "muse 1.4.0"
 
         def probe(argv, paths):
             return outputs.get(argv[0])
