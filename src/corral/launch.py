@@ -369,7 +369,10 @@ def launch(
         admit(tgt, number, list_fn=list_fn, usage=usage)
         _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
         unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
-        command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
+        try:
+            command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
+        except ValueError as err:
+            raise LaunchError(str(err)) from None
         argv = units.unit_argv(
             unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
         )
@@ -436,13 +439,16 @@ def resume(
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
         unit = units.unit_name(tgt.prefix, tgt.repo, number, max(units.next_gen(session), 1))
-        command = adapter.argv(
-            session,
-            message,
-            model=model,
-            resume=handle,
-            max_time=runtimes.DEFAULT_MAX_TIME,
-        )
+        try:
+            command = adapter.argv(
+                session,
+                message,
+                model=model,
+                resume=handle,
+                max_time=runtimes.DEFAULT_MAX_TIME,
+            )
+        except ValueError as err:
+            raise LaunchError(str(err)) from None
         argv = units.unit_argv(
             unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
         )
