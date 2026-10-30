@@ -55,11 +55,21 @@ reads from one optional people-owned text field holding comma-separated
 `owner/repo#N` refs, parsed strictly: an unparseable entry is ignored and
 reported as a sync error line, never guessed.
 
+On the wire the board adapter reports a claim holder and in-flight state
+through the existing `TrackerItem.agent` and `TrackerItem.status`
+attributes, and the triage rank through
+`TrackerItem.extra["priority"]`, so settlement reads them
+attribute-first exactly as it does for label rows.
+
 Ownership follows `00-design.md` field ownership with no new rule:
 
-- People win people-owned fields. A tracker reading always overwrites the
-  stored value. These concepts are never enqueued, and the adapter offers
-  no write path for them (no method, not a refused one).
+- People win people-owned fields. A reader overwrites only the concepts
+  it carries; a concept absent from a reading means keep, never clear.
+  The store's upsert merges `extra` by key, and only an explicit
+  "cleared" marker from the board adapter removes a concept, so a REST
+  feed reading that carries no board concepts leaves the stored board
+  `extra` untouched. These concepts are never enqueued, and the adapter
+  offers no write path for them (no method, not a refused one).
 - corral wins `agent` and `status`. A reading only settles queued writes,
   with the exact label semantics already in `board.py`: a fresher reading
   echoing a queued value marks it sent, a fresher different value drops it
@@ -93,8 +103,11 @@ same constructor shape (`run(args)` injected, fakes at that seam only). It
 calls `gh api graphql` through `corral.github.gh.graphql` for board reads
 and mutations, and the existing REST paths for issues, sub-issues and
 milestones. Nothing outside the two adapters calls `gh` or knows a URL or
-query shape, per the AGENTS.md rule. This changes no seam: it reuses the
-one `gh` seam and the machine-wide `GraphqlPacer`.
+query shape, per the AGENTS.md rule. This needs one small seam change
+(ticket 1): `graphql()` and `paced_run()` today build the real pacer over
+the real state dir and call the real `run()`, so no test can drive them.
+Both accept an injected `run` and an injected pacer, defaulting to the
+real ones, the same way the REST adapter takes `run`.
 
 Cost per read, budgeted up front: one page of up to 100 items with all
 mapped field values costs one GraphQL read call; field and option
@@ -129,8 +142,11 @@ names) is cached in a small store table with a `fetched_at` stamp, under a
 `board.schema_max_age_s` setting; past the bound the next board step
 refreshes it live or degrades per the budget rule above. Item freshness
 reuses the existing `fetched_at` and audit ordering. Option matching is by
-option id, never by name, so renames are free and option-name maps are
-validated against ids at refresh time.
+stable option id, never by name: the config maps ids, display names are
+comments only, and a refresh that finds a mapped id missing from the
+board keeps the stored value, logs a sync error line, and leaves the
+doctor check (section 5) to report it. Display-name renames are free;
+a deleted or replaced id is a configuration error, not silent remapping.
 
 ## 3. Sync: feed, board poll, cursors, and silent field edits
 
@@ -154,15 +170,28 @@ first:
 
 Cursor semantics match the existing contract: a cursor names an instant in
 the existing ISO wire shape, never moves backwards, and a failed step
-keeps the old cursor with an error line. Detection is field-level: each
-fetched item is compared concept by concept against the stored `extra`,
-and any difference upserts through the same ownership rules as section 1.
+keeps the old cursor with an error line. The board cursor is its own
+clock, stored under a separate cursor-table name and never compared with
+the issue-feed cursor; each advances only on its own reader's success.
+Detection is field-level: each fetched item is compared concept by
+concept against the stored `extra`, and any difference upserts through
+the same ownership rules as section 1, merged per concept so a reading
+that carries no board concepts keeps the stored ones.
 
-`TrackerItem` gains `extra: dict` with a default of empty, carrying only
-canonical concept values, never raw board shapes; `sync._reading` copies
-it into `board.Item.extra`, which the store already persists. This is a
-public interface change to the tracker protocol, named here: fake
-trackers in existing tests keep working through the default.
+A board-sourced item's `updated_at` is the maximum of the issue time and
+the board item time, so a board-only edit still moves the row forward.
+Settlement keys on it exactly as it does for label rows: a reading at or
+past a queued write's `created_at` settles it (echo marks sent, a
+different value drops it as `overridden`, an empty value settles
+nothing), and a stale reading settles nothing.
+
+`TrackerItem` gains `extra: dict | None` defaulting to `None`,
+normalized to `{}` on read, carrying only canonical concept values,
+never raw board shapes; `sync._reading` copies it into
+`board.Item.extra`, which the store already persists, copying on read so
+no two rows share one dict. This is a public interface change to the
+tracker protocol, named here: fake trackers in existing tests keep
+working through the default.
 
 Why not poll the board only and drop the feed: the feed is cheaper per
 pass for issue churn and already handles cursors, adoption and absence.
@@ -188,13 +217,15 @@ queued for the next pass.
 
 Two board-specific cases:
 
-- An option disappears or is renamed on the board. Reads match by option
-  id: a stored id with no live option keeps its stored value, logs a sync
-  error line, and is flagged by the doctor check (section 5) instead of
-  being mapped to a lookalike. A queued corral-owned write whose field or
-  option id is gone is dropped with reason `unknown-option` plus an error
-  line: corral never invents a mapping. Renames need no handling at all,
-  since names are display only.
+- An option disappears or is renamed on the board. Reads match by stable
+  option id: a stored id with no live option keeps its stored value, logs
+  a sync error line, and is flagged by the doctor check (section 5)
+  instead of being mapped to a lookalike. A queued corral-owned write
+  whose field or option id is gone is dropped with reason
+  `unknown-option` plus an error line: corral never invents a mapping.
+  Display-name renames need no handling, since the map is keyed by id
+  and names are comments only; a deleted or replaced id is a
+  configuration error surfaced by the doctor, not a silent remap.
 - A missing board field at mirror time (deleted or renamed upstream) is a
   configuration error surfaced once per pass, and the rows stay queued;
   the doctor names the repo and the field.
@@ -222,11 +253,11 @@ area_column = "Area"
 pool_column = "Pool"
 blocked_by_column = "Blocked by"
 
-[repo.board.priority_map]   # option name to corral rank; ids resolved live
-"P0" = "urgent"
-"P1" = "high"
-"P2" = "normal"
-"P3" = "low"
+[repo.board.priority_map]   # stable option id to corral rank; names are comments only
+"opt-p0-id" = "urgent"  # P0
+"opt-p1-id" = "high"    # P1
+"opt-p2-id" = "normal"  # P2
+"opt-p3-id" = "low"     # P3
 ```
 
 Rules: corral code names concept keys only, never a project's field or
@@ -237,7 +268,9 @@ accepted for renames). Scalar board settings in the registry:
 `board.schema_max_age_s`, `board.item_max_age_s` for freshness-gated
 reads. The doctor gains one board check per repo in board mode: the board
 resolves, every mapped field and every mapped option id exists, and no
-queued writes predate a variant flip. A flip with a non-empty outbox is
+queued writes predate a variant flip. The check names the repo, the
+field, and the missing id; a one-time run after a board edit reports an
+id that no longer exists on the board. A flip with a non-empty outbox is
 refused as a configuration error so no write crosses variants.
 
 ## 6. Coexistence, migration, and exit codes
@@ -273,13 +306,19 @@ Exit codes are unchanged (AGENTS.md fixes their meaning):
 
 No test touches the outside world per AGENTS.md. Every behavior below is
 tested through the injected `run(args)` seam (canned GraphQL and REST
-payloads) plus a fake pacer clock, with a temporary store:
+payloads) plus a fake pacer, with a temporary store. A guard test proves
+no test reaches the real pacer state file or a real subprocess: the fake
+pacer records its calls and the fake `run` records its argv, and the suite
+fails if either real one is touched:
 
 | Behavior | Seam (fake) |
 | --- | --- |
+| `graphql()` and `paced_run()` honor the injected `run` and pacer; nothing reaches the real pacer file or subprocess | fake `run` argv plus fake pacer call log |
 | Issue parse plus board concepts land in `extra`; unknown option keeps stored value with an error line | fake `run` payloads |
+| An issue edit through the REST feed preserves the stored board `extra`; only a board "cleared" marker removes a concept | fake `run` feed plus temp store with board `extra` |
 | Board poll pages with `after`, stops on short page; malformed page is `TrackerError`, never partial | fake `run` pages |
 | Board-only edit (issue `updated_at` unchanged) detected by poll and audit | fake `run`, temp store with aged row |
+| Board `updated_at` is the max of issue and board times; board cursor moves on its own reader only and is never compared with the feed cursor | fake `run` with split stamps, temp store cursors |
 | Cursor pair advances independently; failed board step keeps old cursor | fake `run` raising once |
 | `enqueue` refuses people-owned concepts; adapter has no write path for them | temp store |
 | Corral-owned write round-trips through one text field per concept; repeat write leaves one label-free mutation | fake `run` recording mutations |
@@ -288,17 +327,25 @@ payloads) plus a fake pacer clock, with a temporary store:
 | Rate-limit answer halts the drain, rows stay queued, cooldown honored | fake `run` rate-limit text, fake pacer |
 | Budget exhausted: pass continues on store data with a board-outage line; stale-gated claim skips | fake pacer in cooldown, fake `Tracker` |
 | Schema cache refresh past `schema_max_age_s`, else reused without a call | fake `run` call counts |
-| Variant flip with queued writes refused; doctor parity flags mismatches | temp store plus outbox rows |
+| Variant flip with queued writes refused; doctor parity flags mismatches; doctor names repo, field and missing option id | temp store plus outbox rows |
 | Resync adopts board-shown claims, reports store-wins conflicts identically | fake `run` full walk |
 
 ## 8. Implementation tickets, in order
 
 Each is sized for one agent, with acceptance criteria.
 
-1. Store carriage for board concepts. `TrackerItem.extra` with a default,
-   `sync._reading` copies it, precedence helper for priority in one place.
-   Criteria: existing fake trackers compile untouched; board-concept rows
-   persist and read back through `extra`.
+1. Store carriage for board concepts, plus the seam change.
+   `TrackerItem.extra` as `dict | None` defaulting to `None` and
+   normalized to `{}` on read, `sync._reading` copies it (copy-on-read,
+   never shared), precedence helper for priority in one place (board
+   `priority` wins when present, else the label-derived rank), and the
+   store upsert merges `extra` by key so a reading keeps the concepts it
+   does not carry. `graphql()` and `paced_run()` accept an injected `run`
+   and an injected pacer, defaulting to the real ones. Criteria: existing
+   fake trackers compile untouched; board-concept rows persist and read
+   back through `extra`; a REST feed reading preserves stored board
+   `extra`; the guard test fails if any test reaches the real pacer
+   state file or a real subprocess.
 2. Board settings and validation. Registry scalars plus the `[repo.board]`
    table parser with strict keys. Criteria: unknown concept key is exit 4
    naming repo and key; defaults leave label mode byte-identical.
@@ -306,9 +353,12 @@ Each is sized for one agent, with acceptance criteria.
    with `after`, strict page shapes, option ids resolved live. Criteria:
    the section 7 read rows pass against canned payloads; malformed page
    fails closed.
-4. Board sync step. `board` cursor, poll plus extended audit, field-level
-   compare, board-only-edit detection. Criteria: the section 7 sync rows
-   pass; cursors move independently and never backwards.
+4. Board sync step. `board` cursor as its own clock (stored separately,
+   never compared with the feed cursor), poll plus extended audit,
+   field-level compare with per-concept merge, board-only-edit detection,
+   board `updated_at` as the max of issue and board times. Criteria: the
+   section 7 sync rows pass; cursors move independently and never
+   backwards; only an explicit board "cleared" marker removes a concept.
 5. Board mirror writes. Concept-to-field translation in the adapter's
    `write`, text-field round-trip, `unknown-option` drop, halt on rate
    limit. Criteria: the section 7 write rows pass; label-mode writes
@@ -317,8 +367,9 @@ Each is sized for one agent, with acceptance criteria.
    stale cases through `upsert` for board-sourced values. Criteria: the
    section 7 race rows pass with identical verdicts to label mode.
 7. Doctor board check and migration path. Schema resolution, option-id
-   validation, flip-with-queue refusal, parity report. Criteria: each
-   failure names repo and field; parity output is stable text.
+   validation with the id-keyed `priority_map` (display names as
+   comments), flip-with-queue refusal, parity report. Criteria: each
+   failure names repo, field and missing id; parity output is stable text.
 8. Docs follow-up. `TicketRow.extra` wired into eligibility rows and the
    drive's freshness-gated re-reads using the board reader. Criteria: a
    stale-gated claim re-reads live through the board adapter and skips
