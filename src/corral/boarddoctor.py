@@ -19,6 +19,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
 from corral import board, paths, settings
+from corral import tracker as iface
 
 
 class BoardSite(NamedTuple):
@@ -50,6 +51,12 @@ def check_options(repo: str, board_config: settings.BoardConfig, schema) -> list
         return [f"{repo}: the board schema has no fields table"]
     priority = fields.get("priority")
     if priority is None:
+        if board_config.priority_map:
+            return [
+                f"{repo}: board field {board_config.priority_column!r} for the"
+                " priority concept is not in the board schema, so the mapped"
+                " option ids were not checked"
+            ]
         return []
     options = getattr(priority, "options", None)
     if not isinstance(options, dict):
@@ -122,6 +129,14 @@ def _check_site(site: BoardSite, *, store: board.Store, fetch) -> BoardRow:
         )
     try:
         schema = fetch(site.board)
+    except iface.TrackerRateLimited as err:
+        return BoardRow(
+            name,
+            "fail",
+            f"{site.repo}: the board read hit the shared budget and is rate"
+            f" limited (transient): {err}",
+            "wait for the cooldown and re-run `corral doctor`",
+        )
     except Exception as err:
         return BoardRow(
             name,
@@ -204,11 +219,12 @@ def check_sites(
     try:
         store = open_store()
     except Exception as err:
+        repos = ", ".join(site.repo for site in wanted)
         return [
             BoardRow(
                 "board",
                 "fail",
-                f"cannot read the board store: {err}",
+                f"cannot read the board store for {repos}: {err}",
                 "make the state dir usable, then run `corral doctor` again",
             )
         ]

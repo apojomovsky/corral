@@ -332,6 +332,10 @@ def _check_board(raw, where):
                 f"{where}: [board] priority_map {option!r} must be a non-empty rank string"
             )
         checked[option] = rank
+    if checked and not columns["priority_column"]:
+        raise SettingsError(
+            f"{where}: [board] priority_map needs priority_column to name the priority field"
+        )
     return BoardConfig(
         project_owner=owner,
         project_number=number,

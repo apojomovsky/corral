@@ -13,6 +13,7 @@ import unittest
 
 from corral import board as store
 from corral import boarddoctor, doctor
+from corral import tracker as iface
 from corral.github import board as boardreader
 from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
@@ -163,6 +164,38 @@ class OptionValidation(unittest.TestCase):
         )
         self.assertEqual(found, [])
 
+    def test_a_map_with_no_priority_concept_is_a_finding(self):
+        unmapped = config(priority_column="", priority_map={"opt-p0-id": "urgent"})
+        rows = boarddoctor.check_sites(
+            [site(board=unmapped)],
+            fetch=fetch_for(schema_run(*full_schema_fields())),
+            open_store=lambda: open_temp_store(tempfile.mkdtemp(prefix="corral-boarddoctor-")),
+        )
+        self.assertEqual(rows[0].status, "fail")
+        self.assertIn(REPO, rows[0].detail)
+        self.assertIn("priority", rows[0].detail)
+        self.assertIn("not in the board schema", rows[0].detail)
+
+    def test_an_empty_map_with_no_priority_concept_is_silent(self):
+        unmapped = config(priority_column="", priority_map={})
+        schema = fetch_for(schema_run(*full_schema_fields()))(unmapped)
+        self.assertEqual(boarddoctor.check_options(REPO, unmapped, schema), [])
+
+    def test_a_rate_limited_board_read_is_a_transient_budget_row(self):
+        def fetch(board_config):
+            raise iface.TrackerRateLimited("slow down", 30.0)
+
+        rows = boarddoctor.check_sites(
+            [site()],
+            fetch=fetch,
+            open_store=lambda: open_temp_store(tempfile.mkdtemp(prefix="corral-boarddoctor-")),
+        )
+        self.assertEqual(rows[0].status, "fail")
+        self.assertIn(REPO, rows[0].detail)
+        self.assertIn("budget", rows[0].detail)
+        self.assertIn("cooldown", rows[0].fix)
+        self.assertIn("re-run", rows[0].fix)
+
 
 class FlipRefusal(unittest.TestCase):
     def test_an_empty_outbox_is_not_a_refusal(self):
@@ -201,6 +234,53 @@ class FlipRefusal(unittest.TestCase):
             open_store=lambda: open_temp_store(directory),
         )
         self.assertEqual(rows[0].status, "ok")
+
+
+class StoreFailures(unittest.TestCase):
+    def check_with_store(self, handle):
+        return boarddoctor.check_sites(
+            [site()],
+            fetch=fetch_for(schema_run(*full_schema_fields())),
+            open_store=lambda: handle,
+        )
+
+    def test_store_read_failures_fail_the_board_row_naming_the_repo(self):
+        for which in ("queued_writes", "items"):
+            with self.subTest(which=which):
+
+                class RaisingStore:
+                    def queued_writes(self):
+                        if which == "queued_writes":
+                            raise OSError("no disk")
+                        return []
+
+                    def items(self, repo=None):
+                        if which == "items":
+                            raise OSError("no disk")
+                        return []
+
+                    def close(self):
+                        pass
+
+                rows = self.check_with_store(RaisingStore())
+                self.assertEqual(rows[0].status, "fail")
+                self.assertIn(REPO, rows[0].detail)
+                self.assertIn("board store", rows[0].detail)
+
+    def test_an_unopenable_store_names_the_repos(self):
+        def fail():
+            raise OSError("no disk")
+
+        rows = boarddoctor.check_sites(
+            [site(), site(repo="example/other")],
+            fetch=fetch_for(schema_run(*full_schema_fields())),
+            open_store=fail,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "fail")
+        self.assertIn(REPO, rows[0].detail)
+        self.assertIn("example/other", rows[0].detail)
+        self.assertIn("board store", rows[0].detail)
 
 
 class ParityReport(unittest.TestCase):
