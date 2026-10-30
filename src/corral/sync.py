@@ -40,10 +40,22 @@ settings.register(
 #: The cursor name this module keeps in the store's cursor table.
 CURSOR_NAME = "tracker"
 
+#: The board cursor name: its own clock in the same cursor table, naming
+#: the newest project-item timestamp applied. It is stored separately and
+#: never compared with the feed cursor; each advances only on its own
+#: reader's success.
+BOARD_CURSOR_NAME = "board"
+
+#: The board page token name: the opaque paging cursor to resume a board
+#: poll stopped by the page cap. It lives in the same cursor table but is
+#: never compared with either timestamp cursor; it is stored when a poll
+#: is truncated and cleared when a poll completes.
+BOARD_PAGE_NAME = "board_page"
+
 
 class SyncResult(NamedTuple):
     items_seen: int  # store rows touched: applied readings, plus absent marks on resync
-    cursor: str | None  # the feed position after the run, None when untouched
+    cursor: str | None  # the position this step advanced (feed or board, per step)
     errors: tuple[str, ...]  # one line per failed tracker call; "" never appears
     conflicts: tuple[str, ...] = ()  # resync-only: "repo#N: store=A tracker=B" where corral wins
 
@@ -74,9 +86,11 @@ def _reading(item: iface.TrackerItem) -> board.Item:
     )
 
 
-def _store_cursor(store: board.Store, repo: str, cursor: str | None) -> None:
+def _store_cursor(
+    store: board.Store, repo: str, cursor: str | None, *, name: str = CURSOR_NAME
+) -> None:
     if cursor is not None:
-        store.set_cursor(repo, CURSOR_NAME, cursor)
+        store.set_cursor(repo, name, cursor)
 
 
 def sync_repo(
@@ -102,6 +116,56 @@ def sync_repo(
         store.upsert_item(_reading(item), operators=operators, now=now)
     _store_cursor(store, repo, nxt)
     return SyncResult(len(found), nxt, ())
+
+
+def sync_board_repo(
+    store: board.Store,
+    reader,
+    schema,
+    repo: str,
+    *,
+    operators,
+    now: float,
+    max_pages: int,
+) -> SyncResult:
+    """Apply one board poll for ``repo``: page the board items oldest first
+    (at most ``max_pages`` pages per call), upsert every returned reading,
+    and advance the board cursor to the newest item applied.
+
+    The board cursor is its own clock: it is stored under
+    ``BOARD_CURSOR_NAME``, never compared with the feed cursor, and never
+    moves backwards. A poll stopped by ``max_pages`` stores its resume
+    token under ``BOARD_PAGE_NAME`` and the next pass resumes from it; a
+    poll that completes clears the token. A failed poll keeps the old
+    cursor and the old token and reports the error; an empty poll changes
+    nothing. Field-level compare falls out of the upsert: each reading
+    merges per concept, so a reading that carries no board concepts keeps
+    the stored ones, and only the cleared encoding (``None`` for a scalar,
+    an empty list for a list) removes one. A board-only edit still moves
+    the row forward, because a board-sourced reading carries the maximum
+    of the issue and board times.
+    """
+    old = store.get_cursor(repo, BOARD_CURSOR_NAME)
+    try:
+        before = iface.parse_cursor(old) if old is not None else None
+        found, resume = reader.poll(
+            schema, after=store.get_cursor(repo, BOARD_PAGE_NAME), max_pages=max_pages
+        )
+    except iface.TrackerError as err:
+        return SyncResult(0, old, (f"{repo}: {err}",))
+    for item in found:
+        store.upsert_item(_reading(item), operators=operators, now=now)
+    if resume is None:
+        store.clear_cursor(repo, BOARD_PAGE_NAME)
+    else:
+        store.set_cursor(repo, BOARD_PAGE_NAME, resume)
+    if not found:
+        return SyncResult(0, old, ())
+    cursor = iface.format_cursor(max(item.updated_at for item in found))
+    if before is not None and before > iface.parse_cursor(cursor):
+        cursor = old
+    _store_cursor(store, repo, cursor, name=BOARD_CURSOR_NAME)
+    return SyncResult(len(found), cursor, ())
 
 
 def resync_repo(

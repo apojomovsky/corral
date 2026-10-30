@@ -418,6 +418,10 @@ class Store:
             (repo, name, value),
         )
 
+    def clear_cursor(self, repo, name):
+        """Drop the stored cursor for ``repo`` and ``name``, if any."""
+        self._conn.execute("DELETE FROM cursors WHERE repo=? AND name=?", (repo, name))
+
     def queued_writes(self, limit=None):
         """Queued outbox rows, oldest first, at most ``limit``."""
         query = (
