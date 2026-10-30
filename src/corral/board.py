@@ -641,6 +641,32 @@ class Store:
             )
             return Claim(repo, number, agent, host, epoch, now)
 
+    def refresh_claim(self, repo, number, agent, epoch, *, now):
+        """Refresh a held claim's heartbeat without changing its owner.
+
+        Only the holder with the matching epoch can refresh; anyone
+        else gets ``Claimed``, which also covers a missing or empty
+        claim row. The item must exist, be open and not external, like
+        every other claim write. The update moves ``claimed_at`` to
+        ``now`` and leaves the epoch alone, so a later release by the
+        same holder still matches while the orphan rule defers to the
+        refreshed heartbeat.
+        """
+        with _txn(self._conn):
+            self._require_writable(repo, number)
+            held = self._conn.execute(
+                "SELECT agent, host, epoch, claimed_at FROM claims WHERE repo=? AND number=?",
+                (repo, number),
+            ).fetchone()
+            if held is None or not held[0] or held[0] != agent or held[2] != epoch:
+                holder = held[0] if held and held[0] else "nobody"
+                raise Claimed(f"item {repo}#{number} is held by {holder}")
+            self._conn.execute(
+                "UPDATE claims SET claimed_at=? WHERE repo=? AND number=?",
+                (now, repo, number),
+            )
+            return Claim(repo, number, held[0], held[1], held[2], now)
+
     def release(self, repo, number, agent, epoch, *, now):
         """Release a held claim. Only the holder with the matching epoch
         can release; anyone else gets ``Claimed``. The claim row is

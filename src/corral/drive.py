@@ -1183,6 +1183,422 @@ def release_orphans(store, *, now, gone_s, present_agents, live_units, out, even
     return released
 
 
+#: Automatic restarts per ticket in any sliding window.
+RESTART_BUDGET = 3
+RESTART_WINDOW_S = 24 * 60 * 60
+
+#: The restart-budget state file inside the state dir.
+RESTARTS_NAME = "drive-restarts.json"
+
+
+def restarts_path():
+    """The restart-budget state file: inside the state dir.
+
+    The only path join for it (AGENTS.md, "One fact, one place").
+    """
+    return os.path.join(paths.state_dir(), RESTARTS_NAME)
+
+
+def prune_restarts(stamps, *, now):
+    """The stamps still inside the sliding window. Pure."""
+    return [stamp for stamp in stamps if now - stamp < RESTART_WINDOW_S]
+
+
+def restart_allowed(stamps, *, now):
+    """Whether another stop-plus-launch restart fits the budget. Pure.
+
+    At most RESTART_BUDGET restarts per ticket in any sliding 24 hour
+    window. Only stop-plus-launch restarts are recorded, so only they
+    count: fix-round resumes never consume the budget.
+    """
+    return len(prune_restarts(stamps, now=now)) < RESTART_BUDGET
+
+
+def record_restart(stamps, *, now):
+    """The stamps after recording one stop-plus-launch restart. Pure.
+
+    Prunes expired stamps, then appends now. Call only for restarts that
+    stopped and launched; anything else never consumes the budget.
+    """
+    return [*prune_restarts(stamps, now=now), now]
+
+
+def load_restarts(path):
+    """The budget stamps by `repo#number`, tolerant of a missing file.
+
+    A missing or corrupt file reads as empty: the budget self-heals on
+    the next recorded restart.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    found = {}
+    for key, stamps in raw.items():
+        if isinstance(key, str) and isinstance(stamps, list):
+            found[key] = [
+                stamp
+                for stamp in stamps
+                if isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
+            ]
+    return found
+
+
+def save_restarts(path, budgets):
+    """Persist the budget stamps, atomically. Raises OSError."""
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    paths.atomic_write_text(path, json.dumps(budgets, sort_keys=True))
+
+
+def classify_stuck(*, known, age, unit_live, stale_s, gone_s):
+    """`healthy` | `watch` | `restart` for one claimed ticket. Pure.
+
+    `known` is whether the holder has any registry entry; `age` is the
+    seconds since its last heartbeat. A heartbeat older than stale_s
+    with a live unit watches once more; older than gone_s or a dead
+    unit restarts. A fresh heartbeat with a dead unit also watches: the
+    agent is alive, so the dead unit may be a listing the pass missed.
+    """
+    if known and age < stale_s and unit_live:
+        return "healthy"
+    if age >= gone_s or (not unit_live and age >= stale_s):
+        return "restart"
+    return "watch"
+
+
+def give_up_body(repo, number, *, observed, restarts):
+    """The decision-protocol comment for a ticket past the restart budget.
+
+    Pure. The body carries the tail of what the pass observed, so the
+    human taking over sees why the loop walked away. It never names the
+    agent id: the id carries the host name and this body is posted to
+    the tracker, so it stays out of every give-up comment.
+    """
+    ref = f"{repo}#{number}"
+    return (
+        f"corral drive gave up on {ref}: {observed}. "
+        f"It used {restarts} stop-plus-launch restarts in the last 24h "
+        f"(budget {RESTART_BUDGET}). A human should take it from here; "
+        "the loop released its claim."
+    )
+
+
+def release_finished(store, *, agent_states, now, out, events=None):
+    """Release claims whose managed holder has a finished registry entry.
+
+    Returns the released count. Runs before the orphan rule, so a
+    finished worker always takes this completion path, never the orphan
+    one. A successful release clears the holder and leaves the epoch for
+    the next claim to mint, which fences the finished holder; the branch
+    and PR stay untouched for a later review. A `Claimed` there
+    means the row changed under the pass, so it is left held with a
+    logbook line, never retried in the same pass. When `events` is a
+    list, each release appends its journal entry. Foreign holders never
+    reach here. Store errors propagate to the caller, like orphans.
+    """
+    released = 0
+    for item in store.items():
+        claim = store.claim_of(item.repo, item.number)
+        if claim is None or not claim.agent or not is_managed_agent(claim.agent):
+            continue
+        seen = agent_states.get(claim.agent)
+        if seen is None or seen[0] != registry.FINISHED:
+            continue
+        ref = f"{claim.repo}#{claim.number}"
+        try:
+            store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
+        except board.Claimed:
+            print(f"{ref}: finished release raced a re-claim, left held", file=out)
+            continue
+        print(
+            f"{ref}: released finished worker `{claim.agent}`, branch and PR left for review",
+            file=out,
+        )
+        if events is not None:
+            events.append({"event": "release", "at": now, "ticket": ref, "agent": claim.agent})
+        released += 1
+    return released
+
+
+def handle_stuck(
+    store,
+    *,
+    agent_states,
+    stale_s,
+    gone_s,
+    live_units,
+    now,
+    host,
+    stuck_project,
+    stop_unit,
+    restarter,
+    tracker_factory,
+    restarts_path,
+    out,
+    err,
+    events=None,
+):
+    """Restart or give up on stuck managed claims. Returns restarted count.
+
+    Only managed holders older than this pass are considered: the pass
+    never restarts, watches or gives up on what it just claimed, and
+    foreign claims are never touched. A stuck row refreshes its claim
+    heartbeat on every restart attempt (success or failure) before any
+    stop or launch, so the orphan rule defers to stuck handling and a
+    failing ticket can no longer escape into a fresh agent id. The
+    budget stamp is written before the stop-plus-launch and rolled back
+    when the stop or launch fails, so a failed stop or launch leaves
+    the budget alone; a crash between the write and the stop can still
+    leave a stamp for a restart that never launched. A stamp the pass
+    cannot persist aborts the restart and keeps the claim. While the
+    budget allows it the row
+    restarts (stop through the stop seam, launch again on the same
+    claim and epoch reusing the identical agent id); past the budget
+    the loop posts through the decision-write seam, then releases.
+    `tracker_factory` maps a tracker repo to its tracker (labels or
+    board, built by the one factory): the give-up decision writes use
+    the tracker the factory returns for the claim's repo. With no
+    factory, or for a repo the factory does not know, the give-up is
+    deferred and the claim is kept. A failed decision write keeps the
+    claim for a later pass, and only stop-plus-launch restarts are
+    recorded, so resumes never consume the budget. When `events` is a
+    list, each restart and give-up appends its journal entry through
+    the pass journal writer. Store errors propagate to the caller,
+    like orphans.
+    """
+    live = live_units if live_units is not None else frozenset()
+    budgets = load_restarts(restarts_path) if restarts_path is not None else {}
+    restarted = 0
+    for item in store.items():
+        claim = store.claim_of(item.repo, item.number)
+        if claim is None or not claim.agent or not is_managed_agent(claim.agent):
+            continue
+        if claim.claimed_at >= now:
+            continue
+        ref = f"{claim.repo}#{claim.number}"
+        seen = agent_states.get(claim.agent)
+        if seen is None or not isinstance(seen[1], (int, float)):
+            known, age = False, float("inf")
+            observed = "no registry entry for the holder"
+        else:
+            known, age = True, now - seen[1]
+            observed = f"last heartbeat {int(age)}s ago"
+        unit_live = (claim.repo, claim.number) in live
+        observed += " with a live unit" if unit_live else " and no live unit"
+        verdict = classify_stuck(
+            known=known, age=age, unit_live=unit_live, stale_s=stale_s, gone_s=gone_s
+        )
+        if verdict == "healthy":
+            continue
+        if verdict == "watch":
+            print(f"{ref}: {observed}, watching once more", file=out)
+            continue
+        key = f"{claim.repo}#{claim.number}"
+        stamps = budgets.get(key, [])
+        if not restart_allowed(stamps, now=now):
+            tracker = None
+            if tracker_factory is not None:
+                try:
+                    tracker = tracker_factory(claim.repo)
+                except KeyError:
+                    print(
+                        f"{ref}: no tracker for this repo, give-up deferred, claim kept",
+                        file=out,
+                    )
+                    continue
+            give_up(
+                store,
+                claim,
+                tracker,
+                observed=observed,
+                restarts=len(prune_restarts(stamps, now=now)),
+                now=now,
+                out=out,
+                events=events,
+            )
+            continue
+        project = stuck_project(claim.repo, claim.number) if stuck_project is not None else None
+        if project is None:
+            print(f"{ref}: stuck but the owning project is unknown, left held", file=out)
+            continue
+        launch = restarter
+        if stop_unit is None or launch is None:
+            print(f"{ref}: stuck but the stop or launch seam is missing, left held", file=out)
+            continue
+        try:
+            claim = store.refresh_claim(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
+        except board.Claimed:
+            print(f"{ref}: restart raced a re-claim, left held", file=out)
+            continue
+        except (board.ExternalItem, board.StoreError) as problem:
+            print(f"{ref}: restart claim refused ({problem}), left held", file=out)
+            continue
+        had = key in budgets
+        stamped = record_restart(stamps, now=now)
+        prior_text = None
+        prior_exists = False
+        if restarts_path is not None:
+            try:
+                with open(restarts_path, encoding="utf-8") as handle:
+                    prior_text = handle.read()
+                prior_exists = True
+            except (OSError, UnicodeError):
+                prior_text = None
+                prior_exists = False
+        budgets[key] = stamped
+        if restarts_path is not None:
+            try:
+                save_restarts(restarts_path, budgets)
+            except OSError as problem:
+                if had:
+                    budgets[key] = stamps
+                else:
+                    budgets.pop(key, None)
+                print(f"corral drive: cannot save the restart budget: {problem}", file=err)
+                print(f"{ref}: restart budget save failed ({problem}), claim kept", file=out)
+                continue
+
+        def unrecord():
+            if had:
+                budgets[key] = stamps
+            else:
+                budgets.pop(key, None)
+            if restarts_path is None:
+                return
+            try:
+                save_restarts(restarts_path, budgets)
+                return
+            except OSError as problem:
+                print(f"corral drive: cannot save the restart budget: {problem}", file=err)
+            try:
+                if prior_exists and prior_text is not None:
+                    paths.atomic_write_text(restarts_path, prior_text)
+                else:
+                    os.remove(restarts_path)
+            except OSError as problem:
+                print(f"corral drive: cannot restore the restart budget: {problem}", file=err)
+                print(f"{ref}: restart budget rollback failed, the stamp stands", file=out)
+                budgets[key] = stamped
+
+        try:
+            stop_unit(claim.repo, claim.number)
+        except Exception as problem:
+            unrecord()
+            print(f"{ref}: restart stop failed ({problem}), claim kept", file=out)
+            continue
+        title = item.title if item.title else ref
+        try:
+            unit = launch(project, claim.repo, claim.number, "start", claim.agent, title, now=now)
+        except Exception as problem:
+            unrecord()
+            print(f"{ref}: restart launch failed ({problem}), claim kept", file=out)
+            continue
+        print(
+            f"{ref}: restarted {unit} with the same agent id"
+            f" (restart {len(budgets[key])} of {RESTART_BUDGET} in 24h)",
+            file=out,
+        )
+        if events is not None:
+            events.append({"event": "restart", "at": now, "ticket": ref, "agent": claim.agent})
+        restarted += 1
+    return restarted
+
+
+def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None):
+    """Post the give-up label and comment, then release the claim.
+
+    The idempotent label goes first, then the comment: a comment
+    failure keeps the claim with the label already in place, so the
+    retry cannot duplicate a comment that was never posted, and a
+    label failure posts nothing at all. A failed decision write or a
+    lost release race keeps the claim for a later pass. With no tracker
+    the give-up is deferred, never released blind. When `events` is a
+    list, a completed give-up appends its journal entry. One row only;
+    the caller decides which rows give up.
+    """
+    ref = f"{claim.repo}#{claim.number}"
+    if tracker is None:
+        print(
+            f"{ref}: past the restart budget, give-up deferred (no tracker), claim kept", file=out
+        )
+        return
+    try:
+        tracker.add_label(claim.repo, claim.number, NEEDS_DECISION)
+        tracker.comment(
+            claim.repo,
+            claim.number,
+            give_up_body(claim.repo, claim.number, observed=observed, restarts=restarts),
+        )
+    except iface.TrackerError as problem:
+        print(f"{ref}: give-up write failed ({problem}), claim kept", file=out)
+        return
+    try:
+        store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
+    except board.Claimed:
+        print(f"{ref}: give-up release raced a re-claim, left held", file=out)
+        return
+    print(f"{ref}: past the restart budget, gave up and released the claim", file=out)
+    if events is not None:
+        events.append({"event": "give_up", "at": now, "ticket": ref, "agent": claim.agent})
+
+
+def production_stuck_inputs(registered, *, now):
+    """`(agent_states, stale_s)` from the registry for the stuck sweep.
+
+    `agent_states` maps every visible agent id to (state, last_seen);
+    an id with no entry reads as gone. Raises SettingsError for bad
+    registry settings.
+    """
+    cfg = registry.config()
+    states = {}
+    for entry, state in registry.visible(now, cfg):
+        last = entry.get("last_seen") or entry.get("started_at") or 0
+        states[entry["id"]] = (state, float(last))
+    return states, cfg["stale_s"]
+
+
+def production_stuck_project(registered, repo):
+    """The registered project name owning tracker repo `repo`, or None.
+
+    The first project whose ops root maps the repo wins; entries that
+    do not map it are skipped. Pure settings reads, no subprocess when
+    the entry names its tracker repo explicitly.
+    """
+    for project in registered:
+        try:
+            _local_repo(project.root, repo)
+        except launch.LaunchError:
+            continue
+        return project.name
+    return None
+
+
+def production_stopper(registered):
+    """The stuck step's stop seam over `launch.stop` with production I/O.
+
+    Resolves the owning project per ticket, then stops the ticket's
+    logged live units. Every argument the stop path needs is fixed here;
+    tests inject a fake instead.
+    """
+    listings = lambda prefix: units.list_units(prefix, run=units.default_run)
+
+    def stop_unit(repo, number):
+        name = production_stuck_project(registered, repo)
+        if name is None:
+            raise units.UnitsError(f"no registered project feeds tracker repo {repo!r}")
+        entry = next(item for item in registered if item.name == name)
+        local = _local_repo(entry.root, repo)
+        tgt = launch.target(entry.root, local)
+        return launch.stop(tgt, number, list_fn=listings, stop_fn=units.systemctl_stop)
+
+    return stop_unit
+
+
 def _claim_and_launch(
     store,
     gated_rows,
@@ -1514,28 +1930,36 @@ def _launching_pass(
     present_agents,
     live_units,
     gone_s,
+    agent_states,
+    stale_s,
+    stop_unit,
+    restarter,
+    restarts_path,
+    stuck_project,
     journal_path=None,
     day_path=None,
     max_starts=None,
 ) -> int:
-    """One claiming pass: sync, release orphans, gate, claim, launch, mirror, print.
+    """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
-    Orphan recovery runs on store, registry and unit state right after
-    the sync, so freed rows gate as unclaimed in the same pass. A unit
-    listing failure skips recovery only: the pass continues, since a
-    claim the pass cannot prove dead is left held. A tracker outage
-    aborts the sync step only: prior rows and the old cursor stand, and
-    the pass continues on store data. A claim whose stale row cannot be
-    re-read live fails closed instead. The mirror drains whatever the
+    Finished reconciliation and orphan recovery run on store, registry
+    and unit state right after the sync, so freed rows gate as unclaimed
+    in the same pass. A unit listing failure skips recovery only: the
+    pass continues, since a claim the pass cannot prove dead is left
+    held. A tracker outage aborts the sync step only: prior rows and the
+    old cursor stand, and the pass continues on store data. A claim whose
+    stale row cannot be re-read live fails closed instead. The stuck
+    sweep restarts or gives up on managed claims the registry has lost,
+    after the fresh claims launch. The mirror drains whatever the
     outbox holds, old backlog and new claims alike; what it cannot push
     stays queued for the next healthy pass. A pass that synced nothing
     at all exits 3; a pass that launched nothing because the service
     manager was unreachable does too. When `journal_path` is set, the
-    pass appends its start, every start, skip and release, and its end
-    with verdict counts; a journal write failure warns and the pass
-    continues. When `day_path` and `max_starts` are set, at most the
-    remaining starts launch and the pass ends with exit 1 once the cap
-    stops a start.
+    pass appends its start, every start, skip, release, restart and
+    give-up, and its end with verdict counts; a journal write failure
+    warns and the pass continues. When `day_path` and `max_starts` are
+    set, at most the remaining starts launch and the pass ends with exit
+    1 once the cap stops a start.
     """
     events: list[dict] = []
     released = 0
@@ -1564,7 +1988,7 @@ def _launching_pass(
                     "started": started,
                     "skipped_by_reason": skipped or {},
                     "released": released,
-                    "gave_up": 0,
+                    "gave_up": sum(1 for entry in events if entry.get("event") == "give_up"),
                 }
             )
         return code
@@ -1638,6 +2062,25 @@ def _launching_pass(
     else:
         present_agents = frozenset(present_agents or ())
         live_units = frozenset(live_units or ())
+    if agent_states is not None:
+        try:
+            release_finished(
+                store,
+                agent_states=agent_states,
+                now=now,
+                out=out,
+                events=events if journal_path is not None else None,
+            )
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"corral drive: finished reconciliation skipped ({problem})", file=err)
+        try:
+            _items = store.items()
+        except board.StoreError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
+        except sqlite3.Error as problem:
+            print(f"corral drive: cannot read the store: {problem}", file=err)
+            return USAGE
     if not skip_orphans:
         try:
             released = release_orphans(
@@ -1692,6 +2135,31 @@ def _launching_pass(
         start_budget=start_budget,
         day_cap=max_starts,
     )
+    if agent_states is not None:
+        defaults = registry.default_config()
+        stale = stale_s if stale_s is not None else defaults["stale_s"]
+        gone = gone_s if gone_s is not None else defaults["gone_s"]
+        launch = restarter if restarter is not None else launcher
+        try:
+            handle_stuck(
+                store,
+                agent_states=agent_states,
+                stale_s=stale,
+                gone_s=gone,
+                live_units=live_units,
+                now=now,
+                host=host,
+                stuck_project=stuck_project,
+                stop_unit=stop_unit,
+                restarter=launch,
+                tracker_factory=tracker_factory,
+                restarts_path=restarts_path,
+                out=out,
+                err=err,
+                events=events if journal_path is not None else None,
+            )
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"corral drive: stuck handling skipped ({problem})", file=err)
     for row in final_rows:
         ref = f"{row.repo}#{row.number}"
         key = (row.project, row.repo, row.number)
@@ -1798,6 +2266,12 @@ def run_pass(
     present_agents=None,
     live_units=None,
     gone_s=None,
+    agent_states=None,
+    stale_s=None,
+    stop_unit=None,
+    restarter=None,
+    restarts_path=None,
+    stuck_project=None,
     journal_path=None,
     pause_path=None,
     day_path=None,
@@ -1805,28 +2279,37 @@ def run_pass(
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
-    `--plan` holds no lock and writes nothing: no sync, orphan release,
-    claim, mirror, journal or day-counter write, whatever seams are
-    passed. The non-plan pass takes the drive lock, releases
+    `--plan` holds no lock and writes nothing: no sync, orphan or
+    finished release, claim, mirror, launch, restart, give-up, journal or
+    day-counter write, whatever seams are passed. The non-plan pass takes
+    the drive lock, reconciles finished claims, releases
     provably-dead claims, and claims through the store transaction, then
     launches through `launcher` (the existing launch path in production;
-    with no launcher the pass stops after claiming and records that)
-    and drains the mirror backlog through the per-repo trackers.
-    `tracker_factory` maps a tracker repo to its tracker (labels or
-    board, built by the one factory); with none there is no sync, no
-    freshness re-read and no mirror. `operators` maps tracker repos to
-    operator logins for the sync and mirror steps; `host` names this
-    host on its claims; `stale_after` bounds the cached rows a claim may
-    use without a live re-read. `present_agents` (ids with a live or
-    stale registry entry), `live_units` ((repo, number) pairs with a
-    live unit) and `gone_s` feed orphan recovery; `gone_s=None` reads
-    all three from the host instead. When `pause_path` names an existing
-    pause file, either pass reports it and exits 1, starting nothing.
-    When `journal_path` is set, the non-plan pass journals its
-    decisions; when `day_path` and `max_starts` are set, starts beyond
-    the day's budget become `cap` skips and the pass ends with exit 1.
-    `now` defaults to the wall clock; every other None means the host
-    default, so tests inject plain data or fakes at those seams and
+    with no launcher the pass stops after claiming and records that),
+    handles stuck claims, and drains the mirror backlog through the
+    per-repo trackers. `tracker_factory` maps a tracker repo to its
+    tracker (labels or board, built by the one factory); with none
+    there is no sync, no freshness re-read, no mirror and no give-up
+    post. `operators` maps tracker repos to operator logins for the sync
+    and mirror steps; `host` names this host on its claims; `stale_after`
+    bounds the cached rows a claim may use without a live re-read.
+    `present_agents` (ids with a live or stale registry entry),
+    `live_units` ((repo, number) pairs with a live unit) and `gone_s`
+    feed orphan recovery; `gone_s=None` reads all three from the host
+    instead. The stuck sweep runs only when `agent_states` (ids to
+    (state, last_seen)) is given: `stale_s` bounds its heartbeats,
+    `stop_unit(repo, number)` stops a ticket, the restarter (or
+    `launcher` when None) relaunches it, `restarts_path` persists the
+    budget (in memory when None), and `stuck_project(repo, number)`
+    names the owning project. With no stop or launch seam a stuck row is
+    left held; a failed seam keeps the claim. When `pause_path` names an
+    existing pause file, either pass reports it and exits 1, starting
+    nothing. When `journal_path` is set, the non-plan pass journals its
+    decisions, restarts and give-ups included; when `day_path` and
+    `max_starts` are set, starts beyond the day's budget become `cap`
+    skips and the pass ends with exit 1. `now` defaults to the wall
+    clock; every other None means the host default, so tests inject
+    plain data or fakes at those seams and
     production reads the host. Returns the exit code.
     """
     moment = time.time() if now is None else now
@@ -1866,6 +2349,12 @@ def run_pass(
                 present_agents=present_agents,
                 live_units=live_units,
                 gone_s=gone_s,
+                agent_states=agent_states,
+                stale_s=stale_s,
+                stop_unit=stop_unit,
+                restarter=restarter,
+                restarts_path=restarts_path,
+                stuck_project=stuck_project,
                 journal_path=journal_path,
                 day_path=day_path,
                 max_starts=max_starts,
@@ -1926,6 +2415,11 @@ def cmd_drive(args: argparse.Namespace) -> int:
         def tracker_factory(repo, _by_repo=by_repo):
             return _by_repo[repo]
 
+        try:
+            stuck_states, stuck_stale = production_stuck_inputs(registered, now=time.time())
+        except settings.SettingsError as problem:
+            print(f"corral drive: {problem}", file=sys.stderr)
+            return USAGE
         return run_pass(
             plan=False,
             store=store,
@@ -1936,6 +2430,11 @@ def cmd_drive(args: argparse.Namespace) -> int:
             tracker_factory=tracker_factory,
             operators=operators,
             launcher=production_launcher(registered),
+            agent_states=stuck_states,
+            stale_s=stuck_stale,
+            stop_unit=production_stopper(registered),
+            restarts_path=restarts_path(),
+            stuck_project=lambda repo, number: production_stuck_project(registered, repo),
             journal_path=journal_path(),
             pause_path=pause_path(),
             day_path=day_path(),
