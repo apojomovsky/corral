@@ -95,6 +95,42 @@ class Report(unittest.TestCase):
         self.assertIn("  see the gh docs", text)
 
 
+class MuseTripwire(unittest.TestCase):
+    """The shipped muse entry pins major 1: canned 1.x passes, 2.x fails."""
+
+    def entry(self):
+        return next(d for d in deps.load() if d.name == "muse")
+
+    def test_corral_deps_reports_muse(self):
+        self.assertEqual(self.entry().probe, ("muse", "--version"))
+        outputs = {d.probe[0]: f"{d.name} 1.0 Linger=yes systemd 255" for d in deps.load()}
+        outputs["uv"] = "uv 0.13.5"
+        outputs["muse"] = "muse 1.4.0"
+        text, ok = deps.report(deps.check_all(deps.load(), fake(outputs)))
+        self.assertTrue(ok)
+        self.assertIn("muse", text)
+
+    def test_canned_1x_output_passes(self):
+        r = deps.check(self.entry(), fake({"muse": "muse 1.4.0\n"}))
+        self.assertTrue(r.ok)
+
+    def test_old_1x_output_fails_with_the_min_floor(self):
+        entry = self.entry()
+        self.assertEqual(entry.min, "1.4")
+        r = deps.check(entry, fake({"muse": "muse 1.0\n"}))
+        self.assertFalse(r.ok)
+        self.assertIn("needs 1.4 or later", r.problem or "")
+
+    def test_canned_2x_output_fails_with_the_cutover_hint(self):
+        entry = self.entry()
+        self.assertEqual(entry.below, "2")
+        self.assertIn("cutover", entry.why)
+        r = deps.check(entry, fake({"muse": "muse 2.0.1\n"}))
+        self.assertFalse(r.ok)
+        self.assertIn("below 2", r.problem or "")
+        self.assertIn("Muse Code installation instructions", entry.install or "")
+
+
 class ShippedList(unittest.TestCase):
     def test_it_parses_and_every_entry_says_how_to_get_it(self):
         listed = deps.load()
@@ -127,6 +163,7 @@ class Command(unittest.TestCase):
     def test_all_present_exits_0(self):
         everything = {d.probe[0]: f"{d.name} 1.0 Linger=yes systemd 255" for d in deps.load()}
         everything["uv"] = "uv 0.13.5"
+        everything["muse"] = "muse 1.4.0"
         self.assertEqual(self.run_cli(everything)[0], 0)
 
     def test_a_missing_program_exits_1(self):
