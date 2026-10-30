@@ -12,7 +12,8 @@ single-instance lock (exit 2 when another pass holds it).
 Exit codes: 0 completed, 2 another pass holds the lock, 3 the tracker
 or live host state (units or the registry) could not be reached, 4 the
 store could not be read, the lock could not be set up, or a project
-failed to load.
+failed to load. A full host that starts nothing routine is still 0:
+saturation is routine dispatch state, not an error.
 """
 
 import argparse
@@ -743,6 +744,28 @@ def _pass(
     return USAGE if problems else OK
 
 
+def production_operators(registered, git):
+    """`{tracker_repo: operators}` across every registered project's root.
+
+    Resolves through the shared helper, the same way sync and mirror
+    do, so the pass's sync, freshness re-reads and mirror agree with
+    both CLIs on which authors are internal. Returns (mapping, None),
+    or (None, problem) on the first configuration error.
+    """
+    mapping = {}
+    for project in registered:
+        try:
+            names = settings.repo_names(project.root)
+        except settings.SettingsError as err:
+            return None, str(err)
+        entries, problem = syncli.repo_operators(project.root, names, git)
+        if problem is not None:
+            return None, problem
+        for _name, (tracker_repo, ops) in entries.items():
+            mapping.setdefault(tracker_repo, ops)
+    return mapping, None
+
+
 def sync_all(store, tracker, *, operators, now):
     """Sync every repo with cached rows from the tracker.
 
@@ -774,24 +797,34 @@ def refresh_row(store, tracker, repo, number, *, operators, now, stale_after):
     """The row to decide from: cached when fresh, live-checked when stale.
 
     Returns (item, None) on the row to use, or (None, reason) when a
-    stale row could not be re-read live: the claim path fails closed
-    instead of deciding from the stale row. With no tracker there is no
-    live check to run, so the cached row stands.
+    stale row could not be re-read live, or when the store itself could
+    not be read: the claim path fails closed instead of deciding from
+    the stale row. With no tracker there is no live check to run, so
+    the cached row stands.
     """
     ref = f"{repo}#{number}"
-    found, fresh = store.item(repo, number, now=now, max_age=stale_after)
+    try:
+        found, fresh = store.item(repo, number, now=now, max_age=stale_after)
+    except board.StoreError as err:
+        return None, f"{ref}: store unreadable, claim refused ({err})"
     if fresh or tracker is None:
         return found, None
     try:
         live = tracker.item(repo, number)
     except iface.TrackerError as err:
         return None, f"{ref}: tracker unreachable, row stale, claim refused ({err})"
-    store.upsert_item(
-        sync._reading(live),
-        operators=list(mirror._ops_for(operators, repo)),
-        now=now,
-    )
-    found, _ = store.item(repo, number, now=now)
+    try:
+        store.upsert_item(
+            sync._reading(live),
+            operators=list(mirror._ops_for(operators, repo)),
+            now=now,
+        )
+    except board.StoreError as err:
+        return None, f"{ref}: store unreadable, claim refused ({err})"
+    try:
+        found, _ = store.item(repo, number, now=now)
+    except board.StoreError as err:
+        return None, f"{ref}: store unreadable, claim refused ({err})"
     if found is None:
         return None, f"{ref}: no store row, skipped as withdrawn"
     return found, None
@@ -802,13 +835,13 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
 
     Returns (rows, started, blocked): the verdict rows to print, the
     launched count, and whether a launch failed because the service
-    manager was unreachable. Starts mint a fresh id with `mint_agent`;
-    any other proceeding kind re-claims the row's own holder id, which
-    is idempotent when the row is unchanged and a race otherwise. A
-    lost race (exit 2 from the store) becomes a skip naming the holder
-    and the pass moves on; a launch through `launcher` appends the unit
-    or the failure to the row's reason. With no `launcher` the pass
-    stops after claiming and records that.
+    manager was unreachable. Only `start` claims and launches, minting
+    a fresh id with `mint_agent`; any other proceeding kind is left
+    unclaimed with a skip line, since its scheduling belongs to a later
+    ticket. A lost race (exit 2 from the store) becomes a skip naming
+    the holder and the pass moves on; a launch through `launcher`
+    appends the unit or the failure to the row's reason. With no
+    `launcher` the pass stops after claiming and records that.
     """
     rows = []
     started = 0
@@ -818,6 +851,21 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
             rows.append(gated)
             continue
         ref = f"{gated.repo}#{gated.number}"
+        if gated.kind != "start":
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict="skip",
+                    reason=(
+                        f"{ref}: {gated.kind} handoff is owned by a later ticket, left unclaimed"
+                    ),
+                    code="claim",
+                )
+            )
+            continue
         fresh, problem = refresh_row(
             store,
             tracker,
@@ -840,11 +888,7 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
                 )
             )
             continue
-        holder = fresh.agent if fresh is not None else ""
-        if gated.kind == "start":
-            agent = mint_agent(gated.repo, gated.number, host=host, now=now)
-        else:
-            agent = holder
+        agent = mint_agent(gated.repo, gated.number, host=host, now=now)
         try:
             store.claim(gated.repo, gated.number, agent, host, now=now)
         except board.Claimed:
@@ -940,11 +984,11 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
 def _local_repo(root, repo):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
-    The entry whose `tracker.repo` names it wins; a plain entry name
-    equal to `repo` is the fallback. Anything else is a `LaunchError`
+    Only the entry whose resolved tracker repo names it wins: an entry
+    name that merely equals `repo` is not a mapping, and a reported
+    problem is surfaced, never masked. Anything else is a `LaunchError`
     naming the root and the repo.
     """
-    fallback = None
     for name in settings.repo_names(root):
         try:
             resolved = settings.load(root=root, repo=name)
@@ -955,10 +999,6 @@ def _local_repo(root, repo):
             raise launch.LaunchError(problem)
         if tracker_repo == repo:
             return name
-        if name == repo:
-            fallback = name
-    if fallback is not None:
-        return fallback
     raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
 
 
@@ -1264,6 +1304,10 @@ def cmd_drive(args: argparse.Namespace) -> int:
         except projects.ProjectsError as problem:
             print(f"corral drive: {problem}", file=sys.stderr)
             return USAGE
+        operators, problem = production_operators(registered, syncli._git)
+        if problem is not None:
+            print(f"corral drive: {problem}", file=sys.stderr)
+            return USAGE
         return run_pass(
             plan=False,
             store=store,
@@ -1272,7 +1316,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             err=sys.stderr,
             projects_fn=lambda: registered,
             tracker=syncli._production_tracker(),
-            operators=None,
+            operators=operators,
             launcher=production_launcher(registered),
         )
 

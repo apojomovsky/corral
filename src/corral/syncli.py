@@ -85,6 +85,30 @@ def _tracker_repo(root, name, resolved, git):
     return repo, None
 
 
+def repo_operators(root, names, git):
+    """`{name: (tracker_repo, operators)}` for each named ``[[repo]]`` entry.
+
+    The single resolver for per-repo operators: sync, mirror and the
+    dispatch pass all build their tracker-repo mapping from it, so the
+    three agree on which authors are internal. Returns (entries, None);
+    on a configuration error returns (None, problem).
+    """
+    entries = {}
+    for name in names:
+        try:
+            resolved = settings.load(root=root, repo=name)
+        except settings.SettingsError as problem:
+            return None, str(problem)
+        tracker_repo, problem = _tracker_repo(root, name, resolved, git)
+        if problem is not None:
+            return None, problem
+        entries[name] = (
+            tracker_repo,
+            _operators(resolved["tracker.operators"], tracker_repo),
+        )
+    return entries, None
+
+
 def sync_root(
     root,
     names,
@@ -114,19 +138,14 @@ def sync_root(
     if unknown:
         _err(f"unknown repo {unknown[0]!r} (not a [[repo]] entry in {root})", err)
         return USAGE
+    entries, problem = repo_operators(root, names or wanted, git)
+    if problem is not None:
+        _err(problem, err)
+        return USAGE
     results: dict = {}
     mirror_ops: dict = {}
     for name in names or wanted:
-        try:
-            resolved = settings.load(root=root, repo=name)
-        except settings.SettingsError as problem:
-            _err(str(problem), err)
-            return USAGE
-        tracker_repo, problem = _tracker_repo(root, name, resolved, git)
-        if problem is not None:
-            _err(problem, err)
-            return USAGE
-        operators = _operators(resolved["tracker.operators"], tracker_repo)
+        tracker_repo, operators = entries[name]
         try:
             if resync:
                 result = sync.resync_repo(
