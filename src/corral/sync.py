@@ -20,6 +20,22 @@ settings.register(
     [],
     "tracker logins treated as operators (default: the repository owner only)",
 )
+settings.register(
+    "tracker.variant", str, "labels", "tracker source: labels or board (default: labels)"
+)
+settings.register("board.poll_pages", int, 5, "board poll page cap per pass (default: small)")
+settings.register(
+    "board.schema_max_age_s",
+    int,
+    3600,
+    "seconds before the board step refreshes the cached board schema",
+)
+settings.register(
+    "board.item_max_age_s",
+    int,
+    300,
+    "seconds before a freshness-gated read re-reads a board row live",
+)
 
 #: The cursor name this module keeps in the store's cursor table.
 CURSOR_NAME = "tracker"
