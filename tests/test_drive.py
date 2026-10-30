@@ -94,6 +94,9 @@ def hermetic_pass(store, lock_path, out, err, plan=True, found=(), policy_dir=No
         "ledger": {},
         "read_labels": lambda kind, repo, number: [],
         "hold_label": "hold",
+        "present_agents": frozenset(),
+        "live_units": frozenset(),
+        "gone_s": 3600.0,
     }
     values.update(fields)
     return drive.run_pass(**values)

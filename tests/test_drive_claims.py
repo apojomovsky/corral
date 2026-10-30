@@ -89,6 +89,9 @@ def drive_pass(
         "launcher": launcher,
         "host": "host-1",
         "stale_after": stale_after,
+        "present_agents": frozenset(),
+        "live_units": frozenset(),
+        "gone_s": 3600.0,
     }
     values.update(fields)
     return drive.run_pass(**values)

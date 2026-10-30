@@ -403,6 +403,14 @@ class Store:
             out.append(found)
         return out
 
+    def claim_of(self, repo, number):
+        """The decided claim holding (``repo``, ``number``), or None.
+
+        Read-only: the agent, host, epoch and claimed time straight from
+        the claim row, so a pass can release with the stored epoch.
+        """
+        return self._holder(repo, number)
+
     def get_cursor(self, repo, name):
         """The stored tracker cursor for ``repo`` and ``name``, or None."""
         row = self._conn.execute(
