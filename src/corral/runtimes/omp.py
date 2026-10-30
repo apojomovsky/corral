@@ -4,6 +4,8 @@
 the session `.jsonl` files in the session directory, not from the unit's
 out.log. The per-launch config is `overlay.yml`, written by hand (stdlib
 only, no YAML library) from a nested dict shaped like omp's own setting ids.
+`reviewer` is a documented no-op: omp has no read-only flag, so the reviewer
+prompt's read-only rule is the only guard.
 """
 
 import functools
@@ -130,7 +132,10 @@ def write_config(session_dir, config):
     paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), overlay_text(config))
 
 
-def argv(session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME):
+def argv(
+    session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME, reviewer=False
+):
+    """The headless run form. `reviewer` is accepted and ignored (see the module docstring)."""
     check_prompt(prompt)
     command = [
         binary(),
