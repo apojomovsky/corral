@@ -317,6 +317,47 @@ class SchemaFetchTest(unittest.TestCase):
         with self.assertRaises(iface.TrackerError):
             schema_for(run)
 
+    def test_non_text_pairs_rejected_for_text_concepts(self):
+        bad_agent = [
+            {
+                "__typename": "ProjectV2IterationField",
+                "id": "F_agent",
+                "name": "Agent",
+                "dataType": "TEXT",
+            },
+            text_field("F_agent", "Agent", datatype="NUMBER"),
+        ]
+        for agent in bad_agent:
+            with self.subTest(agent=agent):
+                fields = [agent if f["name"] == "Agent" else f for f in full_schema_fields()]
+                run = BoardFakeRun().script("BoardSchemaByNumber", [schema_payload(*fields)])
+                with self.assertRaises(iface.TrackerError):
+                    schema_for(run)
+
+    def test_non_select_pairs_rejected_for_select_concepts(self):
+        bad_priority = [
+            text_field("F_prio", "Priority"),
+            {
+                "__typename": "ProjectV2SingleSelectField",
+                "id": "F_prio",
+                "name": "Priority",
+                "dataType": "TEXT",
+                "options": [{"id": "o1", "name": "P0"}],
+            },
+            {
+                "__typename": "ProjectV2IterationField",
+                "id": "F_prio",
+                "name": "Priority",
+                "dataType": "SINGLE_SELECT",
+            },
+        ]
+        for priority in bad_priority:
+            with self.subTest(priority=priority):
+                fields = [priority if f["name"] == "Priority" else f for f in full_schema_fields()]
+                run = BoardFakeRun().script("BoardSchemaByNumber", [schema_payload(*fields)])
+                with self.assertRaises(iface.TrackerError):
+                    schema_for(run)
+
     def test_malformed_schema_shapes_fail_closed(self):
         good = full_schema_fields()
         bad_shapes = [
@@ -377,6 +418,16 @@ class SchemaFetchTest(unittest.TestCase):
         run = BoardFakeRun().script("BoardSchemaByNumber", [gh.GhError("other", "nope")])
         with self.assertRaises(iface.TrackerError):
             schema_for(run)
+
+    def test_non_json_answer_is_a_tracker_error(self):
+        run = lambda args, **kwargs: "not json{{{"
+        with self.assertRaises(iface.TrackerError):
+            reader_for(run).schema()
+
+    def test_list_shaped_answer_is_a_tracker_error(self):
+        run = lambda args, **kwargs: "[1, 2]"
+        with self.assertRaises(iface.TrackerError):
+            reader_for(run).schema()
 
 
 class PollPagingTest(unittest.TestCase):
@@ -651,6 +702,24 @@ class PollItemsTest(unittest.TestCase):
         reader = reader_for(run)
         with self.assertRaises(iface.TrackerError):
             reader.poll(reader.schema(), max_pages=10)
+
+    def test_select_value_missing_option_id_reads_as_absent(self):
+        run = BoardFakeRun()
+        entry = {
+            "__typename": "ProjectV2ItemFieldSingleSelectValue",
+            "field": {
+                "__typename": "ProjectV2SingleSelectField",
+                "id": "F_prio",
+                "name": "Priority",
+            },
+        }
+        found = self.poll_one(run, [entry])
+        self.assertNotIn("priority", found.extra)
+
+    def test_select_value_null_option_id_reads_as_absent(self):
+        run = BoardFakeRun()
+        found = self.poll_one(run, [select_value("F_prio", "Priority", None, "P0")])
+        self.assertNotIn("priority", found.extra)
 
     def test_unknown_field_ids_are_ignored(self):
         run = BoardFakeRun()

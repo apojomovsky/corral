@@ -171,6 +171,8 @@ class BoardReader:
             if gh.is_rate_limited(text):
                 raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
             raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
 
     def schema(self) -> BoardSchema:
         """The project's node id, field ids and option ids, live."""
@@ -233,14 +235,14 @@ class BoardReader:
         """One mapped schema node as a ``FieldDef``, else ``TrackerError``."""
         typename = node.get("__typename")
         datatype = node.get("dataType")
-        if typename == "ProjectV2SingleSelectField" or datatype == "SINGLE_SELECT":
+        if typename == "ProjectV2SingleSelectField" and datatype == "SINGLE_SELECT":
             kind = "single_select"
-        elif typename == "ProjectV2Field" or datatype == "TEXT":
+        elif typename == "ProjectV2Field" and datatype == "TEXT":
             kind = "text"
         else:
             kind = "other"
-        want_select = concept in _SELECT_CONCEPTS
-        if (kind == "single_select") != want_select:
+        want = "single_select" if concept in _SELECT_CONCEPTS else "text"
+        if kind != want:
             raise _fail(f"board field {name!r} for {concept} has the wrong kind")
         options = {}
         if kind == "single_select":
@@ -407,10 +409,10 @@ class BoardReader:
             if not isinstance(text, str):
                 raise _fail(f"bad board value for {concept}: {text!r}")
             return concept, "text", text.strip()
-        if "optionId" not in entry:
-            raise _fail(f"board value for {concept} is not a select")
-        oid = entry["optionId"]
+        oid = entry.get("optionId")
         if oid is None:
+            if "text" in entry:
+                raise _fail(f"board value for {concept} is not a select")
             return None, None, None
         if not isinstance(oid, str) or not oid:
             raise _fail(f"bad board value for {concept}: {oid!r}")
