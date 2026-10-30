@@ -34,7 +34,7 @@ class TrackerRateLimited(TrackerError):
 
 
 class UnknownOption(TrackerError):
-    """A corral-owned write names a board field or option the board no longer has.
+    """A corral-owned write names a concept the board config never mapped.
 
     A subclass of ``TrackerError`` so callers that do not handle it still
     fail closed with exit code 3. The mirror drops the write with reason
@@ -90,9 +90,11 @@ class Tracker(Protocol):
         fields is refused with ``ValueError``. A failed call raises
         ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
         with the seconds to wait. A board-backed tracker raises
-        ``UnknownOption`` when the field or option the write names is gone
-        from the board. Writing the same value twice leaves one
-        label behind: the write is idempotent.
+        ``UnknownOption`` for a concept the board config never mapped (the
+        mirror drops it), and a plain ``TrackerError`` when the mapped
+        field is absent from the live board (the rows stay queued).
+        Writing the same value twice leaves one label behind: the write is
+        idempotent.
         """
         ...
 
