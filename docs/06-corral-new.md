@@ -29,9 +29,11 @@ corral new <name> [--path DIR] [--template NAME] [--template-dir DIR]
 `<name>` is the project and repository name. It must satisfy the one rule
 every repo-named path already shares (`paths.plain_repo_name`): one path part,
 no `.git` suffix. Anything else is exit 4. The target directory defaults to
-`<cwd>/<name>`; `--path DIR` names the parent explicitly. A target that exists,
-is non-empty, and is not a tree `new` can prove it created (section 5) is exit
-4: `new` never adopts an unrelated tree.
+`<cwd>/<name>`; `--path DIR` names the parent explicitly. A target that exists
+and is non-empty converges only on positive proof that the tree is `new`'s
+own (section 5): every file present at a scaffold path is byte-identical to
+the template render. A single differing file fails the proof and is exit 4
+before any write: `new` never adopts an unrelated tree.
 
 Steps, in order (each is re-runnable; section 5):
 
@@ -44,13 +46,20 @@ Steps, in order (each is re-runnable; section 5):
    exists, stop with exit 4 before writing anything locally, so a refusal
    leaves nothing behind. Section 3 decides the exact rules.
 2. **Create and initialise the tree.** Create the directory, `git init -b`
-   with the initial branch (`--default-branch X`, else `main`), and copy the
-   template files (section 2). `--default-branch` is a `new`-side flag that
-   passes through as `--set clone.default_branch=X`; it adds no input to
-   `init.collect` and changes no `init` behavior. Template files are created only when missing;
-   an existing identical file is kept, an existing different scaffold file is
-   left alone and reported (scaffold files belong to the user after the first
-   run, exactly like `agents.overlay.md`).
+   with the effective initial branch, and copy the template files
+   (section 2). The effective branch is resolved once: `--default-branch X`
+   when given, else `--set clone.default_branch=Y` when given, else `main`;
+   giving both with different values is exit 4 (two answers for one fact).
+   Both the `git init -b` argument and the `collect` input use it (`new`
+   passes the `--set` through, injecting it when the flag supplied it), so
+   the checked-out branch and `corral.toml` can never disagree. It adds no
+   input to `init.collect` and changes no `init` behavior. Template files are
+   created only when missing; an existing identical file is kept. An existing
+   file at a scaffold path that differs from the render fails the ownership
+   proof (section 5): exit 4 naming the file, before any write. Scaffold
+   files belong to the user after the first run, exactly like
+   `agents.overlay.md`, so `new` never overwrites one, with or without
+   `--force`.
 3. **Onboard through `init`.** Call `init.collect` (detection plus the
    `--set`/`--runtime`/`--cap`/`--test-cmd` overrides, unchanged) and then the
    same apply path `init` uses: `corral.toml`, `agents.overlay.md`
@@ -256,9 +265,16 @@ side effect of a command whose name does not say so.
 
 Every step is safe to re-run, like `init`:
 
-- Scaffold files are create-only (overlay rule): missing files are written,
-  identical files are kept, differing files are left alone and reported.
-  `--force` does not touch them.
+- Scaffold files are create-only (overlay rule) and never overwritten, with
+  or without `--force`: missing files are written, identical files are kept.
+  The tree is provably `new`'s own when every file present at a scaffold
+  path is byte-identical to the template render; missing files are an
+  interrupted run, and `new` writes them and converges. A single differing
+  file fails the proof: without `--force` that is exit 4 naming the file,
+  before any write, so a foreign colliding tree is left untouched. With
+  `--force` the operator asserts ownership: `new` converges the
+  `init`-owned files (`corral.toml`, the registration) but still never
+  writes the differing scaffold file, which is left alone and reported.
 - `corral.toml`, hooks, the exclude line and the registration converge
   through the `init` apply path, so a re-run that changes nothing exits 1
   (nothing to do), mirroring `init`'s exit codes.
@@ -291,7 +307,7 @@ Exit codes (public interface, per `AGENTS.md`):
 | 1 | nothing to do (converged re-run), or a gate said no (a label refused) |
 | 2 | race lost (the remote appeared between pre-check and create) |
 | 3 | the forge, tracker or host is unreachable |
-| 4 | usage or configuration error (bad name, non-empty target, remote exists, unresolvable owner, bad template or placeholder, `--public` without `--create-remote`) |
+| 4 | usage or configuration error (bad name, foreign target with a differing scaffold file, conflicting branch inputs, remote exists, unresolvable owner, bad template or placeholder, `--public` without `--create-remote`) |
 | 75 | never used by `new` (it consumes no admission slot) |
 
 ## 6. Interaction with `init`, `uninit`, `takeoff`, `doctor`
@@ -339,7 +355,17 @@ Cases:
   an unknown `{{...}}` placeholder is exit 4 naming file and placeholder;
 - an unknown `--template` name is exit 4 listing the known names;
 - a bad `<name>` (multi-part, `.git` suffix) is exit 4;
-- an existing non-empty target that is not ours is exit 4 and untouched;
+- a foreign colliding tree (a pre-existing file at a scaffold path differs
+  from the render) is exit 4 naming the file, and the tree is untouched;
+- an own partial tree after a crash (some scaffold files present and
+  identical, the rest missing) converges: the missing files are written,
+  exit 0;
+- `--force` replaces a differing `corral.toml` and registration but leaves a
+  user-edited scaffold file such as `README.md` untouched;
+- `corral new foo --set clone.default_branch=trunk` checks out branch
+  `trunk` and writes that same branch to `corral.toml` (never branch `main`
+  with `corral.toml` saying `trunk`); `--default-branch X` combined with a
+  differing `--set clone.default_branch=Y` is exit 4;
 - `init` on a `new` tree converges (exit 1, no diff);
 - `uninit` removes hooks and registration, keeps `corral.toml`, the overlay
   and every scaffold file;
