@@ -278,5 +278,26 @@ class ProvidersTest(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["tracker.operators"].default, [])
 
 
+class RepoOperatorsTest(SyncRootCase):
+    def test_configured_operators_resolve_per_entry(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TOML + 'tracker.operators = ["mallory"]\n')
+        entries, problem = syncli.repo_operators(self.root, ["app"], git_ok())
+        self.assertIsNone(problem)
+        self.assertEqual(entries, {"app": ("acme/app", ["mallory"])})
+
+    def test_missing_operators_default_to_the_owner(self):
+        entries, problem = syncli.repo_operators(self.root, ["app"], git_ok())
+        self.assertIsNone(problem)
+        self.assertEqual(entries, {"app": ("acme/app", ["acme"])})
+
+    def test_a_bad_entry_returns_the_problem(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TOML + 'tracker.repo = "not-a-repo"\n')
+        entries, problem = syncli.repo_operators(self.root, ["app"], git_ok())
+        self.assertIsNone(entries)
+        self.assertIn("not-a-repo", problem)
+
+
 if __name__ == "__main__":
     unittest.main()
