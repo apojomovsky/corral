@@ -21,10 +21,14 @@ here, only shapes. Home paths below are generic stand-ins:
 
 One new module, `src/corral/runtimes/muse.py`, exposing the same
 `Runtime` protocol as the other two (`argv`, `env`, `write_config`,
-`with_models`, `resume_handle`), plus two small helpers this runtime
-needs: `resolve(session_id)` (session id to session file) and
-`classify(returncode, stderr_text, stream_text)` (provider error
-classification, section 5). `runtimes/__init__.py` gains the name:
+`with_models`, `resume_handle`, `activity_file`), plus two small
+helpers this runtime needs: `resolve(session_id)` (session id to
+session file) and `classify(returncode, stderr_text, stream_text)`
+(provider error classification, section 5). `activity_file(session)`
+returns the unit's `out.log` path when present and `None` otherwise,
+exactly like the opencode adapter, because `launch.py` tail calls it
+unconditionally; without it a muse session would crash `corral tail`.
+`runtimes/__init__.py` gains the name:
 `NAMES` becomes `("omp", "opencode", "muse")`, `get("muse")` returns the
 adapter, and `agents.runtime` accepts `muse`. `DEFAULT_RUNTIME` stays
 `omp`; `record`/`recorded` are unchanged. `settings.PROVIDERS` already
@@ -33,7 +37,13 @@ lists `corral.runtimes`, and this design adds no new setting (section
 
 Model ids: `quota.chain_provider` takes the part before the first `/`,
 so a chain entry `muse/muse-spark-1.3` names provider `muse` and the
-adapter passes the part after the slash as `--model`. The accounts file
+adapter passes the part after the slash as `--model`. The strip has
+one owner: a tiny `models.bare_id(entry)` returning the part after
+the first `/` (a bare id with no slash passes through unchanged).
+`with_models` keeps the full chain entry in `config["model"]`, and
+`argv` applies `bare_id` when building `--model` from either the
+config model or the `model=` override, which `launch.py` passes
+unstripped as today. The accounts file
 carries one `[[provider]]` named `muse` with a muse quota reader
 (section 6). The model id `muse-spark-1.3` is in the on-disk catalog:
 observed, `muse model-profile show muse-spark-1.3 --effort high`
@@ -72,7 +82,9 @@ What each flag is, and the evidence:
 - `--model <id>`: from the models declaration. `with_models` lays the
   live chains over the per-launch config and the adapter passes the
   default role's head (via `models.primary`, as opencode does), with
-  the `muse/` provider prefix stripped. Observed: `--model` is refused
+  the `muse/` provider prefix stripped through `models.bare_id`.
+  A `model=` override takes the same path: `muse/other` and a bare
+  `other` both yield `--model other`. Observed: `--model` is refused
   under `--provider echo` (`--model requires --provider meta or
   local`), and its shape is verified in `muse exec --help`. An end to
   end run with `--model` needs a real call, so the value flow is
@@ -160,12 +172,16 @@ Session location from a session id, observed: an `exec` run with
 files, and a `subagent/` tree. The date is the run date.
 
 - `resolve(session_id)` is the one helper that maps an id to its file:
-  it globs `sessions/*/*/*/<uuid>/session.jsonl` and takes the newest,
-  returning `None` when absent. One fact, one place.
+  it globs `sessions/*/*/*/<uuid>/session.jsonl` and takes the newest
+  by `(mtime, basename)`, the `omp.resume_handle` rule, so equal
+  mtimes never depend on directory order, returning `None` when
+  absent. One fact, one place.
 - `resume_handle(session_dir)` does not scan: corral chose the uuid at
   launch, so launch records it in corral's own session dir (a
   `muse_session_id` file next to the `runtime` record) and resume reads
-  it back. The scan exists for export and audit only.
+  it back. The scan exists for export and audit only: its named
+  callers are a future `muse export` reader and offline audits.
+  Launch and resume never call it.
 
 Tail reads the unit's `out.log` (the `--json` stdout stream), not the
 on-disk `session.jsonl`. This distinction was observed, not assumed:
@@ -340,7 +356,9 @@ New `tests/test_runtimes_muse.py` (session dirs are temp dirs):
 - argv: exact worker, reviewer (`--disable-write`), and resume
   (`--session-id` plus message file) lists; prompt starting with `-`
   refused; `--model` carries the stripped head, provider prefix
-  removed.
+  removed through `models.bare_id`; a `model=` override takes the
+  same path (`muse/other` and bare `other` both yield `--model
+  other`).
 - config: `-c` encoding (JSON scalars, whole-value `${VAR}`
   passthrough); unknown-key refusal is muse's exit 2, so the adapter
   test asserts the argv shape that produces it rather than running
@@ -351,8 +369,10 @@ New `tests/test_runtimes_muse.py` (session dirs are temp dirs):
   or `~/.local/share/muse/`; the full flag allowlist is pinned, so an
   added persisting flag fails.
 - sessions: `resolve` finds the newest `<uuid>/session.jsonl` across
-  date dirs and returns `None` when absent; `resume_handle` returns
-  the recorded uuid; `record`/`recorded`/`get("muse")` behave.
+  date dirs by `(mtime, basename)` and returns `None` when absent;
+  `resume_handle` returns the recorded uuid; `activity_file` returns
+  the session `out.log` path when present and `None` otherwise;
+  `record`/`recorded`/`get("muse")` behave.
 - doctor/deps: the `system_deps.toml` muse entry parses, and the
   `below` bound trips on a canned `2.x` probe and passes on `1.x`.
 
@@ -369,7 +389,9 @@ Extended `tests/test_tail.py` (canned lines, temp files):
 Extended `tests/test_launch.py` (existing fake seams only): launch,
 resume, tail and stop of a muse ticket through fake `run`/`list_fn`
 with a forced stop implementation, proving the adapter honors the
-protocol (`max_time` accepted and ignored, `resume` passed through).
+protocol (`max_time` accepted and ignored, `resume` passed through,
+`activity_file` returning the session `out.log`, with a missing file
+raising the no-activity `LaunchError`).
 
 ## 10. Implementation tickets
 
@@ -384,14 +406,17 @@ public interface beyond `agents.runtime: muse`.
   `env`, `-c` encoding, the flag allowlist test. Acceptance: the
   config and home-proof tests pass; no new setting registered.
 - T3: sessions and resume. Build the `muse_session_id` record,
-  `resume_handle`, `resolve`, and the launch/resume path through the
-  existing fake seams. Acceptance: launch then resume in tests uses
-  one uuid; `resolve` finds a canned date tree; missing file is a
+  `resume_handle`, `resolve`, `activity_file`, and the launch/resume
+  path through the existing fake seams. Acceptance: launch then
+  resume in tests uses one uuid; `resolve` finds a canned date tree
+  newest by `(mtime, basename)`; `activity_file` returns the session
+  `out.log` when present and `None` otherwise; missing file is a
   launch error.
 - T4: tail rendering. Extend `tail.render` with the muse rules from
   section 3 and its tests, with `tool.result` asserting skip until
-  T8 lands its fixture. Acceptance: the tail tests pass; omp and
-  opencode rendering unchanged.
+  T8 lands its fixture. Acceptance: the tail tests pass, fed through
+  `activity_file` (a missing file raises the no-activity
+  `LaunchError`); omp and opencode rendering unchanged.
 - T5: error classification. Build `classify` with the verified exit-2
   usage rules and the `unknown` default, plus fixtures cut from the
   observed stderr lines. Acceptance: usage fixtures classify; every
