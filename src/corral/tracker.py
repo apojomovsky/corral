@@ -33,6 +33,15 @@ class TrackerRateLimited(TrackerError):
         self.retry_after = retry_after
 
 
+class UnknownOption(TrackerError):
+    """A corral-owned write names a board field or option the board no longer has.
+
+    A subclass of ``TrackerError`` so callers that do not handle it still
+    fail closed with exit code 3. The mirror drops the write with reason
+    ``unknown-option`` instead of retrying: corral never invents a mapping.
+    """
+
+
 class TrackerItem(NamedTuple):
     repo: str  # "owner/name" as the tracker names it
     number: int
@@ -80,7 +89,9 @@ class Tracker(Protocol):
         ``value == ""`` clears the field. Anything outside the corral-owned
         fields is refused with ``ValueError``. A failed call raises
         ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
-        with the seconds to wait. Writing the same value twice leaves one
+        with the seconds to wait. A board-backed tracker raises
+        ``UnknownOption`` when the field or option the write names is gone
+        from the board. Writing the same value twice leaves one
         label behind: the write is idempotent.
         """
         ...
