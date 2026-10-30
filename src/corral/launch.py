@@ -30,7 +30,7 @@ import sys
 import time
 from dataclasses import dataclass
 
-from corral import accounts, admission, disk, models, paths, projects, quota_ledger
+from corral import accounts, admission, disk, models, paths, projects, quota, quota_ledger
 from corral import prompts, registry, runtimes, settings, units, worktrees
 from corral.runtimes import muse
 from corral.runtimes import tail as runtime_tail
@@ -297,16 +297,11 @@ def _model_chains(tgt, pool, ledger, now):
     if not chains:
         return {}
     models.validate(chains, pool)
-    bounds = [
-        s
-        for s in (getattr(provider, "stale_after_s", None) for provider in pool or ())
-        if isinstance(s, (int, float)) and not isinstance(s, bool)
-    ] or [accounts.DEFAULT_STALE_AFTER_S]
     return models.check(
         chains,
         ledger,
         now,
-        stale_after=min(bounds),
+        stale_after=quota.stale_after_for(chains, pool),
         low_pct=tgt.resolved["quota.low_pct"],
         unknown_blocks=tgt.resolved["quota.unknown_blocks"],
     )
