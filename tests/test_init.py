@@ -250,6 +250,9 @@ TAIL = """# Defaults: uncomment to override.
 # disk.min_free_pct = 10  # free-space percent under which the disk reads low
 # disk.session_retention_days = 14  # days before a finished ticket's session dir is a reclaim candidate
 #
+# [drive]
+# drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
+#
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
 # git.commits.conventional = true  # enforce Conventional Commits
@@ -349,6 +352,9 @@ commits.conventional = false
 # disk.min_free_gb = 5  # free gigabytes under which the disk reads low
 # disk.min_free_pct = 10  # free-space percent under which the disk reads low
 # disk.session_retention_days = 14  # days before a finished ticket's session dir is a reclaim candidate
+#
+# [drive]
+# drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
