@@ -2,9 +2,10 @@
 
 Each project registers one file, ``projects.d/<name>.toml`` in the corral
 config dir, naming its unit prefix, its ops root, and its share of the
-host: a guaranteed floor and a ceiling. Launch admission reads the
-registry, so one project's agents count against the host total no matter
-which project starts them.
+host: a guaranteed floor and a ceiling. An optional ``eligibility``
+entry names the policy module the dispatch pass asks for startable
+tickets. Launch admission reads the registry, so one project's agents
+count against the host total no matter which project starts them.
 """
 
 import os
@@ -12,7 +13,7 @@ import re
 import tomllib
 from typing import NamedTuple
 
-from corral import admission, paths, settings
+from corral import admission, eligibility, paths, settings
 
 #: The registry directory, inside the corral config dir.
 PROJECTS_DIR = "projects.d"
@@ -27,13 +28,19 @@ class ProjectsError(ValueError):
 
 
 class Project(NamedTuple):
-    """One registered project: its name, unit prefix, ops root and share."""
+    """One registered project: its name, unit prefix, ops root and share.
+
+    `eligibility` is the optional policy entry point (`module:function`
+    or `path/to/policy.py:function`) the dispatch pass calls; None
+    registers no candidates.
+    """
 
     name: str
     unit_prefix: str
     root: str
     floor: int = 0
     ceiling: int | None = None
+    eligibility: str | None = None
 
 
 def projects_dir(config_dir: str | None = None) -> str:
@@ -75,12 +82,21 @@ def _project(stem: str, path: str, raw: object) -> Project:
         ceiling = _count(ceiling, "ceiling", path)
     if ceiling is not None and floor > ceiling:
         raise _fail(path, f"floor {floor} is above its ceiling {ceiling}")
+    entry = raw.get("eligibility")
+    if entry is not None:
+        if not isinstance(entry, str) or not entry or ":" not in entry:
+            raise _fail(
+                path,
+                f"eligibility {entry!r} must look like "
+                "module:function or path/to/policy.py:function",
+            )
     return Project(
         name=name,
         unit_prefix=prefix,
         root=os.path.normpath(root),
         floor=floor,
         ceiling=ceiling,
+        eligibility=entry,
     )
 
 
@@ -153,10 +169,12 @@ def limits(found: list[Project], *, total_cap: int, repo_cap: int) -> admission.
 
 
 def check(config_dir: str | None = None) -> list[str]:
-    """Problems with the registry: bad files, and ceilings above the host total.
+    """Problems with the registry: bad files, ceilings above the host total,
+    and eligibility entries that do not resolve.
 
     [] means every registration is usable. A missing registry dir counts
-    as usable: the host just holds one unregistered project.
+    as usable: the host just holds one unregistered project. Resolving
+    never calls a policy.
     """
     try:
         found = load_all(config_dir)
@@ -172,4 +190,8 @@ def check(config_dir: str | None = None) -> list[str]:
             problems.append(
                 f"project {project.name} asks ceiling {project.ceiling}, host allows {total}"
             )
+        if project.eligibility is not None:
+            problem = eligibility.check_entry(project.eligibility, project=project.name)
+            if problem is not None:
+                problems.append(problem)
     return problems
