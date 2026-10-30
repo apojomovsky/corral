@@ -463,7 +463,7 @@ class PollPagingTest(unittest.TestCase):
         reader, schema = self.poller(run)
         found, cursor = reader.poll(schema, max_pages=10)
         self.assertEqual(len(found), 101)
-        self.assertEqual(cursor, "C1")
+        self.assertIsNone(cursor)
         variables = run.graphql_variables("BoardItems")
         self.assertEqual(variables, [{"project": "PVT_1"}, {"project": "PVT_1", "after": "C1"}])
 

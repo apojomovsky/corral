@@ -268,13 +268,13 @@ class BoardReader:
         ends it; at most ``max_pages`` pages per call. A malformed page
         raises ``TrackerError`` and returns nothing, never a partial
         result. A call stopped by ``max_pages`` returns what it fetched
-        with the cursor to resume from.
+        with the cursor to resume from; a call that reaches the end
+        returns ``None`` so the next pass starts over from the head.
         """
         if max_pages < 1:
             raise ValueError(f"max_pages must be at least 1, got {max_pages!r}")
         by_field = {field.id: concept for concept, field in schema.fields.items()}
         items = []
-        cursor = after
         fetch_after = after
         for _ in range(max_pages):
             nodes, info = self._page(schema.project_id, fetch_after)
@@ -283,12 +283,10 @@ class BoardReader:
                 if found is not None:
                     items.append(found)
             end, more = self._resume(info, len(nodes))
-            if end:
-                cursor = end
             if not more:
-                break
+                return items, None
             fetch_after = end
-        return items, cursor
+        return items, fetch_after
 
     def _page(self, project_id, after):
         """One items page as ``(nodes, pageInfo)``, else ``TrackerError``."""
