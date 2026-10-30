@@ -242,6 +242,35 @@ def _reading_value(item, field):
     return _canon(value)
 
 
+def effective_priority(label_priority, extra):
+    """The rank eligibility reads: the board rank wins when present,
+    else the label-derived rank. Pure, and the only place that decides
+    between the two sources."""
+    if isinstance(extra, dict):
+        board_priority = extra.get("priority")
+        if board_priority:
+            return board_priority
+    return label_priority or ""
+
+
+def merge_extra(stored, reading):
+    """The stored board concepts plus one reading's carried keys.
+
+    A reading overwrites only the concepts it carries: an absent key
+    keeps the stored value, while the cleared encoding removes it (None
+    clears a scalar key, an empty list clears a list key). A reading
+    that is not a dict carries nothing. Pure."""
+    merged = dict(stored)
+    if not isinstance(reading, dict):
+        return merged
+    for key, value in reading.items():
+        if value is None or (isinstance(value, list) and not value):
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
+
+
 class Store:
     """One open board store. One connection per thread; methods commit
     per call, and claim/release decide inside a single transaction."""
@@ -436,12 +465,16 @@ class Store:
 
     def upsert_item(self, item, *, operators, now):
         """Apply a tracker reading. People-owned fields always take the
-        tracker's value. Corral-owned fields are never originated here:
+        tracker's value, while board concepts in ``extra`` merge by key:
+        a reading overwrites only the concepts it carries, and only the
+        cleared encoding (None for a scalar, an empty list for a list)
+        removes one. Corral-owned fields are never originated here:
         the reading only settles queued writes. A fresh tracker value
         echoing a queued write marks it sent, a fresh different value
         drops it as overridden, and a reading that says nothing (an empty
         value, e.g. a title-only edit that left no label behind) settles
-        nothing. A stale reading settles nothing either."""
+        nothing. A stale reading settles nothing either and keeps the
+        stored concepts."""
         with _txn(self._conn):
             stored = self._row(item.repo, item.number)
             external = bool(
@@ -450,7 +483,18 @@ class Store:
             try:
                 labels = json.dumps(list(item.labels or []))
                 assignees = json.dumps(list(item.assignees or []))
-                extra = json.dumps(item.extra if isinstance(item.extra, dict) else {})
+            except (TypeError, ValueError) as err:
+                raise StoreError(f"unusable item {item.repo}#{item.number}: {err}")
+            try:
+                base = json.loads(stored[15]) if stored is not None else {}
+            except ValueError as err:
+                raise StoreError(f"unusable item {item.repo}#{item.number}: corrupt extra: {err}")
+            if not isinstance(base, dict):
+                raise StoreError(
+                    f"unusable item {item.repo}#{item.number}: extra must be an object"
+                )
+            try:
+                extra = json.dumps(merge_extra(base, item.extra))
             except (TypeError, ValueError) as err:
                 raise StoreError(f"unusable item {item.repo}#{item.number}: {err}")
             if stored is None:
