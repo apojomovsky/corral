@@ -91,6 +91,7 @@ reader = "my_tools.quota:ProviderA"
 | `corral tail REPO N [--last K] [--root PATH]` | show the ticket's agent activity, from its session file |
 | `corral agent register\|heartbeat\|done\|list` | the host's agent registry: any agent, from any runtime, reports itself; a ticket is `--repo` and `--number` (optional `--project`); exit 4 on a heartbeat means the agent was dropped and registers again |
 | `corral projects [--json]` | the registered projects with their prefix, root, floor, ceiling and live agents, counted with the host registry settings (a per-project `registry.*` override applies to launch admission only) |
+| `corral drive [--plan]` | run one dispatch pass over the board store: the pass holds the single-instance lock (exit 2 when another pass holds it) and changes nothing yet; `--plan` never takes the lock and always prints the candidate table |
 | `corral prompts show ROLE [--ops DIR]` | print the effective role prompt template (override or built-in), unrendered |
 | `corral prompts eject ROLE [--ops DIR] [--force]` | copy the built-in template to `.corral/prompts/` for editing; prints the path and refuses to overwrite without `--force` |
 | `corral prompts check [--ops DIR]` | validate every override's placeholders and report stale ejections; exit 1 when something is stale or invalid |
