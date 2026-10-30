@@ -84,6 +84,26 @@ class Tracker(Protocol):
         """
         ...
 
+    def comment(self, repo: str, number: int, body: str) -> None:
+        """Post one comment on an item, for the decision protocol only.
+
+        The loop calls this with its own question when a ticket needs a
+        human; nothing else posts comments. A failed call raises
+        ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
+        with the seconds to wait.
+        """
+        ...
+
+    def add_label(self, repo: str, number: int, label: str) -> None:
+        """Add one decision label to an item, for the decision protocol only.
+
+        The loop calls this with the single hold label; any other name is
+        refused with ``ValueError``. A failed call raises ``TrackerError``;
+        a rate-limit answer raises ``TrackerRateLimited`` with the seconds
+        to wait.
+        """
+        ...
+
 
 #: Cursor wire shape: the UTC second an item was last updated. ISO by
 #: the clock, lexicographic by accident; compare as epochs, never as text.
