@@ -128,16 +128,37 @@ Per-candidate gate order, cheapest first:
 
 1. Non-open, externally owned (the row's stored `external` field,
    computed at sync time by `board.is_external`; the loop never
-   re-derives it), or already claimed by someone else: skip with
+   re-derives it), or withdrawn by this pass's eligibility: skip with
    reason.
-2. Hold: `hold.reason` over the ticket and linked PR labels.
+2. Claim routing by request kind against the row's live holder.
+   `resume`, `fix`, `review` and stuck restarts are classified here,
+   before any claimed check, so the check below never sees them as
+   plain starts:
+   - Unclaimed row: `start` and `review` proceed. A `resume` or
+     `fix` naming an unclaimed ticket means its holder went away
+     between eligibility and gating; the request is reclassified as
+     a fresh `start` on the same ticket and branch (the branch is
+     reused, nothing is deleted).
+   - Claimed row plus `start`: skip ("already claimed by `<agent>`").
+   - Claimed row plus `resume`, `fix` or restart: proceed only when
+     the holder is a managed agent, meaning an id this loop minted
+     (recognized by its `drive-` prefix; every other reader still
+     treats the id as opaque, and fencing still uses only
+     `Claim.epoch`). Any other holder is a foreign claim (operator
+     work adopted by resync, another host's agent, a hand claim):
+     skip with reason "foreign claim" and never touch it. No resume,
+     no restart, no release.
+   - Claimed row plus `review`: skip while the worker still holds
+     the claim. The review is scheduled on a later pass, after the
+     section 5 completion release frees the row.
+3. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
    not started, resumed or reviewed by the loop.
-3. Admission (`admission.admit` against live state from
+4. Admission (`admission.admit` against live state from
    `launch.admission_state`): project ceiling and repo cap first, then
    the host total with the floor rule.
-4. Quota gate over the project's chains against the shared ledger. A
+5. Quota gate over the project's chains against the shared ledger. A
    refused role is a skip for that candidate only; another project's
    chains may route around the exhausted provider.
 
@@ -247,8 +268,22 @@ failures), the loop posts the question as a comment, adds the
 `needs-decision` label through the outbox, releases its claim, and
 walks away. Tickets carrying that label are never started (section 3).
 
+Finished workers are reconciled before stuck ones. When the row's
+holder has a `finished` registry entry (a `done` file, kept for
+`RETAIN_S`), the worker is complete: the loop releases the claim
+with a logbook line, leaving branch and PR untouched, so a later
+pass can schedule review on the unclaimed PR-ready row. Worker
+completion releases before any reviewer start and long before merge;
+merge-ready rows stay unclaimed and the loop ignores them. A
+`finished` entry is neither `live` nor `stale` under
+`registry.status`, so it already counts as "no live or stale entry"
+for the section 4 orphan rule; reconciliation runs first, so a
+finished worker always takes this completion path, never the orphan
+one.
+
 Stuck agents: each pass compares claimed tickets against registry
-liveness and unit liveness.
+liveness and unit liveness. Only managed holders ever reach here;
+foreign claims were skipped at gate step 2.
 
 - Heartbeat older than `registry.stale_s` with a live unit: watch once
   more; older than `registry.gone_s` or unit dead: restart (stop the
@@ -256,14 +291,17 @@ liveness and unit liveness.
   and epoch, reusing the identical agent id: `Store.claim` is
   idempotent only for the same agent, and a fresh id on a still-held
   row gets `Claimed`).
-- Restart budget: at most 3 automatic restarts per ticket per 24 hours,
-  counted in a small state file, decremented only by stop-plus-launch
-  restarts. Fix rounds are not restarts: a `resume` that reuses the
-  live unit and session never decrements the budget. Past the budget,
-  give up: comment with the tail of what was observed, add
-  `needs-decision`, release the claim.
-- A `done` or `finished` registry entry for a claimed ticket ends the
-  loop's duty for that ticket; the PR state decides what happens next.
+- Restart budget: at most 3 automatic restarts per ticket in any
+  sliding 24 hour window, counted as timestamps in a small state
+  file: a restart is allowed only when fewer than 3 stored timestamps
+  are newer than now minus 24 hours, and each pass prunes older ones.
+  (The section 7 day cap is date-keyed instead: it bounds starts per
+  calendar day, while this window bounds restart rate around an
+  incident.) Only stop-plus-launch restarts consume the budget. Fix
+  rounds are not restarts: a `resume` that reuses the live unit and
+  session never consumes it. Past the budget, give up: comment with
+  the tail of what was observed, add `needs-decision`, release the
+  claim.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 
@@ -341,6 +379,8 @@ is tested through the seam its production code already injects:
 | Sync, resync, audit fill rows; outage keeps cursor | fake `Tracker` (in-memory items, scripted `TrackerError`) |
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
+| Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
+| Finished worker releases before review; `finished` takes the completion path, never the orphan one | temp `Store`, fake registry with a `done` entry, linked-PR fixture |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |
@@ -348,7 +388,7 @@ is tested through the seam its production code already injects:
 | Quota refusal skips one project, not the pass | fake ledger readings plus project chains |
 | Hold and unreadable labels skip; `needs-decision` skips | fake `read_labels` |
 | Ordering: resume before start, priority, wait time, determinism | pure ordering function over constructed rows |
-| Restart budget counts, give-up comments and releases | fake units stop seam, fake registry, temp outbox |
+| Restart budget counts stop-plus-launch restarts in a sliding 24h window, foreign holders never restart, give-up comments and releases | fake units stop seam, fake registry, temp state dir with budget timestamps |
 | Day cap stops starts, not resumes; pause file stops all | temp state dir with counter and pause files |
 | `--plan` writes nothing | read-only assertion: store and outbox hashes unchanged |
 | Snapshot `drive` section on missing or corrupt journal | temp state dir, section-error shape |
@@ -374,10 +414,13 @@ the modules named.
    call with rows and `now`. Criteria: stub policies over fixture rows
    return ordered requests; bad entry is exit 4 naming project and entry;
    project without the entry is skipped with a logbook line.
-3. Gate order: external, hold, admission, quota. Criteria: one test
-   per skip reason in section 3; floor project admitted at full total;
-   ceiling and repo cap skip and continue; quota refusal skips one
-   candidate only.
+3. Gate order: external, claim routing, hold, admission, quota.
+   Criteria: one test per skip reason in section 3; claimed plus
+   `start` skips while claimed plus `resume` on a managed holder
+   proceeds; foreign holder skips with "foreign claim"; unclaimed
+   `resume` reclassifies as a start; floor project admitted at full
+   total; ceiling and repo cap skip and continue; quota refusal skips
+   one candidate only.
 4. Claims and the launch handoff. Criteria: claim then launch through
    fake units; lost race (exit 2) records and continues; tracker
    outage keeps cursor and continues on store data; mirror backlog
@@ -391,11 +434,13 @@ the modules named.
    for PR-ready rows with author check intact; fix round resumes when
    possible else restarts on the same branch; merge-ready rows are
    ignored by the loop.
-7. Stuck detection, restart budget, give-up. Criteria: gone agent with
-   dead unit restarts within budget reusing the identical agent id;
-   only stop-plus-launch restarts decrement the budget, fix-round
-   resumes do not; past budget posts comment, adds
-   `needs-decision`, releases; `done` entries end loop duty.
+7. Stuck detection, restart budget, give-up. Criteria: gone managed
+   agent with dead unit restarts within budget reusing the identical
+   agent id; foreign holders are never restarted; the budget counts
+   only stop-plus-launch restarts in a sliding 24h window, fix-round
+   resumes do not consume it; past budget posts comment, adds
+   `needs-decision`, releases; `finished` holders take the section 5
+   completion release before any stuck handling.
 8. Observability: journal and snapshot section. Criteria: each pass
    appends well-formed lines; snapshot shows the section 6 fields;
    corrupt journal yields a section error, not a crash.
