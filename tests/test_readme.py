@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from corral import cli
+from corral import runtimes
 
 SPAN_RE = re.compile(r"`([^`]*)`")
 COMMAND_RE = re.compile(r"\bcorral ([a-z][a-z0-9-]*)")
@@ -44,6 +45,23 @@ def table_tokens(section):
         for span in SPAN_RE.findall(cells[1]):
             found.update(COMMAND_RE.findall(span))
     return found
+
+
+def runtimes_bullet():
+    """The Headless runtimes bullet, the line that must name every runtime."""
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    lines = [line for line in text.splitlines() if "Headless runtimes" in line]
+    return "\n".join(lines)
+
+
+class RegisteredRuntimes(unittest.TestCase):
+    def test_readme_names_every_registered_runtime(self):
+        bullet = runtimes_bullet()
+        self.assertTrue(bullet, "no Headless runtimes bullet in README.md")
+        missing = [
+            name for name in runtimes.NAMES if not re.search(rf"\b{re.escape(name)}\b", bullet)
+        ]
+        self.assertEqual(missing, [])
 
 
 class Table(unittest.TestCase):
