@@ -25,6 +25,7 @@ def entry(
     repo="repo-a",
     number=1,
     runtime="omp",
+    role=None,
     model="m1",
     note="working",
     age=10,
@@ -33,6 +34,7 @@ def entry(
     data = {
         "id": agent_id,
         "runtime": runtime,
+        "role": role,
         "ticket": None
         if repo is None
         else {"project": project or "", "repo": repo, "number": number},
@@ -126,6 +128,7 @@ class FullDocument(unittest.TestCase):
                         "repo": None,
                         "number": None,
                         "runtime": "omp",
+                        "role": None,
                         "model": "m1",
                         "state": "finished",
                         "started_at": T0 - 100,
@@ -138,6 +141,7 @@ class FullDocument(unittest.TestCase):
                         "repo": "repo-a",
                         "number": 1,
                         "runtime": "omp",
+                        "role": None,
                         "model": "m1",
                         "state": "live",
                         "started_at": T0 - 100,
@@ -150,6 +154,7 @@ class FullDocument(unittest.TestCase):
                         "repo": "repo-b",
                         "number": 2,
                         "runtime": "omp",
+                        "role": None,
                         "model": "m1",
                         "state": "stale",
                         "started_at": T0 - 100,
@@ -192,6 +197,7 @@ class FullDocument(unittest.TestCase):
                     "repo": None,
                     "number": None,
                     "runtime": "omp",
+                    "role": None,
                     "model": "m1",
                     "state": "live",
                     "started_at": T0 - 100,
@@ -238,6 +244,7 @@ class FullDocument(unittest.TestCase):
                 "repo": None,
                 "number": None,
                 "runtime": None,
+                "role": None,
                 "model": None,
                 "state": "live",
                 "started_at": None,
@@ -245,6 +252,16 @@ class FullDocument(unittest.TestCase):
                 "note": None,
             },
         )
+
+    def test_reviewer_and_worker_roles_show_in_rows(self):
+        doc = doc_of(
+            registry_view=view(
+                (entry("w1", role="worker"), "live"),
+                (entry("r1", role="reviewer", repo="repo-b", number=2), "live"),
+            )
+        )
+        roles = {row["id"]: row["role"] for row in doc["agents"]}
+        self.assertEqual(roles, {"w1": "worker", "r1": "reviewer"})
 
 
 class SectionErrors(unittest.TestCase):
@@ -381,6 +398,16 @@ class CliExits(unittest.TestCase):
         code, out, _ = self.run_main(["snapshot"])
         self.assertEqual(code, 0)
         self.assertIn("a1", out)
+
+    def test_human_output_shows_reviewer_vs_worker(self):
+        rows = view(
+            (entry("w1", role="worker"), "live"),
+            (entry("r1", role="reviewer"), "live"),
+        )
+        code, out, _ = self.run_main(["snapshot"], registry_view=rows)
+        self.assertEqual(code, 0)
+        self.assertIn("  worker  ", out)
+        self.assertIn("  reviewer  ", out)
 
     def test_section_error_still_exits_zero(self):
         code, out, _ = self.run_main(["snapshot", "--json"], quota=ValueError("pool gone"))

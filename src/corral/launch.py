@@ -46,6 +46,11 @@ REGISTERED_NOTE = "(registered agent, counts until its heartbeat goes stale)"
 #: The unit's environment entry that names the agent, read by the agent's hooks.
 AGENT_ID_VAR = "CORRAL_AGENT_ID"
 
+#: The session file holding the prompt role the launch ran with, so a
+#: resume runs the same reviewer mode. Absent for prompt-file launches
+#: and for sessions launched before roles were recorded.
+ROLE_FILE = "role"
+
 #: Launch runtimes to registry runtimes. The runtime adapters and the
 #: registry name one runtime differently; unknown names pass through and
 #: the registry refuses them, so a new adapter without a mapping here is
@@ -335,11 +340,12 @@ def _close_previous(tgt, number, list_fn):
     return closed
 
 
-def _register_started(tgt, unit, number, model):
+def _register_started(tgt, unit, number, model, role=None):
     """Register the unit before it starts, so agent list and snapshot show it.
 
     The ticket names the registered project of the ops root, so the
-    agent counts for the same project its unit prefix counts for.
+    agent counts for the same project its unit prefix counts for. The
+    role is recorded too, so snapshot shows reviewer vs worker.
     Raises LaunchError naming the unit when the registry cannot record
     it; the unit is not running yet.
     """
@@ -351,6 +357,7 @@ def _register_started(tgt, unit, number, model):
             _RUNTIME_NAMES.get(tgt.runtime, tgt.runtime),
             ticket=ticket,
             model=model,
+            role=role,
         )
     except (registry.RegistryError, OSError) as err:
         raise LaunchError(f"cannot register the agent {unit}: {err}") from None
@@ -371,6 +378,13 @@ def _close_never_started(unit):
         print(f"corral: cannot close the never-started agent {unit}: {err}", file=sys.stderr)
 
 
+def _check_role(role):
+    """The launch role, or a LaunchError for anything but a known role or None."""
+    if role is not None and role not in prompts.ROLES:
+        raise LaunchError(f"unknown role {role!r}: expected one of {', '.join(prompts.ROLES)}")
+    return role
+
+
 def launch(
     tgt,
     number,
@@ -379,6 +393,7 @@ def launch(
     title=None,
     model=None,
     runtime_config=None,
+    role=None,
     list_fn,
     run,
     usage,
@@ -402,10 +417,18 @@ def launch(
     after the worktree is made, so the rendered prompt names the worktree
     and branch the agent actually gets. Either form gets the registry
     heartbeat instructions appended before it is written.
+
+    `role` is the prompt role (`--role`), or None for a prompt file. The
+    reviewer role selects both the reviewer prompt and the runtime's
+    read-only mode (`reviewer=True` in `adapter.argv`); it is recorded in
+    the session and the registry entry, so a resume keeps the same mode
+    and snapshot shows reviewer vs worker.
     """
     factory = prompt if callable(prompt) else None
     if factory is None:
         _check_text(prompt, "prompt")
+    role = _check_role(role)
+    reviewer = role == "reviewer"
     model = _check_model(model)
     if title is not None and not isinstance(title, str):
         raise LaunchError("title must be a string")
@@ -439,13 +462,19 @@ def launch(
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
         prompt = prompts.with_heartbeat(prompt)
-        session_id = _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
+        session_id = _write_session(
+            session, adapter, tgt.runtime, prompt, runtime_config, chains, role
+        )
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
             try:
                 if session_id is None:
                     command = adapter.argv(
-                        session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME
+                        session,
+                        prompt,
+                        model=model,
+                        max_time=runtimes.DEFAULT_MAX_TIME,
+                        reviewer=reviewer,
                     )
                 else:
                     command = adapter.argv(
@@ -453,6 +482,7 @@ def launch(
                         prompt,
                         model=model,
                         max_time=runtimes.DEFAULT_MAX_TIME,
+                        reviewer=reviewer,
                         session_id=session_id,
                     )
             except ValueError as err:
@@ -464,7 +494,7 @@ def launch(
             if session_id is not None:
                 _drop_session_id(session)
             raise
-        _register_started(tgt, unit, number, model)
+        _register_started(tgt, unit, number, model, role)
         try:
             units.start(argv, session, unit, run=run)
         except Exception:
@@ -488,17 +518,51 @@ def _drop_session_id(session):
         pass
 
 
-def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None):
-    """The prompt, the runtime record and the per-launch config, into the session dir.
+def _recorded_role(session):
+    """The prompt role the session was launched with, or None.
 
-    Returns the fresh muse session id for a muse launch, else None. The id
-    is generated here, recorded here and passed to `argv` by the caller, so
-    the recorded id and the run's id cannot differ.
+    Sessions launched from a prompt file record no role, and neither do
+    sessions from before roles were recorded; both read as None, the
+    worker behaviour. A role file that exists but cannot be read or
+    holds an unknown role raises LaunchError: failing open to writable
+    would silently resume a reviewer with write access.
+    """
+    try:
+        with open(os.path.join(session, ROLE_FILE), encoding="utf-8") as handle:
+            role = handle.read().strip()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise LaunchError(f"cannot read the agent's role: {err}") from None
+    if role not in prompts.ROLES:
+        raise LaunchError(f"unknown role {role!r}: expected one of {', '.join(prompts.ROLES)}")
+    return role
+
+
+def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None, role=None):
+    """The prompt, the runtime and role records and the per-launch config.
+
+    Writes into the session dir. Returns the fresh muse session id for a
+    muse launch, else None. The id is generated here, recorded here and
+    passed to `argv` by the caller, so the recorded id and the run's id
+    cannot differ.
     """
     try:
         os.makedirs(session, exist_ok=True)
         paths.atomic_write_text(os.path.join(session, "prompt.md"), prompt)
         runtimes.record(session, runtime)
+        if role is not None:
+            paths.atomic_write_text(os.path.join(session, ROLE_FILE), role + "\n")
+        else:
+            # A relaunch without a role must not inherit the previous
+            # generation's: a stale reviewer record would resume read-only.
+            # Only a missing file is fine; any other removal failure
+            # reaches the LaunchError below instead of leaving the
+            # stale record behind silently.
+            try:
+                os.remove(os.path.join(session, ROLE_FILE))
+            except FileNotFoundError:
+                pass
         config = runtime_config or {}
         if chains:
             config = adapter.with_models(config, chains)
@@ -526,11 +590,13 @@ def resume(
 ):
     """Resume ticket `number`'s newest runtime session in a new unit. Returns `(unit, workdir)`.
 
-    The runtime is the one the session recorded at launch. Raises LaunchError
-    when there is no session to resume, and HeldError when the ticket is
-    held for a human. `hold_reason_fn(tgt, number)` returns the hold text,
-    or None when the ticket is free to resume; it is required, and it runs
-    before the spawn lock is taken or any worktree is touched.
+    The runtime is the one the session recorded at launch, and the
+    reviewer mode is the one the launch ran with: a resumed reviewer
+    stays read-only. Raises LaunchError when there is no session to
+    resume, and HeldError when the ticket is held for a human.
+    `hold_reason_fn(tgt, number)` returns the hold text, or None when the
+    ticket is free to resume; it is required, and it runs before the
+    spawn lock is taken or any worktree is touched.
     """
     reason = hold_reason_fn(tgt, number)
     if reason is not None:
@@ -539,6 +605,7 @@ def resume(
     model = _check_model(model)
     session = _session(tgt, number)
     adapter = _adapter(runtimes.recorded(session))
+    role = _recorded_role(session)
     handle = adapter.resume_handle(session)
     if handle is None:
         raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} session to resume")
@@ -557,6 +624,10 @@ def resume(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
+        # A concurrent launch of this ticket may have replaced the
+        # session between the pre-lock read and this lock: re-read the
+        # role here, so the mode started is the mode recorded.
+        role = _recorded_role(session)
         if adapter.name == muse.NAME:
             try:
                 muse.write_message(session, message)
@@ -570,13 +641,14 @@ def resume(
                 model=model,
                 resume=handle,
                 max_time=runtimes.DEFAULT_MAX_TIME,
+                reviewer=(role == "reviewer"),
             )
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(
             unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
         )
-        _register_started(tgt, unit, number, model)
+        _register_started(tgt, unit, number, model, role)
         try:
             units.start(argv, session, unit, run=run)
         except Exception:

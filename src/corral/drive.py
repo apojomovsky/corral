@@ -1449,6 +1449,7 @@ def production_launcher(registered):
             number,
             factory,
             title=title,
+            role="worker",
             list_fn=lambda prefix: units.list_units(prefix, run=units.default_run),
             run=units.default_run,
             usage=disk.production_usage,
