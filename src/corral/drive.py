@@ -1,10 +1,11 @@
 """`corral drive`: one dispatch pass over the board store.
 
-Each pass syncs the board store from the tracker, joins every
-registered project's eligibility requests to the store rows, runs the
-section 3 gate order over the candidates, claims the proceeding ones
-through the store transaction, hands the starts to the existing launch
-path, drains the mirror backlog, and prints the verdict table.
+Each pass syncs the board store from the tracker, releases
+provably-dead claims, joins every registered project's eligibility
+requests to the store rows, runs the section 3 gate order over the
+candidates, claims the proceeding ones through the store transaction,
+hands the starts to the existing launch path, drains the mirror
+backlog, and prints the verdict table.
 `--plan` is the dry run: it holds no lock and writes nothing, running
 no sync, claim, mirror or launch. The non-plan pass holds the
 single-instance lock (exit 2 when another pass holds it).
@@ -830,6 +831,70 @@ def refresh_row(store, tracker, repo, number, *, operators, now, stale_after):
     return found, None
 
 
+def is_orphan(claim, *, now, gone_s, present_agents, live_units) -> bool:
+    """Whether `claim` is provably dead under the section 4 rule. Pure.
+
+    Dead means the store names a managed holder (an id this loop
+    minted), the registry shows no live or stale entry for that id, no
+    live unit exists for the ticket, and the claim is older than twice
+    `gone_s`. `present_agents` is the ids with a live or stale registry
+    entry; `live_units` is the (repo, number) pairs with a live unit.
+    Anything less certain (a present agent, a live unit, a young claim)
+    is left for stuck handling, and a foreign holder is never an
+    orphan: the loop never touches a foreign claim.
+    """
+    if claim is None or not claim.agent:
+        return False
+    if not is_managed_agent(claim.agent):
+        return False
+    if claim.agent in present_agents:
+        return False
+    if (claim.repo, claim.number) in live_units:
+        return False
+    return now - claim.claimed_at > 2 * gone_s
+
+
+def release_orphans(store, *, now, gone_s, present_agents, live_units, out) -> int:
+    """Release every provably-dead claim, one logbook line each.
+
+    Returns the released count. Each claim's agent and epoch go
+    straight from the store row into `Store.release`, which releases
+    only on a matching agent plus epoch and raises `Claimed`
+    otherwise. A `Claimed` there means the row changed under the pass
+    (re-claimed elsewhere), so it is no longer an orphan: the row is
+    skipped with a logbook line, never retried in the same pass. A
+    successful release clears the holder and leaves the epoch for the
+    next claim to mint, which fences a stale holder still acting on the
+    old epoch; the worktree and branch stay untouched. Rows with no
+    claim are left alone: adoption happens only in resync, never here.
+    """
+    released = 0
+    for item in store.items():
+        claim = store.claim_of(item.repo, item.number)
+        if claim is None:
+            continue
+        if not is_orphan(
+            claim,
+            now=now,
+            gone_s=gone_s,
+            present_agents=present_agents,
+            live_units=live_units,
+        ):
+            continue
+        ref = f"{claim.repo}#{claim.number}"
+        try:
+            store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
+        except board.Claimed:
+            print(f"{ref}: orphan release raced a re-claim, left held", file=out)
+            continue
+        print(
+            f"{ref}: released dead claim by `{claim.agent}`, epoch {claim.epoch} kept",
+            file=out,
+        )
+        released += 1
+    return released
+
+
 def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, now, stale_after):
     """Claim each proceeding candidate, launch each claim.
 
@@ -1045,6 +1110,29 @@ def _worker_prompt(root, tgt, number, title):
     return render_prompt
 
 
+def production_orphan_inputs(registered, *, now):
+    """`(present_agents, live_units, gone_s)` from the registry and units.
+
+    `present_agents` is every agent id with a live or stale registry
+    entry; `live_units` is every (repo, number) with a live unit under
+    any registered prefix; `gone_s` is the registry setting of the same
+    name, the single resolver for it. Raises the settings error when
+    the registry settings are bad, and `units.Unreachable` when a unit
+    listing fails.
+    """
+    cfg = registry.config()
+    present = {
+        entry["id"]
+        for entry, state in registry.visible(now, cfg)
+        if state in (registry.LIVE, registry.STALE)
+    }
+    tickets = set()
+    for project in registered:
+        listed = units.list_units(project.unit_prefix, run=units.default_run)
+        tickets |= units.live_tickets(project.unit_prefix, listed)
+    return present, tickets, cfg["gone_s"]
+
+
 def production_launcher(registered):
     """The launch handoff over the existing launch path.
 
@@ -1101,16 +1189,23 @@ def _launching_pass(
     launcher,
     host,
     stale_after,
+    present_agents,
+    live_units,
+    gone_s,
 ) -> int:
-    """One claiming pass: sync, gate, claim, launch, mirror, print.
+    """One claiming pass: sync, release orphans, gate, claim, launch, mirror, print.
 
-    A tracker outage aborts the sync step only: prior rows and the old
-    cursor stand, and the pass continues on store data. A claim whose
-    stale row cannot be re-read live fails closed instead. The mirror
-    drains whatever the outbox holds, old backlog and new claims alike;
-    what it cannot push stays queued for the next healthy pass. A pass
-    that synced nothing at all exits 3; a pass that launched nothing
-    because the service manager was unreachable does too.
+    Orphan recovery runs on store, registry and unit state right after
+    the sync, so freed rows gate as unclaimed in the same pass. A unit
+    listing failure skips recovery only: the pass continues, since a
+    claim the pass cannot prove dead is left held. A tracker outage
+    aborts the sync step only: prior rows and the old cursor stand, and
+    the pass continues on store data. A claim whose stale row cannot be
+    re-read live fails closed instead. The mirror drains whatever the
+    outbox holds, old backlog and new claims alike; what it cannot push
+    stays queued for the next healthy pass. A pass that synced nothing
+    at all exits 3; a pass that launched nothing because the service
+    manager was unreachable does too.
     """
     try:
         seen, sync_errors = sync_all(store, tracker, operators=operators, now=now)
@@ -1149,6 +1244,42 @@ def _launching_pass(
         quota_for,
         pool,
     ) = ctx
+    skip_orphans = False
+    if gone_s is None:
+        try:
+            present_agents, live_units, gone_s = production_orphan_inputs(registered, now=now)
+        except settings.SettingsError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
+        except units.Unreachable as problem:
+            print(
+                f"corral drive: cannot read live units, orphan recovery skipped ({problem})",
+                file=err,
+            )
+            skip_orphans = True
+    else:
+        present_agents = frozenset(present_agents or ())
+        live_units = frozenset(live_units or ())
+    if not skip_orphans:
+        try:
+            release_orphans(
+                store,
+                now=now,
+                gone_s=gone_s,
+                present_agents=present_agents,
+                live_units=live_units,
+                out=out,
+            )
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"corral drive: orphan recovery skipped ({problem})", file=err)
+        try:
+            _items = store.items()
+        except board.StoreError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
+        except sqlite3.Error as problem:
+            print(f"corral drive: cannot read the store: {problem}", file=err)
+            return USAGE
     gated_rows, problems = _gate_all(
         _items,
         registered,
@@ -1232,20 +1363,27 @@ def run_pass(
     launcher=None,
     host=None,
     stale_after=None,
+    present_agents=None,
+    live_units=None,
+    gone_s=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
-    `--plan` holds no lock and writes nothing: no sync, claim, mirror
-    or launch, whatever seams are passed. The non-plan pass takes the
-    drive lock and claims through the store transaction, then launches
-    through `launcher` (the existing launch path in production; with
-    no launcher the pass stops after claiming and records that) and
-    drains the mirror backlog through `tracker`. `tracker` is the injected
-    tracker double; with none there is no sync, no freshness re-read
-    and no mirror. `operators` maps tracker repos to operator logins for
-    the sync and mirror steps; `host` names this host on its claims;
-    `stale_after` bounds the cached rows a claim may use without a live
-    re-read. `now` defaults to the wall clock; every other None means
+    `--plan` holds no lock and writes nothing: no sync, orphan release,
+    claim, mirror or launch, whatever seams are passed. The non-plan
+    pass takes the drive lock, releases provably-dead claims, and claims
+    through the store transaction, then launches through `launcher`
+    (the existing launch path in production; with no launcher the pass
+    stops after claiming and records that) and drains the mirror backlog
+    through `tracker`. `tracker` is the injected tracker double; with
+    none there is no sync, no freshness re-read and no mirror.
+    `operators` maps tracker repos to operator logins for the sync and
+    mirror steps; `host` names this host on its claims; `stale_after`
+    bounds the cached rows a claim may use without a live re-read.
+    `present_agents` (ids with a live or stale registry entry),
+    `live_units` ((repo, number) pairs with a live unit) and `gone_s`
+    feed orphan recovery; `gone_s=None` reads all three from the host
+    instead. `now` defaults to the wall clock; every other None means
     the host default, so tests inject plain data or fakes at those
     seams and production reads the host. Returns the exit code.
     """
@@ -1274,6 +1412,9 @@ def run_pass(
                 launcher=launcher,
                 host=host,
                 stale_after=stale_after,
+                present_agents=present_agents,
+                live_units=live_units,
+                gone_s=gone_s,
                 **args,
             )
     except LockHeld as held:

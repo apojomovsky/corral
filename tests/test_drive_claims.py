@@ -89,6 +89,9 @@ def drive_pass(
         "launcher": launcher,
         "host": "host-1",
         "stale_after": stale_after,
+        "present_agents": frozenset(),
+        "live_units": frozenset(),
+        "gone_s": 3600.0,
     }
     values.update(fields)
     return drive.run_pass(**values)
@@ -735,6 +738,110 @@ class MirrorBacklogTest(unittest.TestCase):
         self.assertEqual(launcher2.calls, [])
         self.assertEqual(store.queued_writes(), [])
         self.assertIn("already claimed", out2.getvalue())
+
+
+class BoardExtraRefreshTest(unittest.TestCase):
+    """Stale-gated claims re-read live board concepts before deciding.
+
+    The live tracker double stands in for the board adapter: both speak
+    the Tracker protocol, and a board reading carries its concepts in
+    ``extra``. A stale row re-reads live and proceeds with the fresh
+    concepts; an unreachable live check skips instead of deciding from
+    the stale row.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-boardextra-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def seed_stale(self, extra):
+        store = stored(self.db, [("app", 7, "open")])
+        store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                kind="issue",
+                title="Title 7",
+                body="Body",
+                state="open",
+                author="operator",
+                labels=[],
+                priority="low",
+                assignees=[],
+                url="https://example.com/app/7",
+                tracker_updated_at=1000.0,
+                extra=dict(extra),
+            ),
+            operators=["operator", "alice"],
+            now=1000.0,
+        )
+        store.set_cursor("app", sync.CURSOR_NAME, tracker.format_cursor(1950.0))
+        return store
+
+    def test_stale_claim_rereads_live_board_concepts_and_proceeds(self):
+        store = self.seed_stale({"pool": "dispatch"})
+        self.addCleanup(store.close)
+        fake = FakeTracker(
+            [
+                reading(
+                    repo="app",
+                    number=7,
+                    updated_at=1900.0,
+                    priority="low",
+                    extra={"priority": "urgent", "pool": "review"},
+                )
+            ]
+        )
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+            stale_after=300.0,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertIn(("item", "app", 7), fake.calls)
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.extra, {"priority": "urgent", "pool": "review"})
+
+    def test_stale_claim_with_board_extra_skips_when_live_reread_fails(self):
+        store = self.seed_stale({"priority": "urgent", "pool": "dispatch"})
+        self.addCleanup(store.close)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        fake.item_errors[("app", 7)] = "board unreachable"
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+            stale_after=300.0,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("tracker unreachable", out.getvalue())
+        self.assertIn("stale", out.getvalue())
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.agent, "")
+        self.assertEqual(row.extra, {"priority": "urgent", "pool": "dispatch"})
 
 
 if __name__ == "__main__":

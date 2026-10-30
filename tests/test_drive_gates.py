@@ -488,6 +488,9 @@ class PassWiringTest(unittest.TestCase):
             "ledger": {},
             "read_labels": lambda kind, repo, number: [],
             "hold_label": "hold",
+            "present_agents": frozenset(),
+            "live_units": frozenset(),
+            "gone_s": 3600.0,
         }
         values.update(fields)
         code = drive.run_pass(**values)
