@@ -21,6 +21,10 @@ settings.register("checks.test", str, "", "the test command the agent and takeof
 #: not a variable assignment (`test := x`, `test ::= x`).
 _MAKE_TEST_TARGET = re.compile(r"^test\s*:(?!:?\s*=)", re.MULTILINE)
 
+#: The test command proposed when no runner is detected but a `tests/`
+#: directory holds `test_*.py` files.
+PLAIN_UNITTEST_COMMAND = "python3 -m unittest discover -s tests -t ."
+
 
 def remote_slug(url):
     """`owner/name` from a git remote URL, else None.
@@ -73,15 +77,8 @@ def test_command(directory):
     if _MAKE_TEST_TARGET.search(makefile):
         return "make test"
     if os.path.isfile(os.path.join(directory, "pyproject.toml")):
-        tests = os.path.join(directory, "tests")
-        try:
-            names = os.listdir(tests)
-        except OSError:
-            names = []
-        for name in names:
-            full = os.path.join(tests, name)
-            if name.startswith("test_") and name.endswith(".py") and os.path.isfile(full):
-                return "uv run python -m unittest"
+        if _has_unittest_files(directory):
+            return "uv run python -m unittest"
         return "uv run pytest"
     try:
         with open(os.path.join(directory, "package.json"), encoding="utf-8") as handle:
@@ -96,6 +93,31 @@ def test_command(directory):
         return "cargo test"
     if os.path.isfile(os.path.join(directory, "go.mod")):
         return "go test ./..."
+    return None
+
+
+def _has_unittest_files(directory):
+    """True when `tests/` holds a `test_*.py` file."""
+    tests = os.path.join(directory, "tests")
+    try:
+        names = os.listdir(tests)
+    except OSError:
+        return False
+    for name in names:
+        full = os.path.join(tests, name)
+        if name.startswith("test_") and name.endswith(".py") and os.path.isfile(full):
+            return True
+    return False
+
+
+def suggested_test_command(directory):
+    """The command to propose when `test_command` finds nothing, else None.
+
+    A `tests/` directory holding `test_*.py` files proposes the plain
+    `unittest` discovery command.
+    """
+    if _has_unittest_files(directory):
+        return PLAIN_UNITTEST_COMMAND
     return None
 
 

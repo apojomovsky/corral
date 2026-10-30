@@ -174,6 +174,23 @@ class TestCommandCase(unittest.TestCase):
         self.write("go.mod", "")
         self.assertEqual(detect.test_command(self.dir), "go test ./...")
 
+    def test_plain_tests_dir_suggests_unittest_discover(self):
+        self.write("tests/test_app.py", "")
+        self.assertIsNone(detect.test_command(self.dir))
+        self.assertEqual(
+            detect.suggested_test_command(self.dir),
+            "python3 -m unittest discover -s tests -t .",
+        )
+
+    def test_empty_dir_suggests_nothing(self):
+        self.assertIsNone(detect.suggested_test_command(self.dir))
+
+    def test_tests_dir_without_test_files_suggests_nothing(self):
+        self.write("tests/helpers.py", "")
+        os.makedirs(os.path.join(self.dir, "tests", "data"), exist_ok=True)
+        self.assertIsNone(detect.test_command(self.dir))
+        self.assertIsNone(detect.suggested_test_command(self.dir))
+
 
 class ExistingCase(unittest.TestCase):
     def setUp(self):
@@ -620,6 +637,19 @@ class ErrorsCase(Fixture):
         code, _, err = self.run_cli(self.root)
         self.assertEqual(code, 4)
         self.assertIn("--test-cmd", err)
+
+    def test_plain_unittest_tree_names_the_usual_command(self):
+        self.write("tests/test_app.py", "")
+        code, _, err = self.run_cli(self.root)
+        self.assertEqual(code, 4)
+        self.assertIn("--test-cmd", err)
+        self.assertIn('--test-cmd "python3 -m unittest discover -s tests -t ."', err)
+
+    def test_missing_test_command_without_hint_stays_short(self):
+        code, _, err = self.run_cli(self.root)
+        self.assertEqual(code, 4)
+        self.assertIn("no test command detected: pass --test-cmd CMD", err)
+        self.assertNotIn("python3 -m unittest", err)
 
     def test_unknown_set_key_names_the_key(self):
         code, _, err = self.run_cli("--set", "nope.x=1", self.root)

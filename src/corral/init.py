@@ -190,6 +190,11 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
         branch = fallback
     command = test_cmd if test_cmd is not None else detect.test_command(root)
     if command is None:
+        hint = detect.suggested_test_command(root)
+        if hint is not None:
+            raise InitError(
+                f'no test command detected: pass --test-cmd CMD (for example --test-cmd "{hint}")'
+            )
         raise InitError("no test command detected: pass --test-cmd CMD")
     trio = {
         "clone.path": clone_path,
