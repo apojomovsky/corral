@@ -446,10 +446,18 @@ def _pacer() -> GraphqlPacer:
     return GraphqlPacer(os.path.join(state_dir(), "graphql-pacing.json"))
 
 
-def graphql(query: str, **variables) -> dict:
+def graphql(query: str, run=None, pacer=None, **variables) -> dict:
     """Run a GraphQL query and return its `data` payload, paced by the
     machine-wide bucket. A mutation costs GRAPHQL_MUTATION_COST, a
-    read GRAPHQL_CALL_COST; a rate-limit answer starts a shared cooldown."""
+    read GRAPHQL_CALL_COST; a rate-limit answer starts a shared cooldown.
+
+    `run` and `pacer` are injected for tests and default to the real
+    ones: `run(args, paced=True)` runs `gh`, and the pacer meters the
+    shared bucket. Only GraphQL variable names may follow them."""
+    active_pacer = _pacer() if pacer is None else pacer
+    # The parameter shadows the module's `run`: fall back to it by name,
+    # so tests patching the module attribute still steer the default.
+    active_run = globals()["run"] if run is None else run
     args = ["api", "graphql", "-f", f"query={query}"]
     for key, value in variables.items():
         # gh needs -F for typed (int, bool) values and -f for strings.
@@ -457,12 +465,12 @@ def graphql(query: str, **variables) -> dict:
         value_str = json.dumps(value) if isinstance(value, bool) else value
         args += [flag, f"{key}={value_str}"]
     cost = GRAPHQL_MUTATION_COST if re.search(r"\bmutation\b", query) else GRAPHQL_CALL_COST
-    _pacer().acquire(cost=cost)
+    active_pacer.acquire(cost=cost)
     try:
-        payload = json.loads(run(args, paced=True))
+        payload = json.loads(active_run(args, paced=True))
     except GhError as err:
         if is_rate_limited(str(err)):
-            _pacer().cooldown(retry_after_s(str(err)))
+            active_pacer.cooldown(retry_after_s(str(err)))
         raise
     if payload.get("errors"):
         errors = payload["errors"]
@@ -471,14 +479,18 @@ def graphql(query: str, **variables) -> dict:
         # when its message names a repo carrying a marker word.
         types = {entry.get("type") for entry in errors if isinstance(entry, dict)}
         if "RATE_LIMITED" in types or is_rate_limited(text):
-            _pacer().cooldown(retry_after_s(text))
+            active_pacer.cooldown(retry_after_s(text))
             raise GhError("unavailable", text)
         raise GhError("other", text)
     return payload["data"]
 
 
 def paced_run(
-    args: list[str], cost: float = REST_READ_COST, timeout: float | None = GH_TIMEOUT_S
+    args: list[str],
+    cost: float = REST_READ_COST,
+    timeout: float | None = GH_TIMEOUT_S,
+    run=None,
+    pacer=None,
 ) -> str:
     """Run a REST `gh` call through the shared bucket.
 
@@ -486,13 +498,20 @@ def paced_run(
     probes) all draw on the same per-account secondary budget the bucket
     meters. Pass REST_WRITE_COST for mutative calls. A rate-limit answer
     starts the shared cooldown, like `graphql` does.
+
+    `run` and `pacer` are injected for tests and default to the real
+    ones, the same way the REST adapter takes `run`.
     """
-    _pacer().acquire(cost=cost)
+    active_pacer = _pacer() if pacer is None else pacer
+    # The parameter shadows the module's `run`: fall back to it by name,
+    # so tests patching the module attribute still steer the default.
+    active_run = globals()["run"] if run is None else run
+    active_pacer.acquire(cost=cost)
     try:
-        return run(args, timeout=timeout, paced=True)
+        return active_run(args, timeout=timeout, paced=True)
     except GhError as err:
         if is_rate_limited(str(err)):
-            _pacer().cooldown(retry_after_s(str(err)))
+            active_pacer.cooldown(retry_after_s(str(err)))
         raise
 
 

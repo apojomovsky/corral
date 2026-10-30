@@ -20,6 +20,22 @@ settings.register(
     [],
     "tracker logins treated as operators (default: the repository owner only)",
 )
+settings.register(
+    "tracker.variant", str, "labels", "tracker source: labels or board (default: labels)"
+)
+settings.register("board.poll_pages", int, 5, "board poll page cap per pass (default: small)")
+settings.register(
+    "board.schema_max_age_s",
+    int,
+    3600,
+    "seconds before the board step refreshes the cached board schema",
+)
+settings.register(
+    "board.item_max_age_s",
+    int,
+    300,
+    "seconds before a freshness-gated read re-reads a board row live",
+)
 
 #: The cursor name this module keeps in the store's cursor table.
 CURSOR_NAME = "tracker"
@@ -35,7 +51,9 @@ class SyncResult(NamedTuple):
 def _reading(item: iface.TrackerItem) -> board.Item:
     """One tracker item as a store reading. The tracker's ``agent`` and
     ``status`` labels ride along so the upsert can settle queued writes;
-    the upsert never originates corral-owned values from them."""
+    the upsert never originates corral-owned values from them. The board
+    concepts ride along in ``extra``, copied on read so no two rows share
+    one dict; a missing or foreign value reads as carrying nothing."""
     return board.Item(
         repo=item.repo,
         number=item.number,
@@ -52,6 +70,7 @@ def _reading(item: iface.TrackerItem) -> board.Item:
         from_fork=item.from_fork,
         agent=item.agent,
         status=item.status,
+        extra=dict(item.extra) if isinstance(item.extra, dict) else {},
     )
 
 

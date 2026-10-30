@@ -107,6 +107,30 @@ class Private(NamedTuple):
     patterns: list[str]
 
 
+class BoardConfig(NamedTuple):
+    """The ``[board]`` table of one ``[[repo]]`` entry: how the board slice
+    finds the project board and maps its fields to concepts.
+
+    Corral code names concept keys only (the column attributes below); the
+    project's field and option names live in the project's own corral.toml.
+    ``priority_map`` keys are opaque board option ids, never resolved
+    against the registry; display names are comments only. Columns default
+    to ``""`` (unmapped); at least the board address (the owner plus the
+    number or the node id) is always present."""
+
+    project_owner: str
+    project_number: int | None
+    project_id: str | None
+    agent_field: str
+    status_field: str
+    status_column: str
+    priority_column: str
+    area_column: str
+    pool_column: str
+    blocked_by_column: str
+    priority_map: dict[str, str]
+
+
 @dataclass(frozen=True)
 class Value:
     value: object
@@ -126,6 +150,9 @@ class Resolved:
     #: config and ``[[repo]]`` entries cannot set it, and read as unknown
     #: settings there.
     private: Private = field(default_factory=lambda: Private(terms=[], patterns=[]))
+    #: The selected repo's ``[board]`` table, or None when the entry has
+    #: none. The board slice reads this; it never re-reads corral.toml.
+    board: BoardConfig | None = None
 
     def __getitem__(self, key):
         return self.values[key].value
@@ -209,6 +236,111 @@ def _check_private(raw, where):
     return Private(terms=checked["terms"], patterns=checked["patterns"])
 
 
+#: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
+#: the ``[models]`` and ``[private]`` precedent: strict keys, so a typo
+#: fails here instead of silently running label mode.
+_BOARD_KEYS = frozenset(
+    {
+        "project_owner",
+        "project_number",
+        "project_id",
+        "agent_field",
+        "status_field",
+        "status_column",
+        "priority_column",
+        "area_column",
+        "pool_column",
+        "blocked_by_column",
+        "priority_map",
+    }
+)
+
+#: Concept keys holding a board field or column name; all default to
+#: unmapped when the table omits them.
+_BOARD_COLUMNS = (
+    "agent_field",
+    "status_field",
+    "status_column",
+    "priority_column",
+    "area_column",
+    "pool_column",
+    "blocked_by_column",
+)
+
+
+def _split_board(raw, where):
+    """A ``[[repo]]`` entry's ``board`` value as ``(scalars, concepts)``.
+
+    Registered ``board.*`` settings (``board.hold_label`` today) keep their
+    scalar path; concept keys (``project_owner`` and friends) go to
+    ``_check_board``. Anything else is an unknown setting, as before."""
+    if raw is None:
+        return {}, {}
+    if not isinstance(raw, dict):
+        raise SettingsError(f"{where}: [board] must be a table")
+    if not raw:
+        raise SettingsError(f"{where}: [board] is an empty table")
+    scalars, concepts = {}, {}
+    for key, value in raw.items():
+        if f"board.{key}" in REGISTRY:
+            scalars[key] = value
+        elif key in _BOARD_KEYS:
+            concepts[key] = value
+        else:
+            raise SettingsError(f"{where}: unknown setting 'board.{key}'")
+    return scalars, concepts
+
+
+def _check_board(raw, where):
+    """One ``[[repo]]`` entry's ``[board]`` concept keys as a BoardConfig.
+
+    Shape errors are exit 4. The option ids in ``priority_map`` are opaque:
+    they are kept verbatim and never resolved against the registry."""
+    if raw is None:
+        return None
+    owner = raw.get("project_owner")
+    if not isinstance(owner, str) or not owner:
+        raise SettingsError(f"{where}: [board] project_owner must be a non-empty string")
+    number = raw.get("project_number")
+    if number is not None and (
+        isinstance(number, bool) or not isinstance(number, int) or number < 1
+    ):
+        raise SettingsError(f"{where}: [board] project_number must be a positive integer")
+    node = raw.get("project_id")
+    if node is not None and (not isinstance(node, str) or not node):
+        raise SettingsError(f"{where}: [board] project_id must be a non-empty string")
+    if (number is None) == (node is None):
+        raise SettingsError(f"{where}: [board] needs exactly one of project_number or project_id")
+    columns = {}
+    for key in _BOARD_COLUMNS:
+        if key not in raw:
+            columns[key] = ""
+            continue
+        value = raw[key]
+        if not isinstance(value, str) or not value:
+            raise SettingsError(f"{where}: [board] {key} must be a non-empty string")
+        columns[key] = value
+    mapping = raw.get("priority_map", {})
+    if not isinstance(mapping, dict):
+        raise SettingsError(f"{where}: [board] priority_map must be a table of option ids")
+    checked = {}
+    for option, rank in mapping.items():
+        if not isinstance(option, str) or not option:
+            raise SettingsError(f"{where}: [board] priority_map keys must be non-empty strings")
+        if not isinstance(rank, str) or not rank:
+            raise SettingsError(
+                f"{where}: [board] priority_map {option!r} must be a non-empty rank string"
+            )
+        checked[option] = rank
+    return BoardConfig(
+        project_owner=owner,
+        project_number=number,
+        project_id=node,
+        priority_map=checked,
+        **columns,
+    )
+
+
 _INT = re.compile(r"-?[0-9]+")
 
 
@@ -239,11 +371,13 @@ def _load(path):
 
 
 def _repo_entries(repos, project_name):
-    """``{name: {dotted key: checked value}}`` for each ``[[repo]]``
-    entry, in file order. The one validation of entry names and keys."""
+    """``({name: {dotted key: checked value}}, {name: BoardConfig | None})``
+    for each ``[[repo]]`` entry, in file order. The one validation of entry
+    names and keys, including every entry's ``[board]`` table."""
     if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
         raise SettingsError(f"{project_name}: [[repo]] must be an array of tables")
     entries: dict = {}
+    boards: dict = {}
     for index, raw in enumerate(repos, 1):
         entry = dict(raw)
         name = entry.pop("name", None)
@@ -252,8 +386,15 @@ def _repo_entries(repos, project_name):
         if name in entries:
             raise SettingsError(f"{project_name}: [[repo]] {name!r} appears twice")
         where = f"{project_name} [[repo]] {name}"
+        scalars, concepts = _split_board(entry.pop("board", None), where)
+        for key, value in scalars.items():
+            dotted = f"board.{key}"
+            if dotted in entry:
+                raise SettingsError(f"{where}: {dotted} is set twice")
+            entry[dotted] = value
+        boards[name] = _check_board(concepts or None, where)
         entries[name] = {k: _check(k, v, where) for k, v in _flatten(entry, where).items()}
-    return entries
+    return entries, boards
 
 
 def repo_names(root):
@@ -264,7 +405,8 @@ def repo_names(root):
         return []
     project_path = os.path.join(root, PROJECT_FILE)
     project = _load(project_path)
-    return list(_repo_entries(project.get("repo", []), project_path))
+    entries, _ = _repo_entries(project.get("repo", []), project_path)
+    return list(entries)
 
 
 def covering_repo(root, clone):
@@ -280,7 +422,7 @@ def covering_repo(root, clone):
     if not root:
         return None
     project_path = os.path.join(root, PROJECT_FILE)
-    entries = _repo_entries(_load(project_path).get("repo", []), project_path)
+    entries, _ = _repo_entries(_load(project_path).get("repo", []), project_path)
     want = os.path.realpath(clone)
     matched = []
     for name, values in entries.items():
@@ -350,7 +492,7 @@ def resolve(
     private = _check_private(project.pop("private", {}), project_name)
     for key, value in _flatten(project, project_name).items():
         result[key] = Value(_check(key, value, project_name), PROJECT)
-    entries = _repo_entries(repos, project_name)
+    entries, boards = _repo_entries(repos, project_name)
     if repo is not None:
         if repo not in entries:
             raise SettingsError(f"{project_name}: no [[repo]] named {repo!r}")
@@ -374,7 +516,8 @@ def resolve(
         current = result[key]
         if isinstance(current.value, int) and current.value > ceiling:
             result[key] = Value(ceiling, current.origin, clamped_from=current.value)
-    return Resolved(result, chains, private)
+    board = boards[repo] if repo is not None else None
+    return Resolved(result, chains, private, board)
 
 
 def load(root=None, repo=None, env=None, flags=None):

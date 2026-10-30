@@ -234,7 +234,10 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [board]
 # board.hold_label = "hold"  # label that holds a ticket for a human
+# board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
+# board.poll_pages = 5  # board poll page cap per pass (default: small)
 # board.ready = "ready"  # label that makes an issue eligible
+# board.schema_max_age_s = 3600  # seconds before the board step refreshes the cached board schema
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
@@ -271,6 +274,7 @@ TAIL = """# Defaults: uncomment to override.
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
 # tracker.repo = ""  # tracker repository as owner/name (default: the clone's origin)
+# tracker.variant = "labels"  # tracker source: labels or board (default: labels)
 """
 
 HEAD = """# corral.toml, written by `corral init`. Settings that differ
@@ -330,6 +334,9 @@ commits.conventional = false
 #
 # [board]
 # board.hold_label = "hold"  # label that holds a ticket for a human
+# board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
+# board.poll_pages = 5  # board poll page cap per pass (default: small)
+# board.schema_max_age_s = 3600  # seconds before the board step refreshes the cached board schema
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
@@ -365,6 +372,7 @@ commits.conventional = false
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
 # tracker.repo = ""  # tracker repository as owner/name (default: the clone's origin)
+# tracker.variant = "labels"  # tracker source: labels or board (default: labels)
 """
 
 
