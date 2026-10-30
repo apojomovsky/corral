@@ -46,10 +46,16 @@ CURSOR_NAME = "tracker"
 #: reader's success.
 BOARD_CURSOR_NAME = "board"
 
+#: The board page token name: the opaque paging cursor to resume a board
+#: poll stopped by the page cap. It lives in the same cursor table but is
+#: never compared with either timestamp cursor; it is stored when a poll
+#: is truncated and cleared when a poll completes.
+BOARD_PAGE_NAME = "board_page"
+
 
 class SyncResult(NamedTuple):
     items_seen: int  # store rows touched: applied readings, plus absent marks on resync
-    cursor: str | None  # the feed position after the run, None when untouched
+    cursor: str | None  # the position this step advanced (feed or board, per step)
     errors: tuple[str, ...]  # one line per failed tracker call; "" never appears
     conflicts: tuple[str, ...] = ()  # resync-only: "repo#N: store=A tracker=B" where corral wins
 
@@ -128,25 +134,35 @@ def sync_board_repo(
 
     The board cursor is its own clock: it is stored under
     ``BOARD_CURSOR_NAME``, never compared with the feed cursor, and never
-    moves backwards. A failed poll keeps the old cursor and reports the
-    error; an empty poll changes nothing. Field-level compare falls out of
-    the upsert: each reading merges per concept, so a reading that carries
-    no board concepts keeps the stored ones, and only the cleared encoding
-    (``None`` for a scalar, an empty list for a list) removes one. A
-    board-only edit still moves the row forward, because a board-sourced
-    reading carries the maximum of the issue and board times.
+    moves backwards. A poll stopped by ``max_pages`` stores its resume
+    token under ``BOARD_PAGE_NAME`` and the next pass resumes from it; a
+    poll that completes clears the token. A failed poll keeps the old
+    cursor and the old token and reports the error; an empty poll changes
+    nothing. Field-level compare falls out of the upsert: each reading
+    merges per concept, so a reading that carries no board concepts keeps
+    the stored ones, and only the cleared encoding (``None`` for a scalar,
+    an empty list for a list) removes one. A board-only edit still moves
+    the row forward, because a board-sourced reading carries the maximum
+    of the issue and board times.
     """
     old = store.get_cursor(repo, BOARD_CURSOR_NAME)
     try:
-        found, _ = reader.poll(schema, max_pages=max_pages)
+        before = iface.parse_cursor(old) if old is not None else None
+        found, resume = reader.poll(
+            schema, after=store.get_cursor(repo, BOARD_PAGE_NAME), max_pages=max_pages
+        )
     except iface.TrackerError as err:
         return SyncResult(0, old, (f"{repo}: {err}",))
     for item in found:
         store.upsert_item(_reading(item), operators=operators, now=now)
+    if resume is None:
+        store.clear_cursor(repo, BOARD_PAGE_NAME)
+    else:
+        store.set_cursor(repo, BOARD_PAGE_NAME, resume)
     if not found:
         return SyncResult(0, old, ())
     cursor = iface.format_cursor(max(item.updated_at for item in found))
-    if old is not None and iface.parse_cursor(old) > iface.parse_cursor(cursor):
+    if before is not None and before > iface.parse_cursor(cursor):
         cursor = old
     _store_cursor(store, repo, cursor, name=BOARD_CURSOR_NAME)
     return SyncResult(len(found), cursor, ())

@@ -25,18 +25,29 @@ def schema():
 
 
 class FakeBoardReader:
-    """A board poll double: scripted readings or one failure. Records calls."""
+    """A board poll double: scripted readings or one failure. Records calls.
 
-    def __init__(self, items=(), error=None):
+    Pages ``items`` in ``page_size`` chunks, honoring ``after`` (an opaque
+    offset token) and ``max_pages`` like the real reader: a call stopped
+    by the cap returns the token to resume from, a complete call returns
+    ``None``.
+    """
+
+    def __init__(self, items=(), error=None, page_size=100):
         self.items = list(items)
         self.error = error
+        self.page_size = page_size
         self.calls = []
 
     def poll(self, found_schema, *, after=None, max_pages=5):
         self.calls.append({"schema": found_schema, "after": after, "max_pages": max_pages})
         if self.error is not None:
             raise self.error
-        return list(self.items), None
+        start = int(after) if after is not None else 0
+        taken = self.items[start : start + max_pages * self.page_size]
+        if start + len(taken) < len(self.items):
+            return list(taken), str(start + len(taken))
+        return list(taken), None
 
 
 class BoardCase(unittest.TestCase):
@@ -77,6 +88,9 @@ class BoardCase(unittest.TestCase):
 
     def board_cursor(self):
         return self.store.get_cursor(REPO, sync.BOARD_CURSOR_NAME)
+
+    def page_token(self):
+        return self.store.get_cursor(REPO, sync.BOARD_PAGE_NAME)
 
     def feed_cursor(self):
         return self.store.get_cursor(REPO, sync.CURSOR_NAME)
@@ -147,6 +161,97 @@ class BoardPollTest(BoardCase):
         self.assertEqual(self.board_cursor(), tracker.format_cursor(T0 - 100))
         after = self.stored(1)
         self.assertEqual((after.title, after.extra), (before.title, before.extra))
+
+    def test_corrupt_board_cursor_returns_an_error_line(self):
+        self.seed(1, T0 - 100, {"pool": "a"})
+        before = self.stored(1)
+        self.store.set_cursor(REPO, sync.BOARD_CURSOR_NAME, "not-a-cursor")
+        result = self.poll(FakeBoardReader([reading(repo=REPO, number=1, updated_at=T0)]))
+        self.assertEqual(result.items_seen, 0)
+        self.assertEqual(result.cursor, "not-a-cursor")
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn(REPO, result.errors[0])
+        self.assertEqual(self.board_cursor(), "not-a-cursor")
+        self.assertEqual(self.feed_cursor(), None)
+        after = self.stored(1)
+        self.assertEqual((after.title, after.extra), (before.title, before.extra))
+
+    def test_truncated_poll_stores_the_page_token(self):
+        reader = FakeBoardReader(
+            [
+                reading(repo=REPO, number=1, updated_at=T0 - 50),
+                reading(repo=REPO, number=2, updated_at=T0 - 20),
+                reading(repo=REPO, number=3, updated_at=T0),
+            ],
+            page_size=2,
+        )
+        result = self.poll(reader, max_pages=1)
+        self.assertEqual(result.items_seen, 2)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(self.page_token(), "2")
+        self.assertEqual(reader.calls[0]["after"], None)
+        self.assertIsNone(self.stored(3))
+
+    def test_timestamp_cursor_never_moves_past_unapplied_items(self):
+        reader = FakeBoardReader(
+            [
+                reading(repo=REPO, number=1, updated_at=T0 - 50),
+                reading(repo=REPO, number=2, updated_at=T0 - 20),
+                reading(repo=REPO, number=3, updated_at=T0),
+            ],
+            page_size=2,
+        )
+        result = self.poll(reader, max_pages=1)
+        self.assertEqual(result.cursor, tracker.format_cursor(T0 - 20))
+        self.assertEqual(self.board_cursor(), tracker.format_cursor(T0 - 20))
+
+    def test_next_pass_resumes_from_the_stored_token(self):
+        reader = FakeBoardReader(
+            [
+                reading(repo=REPO, number=1, updated_at=T0 - 50),
+                reading(repo=REPO, number=2, updated_at=T0 - 20),
+                reading(repo=REPO, number=3, updated_at=T0),
+            ],
+            page_size=2,
+        )
+        self.poll(reader, max_pages=1)
+        result = self.poll(reader, max_pages=1)
+        self.assertEqual(reader.calls[1]["after"], "2")
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.cursor, tracker.format_cursor(T0))
+        self.assertEqual(self.page_token(), None)
+        self.assertEqual(self.board_cursor(), tracker.format_cursor(T0))
+
+    def test_complete_poll_clears_the_page_token(self):
+        reader = FakeBoardReader(
+            [
+                reading(repo=REPO, number=1, updated_at=T0 - 50),
+                reading(repo=REPO, number=2, updated_at=T0 - 20),
+                reading(repo=REPO, number=3, updated_at=T0),
+            ],
+            page_size=2,
+        )
+        self.store.set_cursor(REPO, sync.BOARD_PAGE_NAME, "2")
+        result = self.poll(reader, max_pages=1)
+        self.assertEqual(reader.calls[0]["after"], "2")
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(self.page_token(), None)
+
+    def test_failed_poll_keeps_the_page_token(self):
+        self.store.set_cursor(REPO, sync.BOARD_PAGE_NAME, "1")
+        result = self.poll(FakeBoardReader(error=tracker.TrackerError("board down")))
+        self.assertEqual(result.items_seen, 0)
+        self.assertEqual(len(result.errors), 1)
+        self.assertEqual(self.page_token(), "1")
+
+    def test_concept_free_reading_keeps_the_stored_extra(self):
+        self.seed(1, T0 - 100, {"priority": "high", "pool": "a"})
+        result = self.poll(
+            FakeBoardReader([reading(repo=REPO, number=1, updated_at=T0, extra=None)])
+        )
+        self.assertEqual(result.errors, ())
+        self.assertEqual(self.stored(1).extra, {"priority": "high", "pool": "a"})
 
     def test_board_cursor_never_moves_backwards(self):
         self.seed(1, T0, {"pool": "new"})
