@@ -50,13 +50,16 @@ the snapshot only summarizes:
 - `GET /v1/quota`: the `quota` section plus `now`.
 - `GET /v1/capacity`: the `capacity` section plus `now`.
 - `GET /v1/disks`: the `disk` section plus `now`.
-- `GET /v1/board?repo=&state=&label=`: board store rows oldest
-  first, each with its confidence (`confirmed`, `pending`, `dirty`),
-  `fetched_at`, claim holder (agent, host, epoch, claimed_at) when
-  held, and queued agent/status overlays. Reads through
-  `Store.items` and `Store.item` with an explicit `max_age` so a
-  decision-grade consumer can ask for freshness and see staleness in
-  the reply instead of guessing it.
+- `GET /v1/board?repo=&state=&label=&max_age=`: board store rows
+  oldest first, each with its confidence (`confirmed`, `pending`,
+  `dirty`), `fetched_at`, claim holder (agent, host, epoch,
+  claimed_at) when held, and queued agent/status overlays. Listing
+  goes through `Store.items` (which takes no `max_age` and reports no
+  freshness); freshness is computed in exactly one place in the serve
+  layer by calling `Store.item(repo, number, now=..., max_age=...)`
+  per listed row, so `item()` stays the single freshness resolver. A
+  decision-grade consumer asks for freshness with `max_age` and sees
+  staleness in the reply instead of guessing it.
 - `GET /v1/events?project=`: one project's unresolved coordinator
   events oldest first (`coordevents.unresolved`), each with id, kind,
   ref, evidence, state, first_seen. A `resolved_since` parameter
@@ -76,6 +79,14 @@ the snapshot only summarizes:
   counter.
 - `GET /v1/version`: `{api: 1, schema_version: 1}` for change
   detection (section 4).
+- `GET /v1/health`: `{ok, host, now, uptime_s, requests_total,
+  requests_304, degraded}` where `ok` is false exactly when
+  `degraded` (the section names whose last build errored) is
+  non-empty, and the counters reset on restart by design (section
+  6). The per-section `{"error"}` body inside a `200` response is the
+  authoritative degraded-state channel; `/v1/health` is only a
+  roll-up of those same errors for polling dashboards, never a second
+  verdict.
 
 What is NOT served in v1:
 
@@ -198,12 +209,15 @@ registry that does not exist yet.
 - Exit codes of the verb (a public interface, AGENTS.md): `0` on a
   clean shutdown after `SIGINT`/`SIGTERM`; `4` on a usage or
   configuration error (bad `--bind`/`--port`, a non-loopback bind
-  without `--allow-remote` and a token, an unreadable token file);
-  `3` when the state dir cannot be read at startup or the port cannot
-  be bound. A request that finds one section unreadable does not move
-  the exit code: the section reads `{"error": ...}` inside a `200`
-  document, the snapshot rule that one broken section never breaks
-  the rest.
+  without `--allow-remote` and a token, an unreadable token file, a
+  bind error other than a held port such as a bad address or
+  permission); `2` when the port cannot be bound because it is already
+  in use (`EADDRINUSE`: race lost or already running); `3` only when
+  the state dir cannot be read at startup (the `snapshot.py`
+  all-failed precedent). A request that finds one section unreadable
+  does not move the exit code: the section reads `{"error": ...}`
+  inside a `200` document, the snapshot rule that one broken section
+  never breaks the rest.
 
 ## 5. Multi-host: mergeable without redesign, aggregator not designed
 
@@ -248,7 +262,13 @@ peer design.
   maxima; the stream emits at most one event per store change per
   poll interval. Disk usage reuses `shutil.disk_usage` (no tree
   walk): the API reports filesystem free space, never the reclaim
-  plan's directory walk, which stays a CLI cost.
+  plan's directory walk, which stays a CLI cost. Concurrent
+  `/v1/stream` connections are bounded (`serve.max_streams`, default
+  20: dashboards are few and each stream holds a
+  `ThreadingHTTPServer` thread); past the bound the server sheds with
+  `503` plus a `Retry-After` header and holds no thread for the
+  refused connection. Polling covers every fact, so a shed stream
+  loses nothing.
 - Caching: the snapshot document is cached in memory with a short
   TTL (`serve.snapshot_ttl_s`, default 2 seconds); every request
   inside the window shares one build. A generation counter bumps on
@@ -299,13 +319,18 @@ takes injected views):
   origins, never `*`.
 - Stream: an SSE response parses as `text/event-stream`, carries ids,
   and resumes from `Last-Event-ID` with no gaps against a canned
-  journal; heartbeats arrive within the idle timeout.
+  journal; heartbeats arrive within the idle timeout; past
+  `serve.max_streams` concurrent streams the next connection gets
+  `503` plus `Retry-After` and no thread is held for it (asserted by
+  opening the bound plus one against a small test bound).
 - Import closure: a test walks `serve.py` imports and fails on `gh`,
   tracker, forge, or any subprocess seam, so a later slice cannot
   smuggle a live call into a read.
-- Exit codes: startup failures (bad flags, bad token perms,
-  unreadable state dir, bound port via a held loopback socket) map to
-  4, 4, 3, 3 through the same validator the verb calls. UNVERIFIED
+- Exit codes: startup failures map through the same validator the
+  verb calls: bad flags to 4, bad token perms to 4, unreadable state
+  dir to 3, a held loopback port (`EADDRINUSE` via a held loopback
+  socket) to 2, and other bind errors (bad address, permission) to 4.
+  UNVERIFIED
   until run: behavior under a real browser `EventSource` client and
   under concurrent dashboard polls; both are safe to learn with
   loopback tools and need no model, network, or account.
@@ -324,7 +349,8 @@ matters: each ticket builds on the previous one's tests.
   green.
 - S2: settings, bind rules, and the verb. Register `serve.bind`
   (default `127.0.0.1`), `serve.port` (default `0`), `serve origins`
-  (default empty), `serve.snapshot_ttl_s`, `serve.tail_max`; add
+  (default empty), `serve.snapshot_ttl_s`, `serve.tail_max`,
+  `serve.max_streams`; add
   `paths.api_token_path`; wire `corral serve [--bind] [--port]
   [--allow-remote] [--allow-origin] [--new-token]` through the CLI
   with the section 3 refusal order and the section 4 exit codes.
@@ -338,7 +364,8 @@ matters: each ticket builds on the previous one's tests.
 - S4: events, journal, and the stream. Add `/v1/events`,
   `/v1/journal` (live plus archives, opaque cursors), and `/v1/stream`
   with ids, resume, and heartbeats. Acceptance: the pagination,
-  continuity, and SSE tests pass; polling alone still covers every
+  continuity, SSE, and stream-shedding (`503` plus `Retry-After` past
+  `serve.max_streams`) tests pass; polling alone still covers every
   fact; `make check` green.
 - S5: caching and health. Add the snapshot TTL cache, the generation
   counter with `ETag`/`304`, and the in-memory request counters in
