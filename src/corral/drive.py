@@ -1238,15 +1238,17 @@ def classify_stuck(*, known, age, unit_live, stale_s, gone_s):
     return "watch"
 
 
-def give_up_body(repo, number, agent, *, observed, restarts):
+def give_up_body(repo, number, *, observed, restarts):
     """The decision-protocol comment for a ticket past the restart budget.
 
     Pure. The body carries the tail of what the pass observed, so the
-    human taking over sees why the loop walked away.
+    human taking over sees why the loop walked away. It never names the
+    agent id: the id carries the host name and this body is posted to
+    the tracker, so it stays out of every give-up comment.
     """
     ref = f"{repo}#{number}"
     return (
-        f"corral drive gave up on {ref} (agent `{agent}`): {observed}. "
+        f"corral drive gave up on {ref}: {observed}. "
         f"It used {restarts} stop-plus-launch restarts in the last 24h "
         f"(budget {RESTART_BUDGET}). A human should take it from here; "
         "the loop released its claim."
@@ -1317,9 +1319,11 @@ def handle_stuck(
     stop or launch, so the orphan rule defers to stuck handling and a
     failing ticket can no longer escape into a fresh agent id. The
     budget stamp is written before the stop-plus-launch and rolled back
-    when the stop or launch fails, so only a completed stop-plus-launch
-    consumes the budget; a stamp the pass cannot persist aborts the
-    restart and keeps the claim. While the budget allows it the row
+    when the stop or launch fails, so a failed stop or launch leaves
+    the budget alone; a crash between the write and the stop can still
+    leave a stamp for a restart that never launched. A stamp the pass
+    cannot persist aborts the restart and keeps the claim. While the
+    budget allows it the row
     restarts (stop through the stop seam, launch again on the same
     claim and epoch reusing the identical agent id); past the budget
     the loop posts through the decision-write seam, then releases. A
@@ -1387,7 +1391,18 @@ def handle_stuck(
             print(f"{ref}: restart claim refused ({problem}), left held", file=out)
             continue
         had = key in budgets
-        budgets[key] = record_restart(stamps, now=now)
+        stamped = record_restart(stamps, now=now)
+        prior_text = None
+        prior_exists = False
+        if restarts_path is not None:
+            try:
+                with open(restarts_path, encoding="utf-8") as handle:
+                    prior_text = handle.read()
+                prior_exists = True
+            except (OSError, UnicodeError):
+                prior_text = None
+                prior_exists = False
+        budgets[key] = stamped
         if restarts_path is not None:
             try:
                 save_restarts(restarts_path, budgets)
@@ -1405,11 +1420,22 @@ def handle_stuck(
                 budgets[key] = stamps
             else:
                 budgets.pop(key, None)
-            if restarts_path is not None:
-                try:
-                    save_restarts(restarts_path, budgets)
-                except OSError as problem:
-                    print(f"corral drive: cannot save the restart budget: {problem}", file=err)
+            if restarts_path is None:
+                return
+            try:
+                save_restarts(restarts_path, budgets)
+                return
+            except OSError as problem:
+                print(f"corral drive: cannot save the restart budget: {problem}", file=err)
+            try:
+                if prior_exists and prior_text is not None:
+                    paths.atomic_write_text(restarts_path, prior_text)
+                else:
+                    os.remove(restarts_path)
+            except OSError as problem:
+                print(f"corral drive: cannot restore the restart budget: {problem}", file=err)
+                print(f"{ref}: restart budget rollback failed, the stamp stands", file=out)
+                budgets[key] = stamped
 
         try:
             stop_unit(claim.repo, claim.number)
@@ -1458,9 +1484,7 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         tracker.comment(
             claim.repo,
             claim.number,
-            give_up_body(
-                claim.repo, claim.number, claim.agent, observed=observed, restarts=restarts
-            ),
+            give_up_body(claim.repo, claim.number, observed=observed, restarts=restarts),
         )
     except iface.TrackerError as problem:
         print(f"{ref}: give-up write failed ({problem}), claim kept", file=out)

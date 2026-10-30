@@ -156,14 +156,21 @@ class BudgetTest(unittest.TestCase):
 
 
 class GiveUpBodyTest(unittest.TestCase):
-    def test_the_body_names_the_ticket_agent_and_what_was_seen(self):
+    def test_the_body_names_the_ticket_and_what_was_seen(self):
         body = drive.give_up_body(
-            "app", 7, AGENT, observed="no registry entry and no live unit", restarts=3
+            "app", 7, observed="no registry entry and no live unit", restarts=3
         )
         self.assertIn("app#7", body)
-        self.assertIn(AGENT, body)
         self.assertIn("no registry entry and no live unit", body)
         self.assertIn("3", body)
+
+    def test_the_body_carries_no_agent_id_or_hostname(self):
+        body = drive.give_up_body(
+            "app", 7, observed="no registry entry and no live unit", restarts=3
+        )
+        self.assertNotIn(AGENT, body)
+        self.assertNotIn(HOST, body)
+        self.assertNotIn("drive-", body)
 
 
 class ReleaseFinishedTest(unittest.TestCase):
@@ -1008,6 +1015,100 @@ class BudgetSaveTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("claim kept", out.getvalue())
         self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_a_failed_rollback_save_restores_the_prior_file(self):
+        from unittest import mock
+
+        from corral import units
+
+        prior = {"other#9": [NOW - 500.0]}
+        drive.save_restarts(self.budget, prior)
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stop = FakeStop()
+        stop.errors[("app", 7)] = units.UnitsError("no bus")
+        real_save = drive.save_restarts
+        calls = []
+
+        def flaky_save(path, budgets):
+            calls.append(dict(budgets))
+            if len(calls) == 1:
+                return real_save(path, budgets)
+            raise OSError("disk gone")
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(drive, "save_restarts", side_effect=flaky_save):
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                agent_states={},
+                stop_unit=stop,
+                restarter=FakeLauncher(),
+                restarts_path=self.budget,
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("claim kept", out.getvalue())
+        self.assertIn("restart budget", err.getvalue())
+        self.assertEqual(drive.load_restarts(self.budget), prior)
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
+
+    def test_a_failed_rollback_restore_fails_the_restart_closed(self):
+        from unittest import mock
+
+        from corral import units
+
+        prior = {"other#9": [NOW - 500.0]}
+        drive.save_restarts(self.budget, prior)
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stop = FakeStop()
+        stop.errors[("app", 7)] = units.UnitsError("no bus")
+        real_save = drive.save_restarts
+        save_calls = []
+
+        def flaky_save(path, budgets):
+            save_calls.append(dict(budgets))
+            if len(save_calls) == 1:
+                return real_save(path, budgets)
+            raise OSError("disk gone")
+
+        real_atomic = drive.paths.atomic_write_text
+        atomic_calls = []
+
+        def flaky_atomic(target, text):
+            atomic_calls.append(target)
+            if len(atomic_calls) == 1:
+                return real_atomic(target, text)
+            raise OSError("disk gone")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive, "save_restarts", side_effect=flaky_save),
+            mock.patch.object(drive.paths, "atomic_write_text", side_effect=flaky_atomic),
+        ):
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                agent_states={},
+                stop_unit=stop,
+                restarter=FakeLauncher(),
+                restarts_path=self.budget,
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("claim kept", out.getvalue())
+        self.assertIn("cannot restore the restart budget", err.getvalue())
+        kept = drive.load_restarts(self.budget)
+        self.assertEqual(kept["other#9"], prior["other#9"])
+        self.assertEqual(len(kept["app#7"]), 1)
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
 
 
 class GiveUpOrderTest(unittest.TestCase):
