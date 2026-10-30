@@ -523,15 +523,20 @@ def _recorded_role(session):
 
     Sessions launched from a prompt file record no role, and neither do
     sessions from before roles were recorded; both read as None, the
-    worker behaviour. An unreadable or unknown value reads as None too,
-    so a damaged record resumes writable rather than refusing.
+    worker behaviour. A role file that exists but cannot be read or
+    holds an unknown role raises LaunchError: failing open to writable
+    would silently resume a reviewer with write access.
     """
     try:
         with open(os.path.join(session, ROLE_FILE), encoding="utf-8") as handle:
-            role = handle.read().strip() or None
-    except OSError:
+            role = handle.read().strip()
+    except FileNotFoundError:
         return None
-    return role if role in prompts.ROLES else None
+    except OSError as err:
+        raise LaunchError(f"cannot read the agent's role: {err}") from None
+    if role not in prompts.ROLES:
+        raise LaunchError(f"unknown role {role!r}: expected one of {', '.join(prompts.ROLES)}")
+    return role
 
 
 def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None, role=None):
@@ -551,9 +556,12 @@ def _write_session(session, adapter, runtime, prompt, runtime_config, chains=Non
         else:
             # A relaunch without a role must not inherit the previous
             # generation's: a stale reviewer record would resume read-only.
+            # Only a missing file is fine; any other removal failure
+            # reaches the LaunchError below instead of leaving the
+            # stale record behind silently.
             try:
                 os.remove(os.path.join(session, ROLE_FILE))
-            except OSError:
+            except FileNotFoundError:
                 pass
         config = runtime_config or {}
         if chains:
@@ -616,6 +624,10 @@ def resume(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
+        # A concurrent launch of this ticket may have replaced the
+        # session between the pre-lock read and this lock: re-read the
+        # role here, so the mode started is the mode recorded.
+        role = _recorded_role(session)
         if adapter.name == muse.NAME:
             try:
                 muse.write_message(session, message)

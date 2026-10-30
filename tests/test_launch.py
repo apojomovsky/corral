@@ -709,6 +709,103 @@ class ReviewerWiringTest(OpsCase):
         (found,) = [e for e in registry.load_all() if e["id"] == "corral-agent-lib-5"]
         self.assertEqual(found["role"], "reviewer")
 
+    def test_resume_with_an_unknown_recorded_role_is_refused(self):
+        _, unit = self.start("worker")
+        self.system.finish(unit)
+        with open(os.path.join(self.session("lib", 5), "role"), "w", encoding="utf-8") as handle:
+            handle.write("auditor\n")
+        before = len(self.system.started)
+        with self.assertRaisesRegex(launch.LaunchError, "unknown role"):
+            launch.resume(
+                self.target("lib"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
+            )
+        self.assertEqual(len(self.system.started), before)
+
+    def test_resume_with_an_unreadable_role_record_is_refused(self):
+        _, unit = self.start(None)
+        self.system.finish(unit)
+        os.mkdir(os.path.join(self.session("lib", 5), "role"))
+        before = len(self.system.started)
+        with self.assertRaisesRegex(launch.LaunchError, "cannot read the agent's role"):
+            launch.resume(
+                self.target("lib"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
+            )
+        self.assertEqual(len(self.system.started), before)
+
+    def test_a_relaunch_without_a_role_clears_a_reviewer_record(self):
+        _, unit = self.start("reviewer")
+        self.system.finish(unit)
+        _, relaunched = self.start(None)
+        self.assertFalse(os.path.exists(os.path.join(self.session("lib", 5), "role")))
+        (found,) = [e for e in registry.load_all() if e["id"] == relaunched]
+        self.assertIsNone(found["role"])
+
+    def test_a_relaunch_that_cannot_clear_the_role_record_is_refused(self):
+        _, unit = self.start("reviewer")
+        self.system.finish(unit)
+        role_path = os.path.join(self.session("lib", 5), "role")
+        os.remove(role_path)
+        os.mkdir(role_path)
+        before = len(self.system.started)
+        with self.assertRaisesRegex(launch.LaunchError, "cannot write the agent's session"):
+            self.start(None)
+        self.assertEqual(len(self.system.started), before)
+
+    def test_resume_uses_the_role_reread_under_the_spawn_lock(self):
+        class ResumableAdapter(FakeAdapter):
+            def resume_handle(self, session_dir):
+                return "handle-1"
+
+        fake = ResumableAdapter()
+        real_recorded_role = launch._recorded_role
+        reads = []
+
+        def flipping(session):
+            role = real_recorded_role(session)
+            reads.append(role)
+            if len(reads) == 1:
+                paths.atomic_write_text(os.path.join(session, launch.ROLE_FILE), "reviewer\n")
+            return role
+
+        with mock.patch.object(runtimes, "get", return_value=fake):
+            unit, _ = launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                role="worker",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+            )
+            self.system.finish(unit)
+            with mock.patch.object(launch, "_recorded_role", side_effect=flipping):
+                resumed, _ = launch.resume(
+                    self.target("lib"),
+                    5,
+                    "keep going",
+                    hold_reason_fn=_free_hold,
+                    list_fn=self.system.list_fn,
+                    usage=roomy,
+                    run=self.system.run,
+                )
+        self.assertEqual(reads, ["worker", "reviewer"])
+        self.assertTrue(fake.calls[-1]["reviewer"])
+        (found,) = [e for e in registry.load_all() if e["id"] == resumed]
+        self.assertEqual(found["role"], "reviewer")
+
 
 class MuseReviewerLaunchTest(OpsCase):
     """A reviewer muse launch carries `--disable-write`; a worker's does not."""
