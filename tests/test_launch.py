@@ -16,6 +16,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+import uuid
 from unittest import mock
 
 from contextlib import redirect_stdout
@@ -471,6 +472,117 @@ class LaunchTest(OpsCase):
             ["corral-agent-lib-5"],
         )
         self.assertEqual(self.system.units["corral-agent-my-repo-5"], "active")
+
+
+class MuseSessionTest(OpsCase):
+    """A muse launch records one uuid; the resume reuses it. Fakes only."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(muse, "binary", return_value="/fake/muse"))
+
+    def test_launch_then_resume_uses_one_uuid(self):
+        unit, _ = launch.launch(
+            self.target("lib", "muse"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        session = self.session("lib", 5)
+        with open(os.path.join(session, "muse_session_id"), encoding="utf-8") as h:
+            recorded = h.read().strip()
+        self.assertEqual(str(uuid.UUID(recorded, version=4)), recorded)
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--session-id") + 1], recorded)
+
+        self.system.finish(unit)
+        with open(os.path.join(session, "out.log"), "w", encoding="utf-8") as h:
+            h.write("{}\n")
+        resumed, _ = launch.resume(
+            self.target("lib"),
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
+        )
+        self.assertEqual(resumed, "corral-agent-lib-5-r1")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--session-id") + 1], recorded)
+        self.assertEqual(argv[argv.index("--prompt-file") + 1], os.path.join(session, "message.md"))
+        with open(os.path.join(session, "message.md"), encoding="utf-8") as h:
+            self.assertEqual(h.read(), "keep going")
+
+    def test_resume_without_a_recorded_id_is_refused(self):
+        unit, _ = launch.launch(
+            self.target("lib", "muse"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.system.finish(unit)
+        os.remove(os.path.join(self.session("lib", 5), "muse_session_id"))
+        with self.assertRaisesRegex(launch.LaunchError, "no muse session to resume"):
+            launch.resume(
+                self.target("lib"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
+            )
+        self.assertEqual(len(self.system.started), 1)
+
+    def test_a_failed_start_removes_only_the_recorded_session_id(self):
+        self.system.fail = "Failed to connect to bus: no medium found"
+        with self.assertRaises(units.Unreachable) as ctx:
+            launch.launch(
+                self.target("lib", "muse"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+            )
+        self.assertEqual(ctx.exception.exit_code, 3)
+        session = self.session("lib", 5)
+        self.assertFalse(os.path.exists(os.path.join(session, "muse_session_id")))
+        self.assertTrue(os.path.exists(os.path.join(session, "prompt.md")))
+        self.assertTrue(os.path.exists(os.path.join(session, "muse.json")))
+        self.assertEqual(runtimes.recorded(session), "muse")
+        with self.assertRaisesRegex(launch.LaunchError, "no muse session to resume"):
+            launch.resume(
+                self.target("lib"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                run=self.system.run,
+            )
+
+    def test_tail_without_an_out_log_is_refused(self):
+        launch.launch(
+            self.target("lib", "muse"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        with self.assertRaises(launch.LaunchError):
+            launch.tail(self.target("lib"), 5, out=io.StringIO())
 
 
 class ResumeTailTest(OpsCase):
