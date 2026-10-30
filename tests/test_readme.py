@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 from corral import cli
+from corral import runtimes
 
 SPAN_RE = re.compile(r"`([^`]*)`")
 COMMAND_RE = re.compile(r"\bcorral ([a-z][a-z0-9-]*)")
@@ -44,6 +45,15 @@ def table_tokens(section):
         for span in SPAN_RE.findall(cells[1]):
             found.update(COMMAND_RE.findall(span))
     return found
+
+
+class RegisteredRuntimes(unittest.TestCase):
+    def test_readme_names_every_registered_runtime(self):
+        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        missing = [
+            name for name in runtimes.NAMES if not re.search(rf"\b{re.escape(name)}\b", text)
+        ]
+        self.assertEqual(missing, [])
 
 
 class Table(unittest.TestCase):

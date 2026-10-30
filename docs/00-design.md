@@ -20,7 +20,7 @@ The test: **if a second project would need it unchanged, it belongs in corral.**
 
 ### corral owns
 
-1. **Runtimes.** One adapter per headless agent runtime (omp, opencode). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors.
+1. **Runtimes.** One adapter per headless agent runtime (omp, opencode, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors.
 2. **Units.** Transient `systemd --user` units: spawn lock, liveness, stop, naming. The unit prefix is set per project.
 3. **Sessions.** One session root per host, one directory per `<project>/<ticket>`.
 4. **Accounts and models.** One accounts file per host lists providers, accounts and their quota readers. Each project declares its own models (roles, fallback chains, sub-agent overrides), naming only providers from that pool. The user's home runtime config is never edited.
