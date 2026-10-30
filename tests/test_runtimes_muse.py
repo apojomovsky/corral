@@ -202,6 +202,24 @@ class BadConfig(SessionCase):
         with self.assertRaisesRegex(ValueError, "muse.json"):
             muse.RUNTIME.argv(self.sdir, PROMPT)
 
+    def test_a_present_but_unusable_model_raises_like_a_corrupt_file(self):
+        for bad in (123, True, ["muse/spark-1"], {"id": "muse/spark-1"}):
+            with self.subTest(bad=bad):
+                with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+                    json.dump({"model": bad}, handle)
+                with self.assertRaisesRegex(ValueError, "muse.json"):
+                    muse.RUNTIME.argv(self.sdir, PROMPT)
+
+    def test_a_null_model_is_present_and_raises(self):
+        with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+            handle.write('{"model": null}')
+        with self.assertRaisesRegex(ValueError, "muse.json"):
+            muse.RUNTIME.argv(self.sdir, PROMPT)
+
+    def test_an_empty_string_model_means_no_model_flag(self):
+        self.write_config_model("")
+        self.assertNotIn("--model", muse.RUNTIME.argv(self.sdir, PROMPT))
+
     def test_a_non_object_config_raises_a_clear_error(self):
         with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
             handle.write('["muse/spark-1"]')
@@ -242,6 +260,106 @@ class ActivityFile(SessionCase):
             muse.RUNTIME.activity_file(self.sdir)
 
 
+class WriteConfig(SessionCase):
+    def test_write_config_round_trips_through_the_session_file(self):
+        config = {"model": "muse/spark-1", "tab.width": 4}
+        muse.RUNTIME.write_config(self.sdir, config)
+        with open(os.path.join(self.sdir, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), config)
+
+    def test_write_config_keeps_every_key(self):
+        config = {"model": "muse/spark-1", "flag": True, "token": "${SECRET}"}
+        muse.RUNTIME.write_config(self.sdir, config)
+        with open(os.path.join(self.sdir, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), config)
+
+
+class WithModels(SessionCase):
+    def test_with_models_sets_the_default_head_and_keeps_other_keys(self):
+        self.assertEqual(
+            muse.RUNTIME.with_models({"tab.width": 4}, {"default": ["muse/spark-1", "muse/other"]}),
+            {"tab.width": 4, "model": "muse/spark-1"},
+        )
+
+    def test_with_models_replaces_a_stale_model(self):
+        self.assertEqual(
+            muse.RUNTIME.with_models(
+                {"model": "muse/old"},
+                {"default": ["muse/spark-1"]},
+            ),
+            {"model": "muse/spark-1"},
+        )
+
+
+class Env(SessionCase):
+    def test_env_points_at_no_home_config(self):
+        env = muse.RUNTIME.env(self.sdir)
+        self.assertEqual(env, {})
+        for value in env.values():
+            self.assertNotIn(".config/muse", value)
+            self.assertNotIn(".local/share/muse", value)
+
+
+class DashC(SessionCase):
+    def write_config(self, config):
+        with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+
+    def test_other_entries_become_dash_c_pairs_after_the_model(self):
+        self.write_config({"model": "muse/spark-1", "tab.width": 4, "flag": True, "name": "x"})
+        self.assertEqual(
+            muse.RUNTIME.argv(self.sdir, PROMPT),
+            [
+                "/fake/muse",
+                "exec",
+                "--json",
+                "--prompt-file",
+                os.path.join(self.sdir, "prompt.md"),
+                "--model",
+                "spark-1",
+                "-c",
+                "flag=true",
+                "-c",
+                'name="x"',
+                "-c",
+                "tab.width=4",
+                "--contributor-mode",
+                "on",
+                "--session-id",
+                SESSION_ID,
+                "--yolo",
+                "--no-foreign-personal-context",
+                "--disable-request-user-input",
+                "--reasoning-effort",
+                "high",
+                "--parallel-tool-calls",
+            ],
+        )
+
+    def test_a_whole_value_env_reference_passes_through_unquoted(self):
+        self.write_config({"token": "${SECRET}"})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT)
+        self.assertIn("-c", argv)
+        self.assertEqual(argv[argv.index("-c") + 1], "token=${SECRET}")
+
+    def test_a_partial_env_reference_stays_json(self):
+        self.write_config({"name": "x-${SECRET}"})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT)
+        self.assertEqual(argv[argv.index("-c") + 1], 'name="x-${SECRET}"')
+
+    def test_a_resume_keeps_dash_c_but_takes_no_model_from_the_config(self):
+        self.write_config({"model": "muse/spark-1", "tab.width": 4})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, resume=EXISTING_ID)
+        self.assertNotIn("--model", argv)
+        self.assertIn("-c", argv)
+        self.assertEqual(argv[argv.index("-c") + 1], "tab.width=4")
+
+    def test_an_unknown_key_takes_the_shape_muse_refuses(self):
+        self.write_config({"bogus.key": 1})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT)
+        self.assertEqual(argv[argv.index("-c") + 1], "bogus.key=1")
+
+
 class HomeProof(SessionCase):
     def test_no_argv_entry_points_at_the_home_config_or_state(self):
         self.write_config_model("muse/spark-1")
@@ -254,6 +372,33 @@ class HomeProof(SessionCase):
             for entry in argv:
                 self.assertNotIn(".config/muse", entry)
                 self.assertNotIn(".local/share/muse", entry)
+
+    def test_the_full_flag_allowlist_is_pinned(self):
+        with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+            json.dump({"model": "muse/spark-1", "tab.width": 4, "token": "${S}"}, handle)
+        argvs = [
+            muse.RUNTIME.argv(self.sdir, PROMPT),
+            muse.RUNTIME.argv(self.sdir, PROMPT, reviewer=True),
+            muse.RUNTIME.argv(self.sdir, PROMPT, resume=EXISTING_ID, model="muse/other"),
+        ]
+        seen = {token for argv in argvs for token in argv if token.startswith("-")}
+        self.assertEqual(
+            seen,
+            {
+                "--json",
+                "--prompt-file",
+                "--model",
+                "--contributor-mode",
+                "--session-id",
+                "--yolo",
+                "--no-foreign-personal-context",
+                "--disable-request-user-input",
+                "--reasoning-effort",
+                "--parallel-tool-calls",
+                "--disable-write",
+                "-c",
+            },
+        )
 
 
 class BinaryResolution(unittest.TestCase):
