@@ -227,6 +227,17 @@ class ChainProvider(unittest.TestCase):
         self.assertEqual(quota.chain_provider("provider-a/model-x"), "provider-a")
 
 
+class BareId(unittest.TestCase):
+    def test_the_bare_id_is_the_part_after_the_first_slash(self):
+        self.assertEqual(models.bare_id("muse/spark-1"), "spark-1")
+
+    def test_a_bare_id_with_no_slash_passes_through(self):
+        self.assertEqual(models.bare_id("spark-1"), "spark-1")
+
+    def test_only_the_first_slash_strips(self):
+        self.assertEqual(models.bare_id("muse/a/b"), "a/b")
+
+
 def pool(*names):
     return [accounts.Provider(name=name, reader="fake:Reader") for name in names]
 
