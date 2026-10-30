@@ -5,11 +5,13 @@ and the remote read (`ls_remote`) and the check commands (`run_cmd`)
 are injected fakes. No `gh`, no network, no real state dirs.
 """
 
+import errno
 import io
 import json
 import os
 import subprocess
 import shutil
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -26,6 +28,43 @@ MAIN = "main"
 
 def _proc(cmd, code, out):
     return subprocess.CompletedProcess(args=cmd, returncode=code, stdout=out, stderr="")
+
+
+class _FakeClock:
+    """A monotonic clock a fake sleep advances: lock waits take no time."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _ContendedFlock:
+    """A `_flock` fake refusing the first `times` acquires, None for always.
+
+    Contention reads as EWOULDBLOCK, the way a held flock answers a
+    non-blocking try.
+    """
+
+    def __init__(self, times: int | None):
+        self.times = times
+        self.calls: list[int] = []
+
+    def __call__(self, fd: int, flags: int) -> None:
+        self.calls.append(flags)
+        if self.times is None or len(self.calls) <= self.times:
+            raise OSError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
+
+
+def _contended(times: int | None) -> _ContendedFlock:
+    """A `_ContendedFlock` refusing the first `times` acquires, None for always."""
+    return _ContendedFlock(times)
 
 
 class TakeoffCase(unittest.TestCase):
@@ -160,6 +199,16 @@ class TakeoffCase(unittest.TestCase):
             if check.name == name:
                 return check.status
         self.fail(f"no check named {name!r}")
+
+    def patch_lock_seams(self, flock, clock):
+        for name, value in (
+            ("_flock", flock),
+            ("_monotonic", clock.monotonic),
+            ("_sleep", clock.sleep),
+        ):
+            patcher = mock.patch.object(takeoff, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_all_ok(self):
         result = self.gate()
@@ -668,6 +717,100 @@ class TakeoffCase(unittest.TestCase):
                 with self.assertRaises(takeoff.TakeoffError):
                     self.gate()
 
+    def test_suite_lock_path_is_under_the_state_dir(self):
+        self.assertEqual(
+            takeoff.suite_lock_path(),
+            os.path.join(os.path.normpath(os.environ["CORRAL_STATE"]), takeoff.SUITE_LOCK_NAME),
+        )
+
+    def test_second_takeoff_waits_for_the_lock_then_runs(self):
+        clock = _FakeClock()
+        flock = _contended(2)
+        self.patch_lock_seams(flock, clock)
+        self.cmd_results["make test"] = (0, "green\n")
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.status(result, "checks"), "ok")
+        self.assertEqual(self.cmd_calls, [("make test", self.work)])
+        self.assertEqual(len(flock.calls), 3)
+        self.assertEqual(len(clock.sleeps), 2)
+
+    def test_lock_held_past_the_timeout_exits_75_without_running(self):
+        clock = _FakeClock()
+        self.patch_lock_seams(_contended(None), clock)
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 75)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "fail")
+        self.assertIn("run takeoff again", found.fix)
+        self.assertEqual(self.cmd_calls, [])
+        self.assertTrue(clock.sleeps)
+
+    def test_no_suite_takes_no_lock(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+        )
+
+        def exploding(fd, flags):
+            raise AssertionError("the lock must not be taken without suite commands")
+
+        self.patch_lock_seams(exploding, _FakeClock())
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.status(result, "checks"), "ok")
+
+    def test_lock_file_is_created_in_the_state_dir(self):
+        path = takeoff.suite_lock_path()
+        if os.path.exists(path):
+            os.unlink(path)
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(os.path.isfile(path))
+
+    def test_a_dead_holder_releases_the_lock(self):
+        path = takeoff.suite_lock_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        child = (
+            "import fcntl, os, sys, time; "
+            f"fd = os.open({path!r}, os.O_CREAT | os.O_RDWR, 0o600); "
+            "fcntl.flock(fd, fcntl.LOCK_EX); "
+            "sys.stdout.write('ready\\n'); sys.stdout.flush(); "
+            "time.sleep(60)"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", child],
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        self.addCleanup(proc.kill)
+        if proc.stdout is None:
+            self.fail("the holder child has no stdout pipe")
+        self.assertEqual(proc.stdout.readline().strip(), "ready")
+        proc.kill()
+        proc.wait(timeout=30)
+        proc.stdout.close()
+        with takeoff.suite_lock(path, 10):
+            pass
+
+    def test_an_invalid_lock_timeout_setting_is_a_usage_error(self):
+        for bad in ("0", "-5", "true", '"soon"'):
+            with self.subTest(value=bad):
+                self.write_ops(
+                    "[[repo]]\n"
+                    f'name = "{REPO}"\n'
+                    f'clone.path = "{self.main}"\n'
+                    f'clone.default_branch = "{MAIN}"\n'
+                    'checks.test = "make test"\n'
+                    f"checks.suite_lock_timeout_s = {bad}\n"
+                )
+                with self.assertRaisesRegex(
+                    takeoff.TakeoffError, "positive number|must be int, not"
+                ):
+                    self.gate()
+
     def test_a_detached_head_fails_the_worktree_check(self):
         self.git("checkout", "-q", "--detach", cwd=self.work)
         result = self.gate()
@@ -771,6 +914,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["checks.no_em_dash"].default, True)
         self.assertEqual(settings.REGISTRY["review.required"].default, True)
         self.assertEqual(settings.REGISTRY["checks.timeout_s"].default, 1800)
+        self.assertEqual(settings.REGISTRY["checks.suite_lock_timeout_s"].default, 3600)
         self.assertIn("corral.takeoff", settings.PROVIDERS)
 
 
@@ -851,6 +995,23 @@ class TakeoffCliCase(unittest.TestCase):
         with redirect_stdout(out), redirect_stderr(err):
             code = args.func(args)
         self.assertEqual(code, 3)
+
+    def test_cli_suite_busy_exits_75(self):
+        from corral import takeoffcli
+        import argparse
+
+        clock = _FakeClock()
+        self.case.patch_lock_seams(_contended(None), clock)
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 75)
+        self.assertIn("takeoff checks: FAIL", out.getvalue())
+        self.assertEqual(self.case.cmd_calls, [])
 
     def test_verb_is_on_the_corral_parser(self):
         from corral import cli
