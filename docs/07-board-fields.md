@@ -228,14 +228,15 @@ Two board-specific cases:
   option id: a stored id with no live option keeps its stored value, logs
   a sync error line, and is flagged by the doctor check (section 5)
   instead of being mapped to a lookalike. A queued corral-owned write
-  whose field or option id is gone is dropped with reason
-  `unknown-option` plus an error line: corral never invents a mapping.
-  Display-name renames need no handling, since the map is keyed by id
-  and names are comments only; a deleted or replaced id is a
-  configuration error surfaced by the doctor, not a silent remap.
+  whose option id is gone is dropped with reason `unknown-option` plus an
+  error line: corral never invents a mapping. Display-name renames need no
+  handling, since the map is keyed by id and names are comments only; a
+  deleted or replaced id is a configuration error surfaced by the doctor,
+  not a silent remap.
 - A missing board field at mirror time (deleted or renamed upstream) is a
-  configuration error surfaced once per pass, and the rows stay queued;
-  the doctor names the repo and the field.
+  configuration error surfaced once per pass: the write raises
+  `TrackerError`, so the rows stay queued for the next pass and the pass
+  continues with the other rows. The doctor names the repo and the field.
 
 ## 5. Configuration: the project declares its board
 
@@ -316,7 +317,8 @@ Exit codes are unchanged (AGENTS.md fixes their meaning):
 | Board poll degraded to store data, pass otherwise complete | 0, with notes |
 | Pass synced nothing at all (tracker and board both unreachable) | 3 |
 | Lost claim race on a board-backed row | 2, same `Claimed` path |
-| Bad board config, unknown field or option, flip with queued writes | 4 |
+| Bad board config, unknown field or option at config or doctor time, flip with queued writes | 4 |
+| A runtime `UnknownOption` that escapes the mirror (a caller with no drop path) | 3, remote unusable |
 | Host full or quota refused under board mode | 75, same gating |
 
 ## 7. Test plan, fakes at the single `gh` seam only
@@ -341,7 +343,7 @@ fails if either real one is touched:
 | `enqueue` refuses people-owned concepts; adapter has no write path for them | temp store |
 | Corral-owned write round-trips through one text field per concept; repeat write leaves one label-free mutation | fake `run` recording mutations |
 | Fresher person edit drops queued write as `overridden`; newer queue overwrites person edit | temp store plus fake readings |
-| Missing field or option id drops with `unknown-option` and an error line; rename by id is free | fake schema payloads |
+| A missing option id drops with `unknown-option` and an error line; a missing field stays queued; rename by id is free | fake schema payloads |
 | Rate-limit answer halts the drain, rows stay queued, cooldown honored | fake `run` rate-limit text, fake pacer |
 | Budget exhausted: pass continues on store data with a board-outage line; stale-gated claim skips | fake pacer in cooldown, fake `Tracker` |
 | Schema cache refresh past `schema_max_age_s`, else reused without a call | fake `run` call counts |

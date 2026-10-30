@@ -34,9 +34,9 @@ WRITE_MARKER = "BoardWriteText"
 CLEAR_MARKER = "BoardClearField"
 
 
-def write_tracker(run, **over):
+def write_tracker(run, max_pages=5, **over):
     """A board write adapter over a fake run and a fake pacer."""
-    return boardmod.BoardTracker(config(**over), run, pacer=FakePacer())
+    return boardmod.BoardTracker(config(**over), run, pacer=FakePacer(), max_pages=max_pages)
 
 
 def script_schema(run, *fields, **over):
@@ -157,14 +157,87 @@ class BoardWriteTest(unittest.TestCase):
             adapter.write(REPO, 7, "agent", "agent-1")
         self.assertEqual(run.calls, [])
 
-    def test_missing_live_field_is_unknown_option(self):
+    def test_missing_live_field_stays_queued(self):
         run = BoardFakeRun()
         fields = [f for f in full_schema_fields() if f["name"] != "Agent"]
         script_schema(run, *fields)
-        with self.assertRaises(tracker.UnknownOption) as caught:
+        with self.assertRaises(tracker.TrackerError) as caught:
             write_tracker(run).write(REPO, 7, "agent", "agent-1")
+        self.assertNotIsInstance(caught.exception, tracker.UnknownOption)
         self.assertIn("Agent", str(caught.exception))
         self.assertEqual(mutations(run), [])
+
+    def test_trailing_space_value_sends_no_mutation(self):
+        run = BoardFakeRun()
+        script_schema(run, *full_schema_fields())
+        script_item(run, 7, [text_value("F_agent", "Agent", "agent-1")])
+        write_tracker(run).write(REPO, 7, "agent", "agent-1 ")
+        self.assertEqual(mutations(run), [])
+        self.assertEqual(mutations(run, CLEAR_MARKER), [])
+
+    def test_whitespace_only_value_clears(self):
+        run = BoardFakeRun()
+        script_schema(run, *full_schema_fields())
+        script_item(run, 7, [text_value("F_agent", "Agent", "agent-1")])
+        run.script(
+            CLEAR_MARKER, [{"clearProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI-7"}}}]
+        )
+        write_tracker(run).write(REPO, 7, "agent", "   ")
+        self.assertEqual(mutations(run, WRITE_MARKER), [])
+        cleared = mutations(run, CLEAR_MARKER)
+        self.assertEqual(len(cleared), 1)
+        self.assertEqual(
+            cleared[0], {"project": "PVT_1", "item": "PVTI_Issue-7", "field": "F_agent"}
+        )
+
+    def test_non_string_value_is_a_tracker_error(self):
+        run = BoardFakeRun()
+        with self.assertRaises(tracker.TrackerError):
+            write_tracker(run).write(REPO, 7, "agent", 123)
+        self.assertEqual(run.calls, [])
+
+    def test_unhashable_field_is_refused(self):
+        run = BoardFakeRun()
+        adapter = write_tracker(run)
+        with self.assertRaises(ValueError):
+            adapter.write(REPO, 7, ["agent"], "x")
+        self.assertEqual(run.calls, [])
+
+    def test_two_fields_on_one_item_cost_one_scan(self):
+        run = BoardFakeRun()
+        script_schema(run, *full_schema_fields())
+        script_item(run, 7)
+        run.script(
+            WRITE_MARKER,
+            [
+                {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI-7"}}},
+                {"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI-7"}}},
+            ],
+        )
+        adapter = write_tracker(run)
+        adapter.write(REPO, 7, "agent", "agent-1")
+        adapter.write(REPO, 7, "status", "working")
+        self.assertEqual(len(run.graphql_variables("BoardSchemaByNumber")), 1)
+        self.assertEqual(run.graphql_variables("BoardItems"), [{"project": "PVT_1"}])
+        self.assertEqual(len(mutations(run)), 2)
+        self.assertEqual(rest_paths(run), [])
+
+    def test_locate_honors_the_page_cap(self):
+        run = BoardFakeRun()
+        script_schema(run, *full_schema_fields())
+        first = [item_node(1000 + n) for n in range(100)]
+        run.script("BoardItems", [items_payload(first, end="C1", more=True)])
+        adapter = write_tracker(run, max_pages=1)
+        with self.assertRaises(tracker.TrackerError) as caught:
+            adapter.write(REPO, 7, "agent", "agent-1")
+        self.assertNotIsInstance(caught.exception, tracker.UnknownOption)
+        self.assertEqual(len(run.graphql_variables("BoardItems")), 1)
+
+    def test_nonpositive_max_pages_is_refused(self):
+        run = BoardFakeRun()
+        with self.assertRaises(ValueError):
+            boardmod.BoardTracker(config(), run, pacer=FakePacer(), max_pages=0)
+        self.assertEqual(run.calls, [])
 
     def test_unknown_option_is_a_tracker_error(self):
         self.assertTrue(issubclass(tracker.UnknownOption, tracker.TrackerError))
@@ -220,7 +293,7 @@ class BoardWriteTest(unittest.TestCase):
         run.script(
             WRITE_MARKER, [gh.GhError("unavailable", "API rate limit exceeded, retry after 45")]
         )
-        adapter = boardmod.BoardTracker(config(), run, pacer=pacer)
+        adapter = boardmod.BoardTracker(config(), run, pacer=pacer, max_pages=5)
         with self.assertRaises(tracker.TrackerRateLimited) as caught:
             adapter.write(REPO, 7, "agent", "agent-1")
         self.assertEqual(caught.exception.retry_after, 45.0)
@@ -347,6 +420,30 @@ class BoardMirrorTest(unittest.TestCase):
         self.assertEqual((result.sent, result.dropped), (1, 1))
         self.assertEqual(len(result.errors), 1)
 
+    def test_missing_field_leaves_rows_queued_and_pass_continues(self):
+        store = self.open(number=7)
+        self.seed(store, 8)
+        store.enqueue(REPO, 7, "agent", "agent-1", now=T0 - 50)
+        store.enqueue(REPO, 7, "status", "working", now=T0 - 40)
+        store.enqueue(REPO, 8, "status", "on-8", now=T0 - 30)
+        run = BoardFakeRun()
+        fields = [f for f in full_schema_fields() if f["name"] != "Agent"]
+        script_schema(run, *fields)
+        script_item(run, 8)
+        script_mutation(run)
+        adapter = boardmod.BoardTracker(config(), run, pacer=FakePacer(), max_pages=5)
+        # BoardTracker covers the write side only; reads arrive in a later
+        # ticket, so the write-only use below needs the narrow carve-out.
+        result = mirror.push(store, adapter, operators=["alice"], now=T0)  # ty: ignore[invalid-argument-type]
+        self.assertEqual((result.sent, result.dropped, result.dirty), (1, 0, 1))
+        self.assertIsNone(result.stopped)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("Agent", result.errors[0])
+        queued = {(row.number, row.field): row for row in store.queued_writes()}
+        self.assertEqual(set(queued), {(7, "agent"), (7, "status")})
+        self.assertEqual(queued[(7, "status")].attempts, 0)
+        self.assertEqual(len(store.outbox_rows(state="sent")), 1)
+
     def test_board_rate_limit_halts_the_drain_with_rows_queued(self):
         store = self.open(number=7)
         self.seed(store, 8)
@@ -358,7 +455,7 @@ class BoardMirrorTest(unittest.TestCase):
         run.script(
             WRITE_MARKER, [gh.GhError("unavailable", "API rate limit exceeded, retry after 45")]
         )
-        adapter = boardmod.BoardTracker(config(), run, pacer=FakePacer())
+        adapter = boardmod.BoardTracker(config(), run, pacer=FakePacer(), max_pages=5)
         # BoardTracker covers the write side only; reads arrive in a later
         # ticket, so the write-only use below needs the narrow carve-out.
         result = mirror.push(store, adapter, operators=["alice"], now=T0)  # ty: ignore[invalid-argument-type]

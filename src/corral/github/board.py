@@ -474,11 +474,37 @@ class BoardTracker(BoardReader):
 
     Only ``agent`` and ``status`` are writable, each through the one
     configured text field for the concept; any other field is refused with
-    ``ValueError``. A write whose concept has no live field raises
-    ``UnknownOption`` (the mirror drops it); a write that changes nothing
-    sends no mutation. Reads stay with ``BoardReader`` and the board sync
-    step.
+    ``ValueError``. A write whose concept the config never mapped raises
+    ``UnknownOption`` (the mirror drops it); a write whose field is missing
+    from the live board raises ``TrackerError`` instead, so the rows stay
+    queued for the next pass. A write that changes nothing sends no
+    mutation. Reads stay with ``BoardReader`` and the board sync step.
+
+    One adapter instance covers one mirror pass: the schema is fetched once
+    and each item's node id is resolved once and reused across that item's
+    fields, so two fields on one item cost one schema fetch plus one scan.
+    Item scans stop at ``max_pages`` pages; the caches live only as long as
+    the instance, so a later pass re-reads the board.
     """
+
+    def __init__(self, board, run, pacer=None, *, max_pages):
+        """``max_pages`` bounds every item scan, like the poll page cap.
+
+        The schema and the located items are cached on the instance: one
+        adapter per mirror pass means one fetch and one scan per item.
+        """
+        super().__init__(board, run, pacer)
+        if max_pages < 1:
+            raise ValueError(f"max_pages must be at least 1, got {max_pages!r}")
+        self._max_pages = max_pages
+        self._schema = None
+        self._located = {}
+
+    def _cached_schema(self):
+        """``(project id, fields by name)``, fetched once per instance."""
+        if self._schema is None:
+            self._schema = self._project_index(self._fetch_project())
+        return self._schema
 
     def write(self, repo: str, number: int, field: str, value: str) -> None:
         """Set one corral-owned concept through its board text field.
@@ -488,8 +514,13 @@ class BoardTracker(BoardReader):
         mutation for ``""``). An already-matching board sends nothing;
         anything outside the corral-owned fields is refused with
         ``ValueError``. Rate-limit answers raise ``TrackerRateLimited``
-        through the shared classifier.
+        through the shared classifier. Values are compared, set and cleared
+        in stripped canonical form, like both read paths; a whitespace-only
+        value clears.
         """
+        if not isinstance(value, str):
+            raise iface.TrackerError(f"bad board value for {field!r}: {value!r}")
+        value = value.strip()
         try:
             attr = dict(_WRITE_ATTRS)[field]
         except (KeyError, TypeError):
@@ -497,41 +528,62 @@ class BoardTracker(BoardReader):
         name = getattr(self._board, attr)
         if not name:
             raise iface.UnknownOption(f"board maps no field for {field!r}")
-        project_id, by_name = self._project_index(self._fetch_project())
+        project_id, by_name = self._cached_schema()
         node = by_name.get(name)
         if node is None:
-            raise iface.UnknownOption(f"board field {name!r} for {field} is missing")
+            raise iface.TrackerError(f"board field {name!r} for {field} is missing")
         field_id = self._parse_field(field, name, node).id
-        item_id, current = self._locate(project_id, repo, number, field_id)
-        if current == (value or ""):
+        item_id, texts, selects = self._locate(project_id, repo, number)
+        if field_id in selects:
+            raise _fail("board value for a text field is not text")
+        if texts.get(field_id, "") == value:
             return
         if value:
             self._graphql(_WRITE_TEXT, project=project_id, item=item_id, field=field_id, text=value)
         else:
             self._graphql(_CLEAR_TEXT, project=project_id, item=item_id, field=field_id)
+        texts[field_id] = value
 
-    def _locate(self, project_id, repo, number, field_id):
-        """``(item node id, current text)`` for the board item behind one issue.
+    def _locate(self, project_id, repo, number):
+        """``(item node id, texts, selects)`` for one issue.
 
-        Pages the board items until the one carrying ``repo#number`` is
-        found. A missing or malformed page is a ``TrackerError``, never a
-        partial search; an item the board does not hold is a
-        ``TrackerError`` too, so the write stays queued.
+        Resolved once per item and cached on the instance, so a second
+        field on the same item reuses the one scan. ``texts`` maps a field
+        id to its stripped text; ``selects`` holds the field ids with a
+        select value, so the write refuses a select behind a text field
+        id. An unset field is in neither: it reads as ``""``.
+        """
+        key = (repo, number)
+        hit = self._located.get(key)
+        if hit is None:
+            hit = self._scan(project_id, repo, number)
+            self._located[key] = hit
+        return hit
+
+    def _scan(self, project_id, repo, number):
+        """One uncached item scan: at most ``max_pages`` pages, else ``TrackerError``.
+
+        A missing or malformed page is a ``TrackerError``, never a partial
+        search; an item the board does not hold, or one past the page cap,
+        is a ``TrackerError`` too, so the write stays queued.
         """
         after = None
-        while True:
+        for _ in range(self._max_pages):
             nodes, info = self._page(project_id, after)
             for node in nodes:
-                found = self._locate_node(node, repo, number, field_id)
+                found = self._locate_node(node, repo, number)
                 if found is not None:
                     return found
             end, more = self._resume(info, len(nodes))
             if not more:
                 raise iface.TrackerError(f"unknown board item {repo}#{number}")
             after = end
+        raise iface.TrackerError(
+            f"board item {repo}#{number} not found within {self._max_pages} pages"
+        )
 
-    def _locate_node(self, node, repo, number, field_id):
-        """``(item id, current text)`` when ``node`` is the wanted issue, else None.
+    def _locate_node(self, node, repo, number):
+        """``(item id, texts, selects)`` for the wanted issue, else None.
 
         Every node is validated like a read: anything short of the full
         shape is a ``TrackerError``. A draft item (no issue behind it)
@@ -560,21 +612,23 @@ class BoardTracker(BoardReader):
         entries = values.get("nodes") if isinstance(values, dict) else None
         if not isinstance(entries, list):
             raise _fail("board field values are not a list")
-        current = ""
+        texts: dict = {}
+        selects = set()
         for entry in entries:
-            text = self._locate_value(entry, field_id)
-            if text is not None:
-                current = text
+            fid, text = self._locate_value(entry)
+            if text is None:
+                selects.add(fid)
+            else:
+                texts[fid] = text
         if got_repo != repo or got_number != number:
             return None
-        return item_id, current
+        return item_id, texts, selects
 
-    def _locate_value(self, entry, field_id):
-        """The entry's stripped text for the wanted field, else None.
+    def _locate_value(self, entry):
+        """``(field id, stripped text or None)`` for one field-value node.
 
-        Entries for other fields read as None; an unset value reads as
-        ``""``. A select value behind a text field id is a
-        ``TrackerError``.
+        A select value reads as ``None``; an unset value reads as ``""``.
+        Anything short of the value shape is a ``TrackerError``.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
@@ -582,15 +636,13 @@ class BoardTracker(BoardReader):
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
             raise _fail(f"bad board value field {field!r}")
-        if fid != field_id:
-            return None
         if "text" in entry:
             text = entry["text"]
             if text is None:
-                return ""
+                return fid, ""
             if not isinstance(text, str):
                 raise _fail(f"bad board value text {text!r}")
-            return text.strip()
+            return fid, text.strip()
         if entry.get("optionId") is not None:
-            raise _fail("board value for a text field is not text")
-        return ""
+            return fid, None
+        return fid, ""
