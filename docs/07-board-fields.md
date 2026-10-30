@@ -52,8 +52,11 @@ label-only rows are unchanged.
 no board mapping is needed for it. `parent` and `children` read from the
 sub-issues REST endpoints through the same single `gh` seam; `blocked_by`
 reads from one optional people-owned text field holding comma-separated
-`owner/repo#N` refs, parsed strictly: an unparseable entry is ignored and
-reported as a sync error line, never guessed.
+`owner/repo#N` refs, parsed strictly and failed closed: an unparseable
+entry is carried verbatim as a raw string in `extra` under the concept,
+so eligibility treats the ticket as blocked rather than free, and the
+doctor parity check names the item and the entry alongside the sync
+error line. Nothing is guessed or dropped.
 
 On the wire the board adapter reports a claim holder and in-flight state
 through the existing `TrackerItem.agent` and `TrackerItem.status`
@@ -65,11 +68,14 @@ Ownership follows `00-design.md` field ownership with no new rule:
 
 - People win people-owned fields. A reader overwrites only the concepts
   it carries; a concept absent from a reading means keep, never clear.
-  The store's upsert merges `extra` by key, and only an explicit
-  "cleared" marker from the board adapter removes a concept, so a REST
-  feed reading that carries no board concepts leaves the stored board
-  `extra` untouched. These concepts are never enqueued, and the adapter
-  offers no write path for them (no method, not a refused one).
+  The store's upsert merges `extra` by key, and only an explicit cleared
+  encoding from the board adapter removes a concept: a scalar concept
+  with value `None` in the adapter's reading means cleared (the upsert
+  deletes that key), an absent key means keep, and an empty list clears
+  a list concept. A REST feed reading that carries no board concepts
+  therefore leaves the stored board `extra` untouched. These concepts
+  are never enqueued, and the adapter offers no write path for them
+  (no method, not a refused one).
 - corral wins `agent` and `status`. A reading only settles queued writes,
   with the exact label semantics already in `board.py`: a fresher reading
   echoing a queued value marks it sent, a fresher different value drops it
@@ -233,9 +239,15 @@ Two board-specific cases:
 ## 5. Configuration: the project declares its board
 
 Decision: one per-repo setting picks the variant, and one project-owned
-table maps names to concepts. Scalars go in the settings registry;
-name maps are TOML tables parsed once by the board slice, with unknown
-concept keys refused as `SettingsError` (exit 4).
+table per repo maps names to concepts. Scalars go in the settings
+registry; the `[repo.board]` tables are popped and validated inside
+`settings.py` in `resolve()`, exactly like the `[models]` and
+`[private]` precedent: strict concept keys (an unknown concept key is
+`SettingsError`, exit 4) with opaque option-id keys in `priority_map`
+that are never resolved against the registry, and the checked tables
+are exposed as data on the resolved settings for the repo. The board
+slice consumes those resolved tables and never re-reads `corral.toml`,
+so the file keeps its single resolver.
 
 ```toml
 [[repo]]
@@ -315,7 +327,8 @@ fails if either real one is touched:
 | --- | --- |
 | `graphql()` and `paced_run()` honor the injected `run` and pacer; nothing reaches the real pacer file or subprocess | fake `run` argv plus fake pacer call log |
 | Issue parse plus board concepts land in `extra`; unknown option keeps stored value with an error line | fake `run` payloads |
-| An issue edit through the REST feed preserves the stored board `extra`; only a board "cleared" marker removes a concept | fake `run` feed plus temp store with board `extra` |
+| An issue edit through the REST feed preserves the stored board `extra`; only the cleared encoding removes a concept (`None` deletes a scalar key, absent keeps, empty list clears a list) | fake `run` feed plus temp store with board `extra` |
+| An unparseable `blocked_by` entry is carried raw in `extra`, the ticket reads as blocked, and the doctor names the item and entry | fake `run` payloads, temp store, doctor check |
 | Board poll pages with `after`, stops on short page; malformed page is `TrackerError`, never partial | fake `run` pages |
 | Board-only edit (issue `updated_at` unchanged) detected by poll and audit | fake `run`, temp store with aged row |
 | Board `updated_at` is the max of issue and board times; board cursor moves on its own reader only and is never compared with the feed cursor | fake `run` with split stamps, temp store cursors |
@@ -328,6 +341,7 @@ fails if either real one is touched:
 | Budget exhausted: pass continues on store data with a board-outage line; stale-gated claim skips | fake pacer in cooldown, fake `Tracker` |
 | Schema cache refresh past `schema_max_age_s`, else reused without a call | fake `run` call counts |
 | Variant flip with queued writes refused; doctor parity flags mismatches; doctor names repo, field and missing option id | temp store plus outbox rows |
+| The documented `[repo.board]` table loads through `resolve()`; an unknown concept key is `SettingsError` (exit 4) naming repo and key | project TOML fixtures, no live file reads |
 | Resync adopts board-shown claims, reports store-wins conflicts identically | fake `run` full walk |
 
 ## 8. Implementation tickets, in order
@@ -339,16 +353,23 @@ Each is sized for one agent, with acceptance criteria.
    normalized to `{}` on read, `sync._reading` copies it (copy-on-read,
    never shared), precedence helper for priority in one place (board
    `priority` wins when present, else the label-derived rank), and the
-   store upsert merges `extra` by key so a reading keeps the concepts it
-   does not carry. `graphql()` and `paced_run()` accept an injected `run`
-   and an injected pacer, defaulting to the real ones. Criteria: existing
-   fake trackers compile untouched; board-concept rows persist and read
-   back through `extra`; a REST feed reading preserves stored board
-   `extra`; the guard test fails if any test reaches the real pacer
+   does not carry, under the cleared encoding (`None` deletes a scalar
+   key, absent keeps, empty list clears a list). `graphql()` and
+   `paced_run()` accept an injected `run` and an injected pacer,
+   defaulting to the real ones. Criteria: existing fake trackers compile
+   untouched; board-concept rows persist and read back through `extra`;
+   a REST feed reading preserves stored board `extra`; a board reading
+   with `None` for a scalar concept deletes that key and an absent key
+   keeps it; the guard test fails if any test reaches the real pacer
    state file or a real subprocess.
-2. Board settings and validation. Registry scalars plus the `[repo.board]`
-   table parser with strict keys. Criteria: unknown concept key is exit 4
-   naming repo and key; defaults leave label mode byte-identical.
+2. Board settings and validation. Registry scalars, plus `settings.py`
+   popping and validating the per-repo `board` tables in `resolve()`
+   on the `[models]` and `[private]` precedent (strict concept keys,
+   opaque option-id keys in `priority_map`), exposed as data for the
+   board slice, which never re-reads the file. Criteria: the documented
+   `[repo.board]` table loads through `resolve()`; an unknown concept
+   key is `SettingsError` (exit 4) naming repo and key; defaults leave
+   label mode byte-identical.
 3. GraphQL board reader. Adapter read path: schema fetch plus paged items
    with `after`, strict page shapes, option ids resolved live. Criteria:
    the section 7 read rows pass against canned payloads; malformed page
@@ -358,7 +379,7 @@ Each is sized for one agent, with acceptance criteria.
    field-level compare with per-concept merge, board-only-edit detection,
    board `updated_at` as the max of issue and board times. Criteria: the
    section 7 sync rows pass; cursors move independently and never
-   backwards; only an explicit board "cleared" marker removes a concept.
+   backwards; only the cleared encoding removes a concept.
 5. Board mirror writes. Concept-to-field translation in the adapter's
    `write`, text-field round-trip, `unknown-option` drop, halt on rate
    limit. Criteria: the section 7 write rows pass; label-mode writes
@@ -370,7 +391,9 @@ Each is sized for one agent, with acceptance criteria.
    validation with the id-keyed `priority_map` (display names as
    comments), flip-with-queue refusal, parity report. Criteria: each
    failure names repo, field and missing id; parity output is stable text.
-8. Docs follow-up. `TicketRow.extra` wired into eligibility rows and the
-   drive's freshness-gated re-reads using the board reader. Criteria: a
-   stale-gated claim re-reads live through the board adapter and skips
-   when unreachable, per section 2.
+8. Eligibility wiring. `TicketRow.extra` wired into eligibility rows and
+   the drive's freshness-gated re-reads using the board reader; this
+   depends on the dispatch-loop eligibility ticket (its ticket 2, which
+   introduces `TicketRow`) landing first. Criteria: a stale-gated claim
+   re-reads live through the board adapter and skips when unreachable,
+   per section 2.
