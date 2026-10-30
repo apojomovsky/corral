@@ -136,6 +136,12 @@ class OmpArgv(unittest.TestCase):
     def test_omp_needs_no_extra_environment(self):
         self.assertEqual(omp.RUNTIME.env("/s"), {})
 
+    def test_reviewer_is_a_documented_no_op(self):
+        self.assertEqual(
+            omp.RUNTIME.argv("/s", PROMPT, reviewer=True),
+            omp.RUNTIME.argv("/s", PROMPT),
+        )
+
 
 class OmpOverlay(SessionCase):
     CONFIG = {
@@ -235,6 +241,12 @@ class OpencodeArgv(unittest.TestCase):
                 MODEL,
                 PROMPT,
             ],
+        )
+
+    def test_reviewer_is_a_documented_no_op(self):
+        self.assertEqual(
+            opencode.RUNTIME.argv("/s", PROMPT, reviewer=True),
+            opencode.RUNTIME.argv("/s", PROMPT),
         )
 
     def test_the_environment_points_at_the_session_config(self):

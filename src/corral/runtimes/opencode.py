@@ -6,7 +6,9 @@ fields. The per-launch config is `opencode.json`, pointed at by OPENCODE_CONFIG.
 
 OPENCODE_CONFIG adds this file on top of the user's global config, which
 opencode still merges, so a setting in the home config can still apply to a
-headless run. corral never writes that home config.
+headless run. corral never writes that home config. `reviewer` is a
+documented no-op: opencode has no read-only flag, so the reviewer prompt's
+read-only rule is the only guard.
 """
 
 import functools
@@ -33,8 +35,13 @@ def binary():
     return shutil.which("opencode") or os.path.expanduser(FALLBACK)
 
 
-def argv(session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME):
-    """`max_time` is accepted for the protocol; opencode has no run limit flag."""
+def argv(
+    session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME, reviewer=False
+):
+    """`max_time` is accepted for the protocol; opencode has no run limit flag.
+
+    `reviewer` is accepted and ignored (see the module docstring).
+    """
     check_prompt(prompt)
     command = [binary(), "run", "--format", "json", "--auto", "--pure"]
     if resume:

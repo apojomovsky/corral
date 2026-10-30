@@ -49,6 +49,7 @@ def _agent_row(entry, state):
         "repo": held[0] if held else None,
         "number": held[1] if held else None,
         "runtime": entry.get("runtime"),
+        "role": entry.get("role"),
         "model": entry.get("model"),
         "state": state,
         "started_at": entry.get("started_at"),
@@ -215,7 +216,8 @@ def _show(doc):
                 project = f"{row['project']}/" if row["project"] else ""
                 ticket = f"{project}{row['repo']} #{row['number']}"
             note = f"  {row['note']}" if row.get("note") else ""
-            print(f"  {row['id']}  {row['runtime']}  {row['state']}  {ticket}{note}")
+            role = row.get("role") or "-"
+            print(f"  {row['id']}  {row['runtime']}  {role}  {row['state']}  {ticket}{note}")
     else:
         _err(
             f"agents: {agents.get('error', 'unreadable') if isinstance(agents, dict) else 'unreadable'}"
