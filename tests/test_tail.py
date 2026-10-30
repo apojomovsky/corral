@@ -1,4 +1,4 @@
-"""Activity lines for both runtime event formats, and `show` over a file.
+"""Activity lines for all three runtime event formats, and `show` over a file.
 
 Offline: every session file is a temp file written by the test.
 """
@@ -189,12 +189,102 @@ class RenderMuse(unittest.TestCase):
             with self.subTest(line=line):
                 self.assertEqual(tail.render(line), [])
 
-    def test_tool_results_are_skipped_until_their_shape_lands(self):
+    def test_a_tool_result_shows_tool_and_outcome(self):
         line = mline(
             "tool.result",
-            {"tool_name": "bash", "correlation_facts": {"outcome": "ok"}},
+            {
+                "call_id": "call_example",
+                "command_id": "example-uuid",
+                "correlation_facts": {"outcome": "success", "tool_name": "read"},
+                "kind": "tool_result",
+                "run_stream": {"id": "example-uuid", "kind": "run"},
+                "text": "Read text file `/work/example`.",
+            },
+        )
+        self.assertEqual(tail.render(line), ["-> read | success"])
+
+    def test_a_tool_result_collapses_its_text_and_edit_facts(self):
+        line = mline(
+            "tool.result",
+            {
+                "call_id": "call_example",
+                "command_id": "example-uuid",
+                "correlation_facts": {"outcome": "success", "tool_name": "edit"},
+                "edit_facts": {
+                    "added": 3,
+                    "path": "/work/example",
+                    "removed": 1,
+                    "tool_name": "edit",
+                },
+                "kind": "tool_result",
+                "run_stream": {"id": "example-uuid", "kind": "run"},
+                "text": "edited changed lines: lines 1-3",
+            },
+        )
+        self.assertEqual(tail.render(line), ["-> edit | success"])
+
+    def test_a_tool_result_without_facts_shows_nothing(self):
+        line = mline(
+            "tool.result",
+            {
+                "call_id": "call_example",
+                "command_id": "example-uuid",
+                "kind": "tool_result",
+                "run_stream": {"id": "example-uuid", "kind": "run"},
+                "text": "still running",
+            },
         )
         self.assertEqual(tail.render(line), [])
+        self.assertEqual(tail.render(mline("tool.result", {})), [])
+        self.assertEqual(tail.render(mline("tool.result", {"correlation_facts": {}})), [])
+        self.assertEqual(tail.render(mline("tool.result", {"correlation_facts": "odd"})), [])
+
+    def test_a_tool_result_without_names_uses_fallbacks(self):
+        line = mline(
+            "tool.result",
+            {"correlation_facts": {"outcome": None, "tool_name": None}},
+        )
+        self.assertEqual(tail.render(line), ["-> tool | unknown"])
+        line = mline("tool.result", {"correlation_facts": {"outcome": "success"}})
+        self.assertEqual(tail.render(line), ["-> tool | success"])
+        line = mline("tool.result", {"correlation_facts": {"tool_name": "bash"}})
+        self.assertEqual(tail.render(line), ["-> bash | unknown"])
+
+    def test_a_long_tool_result_is_cut(self):
+        line = mline(
+            "tool.result",
+            {"correlation_facts": {"outcome": "success", "tool_name": "x" * 500}},
+        )
+        rendered = tail.render(line)
+        self.assertEqual(len(rendered), 1)
+        self.assertLessEqual(len(rendered[0]), tail.WIDTH)
+
+    def test_prompt_duplicates_and_tool_output_chunks_show_nothing(self):
+        lines = [
+            mline("turn.input.user", {"prompt": "Do the thing."}),
+            mline(
+                "task.lifecycle.output",
+                {"event": {"chunk": "Read text file `/work/example`."}},
+            ),
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertEqual(tail.render(line), [])
+
+    def test_newly_observed_roster_and_status_records_show_nothing(self):
+        lines = [
+            mline("run.model.configured", {"model_id": "example-model"}),
+            mline("runtime.command.accepted", {}),
+            mline("session.workspace_branch.observed", {}),
+            mline("task.lifecycle.accepted", {}),
+            mline("task.lifecycle.rejected", {"event": {"reason": "skip_if_running"}}),
+            mline("task.lifecycle.side_effect_intent", {}),
+            mline("task.lifecycle.status", {"event": {"message": "opening stream"}}),
+            mline("task.lifecycle.tool_output_ref", {}),
+        ]
+        for line in lines:
+            with self.subTest(line=line):
+                self.assertEqual(tail.render(line), [])
 
     def test_a_listed_type_without_a_usable_key_is_skipped(self):
         with mock.patch.dict(tail._MUSE_TEXT, {"run.test.nokey": None}):

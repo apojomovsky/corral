@@ -4,7 +4,7 @@ Three event formats are read, told apart by their shape: omp's session
 `.jsonl` (assistant messages with tool calls and text), opencode's
 `--format json` events (a `part` with a tool use or text), and muse's
 `--json` stream (records with a `payload_type` and a `payload`). Each
-shows the agent's tool calls with their intent or description, and what
+shows the agent's tool calls with their tool name or outcome, and what
 it says. Thinking, tool output, steps and the prompt are left out, except
 that a muse run header shows the prompt that started the run.
 """
@@ -78,15 +78,33 @@ _MUSE_TEXT = {
 }
 
 
+def _render_tool_result(payload):
+    """One `tool.result` record: `-> <tool> | <outcome>`, collapsed to one line.
+
+    The record carries the full tool output in `text` and, for edits, an
+    `edit_facts` summary; the tail shows only the tool name and the
+    `correlation_facts` outcome. A record without those facts is not a
+    result yet and shows nothing.
+    """
+    facts = _dict(payload.get("correlation_facts"))
+    if not facts:
+        return []
+    tool = facts.get("tool_name") or "tool"
+    outcome = facts.get("outcome") or "unknown"
+    return [_one_line(f"-> {tool} | {outcome}")]
+
+
 def _render_muse(entry):
     """One muse `--json` stream record.
 
     The run header shows the starting prompt, a delta and the terminal
-    record show their text. Usage, subagent roster noise, reconciliation
-    and link records show nothing. `tool.result` also shows nothing: its
-    render rule waits on the first real tool call fixture. Anything else
-    is skipped, so unknown record types never misrender.
+    record show their text, and a tool result shows its tool and outcome.
+    Usage, subagent roster noise, prompt duplicates, tool output chunks,
+    reconciliation and link records show nothing. Anything else is
+    skipped, so unknown record types never misrender.
     """
+    if entry["payload_type"] == "tool.result":
+        return _render_tool_result(_dict(entry.get("payload")))
     key = _MUSE_TEXT.get(entry["payload_type"])
     if key is None:
         return []
