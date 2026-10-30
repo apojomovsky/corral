@@ -12,6 +12,7 @@ bounds the run.
 """
 
 import functools
+import glob
 import json
 import os
 import re
@@ -30,6 +31,12 @@ CONFIG_NAME = "muse.json"
 PROMPT_NAME = "prompt.md"
 #: The resume message file; the resume run reads the message from here.
 MESSAGE_NAME = "message.md"
+#: The corral session file holding the uuid this ticket's runs share.
+SESSION_ID_FILE = "muse_session_id"
+#: The unit's stdout capture: the `--json` event stream, the run's activity.
+OUT_LOG = "out.log"
+#: The per-run log muse itself writes under its home state dir.
+SESSION_FILE = "session.jsonl"
 
 
 @functools.cache
@@ -103,19 +110,34 @@ def _config_flags(config):
 
 
 def argv(
-    session_dir, prompt, *, model=None, resume=None, max_time=DEFAULT_MAX_TIME, reviewer=False
+    session_dir,
+    prompt,
+    *,
+    model=None,
+    resume=None,
+    max_time=DEFAULT_MAX_TIME,
+    reviewer=False,
+    session_id=None,
 ):
-    """The command line for one headless run. `resume` is an existing session id."""
+    """The command line for one headless run. `resume` is an existing session id.
+
+    A fresh run takes its id from `session_id`: the launch generates it,
+    records it and passes it, so the recorded id and the run's id cannot
+    differ. A fresh run without one is refused; a resume uses `resume`
+    and ignores `session_id`.
+    """
     from corral import models
 
     check_prompt(prompt)
     config = _read_config(session_dir)
     if resume:
-        session_id = resume
+        run_id = resume
         prompt_file = os.path.join(session_dir, MESSAGE_NAME)
         chosen = model if model else None
     else:
-        session_id = new_session_id()
+        if not session_id:
+            raise ValueError(f"a fresh muse run needs a session id recorded in {SESSION_ID_FILE}")
+        run_id = session_id
         prompt_file = os.path.join(session_dir, PROMPT_NAME)
         chosen = model if model else _model_of(config, session_dir)
     command = [binary(), "exec", "--json", "--prompt-file", prompt_file]
@@ -126,7 +148,7 @@ def argv(
         "--contributor-mode",
         "on",
         "--session-id",
-        session_id,
+        run_id,
         "--yolo",
         "--no-foreign-personal-context",
         "--disable-request-user-input",
@@ -158,14 +180,59 @@ def with_models(config, chains):
     return {**(config or {}), "model": models.primary(chains)}
 
 
+def sessions_root():
+    """Where muse keeps its own session logs. Corral reads here, never writes."""
+    return os.path.expanduser(os.path.join("~", ".local", "share", "muse", "sessions"))
+
+
+def record_session_id(session_dir, session_id):
+    """Record `session_id` as this session's muse id, atomically. Raises OSError."""
+    os.makedirs(session_dir, exist_ok=True)
+    paths.atomic_write_text(os.path.join(session_dir, SESSION_ID_FILE), session_id + "\n")
+
+
 def resume_handle(session_dir):
-    """Refused until the sessions-and-resume ticket builds it: no fake behavior."""
-    raise NotImplementedError("muse resume_handle lands in T3")
+    """The recorded muse session id, or None when nothing was recorded."""
+    try:
+        with open(os.path.join(session_dir, SESSION_ID_FILE), encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def resolve(session_id, root=None):
+    """The muse session file for `session_id`, or None when absent.
+
+    Scans `<root>/YYYY/MM/DD/<id>/session.jsonl` and takes the newest by
+    `(mtime, path)`. Every `session.jsonl` basename is the same, so the
+    path is the tie-break, and the pick never depends on directory order.
+    `root` defaults to muse's own sessions dir; an id that could escape
+    the root finds nothing.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if session_id in (".", "..") or os.sep in session_id:
+        return None
+    if os.altsep and os.altsep in session_id:
+        return None
+    base = root if root is not None else sessions_root()
+    pattern = os.path.join(base, "*", "*", "*", glob.escape(session_id), SESSION_FILE)
+    found = [found_path for found_path in glob.glob(pattern) if os.path.isfile(found_path)]
+    if not found:
+        return None
+    return os.path.abspath(max(found, key=lambda p: (os.path.getmtime(p), os.path.abspath(p))))
 
 
 def activity_file(session_dir):
-    """Refused until the sessions-and-resume ticket builds it: no fake behavior."""
-    raise NotImplementedError("muse activity_file lands in T3")
+    """The session's `out.log` when present, else None: tail reads the stream."""
+    path = os.path.join(session_dir, OUT_LOG)
+    return path if os.path.exists(path) else None
+
+
+def write_message(session_dir, message):
+    """Write `message` as `message.md`: the resume run reads it back. Raises OSError."""
+    os.makedirs(session_dir, exist_ok=True)
+    paths.atomic_write_text(os.path.join(session_dir, MESSAGE_NAME), message)
 
 
 class Muse:

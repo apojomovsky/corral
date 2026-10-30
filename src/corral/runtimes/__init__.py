@@ -76,6 +76,10 @@ class Runtime(Protocol):
         """The newest session file or id in `session_dir`, or None."""
         ...
 
+    def activity_file(self, session_dir: str) -> str | None:
+        """The file tail reads for this session's activity, or None."""
+        ...
+
 
 def get(name: str) -> Runtime:
     """The adapter for `name`; UnknownRuntime for anything else."""

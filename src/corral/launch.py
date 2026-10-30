@@ -32,6 +32,7 @@ from dataclasses import dataclass
 
 from corral import accounts, admission, disk, models, paths, projects, quota_ledger
 from corral import registry, runtimes, settings, units, worktrees
+from corral.runtimes import muse
 from corral.runtimes import tail as runtime_tail
 
 #: The run time limit handed to the runtime, in seconds for the unit's
@@ -367,10 +368,21 @@ def launch(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
-        _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
+        session_id = _write_session(session, adapter, tgt.runtime, prompt, runtime_config, chains)
         unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
         try:
-            command = adapter.argv(session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME)
+            if session_id is None:
+                command = adapter.argv(
+                    session, prompt, model=model, max_time=runtimes.DEFAULT_MAX_TIME
+                )
+            else:
+                command = adapter.argv(
+                    session,
+                    prompt,
+                    model=model,
+                    max_time=runtimes.DEFAULT_MAX_TIME,
+                    session_id=session_id,
+                )
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(
@@ -381,7 +393,12 @@ def launch(
 
 
 def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None):
-    """The prompt, the runtime record and the per-launch config, into the session dir."""
+    """The prompt, the runtime record and the per-launch config, into the session dir.
+
+    Returns the fresh muse session id for a muse launch, else None. The id
+    is generated here, recorded here and passed to `argv` by the caller, so
+    the recorded id and the run's id cannot differ.
+    """
     try:
         os.makedirs(session, exist_ok=True)
         paths.atomic_write_text(os.path.join(session, "prompt.md"), prompt)
@@ -390,6 +407,11 @@ def _write_session(session, adapter, runtime, prompt, runtime_config, chains=Non
         if chains:
             config = adapter.with_models(config, chains)
         adapter.write_config(session, config)
+        if adapter.name == muse.NAME:
+            session_id = muse.new_session_id()
+            muse.record_session_id(session, session_id)
+            return session_id
+        return None
     except (ValueError, TypeError, OSError) as err:
         raise LaunchError(f"cannot write the agent's session: {err}") from None
 
@@ -438,6 +460,11 @@ def resume(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
+        if adapter.name == muse.NAME:
+            try:
+                muse.write_message(session, message)
+            except OSError as err:
+                raise LaunchError(f"cannot write the agent's session: {err}") from None
         unit = units.unit_name(tgt.prefix, tgt.repo, number, max(units.next_gen(session), 1))
         try:
             command = adapter.argv(
