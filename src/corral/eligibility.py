@@ -13,13 +13,17 @@ modules the host operator trusts; a policy that needs the outside
 world is a configuration error in that project, never a new seam.
 
 The entry is either a dotted ``module:function`` name or a
-``path/to/policy.py:function`` file path. A project without the entry
-registers no candidates; loading failures are configuration errors
-(exit 4) naming the project and the entry, blocking only that project.
+``path/to/policy.py:function`` file path. A relative file path resolves
+against the project's registered ops root, never the process working
+directory, so the same entry loads from a shell and under a unit.
+A project without the entry registers no candidates; loading failures
+are configuration errors (exit 4) naming the project and the entry,
+blocking only that project.
 """
 
 import importlib
 import importlib.util
+import math
 import os
 import sys
 from collections.abc import Callable, Sequence
@@ -81,6 +85,8 @@ class StartRequest:
 
 def row_from_item(item: board.Item) -> TicketRow:
     """The policy view of one board store item. Pure."""
+    # pulls stays empty here; the reviewer-scheduling pass (ticket 6 of
+    # docs/04-dispatch-loop.md) populates it from linked pull requests.
     return TicketRow(
         repo=item.repo,
         number=item.number,
@@ -100,7 +106,7 @@ def rows_from_items(items: Sequence[board.Item]) -> list[TicketRow]:
     return [row_from_item(item) for item in items]
 
 
-def _resolve(entry: str, *, project: str) -> Callable[..., Any]:
+def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[..., Any]:
     """The callable an entry names, dotted or file path. Never called here."""
     head, sep, attrs = entry.partition(":")
     if not sep or not head or not attrs:
@@ -109,7 +115,7 @@ def _resolve(entry: str, *, project: str) -> Callable[..., Any]:
             "module:function or path/to/policy.py:function"
         )
     if "/" in head or os.sep in head or head.endswith(".py"):
-        target: Any = _load_file(head, entry=entry, project=project)
+        target: Any = _load_file(head, entry=entry, project=project, base=base)
     else:
         try:
             target = importlib.import_module(head)
@@ -129,8 +135,14 @@ def _resolve(entry: str, *, project: str) -> Callable[..., Any]:
     return target
 
 
-def _load_file(path: str, *, entry: str, project: str) -> Any:
-    """The module at `path`, imported under a name derived from the path."""
+def _load_file(path: str, *, entry: str, project: str, base: str | None = None) -> Any:
+    """The module at `path`, imported under a name derived from the path.
+
+    A relative `path` resolves against `base`, the project's registered
+    ops root; without a base it stays relative to the working directory.
+    """
+    if base is not None and not os.path.isabs(path):
+        path = os.path.join(base, path)
     if not os.path.isfile(path):
         raise EligibilityError(f"project {project}: eligibility {entry!r} has no file {path!r}")
     name = "corral_policy_" + os.path.abspath(path).encode().hex()
@@ -166,8 +178,10 @@ class LoadedPolicy:
     def eligible(self, rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]:
         try:
             found = self.func(list(rows), now=now)
-        except EligibilityError:
-            raise
+        except EligibilityError as err:
+            raise EligibilityError(
+                f"project {self.project}: eligibility {self.entry!r} failed: {err}"
+            ) from None
         except Exception as err:
             raise EligibilityError(
                 f"project {self.project}: eligibility {self.entry!r} failed: {err}"
@@ -188,34 +202,55 @@ def _ordered(found: Any, *, project: str, entry: str) -> list[StartRequest]:
                 f"project {project}: eligibility {entry!r} must return "
                 f"StartRequest rows, got {type(request).__name__}"
             )
+        if not isinstance(request.repo, str):
+            raise EligibilityError(
+                f"project {project}: eligibility {entry!r} carries a "
+                f"non-string repo {request.repo!r}"
+            )
+        if not isinstance(request.number, int) or isinstance(request.number, bool):
+            raise EligibilityError(
+                f"project {project}: eligibility {entry!r} carries a "
+                f"non-integer number {request.number!r}"
+            )
         if request.kind not in KINDS:
             raise EligibilityError(
                 f"project {project}: eligibility {entry!r} names unknown kind {request.kind!r}"
             )
-        if not isinstance(request.weight, (int, float)) or isinstance(request.weight, bool):
+        if (
+            not isinstance(request.weight, (int, float))
+            or isinstance(request.weight, bool)
+            or not math.isfinite(request.weight)
+        ):
             raise EligibilityError(
                 f"project {project}: eligibility {entry!r} carries a "
-                f"non-numeric weight {request.weight!r}"
+                f"non-finite weight {request.weight!r}"
             )
     return sorted(found, key=lambda request: (-request.weight, request.repo, request.number))
 
 
-def load_policy(entry: str, *, project: str) -> LoadedPolicy:
-    """The policy an entry names. Importing never calls it.
+def load_policy(entry: str, *, project: str, base: str | None = None) -> LoadedPolicy:
+    """The policy an entry names. Resolving imports the module but never
+    calls the entry function; the module's own top-level code runs on
+    import, which is the in-process trust boundary for policy code.
 
-    Raises EligibilityError (exit 4) naming the project and the entry.
+    `base` is the project's registered ops root, against which a
+    relative file path resolves. Raises EligibilityError (exit 4)
+    naming the project and the entry.
     """
-    return LoadedPolicy(project=project, entry=entry, func=_resolve(entry, project=project))
+    return LoadedPolicy(
+        project=project, entry=entry, func=_resolve(entry, project=project, base=base)
+    )
 
 
-def check_entry(entry: str, *, project: str) -> str | None:
+def check_entry(entry: str, *, project: str, base: str | None = None) -> str | None:
     """None when the entry resolves to a callable, else the error text.
 
-    Importing never calls the policy. A resolver-side helper so health
-    checks report a bad entry without raising.
+    Resolving imports the module but never calls the entry function;
+    the module's own top-level code runs on import. A resolver-side
+    helper so health checks report a bad entry without raising.
     """
     try:
-        load_policy(entry, project=project)
+        load_policy(entry, project=project, base=base)
     except EligibilityError as err:
         return str(err)
     return None
@@ -241,5 +276,5 @@ def for_project(project: Any, items: Sequence[board.Item], *, now: float) -> Out
     """
     if not project.eligibility:
         return Outcome([], f"project {project.name} has no eligibility entry: skipped")
-    policy = load_policy(project.eligibility, project=project.name)
+    policy = load_policy(project.eligibility, project=project.name, base=project.root)
     return Outcome(policy.eligible(rows_from_items(items), now=now), None)

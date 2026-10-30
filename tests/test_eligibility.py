@@ -160,6 +160,50 @@ class LoaderTest(unittest.TestCase):
             policy.eligible([], now=2000.0)
         self.assertIn("blue", str(ctx.exception))
 
+    def test_relative_path_entry_resolves_against_base_not_cwd(self):
+        ops_root = os.path.join(self.tmp, "ops")
+        os.makedirs(os.path.join(ops_root, "policies"))
+        with open(
+            os.path.join(ops_root, "policies", "blue_policy.py"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-cwd-"))
+        old = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            policy = eligibility.load_policy(
+                "policies/blue_policy.py:eligible", project="blue", base=ops_root
+            )
+        finally:
+            os.chdir(old)
+        self.assertEqual(policy.eligible([], now=2000.0), [])
+
+    def test_relative_path_entry_without_base_stays_relative_to_cwd(self):
+        policy_dir = os.path.join(self.tmp, "relonly")
+        os.makedirs(policy_dir)
+        with open(os.path.join(policy_dir, "rel_policy.py"), "w", encoding="utf-8") as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        old = os.getcwd()
+        os.chdir(policy_dir)
+        try:
+            policy = eligibility.load_policy("rel_policy.py:eligible", project="blue")
+        finally:
+            os.chdir(old)
+        self.assertEqual(policy.eligible([], now=2000.0), [])
+
+    def test_dotted_entry_with_attribute_path(self):
+        module_path = os.path.join(self.tmp, "attrmod.py")
+        with open(module_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "class Holder:\n"
+                "    def eligible(self, rows, *, now):\n"
+                "        return []\n"
+                "holder = Holder()\n"
+            )
+        with mock.patch.object(sys, "path", [self.tmp, *sys.path]):
+            policy = eligibility.load_policy("attrmod:holder.eligible", project="blue")
+        self.assertEqual(policy.eligible([], now=2000.0), [])
+
 
 class PureCallTest(unittest.TestCase):
     def test_requests_come_back_heaviest_first_then_repo_and_number(self):
@@ -198,6 +242,76 @@ class PureCallTest(unittest.TestCase):
             project="blue", entry="stub:eligible", func=lambda rows, *, now: []
         )
         self.assertEqual(policy.eligible([], now=2000.0), [])
+
+    def test_a_non_list_return_names_the_project_and_entry(self):
+        for found in ({"app": 7}, "app:7", None):
+            with self.subTest(found=found):
+                policy = eligibility.LoadedPolicy(
+                    project="blue",
+                    entry="stub:eligible",
+                    func=lambda rows, *, now, found=found: found,
+                )
+                with self.assertRaises(eligibility.EligibilityError) as ctx:
+                    policy.eligible([], now=2000.0)
+                self.assertEqual(ctx.exception.exit_code, 4)
+                self.assertIn("blue", str(ctx.exception))
+                self.assertIn("stub:eligible", str(ctx.exception))
+
+    def test_a_bool_weight_is_not_a_number(self):
+        policy = eligibility.LoadedPolicy(
+            project="blue",
+            entry="stub:eligible",
+            func=lambda rows, *, now: [
+                eligibility.StartRequest(repo="app", number=1, kind="start", weight=True)
+            ],
+        )
+        with self.assertRaises(eligibility.EligibilityError) as ctx:
+            policy.eligible([], now=2000.0)
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertIn("blue", str(ctx.exception))
+
+    def test_a_non_finite_weight_is_exit_four(self):
+        for weight in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(weight=weight):
+                policy = eligibility.LoadedPolicy(
+                    project="blue",
+                    entry="stub:eligible",
+                    func=lambda rows, *, now, weight=weight: [
+                        eligibility.StartRequest(repo="app", number=1, kind="start", weight=weight)
+                    ],
+                )
+                with self.assertRaises(eligibility.EligibilityError) as ctx:
+                    policy.eligible([], now=2000.0)
+                self.assertEqual(ctx.exception.exit_code, 4)
+                self.assertIn("blue", str(ctx.exception))
+
+    def test_a_bad_repo_or_number_names_the_project_and_entry(self):
+        bad = [
+            eligibility.StartRequest(repo=42, number=1, kind="start"),  # ty: ignore[invalid-argument-type]
+            eligibility.StartRequest(repo="app", number="1", kind="start"),  # ty: ignore[invalid-argument-type]
+            eligibility.StartRequest(repo="app", number=True, kind="start"),
+        ]
+        for request in bad:
+            with self.subTest(request=request):
+                policy = eligibility.LoadedPolicy(
+                    project="blue", entry="stub:eligible", func=lambda rows, *, now: [request]
+                )
+                with self.assertRaises(eligibility.EligibilityError) as ctx:
+                    policy.eligible([], now=2000.0)
+                self.assertEqual(ctx.exception.exit_code, 4)
+                self.assertIn("blue", str(ctx.exception))
+                self.assertIn("stub:eligible", str(ctx.exception))
+
+    def test_a_policy_that_raises_eligibility_error_is_annotated(self):
+        def func(rows, *, now):
+            raise eligibility.EligibilityError("inner trouble")
+
+        policy = eligibility.LoadedPolicy(project="blue", entry="stub:eligible", func=func)
+        with self.assertRaises(eligibility.EligibilityError) as ctx:
+            policy.eligible([], now=2000.0)
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertIn("blue", str(ctx.exception))
+        self.assertIn("stub:eligible", str(ctx.exception))
 
 
 class ForProjectTest(unittest.TestCase):
@@ -241,6 +355,29 @@ class ForProjectTest(unittest.TestCase):
         self.assertEqual(ctx.exception.exit_code, 4)
         self.assertIn("blue", str(ctx.exception))
         self.assertIn("missing_module_xyz:eligible", str(ctx.exception))
+
+    def test_a_relative_entry_resolves_against_the_project_root(self):
+        ops_root = os.path.join(self.tmp, "ops")
+        os.makedirs(os.path.join(ops_root, "policies"))
+        with open(
+            os.path.join(ops_root, "policies", "blue_policy.py"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        project = projects.Project(
+            name="blue",
+            unit_prefix="blue-agent",
+            root=ops_root,
+            eligibility="policies/blue_policy.py:eligible",
+        )
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-cwd-"))
+        old = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            outcome = eligibility.for_project(project, [item()], now=2000.0)
+        finally:
+            os.chdir(old)
+        self.assertIsNone(outcome.skipped)
+        self.assertEqual(outcome.requests, [])
 
 
 class RegistrationTest(unittest.TestCase):
@@ -309,6 +446,27 @@ class RegistrationTest(unittest.TestCase):
         )
         with mock.patch.object(sys, "path", [policy_dir, *sys.path]):
             self.assertEqual(projects.check(), [])
+
+    def test_check_resolves_a_relative_entry_against_the_project_root(self):
+        ops_root = os.path.join(self.tmp, "ops")
+        os.makedirs(os.path.join(ops_root, "policies"))
+        with open(
+            os.path.join(ops_root, "policies", "blue_policy.py"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        self.write_project(
+            "blue",
+            'name = "blue"\nunit_prefix = "blue-agent"\n'
+            f'root = "{ops_root}"\n'
+            'eligibility = "policies/blue_policy.py:eligible"\n',
+        )
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-cwd-"))
+        old = os.getcwd()
+        os.chdir(elsewhere)
+        try:
+            self.assertEqual(projects.check(), [])
+        finally:
+            os.chdir(old)
 
 
 if __name__ == "__main__":

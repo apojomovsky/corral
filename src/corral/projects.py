@@ -174,7 +174,7 @@ def check(config_dir: str | None = None) -> list[str]:
 
     [] means every registration is usable. A missing registry dir counts
     as usable: the host just holds one unregistered project. Resolving
-    never calls a policy.
+    imports the policy module but never calls the entry function.
     """
     try:
         found = load_all(config_dir)
@@ -191,7 +191,9 @@ def check(config_dir: str | None = None) -> list[str]:
                 f"project {project.name} asks ceiling {project.ceiling}, host allows {total}"
             )
         if project.eligibility is not None:
-            problem = eligibility.check_entry(project.eligibility, project=project.name)
+            problem = eligibility.check_entry(
+                project.eligibility, project=project.name, base=project.root
+            )
             if problem is not None:
                 problems.append(problem)
     return problems
