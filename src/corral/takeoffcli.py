@@ -1,7 +1,8 @@
 """`corral takeoff`: the project-level gate before a PR.
 
 Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
-could not be read, 4 usage or configuration error.
+could not be read, 4 usage or configuration error, 75 another takeoff
+held the full-suite lock past the wait.
 """
 
 import argparse
@@ -73,7 +74,8 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
         "the ticket branch, the commit rules, the PR body, the leak guard, "
         "the review record and the configured takeoff commands. Exit 0 when "
         "every check is ok or skipped, 1 when one failed, 3 when the remote "
-        "could not be read, 4 on usage or configuration error.",
+        "could not be read, 4 on usage or configuration error, 75 when "
+        "another takeoff holds the full-suite lock past the wait.",
     )
     p.add_argument("--body", default=None, metavar="FILE", help="the PR body file")
     p.add_argument(
