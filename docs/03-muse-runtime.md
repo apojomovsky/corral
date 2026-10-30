@@ -87,9 +87,11 @@ What each flag is, and the evidence:
   A `model=` override takes the same path: `muse/other` and a bare
   `other` both yield `--model other`. Observed: `--model` is refused
   under `--provider echo` (`--model requires --provider meta or
-  local`), and its shape is verified in `muse exec --help`. An end to
-  end run with `--model` needs a real call, so the value flow is
-  UNVERIFIED at runtime but the flag shape is verified.
+  local`), and its shape is verified in `muse exec --help`. A real
+  worker run through `corral launch` has since executed end to end
+  under the configured model: `run.model.configured` names the model
+  id at startup and `run.usage` carries its per-model counts, ending
+  in `run.terminal.completed`. Value flow verified.
 - `--contributor-mode on`: fixed. Observed in the top-level `--help`:
   a per-run override that is never persisted. The adapter passes it
   explicitly so a headless run never depends on the home config.
@@ -194,31 +196,44 @@ entirely `runtime.*` shapes (`runtime.session`,
 activity; the file is muse's own record, read by `muse export` when a
 full transcript is needed.
 
-Payload types that matter for `tail.render`, observed under echo:
+Payload types that matter for `tail.render`, confirmed in a real
+worker run through `corral launch` (echo had shown a subset):
 
 - `run.lifecycle.started`: carries the prompt; shown once as the run
   header.
+- `turn.input.user`: carries the same prompt again; skipped, so the
+  header shows once.
 - `run.output.delta`: carries `text`; the agent's visible reply,
   rendered like assistant text.
 - `run.terminal.completed`: carries `terminal: completed`, `reason`,
   and final `text`; the run's last line.
-- `run.usage`: carries `calls`, per-model token counts, and
-  `allowance` (null under echo). Not activity; it feeds the quota
-  tail-scan (section 6), not the display lines.
-- `task.lifecycle.*` (`proposed`, `scheduled`, `started`,
-  `completed`, `failed`): subagent roster noise under echo (reminder
-  agents); skipped by the renderer. A tool call surfacing as a task
-  event is UNVERIFIED (no tool ran under echo).
-
-`tool.result` (with `tool_name` and
-`correlation_facts.outcome`) is reported in the maintainer notes but
-did not appear in any echo run, so its render rule is
-designed-from-notes and UNVERIFIED: render `-> <tool_name> |
-<outcome>` and collapse the rest, mirroring the omp/opencode
-one-line tool format. Everything else (reconciliation records,
-`session.run.linked`, `task.stream.linked`) renders to nothing. The
-renderer stays total: unknown `payload_type` values and non-JSON lines
-are skipped, as today.
+- `run.model.configured`: names the model id at startup; not
+  activity, skipped.
+- `run.usage`: carries `calls`, per-model token counts, and a
+  populated `allowance` (weekly and window entries; null under echo).
+  Not activity; it feeds the quota tail-scan (section 6), not the
+  display lines.
+- `tool.result`: carries `call_id`, `command_id`, `kind:
+  tool_result`, `run_stream`, the full output in `text`, and
+  `correlation_facts` with `outcome` and `tool_name`; edits add an
+  `edit_facts` summary. Every observed outcome was `success`; one
+  interim record carried no `correlation_facts` (the command was still
+  running). Rendered `-> <tool_name> | <outcome>`, width-capped,
+  collapsing the rest and mirroring the omp/opencode one-line tool
+  format: verified. No failed command appeared in the observed run, so
+  the failure outcome string stays UNVERIFIED.
+- `task.lifecycle.*` (`accepted`, `proposed`, `scheduled`,
+  `side_effect_intent`, `started`, `status`, `output`, `completed`,
+  `rejected`, `tool_output_ref`): subagent roster and status noise;
+  skipped by the renderer. `output` carries each tool's output chunk
+  and `tool_output_ref` points at it, but the one-line `tool.result`
+  record already covers the call. Tool calls surface as
+  `tool.result`, never as a task event, in the observed run: verified for that run.
+- `runtime.command.accepted`, `session.run.linked`,
+  `session.workspace_branch.observed`, `task.stream.linked`: linkage
+  records; skipped. No reconciliation record appeared in the real run;
+  the renderer skips them as today. The renderer stays total: unknown
+  `payload_type` values and non-JSON lines are skipped.
 
 ## 4. Resume
 
@@ -252,11 +267,13 @@ Observed today: usage errors exit 2 with a one-line `muse:` message on
 stderr (bad `--session-id`, unknown `-c` key, prompt-file plus
 positional text, meta-only flags under echo). Success exits 0 with
 `run.terminal.completed` (`terminal: completed`) as the last stdout
-record.
+record. A real worker run through `corral launch` has since confirmed
+the success path: exit 0, `terminal: completed`, no failed calls.
 
 Provider failures (auth failure, quota exhaustion, rate limit,
-network failure) are UNVERIFIED: learning them needs a real call,
-which probing forbids. The exported wire schema was checked and
+network failure) are still UNVERIFIED: the observed real run completed
+cleanly, so learning them still needs a real failure, which this log
+does not contain. The exported wire schema was checked and
 covers only transport-level codes, so classification must come from
 observed runs, not from the schema. The design therefore ships
 `classify` with verified usage-error rules and an explicit unknown
@@ -300,9 +317,10 @@ seconds. That is the whole provider-specific surface, and it fits
 ops root (never in corral), is named by the `muse` entry in
 `accounts.toml`, gets credentials at call time, raises `ReaderError`
 on failure, and corral ships no muse reader. `run.usage` in the event
-stream also carries an `allowance` field, but it was null under echo,
-so the stream is not a quota source; whether real runs populate it is
-UNVERIFIED. The reader's `parse_limit_error` ships returning `None`
+stream also carries an `allowance` field, null under echo but
+populated in a real worker run (weekly and window entries alongside
+per-model token counts); the stream is still not a quota source by
+design. The reader's `parse_limit_error` ships returning `None`
 for every input until section 5 learns the wording; that gap is an
 explicit ticket (T6), not a silent default: unknown text posts no
 mark.
@@ -383,9 +401,9 @@ Extended `tests/test_tail.py` (canned lines, temp files):
   `run.terminal.completed` show text; `run.usage`,
   `task.lifecycle.*`, reconciliation and link records show nothing;
   unknown `payload_type` and non-JSON lines show nothing.
-- `tool.result` cases are added with the fixture the first real tool
-  call produces (T8); until then the renderer test asserts such lines
-  are skipped, not misrendered.
+- `tool.result` cases use the sanitized fixture cut from the first
+  real worker run (T8): tool and outcome render one line, records
+  without facts and prompt duplicates render nothing.
 
 Extended `tests/test_launch.py` (existing fake seams only): launch,
 resume, tail and stop of a muse ticket through fake `run`/`list_fn`
