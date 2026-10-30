@@ -436,6 +436,19 @@ class DecisionAdapterTest(unittest.TestCase):
             self.adapter.add_label("acme/app", 7, "needs-decision")
         self.assertEqual(ctx.exception.retry_after, 62.0)
 
+    def test_comment_rate_limit_maps_to_tracker_rate_limited(self):
+        self.error = ghmod.GhError("unavailable", "API rate limit exceeded, retry after 62s")
+        with self.assertRaises(tracker.TrackerRateLimited) as ctx:
+            self.adapter.comment("acme/app", 7, "body")
+        self.assertEqual(ctx.exception.retry_after, 62.0)
+
+    def test_label_failure_is_a_tracker_error(self):
+        self.error = RuntimeError("connection refused")
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.add_label("acme/app", 7, "needs-decision")
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
+        self.assertEqual(ctx.exception.exit_code, 3)
+
 
 if __name__ == "__main__":
     unittest.main()
