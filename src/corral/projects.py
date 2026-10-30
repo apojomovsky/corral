@@ -151,6 +151,22 @@ def for_root(root: str | None, registered: list[Project] | None = None) -> Proje
     return None
 
 
+def unit_prefix(
+    root: str | None, resolved: settings.Resolved, registered: list[Project] | None = None
+) -> str:
+    """This root's unit prefix, the one place that decides it.
+
+    The registration's prefix when one claims the root, else the
+    `agents.unit_prefix` setting. Launch, admission and stop read it
+    through the target; the projects verb reads the registrations it
+    comes from.
+    """
+    project = for_root(root, registered)
+    if project is not None:
+        return project.unit_prefix
+    return resolved["agents.unit_prefix"]
+
+
 def limits(found: list[Project], *, total_cap: int, repo_cap: int) -> admission.Limits:
     """The admission limits for these projects, validated.
 
