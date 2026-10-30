@@ -1,20 +1,22 @@
 """`corral drive`: one dispatch pass over the board store.
 
-Ticket 1 is the skeleton: take the single-instance lock (exit 2 when
-held), read the store, print the candidate table, and write nothing.
-`--plan` is the dry run: it never syncs, claims, enqueues, starts,
-mirrors or journals. There is no eligibility hook yet, so every open
-item is listed with verdict "no policy". Later tickets add the policy
-call, the gate order, claims and the real pass behind the same lock.
+Ticket 1 is the skeleton: read the store, print the candidate table,
+and write nothing. The non-plan pass holds the single-instance lock
+(exit 2 when another pass holds it). `--plan` is the dry run: it never
+takes the lock, never syncs, claims, enqueues, starts, mirrors or
+journals. There is no eligibility hook yet, so every open item is
+listed with verdict "no policy". Later tickets add the policy call,
+the gate order, claims and the real pass behind the same lock.
 
 Exit codes: 0 completed, 2 another pass holds the lock, 4 the store
-could not be read or the lock directory could not be set up.
+could not be read or the lock could not be set up.
 """
 
 import argparse
 import contextlib
 import fcntl
 import os
+import sqlite3
 import sys
 from dataclasses import dataclass
 
@@ -33,6 +35,12 @@ class LockHeld(Exception):
     """Another pass holds the drive lock (exit 2)."""
 
     exit_code = 2
+
+
+class LockError(Exception):
+    """The lock could not be set up: bad directory or file (exit 4)."""
+
+    exit_code = 4
 
 
 @dataclass(frozen=True)
@@ -57,19 +65,20 @@ def lock_path():
 def drive_lock(path):
     """Hold a non-blocking exclusive flock on `path` for the pass.
 
-    Creates the lock file when missing. Raises `LockHeld` when another
-    pass holds it. The lock releases when the context exits.
+    Creates the lock file when missing. Raises `LockHeld` only when
+    another pass holds the lock; setup and open failures raise
+    `LockError`. The lock releases when the context exits.
     """
     parent = os.path.dirname(path)
     if parent:
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as err:
-            raise LockHeld(f"cannot set up the drive lock: {err}")
+            raise LockError(f"cannot set up the drive lock: {err}")
     try:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError as err:
-        raise LockHeld(f"cannot open the drive lock {path}: {err}")
+        raise LockError(f"cannot open the drive lock {path}: {err}")
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -108,25 +117,38 @@ def render(rows):
     return "\n".join(lines) + "\n"
 
 
-def run_pass(*, plan, store, lock_path, out, err) -> int:
-    """One pass: lock, read the store, print the table, write nothing.
+def _read_and_print(store, out, err) -> int:
+    """Read the store and print the candidate table, writing nothing."""
+    try:
+        items = store.items(state="open")
+    except board.StoreError as problem:
+        print(f"corral drive: {problem}", file=err)
+        return USAGE
+    except sqlite3.Error as problem:
+        print(f"corral drive: cannot read the store: {problem}", file=err)
+        return USAGE
+    out.write(render(candidates(items)))
+    return OK
 
+
+def run_pass(*, plan, store, lock_path, out, err) -> int:
+    """One pass: read the store, print the table, write nothing.
+
+    Only the non-plan pass takes the drive lock; `--plan` never does.
     All seams injected (`store`, the lock path, the streams), so tests
     use a temporary store and lock. Returns the exit code.
     """
-    _ = plan
+    if plan:
+        return _read_and_print(store, out, err)
     try:
         with drive_lock(lock_path):
-            try:
-                items = store.items(state="open")
-            except board.StoreError as problem:
-                print(f"corral drive: {problem}", file=err)
-                return USAGE
-            out.write(render(candidates(items)))
+            return _read_and_print(store, out, err)
     except LockHeld as held:
         print(f"corral drive: {held}", file=err)
         return RACE
-    return OK
+    except LockError as problem:
+        print(f"corral drive: {problem}", file=err)
+        return USAGE
 
 
 def cmd_drive(args: argparse.Namespace) -> int:

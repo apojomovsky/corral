@@ -9,6 +9,7 @@ import argparse
 import fcntl
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -114,22 +115,77 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("0 candidate", out)
 
-    def test_pass_releases_the_lock(self):
-        store = stored(self.db, [("app", 7, "open")])
-        self.addCleanup(store.close)
-        code, _, _ = self.run_pass(store)
-        self.assertEqual(code, 0)
-        with open(self.lock, "r") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-
-    def test_second_concurrent_pass_exits_two(self):
+    def test_plan_never_takes_the_lock(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         with open(self.lock, "w") as holder:
             fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
-            code, _, err = self.run_pass(store)
+            code, out, err = self.run_pass(store, plan=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("app#7: no policy", out)
+
+    def test_non_plan_pass_takes_and_releases_the_lock(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        code, out, err = self.run_pass(store, plan=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("app#7: no policy", out)
+        with open(self.lock, "r") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_second_concurrent_non_plan_pass_exits_two(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with open(self.lock, "w") as holder:
+            fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+            code, _, err = self.run_pass(store, plan=False)
         self.assertEqual(code, 2)
         self.assertIn("already running", err)
+
+    def test_lock_setup_failure_is_exit_four(self):
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w") as handle:
+            handle.write("not a directory")
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        out, err = io.StringIO(), io.StringIO()
+        code = drive.run_pass(
+            plan=False,
+            store=store,
+            lock_path=os.path.join(blocker, "drive.lock"),
+            out=out,
+            err=err,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err.getvalue())
+        self.assertNotIn("already running", err.getvalue())
+
+    def test_corrupt_row_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        store.close()
+        raw = sqlite3.connect(self.db)
+        try:
+            raw.execute("INSERT INTO items(repo, number, labels) VALUES('app', 1, 'bogus')")
+            raw.commit()
+        finally:
+            raw.close()
+        store = board.open_store(self.db)
+        self.addCleanup(store.close)
+        code, _, err = self.run_pass(store, plan=True)
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err)
+
+    def test_raw_sqlite_error_is_exit_four(self):
+        class BrokenStore:
+            def items(self, **kwargs):
+                raise sqlite3.OperationalError("boom")
+
+        out, err = io.StringIO(), io.StringIO()
+        code = drive.run_pass(plan=True, store=BrokenStore(), lock_path=self.lock, out=out, err=err)
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err.getvalue())
 
 
 class LockPathTest(unittest.TestCase):
