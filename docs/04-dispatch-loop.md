@@ -265,17 +265,38 @@ States and who moves them:
 The decision protocol stays human: when a ticket needs a maintainer
 (a design question, a takeoff failure needing judgment, repeated fix
 failures), the loop posts the question as a comment, adds the
-`needs-decision` label through the outbox, releases its claim, and
-walks away. Tickets carrying that label are never started (section 3).
+`needs-decision` label, releases its claim, and walks away. Tickets
+carrying that label are never started (section 3).
+
+This is an explicit protocol change: neither write can go through
+the outbox. `Store.enqueue` refuses anything outside `AGENT_FIELDS`
+(`board.py`), and `Tracker.write` covers only the corral-owned
+`agent` and `status` fields, while `00-design.md` reserves labels and
+comments as people-owned tracker fields. So the loop gains a narrow
+decision-write seam on `Tracker`: `comment(repo, number, body)` and
+`add_label(repo, number, label)`, implemented once by the GitHub
+adapter behind the single `gh` seam. The people-owned rule stands:
+the loop writes only the one `needs-decision` label and its own
+comment (marked as the loop's), and never edits title, body, other
+labels or assignments; the mirror treats those two writes as
+corral-originated, never as conflicts to drop. The writes go direct,
+not through the outbox, and on `TrackerError` the loop keeps the
+claim, logs, and retries on a later pass: it never releases a ticket
+it failed to flag for a human.
 
 Finished workers are reconciled before stuck ones. When the row's
 holder has a `finished` registry entry (a `done` file, kept for
 `RETAIN_S`), the worker is complete: the loop releases the claim
 with a logbook line, leaving branch and PR untouched, so a later
-pass can schedule review on the unclaimed PR-ready row. Worker
-completion releases before any reviewer start and long before merge;
-merge-ready rows stay unclaimed and the loop ignores them. A
-`finished` entry is neither `live` nor `stale` under
+pass can schedule review on the unclaimed PR-ready row. Before
+releasing, the loop captures the worker's agent id (falling back to
+the `finished` registry entry, which carries it for `RETAIN_S`) and
+passes it as the reviewer's `--author`: `review record --author` is
+required and `reviewrecord` refuses author==reviewer, so the
+reviewer start needs the worker id the release just cleared from
+the row. Worker completion releases before any reviewer start and
+long before merge; merge-ready rows stay unclaimed and the loop
+ignores them. A `finished` entry is neither `live` nor `stale` under
 `registry.status`, so it already counts as "no live or stale entry"
 for the section 4 orphan rule; reconciliation runs first, so a
 finished worker always takes this completion path, never the orphan
@@ -299,9 +320,11 @@ foreign claims were skipped at gate step 2.
   calendar day, while this window bounds restart rate around an
   incident.) Only stop-plus-launch restarts consume the budget. Fix
   rounds are not restarts: a `resume` that reuses the live unit and
-  session never consumes it. Past the budget, give up: comment with
-  the tail of what was observed, add `needs-decision`, release the
-  claim.
+  session never consumes it. Past the budget, give up: post the
+  tail of what was observed with `Tracker.comment`, add
+  `needs-decision` with `Tracker.add_label` (the decision-write seam
+  above; the outbox carries neither), then release the claim. A
+  failed decision write keeps the claim for a later pass.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 
@@ -389,6 +412,8 @@ is tested through the seam its production code already injects:
 | Hold and unreadable labels skip; `needs-decision` skips | fake `read_labels` |
 | Ordering: resume before start, priority, wait time, determinism | pure ordering function over constructed rows |
 | Restart budget counts stop-plus-launch restarts in a sliding 24h window, foreign holders never restart, give-up comments and releases | fake units stop seam, fake registry, temp state dir with budget timestamps |
+| Decision comment and `needs-decision` label through the new seam; a failed write keeps the claim | fake `Tracker` recording `comment`/`add_label` calls, scripted `TrackerError` |
+| Reviewer start carries the pre-release worker id as `--author` | temp `Store`, fake registry with a `done` entry, author==reviewer refusal case |
 | Day cap stops starts, not resumes; pause file stops all | temp state dir with counter and pause files |
 | `--plan` writes nothing | read-only assertion: store and outbox hashes unchanged |
 | Snapshot `drive` section on missing or corrupt journal | temp state dir, section-error shape |
@@ -431,23 +456,31 @@ the modules named.
    with a logbook line; stale-but-present agents and live
    units are left alone; adoption still happens only in resync.
 6. Reviewer scheduling and fix rounds. Criteria: reviewer starts only
-   for PR-ready rows with author check intact; fix round resumes when
-   possible else restarts on the same branch; merge-ready rows are
-   ignored by the loop.
-7. Stuck detection, restart budget, give-up. Criteria: gone managed
+   for PR-ready rows, with the pre-release worker id passed as
+   `--author` (author==reviewer refusal intact at record time); fix
+   round resumes when possible else restarts on the same branch;
+   merge-ready rows are ignored by the loop.
+7. Tracker decision-write seam. `comment` and `add_label` on the
+   `Tracker` protocol plus the GitHub adapter implementation behind
+   the single `gh` seam. Criteria: adapter test posts one comment
+   and one label through a fake `gh`; fake-`Tracker` test records
+   both calls; the outbox still refuses both fields; only the
+   `needs-decision` label and the loop's own comment go through it.
+8. Stuck detection, restart budget, give-up. Criteria: gone managed
    agent with dead unit restarts within budget reusing the identical
    agent id; foreign holders are never restarted; the budget counts
    only stop-plus-launch restarts in a sliding 24h window, fix-round
-   resumes do not consume it; past budget posts comment, adds
-   `needs-decision`, releases; `finished` holders take the section 5
-   completion release before any stuck handling.
-8. Observability: journal and snapshot section. Criteria: each pass
+   resumes do not consume it; past budget posts through the ticket 7
+   decision-write seam, then releases, and a failed write keeps the
+   claim; `finished` holders take the section 5 completion release
+   before any stuck handling.
+9. Observability: journal and snapshot section. Criteria: each pass
    appends well-formed lines; snapshot shows the section 6 fields;
    corrupt journal yields a section error, not a crash.
-9. Safety: pause file and day cap. Criteria: pause file exits 1 with
-   the file's reason and starts nothing; cap counts starts not
-   resumes or plans and resets on date change.
-10. Timer unit, doctor checks and docs. Criteria: user timer installed
+10. Safety: pause file and day cap. Criteria: pause file exits 1 with
+    the file's reason and starts nothing; cap counts starts not
+    resumes or plans and resets on date change.
+11. Timer unit, doctor checks and docs. Criteria: user timer installed
     and enabled by an explicit operator step; doctor reports missing
     timer, bad registration entries and unreadable policy modules;
     README commands row added if a verb ships.
