@@ -6,6 +6,7 @@ network, no subprocess, no real state dir.
 """
 
 import argparse
+import errno
 import fcntl
 import io
 import os
@@ -186,6 +187,37 @@ class PlanTest(unittest.TestCase):
         code = drive.run_pass(plan=True, store=BrokenStore(), lock_path=self.lock, out=out, err=err)
         self.assertEqual(code, 4)
         self.assertIn("corral drive:", err.getvalue())
+
+    def test_plan_summary_says_plan(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        code, out, _ = self.run_pass(store, plan=True)
+        self.assertEqual(code, 0)
+        self.assertTrue(out.splitlines()[-1].startswith("plan:"), out)
+
+    def test_locking_pass_summary_says_pass(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        code, out, _ = self.run_pass(store, plan=False)
+        self.assertEqual(code, 0)
+        self.assertTrue(out.splitlines()[-1].startswith("pass:"), out)
+
+    def test_non_contention_flock_error_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        real = drive._flock
+
+        def broken(_fd: int, _op: int) -> None:
+            raise OSError(errno.ENOLCK, "No locks available")
+
+        drive._flock = broken
+        try:
+            code, _, err = self.run_pass(store, plan=False)
+        finally:
+            drive._flock = real
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err)
+        self.assertNotIn("already running", err)
 
 
 class LockPathTest(unittest.TestCase):

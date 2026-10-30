@@ -14,10 +14,12 @@ could not be read or the lock could not be set up.
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import os
 import sqlite3
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from corral import board, paths
@@ -61,13 +63,18 @@ def lock_path():
     return os.path.join(paths.state_dir(), LOCK_NAME)
 
 
+#: The flock seam: production locks with fcntl, tests assign a fake.
+_flock: Callable[[int, int], None] = fcntl.flock
+
+
 @contextlib.contextmanager
 def drive_lock(path):
     """Hold a non-blocking exclusive flock on `path` for the pass.
 
-    Creates the lock file when missing. Raises `LockHeld` only when
-    another pass holds the lock; setup and open failures raise
-    `LockError`. The lock releases when the context exits.
+    Creates the lock file when missing. Raises `LockHeld` only for
+    lock contention (`EWOULDBLOCK`, `EAGAIN`, `EACCES`); setup, open
+    and other lock failures raise `LockError`. The lock releases when
+    the context exits.
     """
     parent = os.path.dirname(path)
     if parent:
@@ -80,10 +87,12 @@ def drive_lock(path):
     except OSError as err:
         raise LockError(f"cannot open the drive lock {path}: {err}")
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+        _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
         os.close(fd)
-        raise LockHeld(f"another drive pass is already running (lock {path})")
+        if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            raise LockHeld(f"another drive pass is already running (lock {path})")
+        raise LockError(f"cannot lock {path}: {err}")
     try:
         yield
     finally:
@@ -110,14 +119,14 @@ def candidates(items):
     return rows
 
 
-def render(rows):
-    """The candidate table plus the summary line."""
+def render(rows, *, label="plan"):
+    """The candidate table plus the summary line under `label`."""
     lines = [f"{row.repo}#{row.number}: {row.verdict} ({row.reason})" for row in rows]
-    lines.append(f"plan: {len(rows)} candidate(s), would start 0")
+    lines.append(f"{label}: {len(rows)} candidate(s), would start 0")
     return "\n".join(lines) + "\n"
 
 
-def _read_and_print(store, out, err) -> int:
+def _read_and_print(store, out, err, *, label) -> int:
     """Read the store and print the candidate table, writing nothing."""
     try:
         items = store.items(state="open")
@@ -127,7 +136,7 @@ def _read_and_print(store, out, err) -> int:
     except sqlite3.Error as problem:
         print(f"corral drive: cannot read the store: {problem}", file=err)
         return USAGE
-    out.write(render(candidates(items)))
+    out.write(render(candidates(items), label=label))
     return OK
 
 
@@ -139,10 +148,10 @@ def run_pass(*, plan, store, lock_path, out, err) -> int:
     use a temporary store and lock. Returns the exit code.
     """
     if plan:
-        return _read_and_print(store, out, err)
+        return _read_and_print(store, out, err, label="plan")
     try:
         with drive_lock(lock_path):
-            return _read_and_print(store, out, err)
+            return _read_and_print(store, out, err, label="pass")
     except LockHeld as held:
         print(f"corral drive: {held}", file=err)
         return RACE
