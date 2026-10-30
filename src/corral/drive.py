@@ -22,6 +22,7 @@ import contextlib
 import datetime
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import socket
@@ -66,6 +67,13 @@ settings.register(
     "real starts one dispatch pass may launch per calendar day (plans never count)",
 )
 
+settings.register(
+    "drive.agent_host",
+    str,
+    "",
+    "display name for the host segment of minted agent ids (empty hashes the hostname)",
+)
+
 #: The lock file inside the state dir.
 LOCK_NAME = "drive.lock"
 
@@ -87,13 +95,31 @@ def is_managed_agent(agent) -> bool:
     return isinstance(agent, str) and agent.startswith(MANAGED_PREFIX)
 
 
+def agent_host_segment(configured="", *, hostname="") -> str:
+    """The host segment for minted agent ids. Pure.
+
+    A configured display name is used with `/` replaced by `-`; an
+    empty or blank one falls back to a short stable hash of the
+    hostname, never the hostname itself: claim agent values are
+    mirrored to the tracker, so a raw hostname there would publish the
+    deployment. Either way the segment is opaque and slash-free.
+    """
+    text = str(configured).strip() if configured else ""
+    if text:
+        return text.replace("/", "-")
+    return hashlib.sha256(str(hostname or "").encode("utf-8")).hexdigest()[:8]
+
+
 def mint_agent(repo, number, *, host, now) -> str:
     """One fresh agent id for (`repo`, `number`). Pure.
 
     Opaque to every reader except debugging: only `is_managed_agent`
     parses it, and only for the prefix. The repo slash becomes a double
     dash so the id itself never contains one, and a host slash becomes a
-    dash. `Claim.epoch` stays the fencing token, never this id.
+    dash. `Claim.epoch` stays the fencing token, never this id. `host`
+    is the display segment from `agent_host_segment`, never the raw
+    hostname: the claim is mirrored to the tracker, so a raw hostname
+    here would publish the deployment.
     """
     owner = str(host).replace("/", "-") if host else "host"
     ticket = str(repo).replace("/", "--")
@@ -1087,7 +1113,7 @@ def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_a
     ref = f"{repo}#{number}"
     try:
         found, fresh = store.item(repo, number, now=now, max_age=stale_after)
-    except board.StoreError as err:
+    except (board.StoreError, sqlite3.Error) as err:
         return None, f"{ref}: store unreadable, claim refused ({err})"
     if fresh or tracker_factory is None:
         return found, None
@@ -1105,11 +1131,11 @@ def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_a
             operators=list(mirror._ops_for(operators, repo)),
             now=now,
         )
-    except board.StoreError as err:
+    except (board.StoreError, sqlite3.Error) as err:
         return None, f"{ref}: store unreadable, claim refused ({err})"
     try:
         found, _ = store.item(repo, number, now=now)
-    except board.StoreError as err:
+    except (board.StoreError, sqlite3.Error) as err:
         return None, f"{ref}: store unreadable, claim refused ({err})"
     if found is None:
         return None, f"{ref}: no store row, skipped as withdrawn"
@@ -1691,7 +1717,21 @@ def _claim_and_launch(
         try:
             store.claim(gated.repo, gated.number, agent, host, now=now)
         except board.Claimed:
-            current, _ = store.item(gated.repo, gated.number, now=now)
+            try:
+                current, _ = store.item(gated.repo, gated.number, now=now)
+            except (board.StoreError, sqlite3.Error) as err:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{ref}: claim refused ({err})",
+                        code="claim",
+                    )
+                )
+                continue
             seen = current.agent if current is not None else ""
             rows.append(
                 Gated(
@@ -1705,7 +1745,7 @@ def _claim_and_launch(
                 )
             )
             continue
-        except (board.ExternalItem, board.StoreError) as err:
+        except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
             rows.append(
                 Gated(
                     project=gated.project,
@@ -2116,7 +2156,12 @@ def _launching_pass(
         hold_label=hold_label,
     )
     if host is None:
-        host = socket.gethostname()
+        try:
+            configured = settings.load(root=None)["drive.agent_host"]
+        except settings.SettingsError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return finish(USAGE)
+        host = agent_host_segment(configured, hostname=socket.gethostname())
     if stale_after is None and tracker_factory is not None:
         try:
             stale_after = settings.load(root=None)["board.item_max_age_s"]
@@ -2200,7 +2245,7 @@ def _launching_pass(
     if tracker_factory is not None:
         try:
             queued_repos = sorted({row.repo for row in store.queued_writes()})
-        except board.StoreError as problem:
+        except (board.StoreError, sqlite3.Error) as problem:
             print(f"corral drive: {problem}", file=err)
             return USAGE
         pairs = []
@@ -2212,7 +2257,7 @@ def _launching_pass(
                 continue
         try:
             outcome = mirror.push_repos(store, pairs, operators=operators, now=now)
-        except board.StoreError as problem:
+        except (board.StoreError, sqlite3.Error) as problem:
             print(f"corral drive: {problem}", file=err)
             return finish(USAGE, started=started, skipped=skipped)
         for line in outcome.errors:
@@ -2291,7 +2336,9 @@ def run_pass(
     tracker (labels or board, built by the one factory); with none
     there is no sync, no freshness re-read, no mirror and no give-up
     post. `operators` maps tracker repos to operator logins for the sync
-    and mirror steps; `host` names this host on its claims; `stale_after`
+    and mirror steps; `host` is the agent-id host segment on its claims
+    (None resolves `drive.agent_host` once, hashing the hostname when
+    empty, so the raw hostname never reaches the tracker); `stale_after`
     bounds the cached rows a claim may use without a live re-read.
     `present_agents` (ids with a live or stale registry entry),
     `live_units` ((repo, number) pairs with a live unit) and `gone_s`
