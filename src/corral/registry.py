@@ -262,6 +262,7 @@ def register(
     *,
     ticket=None,
     model=None,
+    role=None,
     parent=None,
     pid=None,
     transcript=None,
@@ -277,12 +278,19 @@ def register(
     A re-register keeps the original ``started_at`` while the agent has
     not ended; after ``done`` it starts a fresh run. A ``ticket`` here is
     explicit; a re-register without one keeps the previous ticket and its
-    source, so a hook retry never drops an inferred ticket.
+    source, so a hook retry never drops an inferred ticket. ``role`` is
+    the prompt role the agent was launched with (worker, reviewer or
+    triage), or None; a re-register without one keeps the previous role.
     """
     if not agent_id or not agent_id.strip():
         raise RegistryError("agent id must not be empty")
     if runtime not in RUNTIMES:
         raise RegistryError(f"unknown runtime {runtime!r}: want one of {', '.join(RUNTIMES)}")
+    if role is not None:
+        from corral import prompts
+
+        if role not in prompts.ROLES:
+            raise RegistryError(f"unknown role {role!r}: want one of {', '.join(prompts.ROLES)}")
     ticket = _check_ticket(ticket)
     if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid < 1):
         raise RegistryError(f"bad pid {pid!r}: want a positive integer")
@@ -298,12 +306,15 @@ def register(
             source = old.get("ticket_source") if ticket else None
         else:
             source = EXPLICIT if ticket else None
+        if role is None and running:
+            role = old.get("role")
         entry = {
             "id": agent_id,
             "runtime": runtime,
             "ticket": ticket,
             "ticket_source": source,
             "model": model,
+            "role": role,
             "parent": parent,
             "pid": pid,
             "transcript": transcript,

@@ -58,6 +58,7 @@ class Runtime(Protocol):
         model: str | None = None,
         resume: str | None = None,
         max_time: str = DEFAULT_MAX_TIME,
+        reviewer: bool = False,
     ) -> list[str]:
         """The command line for one headless run. `resume` is a `resume_handle`."""
         ...

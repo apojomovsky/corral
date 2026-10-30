@@ -318,6 +318,34 @@ class TicketSourceTest(RegistryCase):
         )
 
 
+class RoleTest(RegistryCase):
+    def test_the_role_is_recorded_and_reads_back(self):
+        self.register(role="reviewer")
+        self.assertEqual(self.entry()["role"], "reviewer")
+        self.register("w1", role="worker")
+        self.assertEqual(self.entry("w1")["role"], "worker")
+
+    def test_no_role_reads_as_none(self):
+        self.register()
+        self.assertIsNone(self.entry()["role"])
+
+    def test_an_unknown_role_is_refused(self):
+        with self.assertRaises(reg.RegistryError):
+            self.register(role="auditor")
+        with self.assertRaises(reg.RegistryError):
+            self.register(role="")
+
+    def test_reregister_without_a_role_keeps_it(self):
+        self.register(role="reviewer")
+        self.register(now=T0 + 10)
+        self.assertEqual(self.entry()["role"], "reviewer")
+
+    def test_reregister_with_a_role_replaces_it(self):
+        self.register(role="reviewer")
+        self.register(role="worker", now=T0 + 10)
+        self.assertEqual(self.entry()["role"], "worker")
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()

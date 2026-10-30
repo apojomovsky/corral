@@ -20,7 +20,7 @@ The test: **if a second project would need it unchanged, it belongs in corral.**
 
 ### corral owns
 
-1. **Runtimes.** One adapter per headless agent runtime (omp, opencode, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors.
+1. **Runtimes.** One adapter per headless agent runtime (omp, opencode, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors. A reviewer launch asks the runtime for its read-only mode (muse adds `--disable-write`); adapters with no read-only flag accept the request and rely on the reviewer prompt's read-only rule.
 2. **Units.** Transient `systemd --user` units: spawn lock, liveness, stop, naming. The unit prefix is set per project.
 3. **Sessions.** One session root per host, one directory per `<project>/<ticket>`.
 4. **Accounts and models.** One accounts file per host lists providers, accounts and their quota readers. Each project declares its own models (roles, fallback chains, sub-agent overrides), naming only providers from that pool. The user's home runtime config is never edited.
@@ -29,7 +29,7 @@ The test: **if a second project would need it unchanged, it belongs in corral.**
 7. **Host hygiene.** One cleanup pass and one disk keeper per host, over every project's worktrees, caches, docker and sessions. Each project supplies a keep-check.
 8. **GitHub pacing.** One token bucket per account, with a `gh` shim on every agent's PATH.
 9. **Review gate building blocks** (optional for a project). Review records keyed by commit, the "reviewer is not the author" check, a diff-derived review budget, and a takeoff skeleton that projects extend with their own gates.
-10. **Agent registry and snapshot.** Every agent on the host from every project (runtime, model, ticket, state) plus quota and capacity, as one stable JSON schema for dashboards.
+10. **Agent registry and snapshot.** Every agent on the host from every project (runtime, role, model, ticket, state) plus quota and capacity, as one stable JSON schema for dashboards.
 11. **Coordinator building blocks** (optional for a project). A lease with generation fencing, a journal, follow-ups and an event queue, keyed by project. The coordinator itself stays in the project.
 12. **Bootstrap and doctor.** The host programs (`system-deps.toml`), linger, units, the accounts file, runtime logins.
 

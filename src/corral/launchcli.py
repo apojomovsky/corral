@@ -242,6 +242,7 @@ def cmd_launch(args, seams: Seams) -> int:
         title=title,
         model=args.model,
         runtime_config=config,
+        role=args.role,
         list_fn=seams.list_fn,
         run=seams.run,
         usage=seams.usage or disk.production_usage,
