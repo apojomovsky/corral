@@ -180,6 +180,9 @@ class GithubTracker:
             from_fork=self._from_fork(repo, number) if kind == "pr" else False,
             agent=field_value_of(labels, "agent"),
             status=field_value_of(labels, "status"),
+            # The REST feed carries no board concepts: an empty reading
+            # keeps the stored board extra when the store merges by key.
+            extra={},
         )
 
     def _page(self, path):
