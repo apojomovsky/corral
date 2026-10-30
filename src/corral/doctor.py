@@ -21,7 +21,8 @@ import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
-from corral import accounts, deps, paths, prompts, registry, settings, units
+from corral import accounts, boarddoctor, deps, paths, prompts, registry, settings, units
+from corral import board as store
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
 
@@ -61,6 +62,15 @@ class Env(NamedTuple):
     #: The disk pressure (`ok`, `low`, `critical`, `unknown`), or None when
     #: the caller has no reading: then the report carries no disk row.
     disk: str | None = None
+    #: Repos in board mode to check, with the seams that check them:
+    #: `board_fetch` resolves one board config to its live schema and
+    #: `board_open_store` opens the store parity rows come from. Empty
+    #: means no board repos, and then the report carries no board row.
+    board_sites: Sequence[boarddoctor.BoardSite] = ()
+    board_fetch: Callable[[settings.BoardConfig], object] | None = None
+    board_open_store: Callable[[], store.Store] | None = None
+    #: The board assembly itself failed: one failing `board` row.
+    board_error: str | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -260,6 +270,25 @@ def _check_disk(pressure: str | None) -> list[Check]:
     ]
 
 
+def _check_boards(env: Env) -> list[Check]:
+    """One row per repo in board mode, mapped from the board slice."""
+    if env.board_error is not None:
+        return [
+            Check(
+                "board",
+                "fail",
+                env.board_error,
+                "fix the ops root's corral.toml, then run `corral doctor` again",
+            )
+        ]
+    return [
+        Check(row.name, row.status, row.detail, row.fix)
+        for row in boarddoctor.check_sites(
+            env.board_sites, fetch=env.board_fetch, open_store=env.board_open_store
+        )
+    ]
+
+
 def run_checks(env: Env) -> list[Check]:
     """Every check, in report order. Pure over the seams in `env`."""
     return [
@@ -272,6 +301,7 @@ def run_checks(env: Env) -> list[Check]:
         *_check_readers(env.reader_errors),
         _check_registry(env.registry_rows, env.registry_error),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
+        *_check_boards(env),
         *_check_disk(env.disk),
     ]
 
@@ -411,6 +441,32 @@ def production_list_fn(prefix: str) -> list:
     return units.list_units(prefix)
 
 
+def production_board_fetch(board_config: settings.BoardConfig) -> object:
+    """The live board schema fetch. Only the CLI builds it; tests never call this."""
+    from corral.github import board as boardreader
+
+    return boardreader.BoardReader(board_config, None, None).schema()
+
+
+def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
+    """Board-mode sites for the live report, or ((), error) that names it.
+
+    Read-only: plain file reads plus the resolved per-repo tables. When
+    the settings themselves failed, there is nothing to assemble, and
+    the settings row already carries the failure.
+    """
+    if settings_error is not None:
+        return (), None
+    try:
+        root = settings.find_root(os.getcwd())
+    except OSError:
+        return (), None
+    if root is None:
+        return (), None
+    sites, error = boarddoctor.sites_from_settings(root)
+    return tuple(sites), error
+
+
 def load_prompts_state() -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
     """(invalid, stale, error) for the prompt overrides, gathered once.
 
@@ -483,6 +539,7 @@ def production_env() -> Env:
     dep_results, deps_error = load_dep_results()
     prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
     disk_pressure = load_disk_pressure(resolved)
+    board_sites, board_error = load_board_sites(settings_error)
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,
@@ -500,6 +557,10 @@ def production_env() -> Env:
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
         disk=disk_pressure,
+        board_sites=board_sites,
+        board_fetch=production_board_fetch,
+        board_open_store=store.open_store,
+        board_error=board_error,
     )
 
 

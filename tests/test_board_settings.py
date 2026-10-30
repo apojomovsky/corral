@@ -212,6 +212,12 @@ class TableErrors(unittest.TestCase):
             with self.subTest(table=table), self.assertRaises(settings.SettingsError):
                 resolve(project=project(table), repo="app")
 
+    def test_a_priority_map_without_a_priority_column_is_an_error(self):
+        table = documented_board()
+        del table["priority_column"]
+        with self.assertRaisesRegex(settings.SettingsError, "app.*priority_map.*priority_column"):
+            resolve(project=project(table), repo="app")
+
     def test_every_entry_is_checked_not_only_the_selected_one(self):
         other = {"name": "other", "board": documented_board(frobnicate="nope")}
         mine = {"name": "app", "tracker": {"variant": "labels"}}
