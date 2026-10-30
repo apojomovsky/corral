@@ -33,8 +33,8 @@ Decision: corral code knows a fixed set of canonical concept keys and
 nothing project-specific. All project naming lives in the project's own
 `corral.toml` (section 5). Concepts travel in the store's existing `extra`
 map (`board.Item.extra`, already persisted as JSON) and reach eligibility
-through one new `TicketRow.extra` mapping, defaulting to empty so
-label-only rows are unchanged.
+through one new `TicketRow.extra` mapping, defaulting to `None` and
+normalized to `{}` on build so label-only rows are unchanged.
 
 | Concept | Carries | Owner |
 | --- | --- | --- |
@@ -85,7 +85,8 @@ Ownership follows `00-design.md` field ownership with no new rule:
   editing a label: their edit either confirms the queue or loses to a
   newer queued write, and the drop is logged.
 
-`TicketRow` gains `extra: Mapping[str, object]` carrying these concepts.
+`TicketRow` gains `extra: Mapping[str, object] | None` defaulting to `None`
+and normalized to `{}` when the row is built, carrying these concepts.
 Precedence between the two sources of rank is resolved in exactly one
 place, a pure helper owned by the board slice: board `priority` wins when
 present, else the label-derived priority stands. Eligibility keeps reading
@@ -186,7 +187,7 @@ that carries no board concepts keeps the stored ones.
 
 A board-sourced item's `updated_at` is the maximum of the issue time and
 the board item time, so a board-only edit still moves the row forward.
-Settlement keys on it exactly as it does for label rows: a reading at or
+Settlement keys on it exactly as it does for label rows: a reading strictly
 past a queued write's `created_at` settles it (echo marks sent, a
 different value drops it as `overridden`, an empty value settles
 nothing), and a stale reading settles nothing.
@@ -251,6 +252,7 @@ so the file keeps its single resolver.
 
 ```toml
 [[repo]]
+name = "example-project"
 tracker.repo = "example/repo"
 tracker.variant = "board"   # "labels" (default) or "board"
 
@@ -273,7 +275,10 @@ blocked_by_column = "Blocked by"
 ```
 
 Rules: corral code names concept keys only, never a project's field or
-option names; those live in the project's file. Boards are looked up by
+option names; those live in the project's file. The entry `name` is the
+key under the ops root (it keys hooks and ticket records), while
+`tracker.repo` is the `owner/name` the adapter talks to (defaulting to
+the clone's origin). Boards are looked up by
 owner plus number (names alone are ambiguous across owners; a node id is
 accepted for renames). Scalar board settings in the registry:
 `tracker.variant` (default `"labels"`), `board.poll_pages`,
@@ -353,8 +358,9 @@ Each is sized for one agent, with acceptance criteria.
    normalized to `{}` on read, `sync._reading` copies it (copy-on-read,
    never shared), precedence helper for priority in one place (board
    `priority` wins when present, else the label-derived rank), and the
-   does not carry, under the cleared encoding (`None` deletes a scalar
-   key, absent keeps, empty list clears a list). `graphql()` and
+   store's upsert merges `extra` by key (a reading overwrites only the
+   concepts it carries), under the cleared encoding (`None` deletes a
+   scalar key, absent keeps, empty list clears a list). `graphql()` and
    `paced_run()` accept an injected `run` and an injected pacer,
    defaulting to the real ones. Criteria: existing fake trackers compile
    untouched; board-concept rows persist and read back through `extra`;
