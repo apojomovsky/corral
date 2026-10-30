@@ -229,7 +229,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
-# agents.runtime = "omp"  # agent runtime: omp or opencode
+# agents.runtime = "omp"  # agent runtime: omp or opencode or muse
 # agents.unit_prefix = "corral-agent-"  # prefix of transient agent unit names
 #
 # [board]

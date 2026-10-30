@@ -1,9 +1,9 @@
 """Agent runtime adapters: how corral launches, resumes and reads each runtime.
 
 One adapter per runtime, and corral supports one major version of each at a
-time (AGENTS.md, "One version of each runtime"). `omp` and `opencode` are the
-two adapters; `get` returns one by name, and `record`/`recorded` keep the
-runtime a session started on, so a resume uses the same runtime.
+time (AGENTS.md, "One version of each runtime"). `omp`, `opencode` and `muse`
+are the three adapters; `get` returns one by name, and `record`/`recorded`
+keep the runtime a session started on, so a resume uses the same runtime.
 
 Every adapter writes only into the session directory it is given. It never
 reads or writes a user's home config (`~/.omp/`, `~/.config/opencode/`); each
@@ -23,7 +23,7 @@ from corral import paths, settings
 RUNTIME_FILE = "runtime"
 #: A session with no recorded runtime was launched on omp.
 DEFAULT_RUNTIME = "omp"
-NAMES = ("omp", "opencode")
+NAMES = ("omp", "opencode", "muse")
 #: The run time limit handed to a runtime that takes one.
 DEFAULT_MAX_TIME = "3h"
 
@@ -79,9 +79,9 @@ class Runtime(Protocol):
 
 def get(name: str) -> Runtime:
     """The adapter for `name`; UnknownRuntime for anything else."""
-    from corral.runtimes import omp, opencode
+    from corral.runtimes import muse, omp, opencode
 
-    adapters = {"omp": omp.RUNTIME, "opencode": opencode.RUNTIME}
+    adapters = {"omp": omp.RUNTIME, "opencode": opencode.RUNTIME, "muse": muse.RUNTIME}
     if name not in adapters:
         raise UnknownRuntime(f"unknown runtime {name!r}: want one of {', '.join(NAMES)}")
     return adapters[name]
