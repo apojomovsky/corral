@@ -40,14 +40,25 @@ def new_session_id():
 
 
 def _config_model(session_dir):
-    """The configured model in the session dir, or None when there is none."""
+    """The configured model in the session dir, or None when there is none.
+
+    Only a missing file means no model: a corrupt file or an unreadable one
+    raises a clear error, so a launch never silently runs on the wrong model.
+    Adapters signal bad input with ValueError, which the launch converts to
+    its own error at the seam; the open failure stays chained underneath.
+    """
+    path = os.path.join(session_dir, CONFIG_NAME)
     try:
-        with open(os.path.join(session_dir, CONFIG_NAME), encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             config = json.load(handle)
-    except OSError:
+    except FileNotFoundError:
         return None
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    except ValueError as err:
+        raise ValueError(f"cannot parse {path}: {err}") from err
     if not isinstance(config, dict):
-        return None
+        raise ValueError(f"cannot parse {path}: want a JSON object")
     model = config.get("model")
     return model if isinstance(model, str) and model else None
 
@@ -59,16 +70,16 @@ def argv(
     from corral import models
 
     check_prompt(prompt)
-    if resume is None:
-        session_id = new_session_id()
-        prompt_file = os.path.join(session_dir, PROMPT_NAME)
-        chosen = model if model is not None else _config_model(session_dir)
-    else:
+    if resume:
         session_id = resume
         prompt_file = os.path.join(session_dir, MESSAGE_NAME)
-        chosen = model
+        chosen = model if model else None
+    else:
+        session_id = new_session_id()
+        prompt_file = os.path.join(session_dir, PROMPT_NAME)
+        chosen = model if model else _config_model(session_dir)
     command = [binary(), "exec", "--json", "--prompt-file", prompt_file]
-    if chosen is not None:
+    if chosen:
         command += ["--model", models.bare_id(chosen)]
     command += [
         "--contributor-mode",
@@ -107,6 +118,11 @@ def resume_handle(session_dir):
     raise NotImplementedError("muse resume_handle lands in T3")
 
 
+def activity_file(session_dir):
+    """Refused until the sessions-and-resume ticket builds it: no fake behavior."""
+    raise NotImplementedError("muse activity_file lands in T3")
+
+
 class Muse:
     name = NAME
     argv = staticmethod(argv)
@@ -114,6 +130,7 @@ class Muse:
     write_config = staticmethod(write_config)
     with_models = staticmethod(with_models)
     resume_handle = staticmethod(resume_handle)
+    activity_file = staticmethod(activity_file)
 
 
 RUNTIME = Muse()

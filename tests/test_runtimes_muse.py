@@ -195,6 +195,53 @@ class MaxTime(SessionCase):
         )
 
 
+class BadConfig(SessionCase):
+    def test_a_corrupt_config_raises_a_clear_error(self):
+        with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        with self.assertRaisesRegex(ValueError, "muse.json"):
+            muse.RUNTIME.argv(self.sdir, PROMPT)
+
+    def test_a_non_object_config_raises_a_clear_error(self):
+        with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+            handle.write('["muse/spark-1"]')
+        with self.assertRaisesRegex(ValueError, "muse.json"):
+            muse.RUNTIME.argv(self.sdir, PROMPT)
+
+    def test_an_unreadable_config_raises_rather_than_silently_defaulting(self):
+        self.write_config_model("muse/spark-1")
+        path = os.path.join(self.sdir, "muse.json")
+        os.chmod(path, 0)
+        try:
+            with self.assertRaisesRegex(ValueError, "muse.json"):
+                muse.RUNTIME.argv(self.sdir, PROMPT)
+        finally:
+            os.chmod(path, 0o600)
+
+
+class EmptyOverrides(SessionCase):
+    def test_an_empty_model_falls_back_to_the_config_model(self):
+        self.write_config_model("muse/spark-1")
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, model="")
+        self.assertEqual(argv[argv.index("--model") + 1], "spark-1")
+
+    def test_an_empty_model_with_no_config_means_no_model_flag(self):
+        self.assertNotIn("--model", muse.RUNTIME.argv(self.sdir, PROMPT, model=""))
+
+    def test_an_empty_resume_means_a_fresh_run(self):
+        self.write_config_model("muse/spark-1")
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, resume="")
+        self.assertIn(os.path.join(self.sdir, "prompt.md"), argv)
+        self.assertIn(SESSION_ID, argv)
+        self.assertEqual(argv[argv.index("--model") + 1], "spark-1")
+
+
+class ActivityFile(SessionCase):
+    def test_activity_file_is_deferred_to_the_resume_ticket(self):
+        with self.assertRaisesRegex(NotImplementedError, "T3"):
+            muse.RUNTIME.activity_file(self.sdir)
+
+
 class HomeProof(SessionCase):
     def test_no_argv_entry_points_at_the_home_config_or_state(self):
         self.write_config_model("muse/spark-1")
