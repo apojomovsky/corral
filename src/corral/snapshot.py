@@ -278,39 +278,35 @@ def _settings_root(start):
     except projects.ProjectsError:
         return None
     for project in registered:
-        if _holds(project.root, want):
+        if _covers(project.root, want):
             return project.root
     return None
 
 
-def _holds(root, want):
+def _covers(root, want):
     """Whether the project at `root` holds the path `want`.
 
-    A project holds its root and the clones its `[[repo]]` entries
-    point at. A file this cannot read holds nothing.
+    A project holds its root, and any path under a clone its
+    `[[repo]]` entries cover. Clone matching goes through
+    `settings.covering_repo`, the one place that maps a clone to its
+    entry; a file that reads broken holds nothing.
     """
     from corral import settings
 
-    if want == os.path.realpath(root):
+    real_root = os.path.realpath(root)
+    if want == real_root or _below(want, real_root):
         return True
-    try:
-        names = settings.repo_names(root)
-    except settings.SettingsError:
-        return False
-    for name in names:
+    here = want
+    while True:
         try:
-            resolved = settings.load(root=root, repo=name)
+            if settings.covering_repo(root, here) is not None:
+                return True
         except settings.SettingsError:
-            continue
-        path = resolved["clone.path"]
-        if not path:
-            continue
-        if not os.path.isabs(path):
-            path = os.path.normpath(os.path.join(root, path))
-        candidate = os.path.realpath(path)
-        if want == candidate or _below(want, candidate):
-            return True
-    return False
+            return False
+        parent = os.path.dirname(here)
+        if parent == here:
+            return False
+        here = parent
 
 
 def _below(path, parent):
