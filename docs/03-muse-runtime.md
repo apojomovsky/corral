@@ -228,7 +228,7 @@ worker run through `corral launch` (echo had shown a subset):
   skipped by the renderer. `output` carries each tool's output chunk
   and `tool_output_ref` points at it, but the one-line `tool.result`
   record already covers the call. Tool calls surface as
-  `tool.result`, never as a task event: verified.
+  `tool.result`, never as a task event, in the observed run: verified for that run.
 - `runtime.command.accepted`, `session.run.linked`,
   `session.workspace_branch.observed`, `task.stream.linked`: linkage
   records; skipped. No reconciliation record appeared in the real run;
