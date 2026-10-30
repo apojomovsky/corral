@@ -239,6 +239,45 @@ def write_message(session_dir, message):
     paths.atomic_write_text(os.path.join(session_dir, MESSAGE_NAME), message)
 
 
+#: What `classify` returns: a verified usage error, or anything else.
+#: Provider failures (auth failure, quota exhaustion, rate limit, network
+#: failure) are UNVERIFIED, so they stay `unknown` until the design learns
+#: their wording. The ledger records no guess.
+USAGE = "usage"
+UNKNOWN = "unknown"
+
+#: `classify` results that may post a reactive quota mark. Empty: a usage
+#: error is a usage matter, and `unknown` posts no mark. The quota and
+#: rate-limit wordings join here once the design learns them; an auth
+#: failure never joins (a login matter, never a mark).
+MARK_CATEGORIES = frozenset()
+
+#: Substrings of the verified exit-2 usage lines: a bad `--session-id`, an
+#: unknown `-c` key, `--prompt-file` with positional text, and a meta-only
+#: flag under a non-meta provider. One-line `muse:` messages on stderr.
+_USAGE_PHRASES = (
+    "invalid --session-id",
+    "refusing run: unknown key",
+    "--prompt-file cannot be used with inline prompt text",
+    "--model requires --provider",
+)
+
+
+def classify(returncode, stderr_text, stream_text):
+    """The failure category for one finished run: `USAGE` or `UNKNOWN`.
+
+    `USAGE` when the run exited 2 with a verified usage line on stderr.
+    Anything else is `UNKNOWN`: a clean run (nothing to classify), a usage
+    line under another exit, or a provider failure whose wording the design
+    has not learned. `stream_text` is the run's stdout stream; the usage
+    rules read stderr only, and it is accepted for the terminal-event rules
+    a later ticket adds. `UNKNOWN` reaches no mark (`MARK_CATEGORIES`).
+    """
+    if returncode == 2 and any(phrase in (stderr_text or "") for phrase in _USAGE_PHRASES):
+        return USAGE
+    return UNKNOWN
+
+
 class Muse:
     name = NAME
     argv = staticmethod(argv)
