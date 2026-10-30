@@ -72,7 +72,7 @@ eligibility = "blue_policy:eligible"
 On each pass corral imports the entry point once per project and calls:
 
 ```python
-def eligible(rows: Sequence[TicketRow]) -> list[StartRequest]: ...
+def eligible(rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]: ...
 ```
 
 `TicketRow` is frozen plain data built from the board store:
@@ -99,9 +99,9 @@ Why not the alternatives:
   exactly what the line in section 2 of `00-design.md` forbids.
 
 Open question settled here: the design doc's `Project.wants()` sketch
-takes no arguments. It becomes `eligible(rows)` as above; a project
-with no `eligibility` entry registers no candidates and the drive
-skips it with a logbook line. Loading failures are configuration
+takes no arguments. It becomes `eligible(rows, *, now)` as above; a
+project with no `eligibility` entry registers no candidates and the
+drive skips it with a logbook line. Loading failures are configuration
 errors (exit 4) naming the project and entry point, reported once per
 pass, and they block only that project.
 
@@ -126,8 +126,10 @@ and re-reads live state before every start, never a cached count.
 
 Per-candidate gate order, cheapest first:
 
-1. Non-open, externally owned (`board.is_external`), or already
-   claimed by someone else: skip with reason.
+1. Non-open, externally owned (the row's stored `external` field,
+   computed at sync time by `board.is_external`; the loop never
+   re-derives it), or already claimed by someone else: skip with
+   reason.
 2. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
@@ -157,9 +159,12 @@ Exit 75 handling differs by source:
 The loop claims through the board store transaction
 (`Store.claim(repo, number, agent, host, now)`), then enqueues the
 `agent` and `status` writes to the outbox for the mirror pass. This is
-the existing rule that claims need zero tracker calls. The agent id is
-`drive/<host>/<epoch-seconds>/<repo>/<number>`; the host field and the
-epoch are the fencing tokens a future multi-host loop needs.
+the existing rule that claims need zero tracker calls. The agent id is opaque to every reader except debugging, for
+example `drive-<host>-<start-seconds>-<owner>--<name>-<number>`
+(the repo segment encodes `owner/name` with a double dash so the id
+itself contains no `/`; `start-seconds` is a wall-clock timestamp,
+not a fencing token). Fencing uses only `Claim.epoch`; the host
+field and the epoch are the tokens a future multi-host loop needs.
 
 - Lost race (exit 2, `Claimed`): re-read the row live. If another agent
   now holds it, record "race lost to `<agent>`" and continue with the
@@ -175,8 +180,14 @@ epoch are the fencing tokens a future multi-host loop needs.
   claiming from the stale row. Local-only bookkeeping (registry and
   unit liveness, hygiene, journal, snapshot) continues through the
   outage. The outage is recorded in the logbook and the pass exit is 0
-  with errors noted, unless nothing at all could be read, which is
-  exit 3 like `snapshot`.
+  with errors noted, unless the pass synced nothing at all, which is
+  exit 3. An unreadable store is different: `board.StoreError`
+  carries exit 4, and `cmd_sync` already maps it to 4, since a store
+  the loop cannot read is a configuration error, not an unreachable
+  host. (`snapshot` instead stays exit 0 with a section error
+  because it reports across sections and the store is only one of
+  them; the loop cannot decide anything without the store, so it
+  fails closed with 4. Tracker-unreachable paths keep 3.)
 - Stale rows: paths that decide (claim, merge preconditions) re-read
   live past the staleness bound, per the board design. The loop never
   claims from a row older than the bound without a live check, and a
@@ -189,7 +200,13 @@ via `Store.adopt_claim`), never in a drive pass. Each pass instead
 releases claims that are provably dead: the store names an agent, and
 the registry shows no live or stale entry for that agent id, and no
 live unit exists for the ticket, and the claim is older than twice
-`registry.gone_s`. Release clears the holder (`agent`/`host`) and
+`registry.gone_s`. The loop passes the agent and epoch straight
+from the store row into `Store.release(repo, number, agent, epoch,
+*, now)`, which releases only on a matching agent plus epoch and
+raises `Claimed` otherwise. A `Claimed` there means the row changed
+under the pass (re-claimed or adopted elsewhere), so it is no longer
+an orphan: skip it with a logbook line, never retry in the same
+pass. A successful release clears the holder (`agent`/`host`) and
 leaves `epoch` untouched, per the `Store.release` contract; the next
 `claim` mints `epoch+1`, which fences a stale holder still acting on
 the old epoch. The release writes a logbook line. The worktree and
@@ -210,9 +227,13 @@ States and who moves them:
   data on the row shows the PR ready for review.
 - PR ready: the loop claims a review slot and starts a reviewer with
   the existing review path. The "reviewer is not the author" check
-  stays where it is; the loop only schedules reviewers for tickets
-  whose author differs from the candidate reviewer pool the project's
-  eligibility already filtered.
+  stays where it is, at record time: `reviewrecord.write_record`
+  refuses author==reviewer, which is the only place both ids are
+  known. The loop does no author comparison when scheduling, by
+  design: eligibility returns `StartRequest`s, never a reviewer
+  pool, and each reviewer id is minted fresh at start time, so there
+  is nothing to compare a row against. No `author` field is added to
+  `TicketRow` because scheduling never needs it.
 - Changes requested: the loop schedules a fix round as `resume` when
   the worker's unit or registry entry is still usable, else a fresh
   `fix` start on the same ticket and branch. Fix rounds count against
@@ -232,10 +253,15 @@ liveness and unit liveness.
 - Heartbeat older than `registry.stale_s` with a live unit: watch once
   more; older than `registry.gone_s` or unit dead: restart (stop the
   unit through the injected stop seam, launch again on the same claim
-  and epoch).
+  and epoch, reusing the identical agent id: `Store.claim` is
+  idempotent only for the same agent, and a fresh id on a still-held
+  row gets `Claimed`).
 - Restart budget: at most 3 automatic restarts per ticket per 24 hours,
-  counted in a small state file. Past it, give up: comment with the
-  tail of what was observed, add `needs-decision`, release the claim.
+  counted in a small state file, decremented only by stop-plus-launch
+  restarts. Fix rounds are not restarts: a `resume` that reuses the
+  live unit and session never decrements the budget. Past the budget,
+  give up: comment with the tail of what was observed, add
+  `needs-decision`, release the claim.
 - A `done` or `finished` registry entry for a claimed ticket ends the
   loop's duty for that ticket; the PR state decides what happens next.
 
@@ -254,12 +280,14 @@ give-up and on the decision protocol; routine skips stay local.
 (started, skipped by reason, released, gave up). Snapshot stays exit 0
 with section errors on failure, per its contract.
 
-`corral drive --plan` is the dry run. It runs sync-reads and the whole
-gate order but writes nothing: no claims, no outbox rows, no starts,
-no mirror, no journal. It prints one row per candidate with the
+`corral drive --plan` is the dry run. It reads the store and runs
+the whole gate order but never syncs and writes nothing: no tracker
+calls, no claims, no outbox rows, no starts, no mirror, no journal. It prints one row per candidate with the
 verdict and the reason in the same words the logbook would use, plus a
 summary (would start N, blocked per gate). Exit 0 on a completed plan,
-3 when the store could not be read, 4 on configuration errors. `--plan`
+4 when the store could not be read or on configuration errors
+(`board.StoreError` already means 4; there is no exit 3 path because
+`--plan` never contacts the tracker). `--plan`
 never takes the drive lock.
 
 ## 7. Safety: kill switch, start caps, never-start rules, no deletion
@@ -314,6 +342,7 @@ is tested through the seam its production code already injects:
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
+| Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |
 | Admission ordering, floor through a full total, ceiling and repo cap skips | pure `admission.admit` over constructed state |
 | Quota refusal skips one project, not the pass | fake ledger readings plus project chains |
@@ -342,8 +371,8 @@ the modules named.
    pass exits 2.
 2. Project registration and the eligibility hook. `eligibility` entry
    in `projects.d`, loader, `TicketRow` and `StartRequest` types, pure
-   call with rows. Criteria: stub policies over fixture rows return
-   ordered requests; bad entry is exit 4 naming project and entry;
+   call with rows and `now`. Criteria: stub policies over fixture rows
+   return ordered requests; bad entry is exit 4 naming project and entry;
    project without the entry is skipped with a logbook line.
 3. Gate order: external, hold, admission, quota. Criteria: one test
    per skip reason in section 3; floor project admitted at full total;
@@ -355,14 +384,17 @@ the modules named.
    drains on the next healthy pass.
 5. Orphan recovery. Criteria: the section 4 dead-claim rule releases
    (holder cleared, epoch left for the next claim to mint) with a
-   logbook line; stale-but-present agents and live
+   logbook line; a release racing a re-claim gets `Claimed` and skips
+   with a logbook line; stale-but-present agents and live
    units are left alone; adoption still happens only in resync.
 6. Reviewer scheduling and fix rounds. Criteria: reviewer starts only
    for PR-ready rows with author check intact; fix round resumes when
    possible else restarts on the same branch; merge-ready rows are
    ignored by the loop.
 7. Stuck detection, restart budget, give-up. Criteria: gone agent with
-   dead unit restarts within budget; past budget posts comment, adds
+   dead unit restarts within budget reusing the identical agent id;
+   only stop-plus-launch restarts decrement the budget, fix-round
+   resumes do not; past budget posts comment, adds
    `needs-decision`, releases; `done` entries end loop duty.
 8. Observability: journal and snapshot section. Criteria: each pass
    appends well-formed lines; snapshot shows the section 6 fields;
