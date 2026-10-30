@@ -21,7 +21,7 @@ from unittest import mock
 from contextlib import redirect_stdout
 
 from corral import cli, hold, launch, launchcli, paths, registry, runtimes, settings, units
-from corral.runtimes import omp, opencode
+from corral.runtimes import muse, omp, opencode
 from tests.test_reviewrecord import git_in
 
 REPOS = ("lib", "my-repo")
@@ -391,6 +391,13 @@ class LaunchTest(OpsCase):
         with open(os.path.join(self.session("lib", 5), "opencode.json"), encoding="utf-8") as h:
             self.assertEqual(json.load(h), {"model": "provider-a/model-1"})
 
+    def test_a_bad_model_in_the_runtime_config_is_a_configuration_error(self):
+        with mock.patch.object(muse, "binary", return_value="/fake/muse"):
+            with self.assertRaises(launch.LaunchError) as ctx:
+                self.start("muse", runtime_config={"model": 123})
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertEqual(self.system.started, [])
+
     def test_a_full_host_refuses_before_anything_is_made(self):
         self.system.units["corral-agent-my-repo-6"] = "active"
         self.system.units["corral-agent-my-repo-7"] = "active"
@@ -495,6 +502,36 @@ class ResumeTailTest(OpsCase):
                 usage=roomy,
                 run=self.system.run,
             )
+
+    def test_a_resume_whose_argv_fails_is_a_configuration_error(self):
+        launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.system.finish("corral-agent-lib-5")
+        before = len(self.system.started)
+        stub = mock.Mock()
+        stub.name = "stub"
+        stub.resume_handle.return_value = "handle-1"
+        stub.argv.side_effect = ValueError("cannot parse /tmp/s/muse.json: bad")
+        with mock.patch.object(runtimes, "get", return_value=stub):
+            with self.assertRaises(launch.LaunchError) as ctx:
+                launch.resume(
+                    self.target(),
+                    5,
+                    "keep going",
+                    hold_reason_fn=_free_hold,
+                    list_fn=self.system.list_fn,
+                    usage=roomy,
+                    run=self.system.run,
+                )
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertEqual(len(self.system.started), before)
 
 
 class HoldResumeTest(OpsCase):
@@ -675,6 +712,28 @@ class CliTest(OpsCase):
         self.assertEqual(
             self.verb("launch", "lib", "5", "--prompt-file", pf, "--runtime-config", cfg)[0], 4
         )
+
+    def test_a_bad_per_launch_config_is_one_line_on_stderr_with_exit_4(self):
+        pf = self.prompt_file()
+        cfg = os.path.join(self.tmp, "cfg.json")
+        with open(cfg, "w", encoding="utf-8") as h:
+            h.write('{"model": 123}')
+        with mock.patch.object(muse, "binary", return_value="/fake/muse"):
+            code, _, err = self.verb(
+                "launch",
+                "lib",
+                "5",
+                "--prompt-file",
+                pf,
+                "--runtime",
+                "muse",
+                "--runtime-config",
+                cfg,
+            )
+        self.assertEqual(code, 4)
+        self.assertTrue(err.startswith("corral: "))
+        self.assertNotIn("\n", err.strip())
+        self.assertEqual(self.system.started, [])
 
     def test_the_verbs_are_registered_on_the_corral_command(self):
         with redirect_stdout(io.StringIO()):

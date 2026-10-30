@@ -4,17 +4,21 @@ The prompt travels by `--prompt-file` only: the worker run reads the
 `prompt.md` the launch already wrote, and a resume reads the message
 file. The `--model` is the configured model or the `model=` override
 with the provider prefix stripped; a resume passes `--model` only when
-the caller overrides it. A reviewer runs the worker form plus
-`--disable-write`. `max_time` is accepted for the protocol and ignored:
-muse has no run limit flag, and the unit still bounds the run.
+the caller overrides it. Every other per-launch config entry travels as
+a repeatable `-c KEY=VALUE` pair with a JSON value. A reviewer runs the
+worker form plus `--disable-write`. `max_time` is accepted for the
+protocol and ignored: muse has no run limit flag, and the unit still
+bounds the run.
 """
 
 import functools
 import json
 import os
+import re
 import shutil
 from uuid import uuid4
 
+from corral import paths
 from corral.runtimes import DEFAULT_MAX_TIME, check_prompt
 
 NAME = "muse"
@@ -39,28 +43,63 @@ def new_session_id():
     return str(uuid4())
 
 
-def _config_model(session_dir):
-    """The configured model in the session dir, or None when there is none.
+#: A whole-value `${NAME}` reference: the one string `-c` value passed raw.
+ENV_REF = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}")
 
-    Only a missing file means no model: a corrupt file or an unreadable one
-    raises a clear error, so a launch never silently runs on the wrong model.
-    Adapters signal bad input with ValueError, which the launch converts to
-    its own error at the seam; the open failure stays chained underneath.
+
+def _read_config(session_dir):
+    """The per-launch config in the session dir, or {} when there is none.
+
+    A corrupt file, an unreadable one, or a non-object raises ValueError
+    naming the file, so a launch never silently runs on the wrong config.
+    Each launch caller converts ValueError to its own error with `from None`
+    for one-line CLI output; the file detail survives inside the message text.
     """
     path = os.path.join(session_dir, CONFIG_NAME)
     try:
         with open(path, encoding="utf-8") as handle:
             config = json.load(handle)
     except FileNotFoundError:
-        return None
+        return {}
     except OSError as err:
         raise ValueError(f"cannot read {path}: {err}") from err
     except ValueError as err:
         raise ValueError(f"cannot parse {path}: {err}") from err
     if not isinstance(config, dict):
         raise ValueError(f"cannot parse {path}: want a JSON object")
-    model = config.get("model")
-    return model if isinstance(model, str) and model else None
+    return config
+
+
+def _model_of(config, session_dir):
+    """The `model` entry of a config, or None when absent or empty.
+
+    A present entry that is not a non-empty string raises the same
+    `cannot parse` ValueError as a corrupt file.
+    """
+    if "model" not in config:
+        return None
+    model = config["model"]
+    if isinstance(model, str):
+        return model or None
+    path = os.path.join(session_dir, CONFIG_NAME)
+    raise ValueError(f"cannot parse {path}: want model to be a non-empty string")
+
+
+def _encode_value(value):
+    """A `-c` value: JSON, except a whole `${NAME}` reference passes through raw."""
+    if isinstance(value, str) and ENV_REF.fullmatch(value):
+        return value
+    return json.dumps(value)
+
+
+def _config_flags(config):
+    """Every non-model config entry as `-c KEY=<value>` pairs, sorted by key."""
+    flags = []
+    for key in sorted(config, key=str):
+        if key == "model":
+            continue
+        flags += ["-c", f"{key}={_encode_value(config[key])}"]
+    return flags
 
 
 def argv(
@@ -70,6 +109,7 @@ def argv(
     from corral import models
 
     check_prompt(prompt)
+    config = _read_config(session_dir)
     if resume:
         session_id = resume
         prompt_file = os.path.join(session_dir, MESSAGE_NAME)
@@ -77,10 +117,11 @@ def argv(
     else:
         session_id = new_session_id()
         prompt_file = os.path.join(session_dir, PROMPT_NAME)
-        chosen = model if model else _config_model(session_dir)
+        chosen = model if model else _model_of(config, session_dir)
     command = [binary(), "exec", "--json", "--prompt-file", prompt_file]
     if chosen:
         command += ["--model", models.bare_id(chosen)]
+    command += _config_flags(config)
     command += [
         "--contributor-mode",
         "on",
@@ -99,18 +140,22 @@ def argv(
 
 
 def env(session_dir):
-    """Refused until the per-launch-config ticket builds it: no fake behavior."""
-    raise NotImplementedError("muse env lands in T2")
+    """No entries: `-c` needs no pointer, so the run adds no home paths."""
+    return {}
 
 
 def write_config(session_dir, config):
-    """Refused until the per-launch-config ticket builds it: no fake behavior."""
-    raise NotImplementedError("muse write_config lands in T2")
+    """Write `muse.json` into the session dir, atomically: the run's audit record."""
+    os.makedirs(session_dir, exist_ok=True)
+    text = json.dumps(config, indent=1) + "\n"
+    paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), text)
 
 
 def with_models(config, chains):
-    """Refused until the per-launch-config ticket builds it: no fake behavior."""
-    raise NotImplementedError("muse with_models lands in T2")
+    """`config` with the default role's head as its model. Other keys are kept."""
+    from corral import models
+
+    return {**(config or {}), "model": models.primary(chains)}
 
 
 def resume_handle(session_dir):
