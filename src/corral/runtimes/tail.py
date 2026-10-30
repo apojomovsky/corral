@@ -68,17 +68,10 @@ def _render_event(entry):
     return []
 
 
-#: Muse `--json` records shown as the agent's visible text.
-_MUSE_TEXT_TYPES = frozenset(
-    {
-        "run.lifecycle.started",
-        "run.output.delta",
-        "run.terminal.completed",
-    }
-)
-
-#: The payload key holding that visible text, per record type.
-_MUSE_TEXT_KEYS = {
+#: Muse `--json` records shown as the agent's visible text, with the
+#: payload key holding that text. One table, so a listed type always has
+#: its key: a type with no usable key shows nothing instead of throwing.
+_MUSE_TEXT = {
     "run.lifecycle.started": "prompt",
     "run.output.delta": "text",
     "run.terminal.completed": "text",
@@ -94,11 +87,11 @@ def _render_muse(entry):
     render rule waits on the first real tool call fixture. Anything else
     is skipped, so unknown record types never misrender.
     """
-    payload_type = entry["payload_type"]
-    if payload_type not in _MUSE_TEXT_TYPES:
+    key = _MUSE_TEXT.get(entry["payload_type"])
+    if key is None:
         return []
     payload = _dict(entry.get("payload"))
-    text = _text(payload.get(_MUSE_TEXT_KEYS[payload_type]))
+    text = _text(payload.get(key))
     if text is None:
         return []
     return ["   " + _one_line(text)]

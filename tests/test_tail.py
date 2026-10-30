@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from corral.runtimes import tail
 
@@ -194,6 +195,10 @@ class RenderMuse(unittest.TestCase):
             {"tool_name": "bash", "correlation_facts": {"outcome": "ok"}},
         )
         self.assertEqual(tail.render(line), [])
+
+    def test_a_listed_type_without_a_usable_key_is_skipped(self):
+        with mock.patch.dict(tail._MUSE_TEXT, {"run.test.nokey": None}):
+            self.assertEqual(tail.render(mline("run.test.nokey", {"text": "hi"})), [])
 
     def test_unknown_payload_types_and_bad_lines_show_nothing(self):
         lines = [
