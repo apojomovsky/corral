@@ -250,7 +250,7 @@ class GithubTracker:
             yield self._parse(repo, entry)
 
     def _write_error(self, err: Exception) -> iface.TrackerError:
-        """One failed label call as the tracker's error. Rate-limit text
+        """One failed label or comment call as the tracker's error. Rate-limit text
         maps to ``TrackerRateLimited`` through the shared classifier, so
         the mirror pass stops; anything else fails closed as
         ``TrackerError``."""
