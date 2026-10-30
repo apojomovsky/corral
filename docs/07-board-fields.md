@@ -1,6 +1,6 @@
 # 07: the board-field tracker variant
 
-Status: design, awaiting maintainer approval. No code ships with this doc.
+Status: approved 2026-10-30. Implemented by the tickets in section 8.
 
 Some projects coordinate through hosted project board fields (a Projects v2
 single-select, number and text fields, and item relationships such as
