@@ -274,6 +274,163 @@ class ExitCode(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
 
+    def test_a_missing_reader_path_fails_deps_with_exit_4(self):
+        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-readers")
+        code, _, err = self.run_deps(f'reader_path = ["{missing}"]\n' + OK_FILE)
+        self.assertEqual(code, 4)
+        self.assertIn(missing, err)
+
+
+FAKE_READER_MODULE = '''\
+from corral import accounts
+
+
+class PathReader:
+    """A reader that reports one window."""
+
+    def read(self, now):
+        return accounts.Reading(windows={"weekly": accounts.Window(used_pct=10.0, resets_at=None)})
+
+    def parse_limit_error(self, text, now):
+        return None
+'''
+
+
+def write_reader_module(directory, name="fakereader"):
+    with open(os.path.join(directory, f"{name}.py"), "w", encoding="utf-8") as handle:
+        handle.write(FAKE_READER_MODULE)
+    return directory
+
+
+def config_with_reader_path(readers_dir, reader="fakereader:PathReader", name="provider-a"):
+    directory = tempfile.mkdtemp(prefix="corral-accounts-")
+    with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+        handle.write(
+            f'reader_path = ["{readers_dir}"]\n[[provider]]\nname = "{name}"\nreader = "{reader}"\n'
+        )
+    return directory
+
+
+class ReaderPath(unittest.TestCase):
+    def test_a_reader_on_reader_path_loads_with_no_sys_path_setup(self):
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        write_reader_module(readers)
+        directory = config_with_reader_path(readers)
+        before = list(sys.path)
+        try:
+            self.assertNotIn(readers, sys.path)
+            reader = accounts.load_reader("fakereader:PathReader", directory)
+            reading = reader.read(1700000000.0)
+            self.assertEqual(reading.windows["weekly"].used_pct, 10.0)
+            self.assertEqual(accounts.check(directory), [])
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_loading_restores_sys_path_on_failure(self):
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        directory = config_with_reader_path(readers, reader="fakereader:NoSuchReader")
+        before = list(sys.path)
+        try:
+            with self.assertRaises(accounts.AccountsError):
+                accounts.load_reader("fakereader:NoSuchReader", directory)
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_check_restores_sys_path(self):
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        write_reader_module(readers)
+        directory = config_with_reader_path(readers)
+        before = list(sys.path)
+        try:
+            self.assertEqual(accounts.check(directory), [])
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_a_tilde_entry_expands(self):
+        home = tempfile.mkdtemp(prefix="corral-home-")
+        readers = os.path.join(home, "readers")
+        os.makedirs(readers)
+        write_reader_module(readers)
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'reader_path = ["~/readers"]\n'
+                '[[provider]]\nname = "provider-a"\nreader = "fakereader:PathReader"\n'
+            )
+        before = list(sys.path)
+        try:
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                reader = accounts.load_reader("fakereader:PathReader", directory)
+                self.assertEqual(reader.read(1700000000.0).windows["weekly"].used_pct, 10.0)
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_a_relative_entry_is_a_configuration_error(self):
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'reader_path = ["ops/readers"]\n'
+                '[[provider]]\nname = "provider-a"\nreader = "fakereader:PathReader"\n'
+            )
+        with self.assertRaises(accounts.AccountsError):
+            accounts.providers(directory)
+        problems = accounts.check(directory)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("ops/readers", problems[0])
+
+    def test_a_missing_reader_path_is_reported_naming_it(self):
+        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-readers")
+        directory = config_with_reader_path(missing)
+        with self.assertRaises(accounts.AccountsError):
+            accounts.providers(directory)
+        problems = accounts.check(directory)
+        self.assertEqual(len(problems), 1)
+        self.assertIn(missing, problems[0])
+
+    def test_a_non_list_reader_path_is_a_configuration_error(self):
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write('reader_path = "/tmp/readers"\n')
+        with self.assertRaises(accounts.AccountsError):
+            accounts.providers(directory)
+        self.assertTrue(accounts.check(directory))
+
+    def test_a_non_string_reader_path_entry_is_a_configuration_error(self):
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write("reader_path = [42]\n")
+        with self.assertRaises(accounts.AccountsError):
+            accounts.providers(directory)
+        self.assertTrue(accounts.check(directory))
+
+    def test_doctor_load_readers_uses_reader_path(self):
+        from corral import doctor
+
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        write_reader_module(readers)
+        directory = config_with_reader_path(readers)
+        before = list(sys.path)
+        try:
+            self.assertEqual(doctor.load_readers(directory), [])
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_only_accounts_touches_sys_path(self):
+        root = os.path.join(os.path.dirname(__file__), "..", "src", "corral")
+        offenders = []
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                if "sys.path" in handle.read() and name != "accounts.py":
+                    offenders.append(name)
+        self.assertEqual(offenders, [])
+
 
 if __name__ == "__main__":
     unittest.main()

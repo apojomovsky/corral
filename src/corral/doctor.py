@@ -395,7 +395,7 @@ def load_readers(config_dir: str | None = None) -> list[tuple[str, str, str]]:
     errors = []
     for provider in found:
         try:
-            accounts.load_reader(provider.reader)
+            accounts.load_reader(provider.reader, config_dir)
         except accounts.AccountsError as err:
             errors.append((provider.name, provider.reader, str(err)))
     return errors

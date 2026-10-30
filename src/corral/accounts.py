@@ -3,14 +3,17 @@
 The accounts file lists the providers every project on this host shares:
 each `[[provider]]` names a provider and the reader that reports its
 quota, plus how long a failure mark covers it (`cooldown`) and how fresh
-a reading must be to count (`stale_after`). A missing file means an
+a reading must be to count (`stale_after`). A top-level `reader_path`
+list names the directories readers live in. A missing file means an
 empty pool, never an error. Later slices add the quota gate that reads
 through these readers.
 """
 
+import contextlib
 import importlib
 import os
 import re
+import sys
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -126,12 +129,42 @@ def _provider(raw: object, where: str) -> Provider:
     return Provider(name=name, reader=entry, cooldown_s=cooldown, stale_after_s=stale_after)
 
 
-def _read_file(path: str) -> list[Provider]:
+def _reader_paths(raw: Mapping, path: str) -> list[str]:
+    """The expanded reader directories in `raw`, the one resolver for this fact.
+
+    Each entry expands `~` and environment variables, then must be
+    absolute: a relative entry stays relative to nothing, so it is a
+    configuration error rather than resolved against the cwd. Each
+    directory must exist and be readable, named in the error when not.
+    """
+    entries = raw.get("reader_path", [])
+    if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
+        raise AccountsError(f"{path}: reader_path must be a list of directories")
+    resolved = []
+    for entry in entries:
+        expanded = os.path.expanduser(os.path.expandvars(entry))
+        if not os.path.isabs(expanded):
+            raise AccountsError(f"{path}: reader_path {entry!r} must be absolute after expansion")
+        resolved.append(os.path.normpath(expanded))
+    for expanded in resolved:
+        if not os.path.isdir(expanded):
+            raise AccountsError(f"{path}: reader_path {expanded!r} is missing or not a directory")
+        if not os.access(expanded, os.R_OK | os.X_OK):
+            raise AccountsError(f"{path}: reader_path {expanded!r} is not readable")
+    return resolved
+
+
+def _load(path: str) -> tuple[list[Provider], list[str]]:
+    """The providers and reader directories in the file at `path`.
+
+    A missing file is an empty pool with no reader dirs, never an
+    error. Every reader of either fact goes through here.
+    """
     try:
         with open(path, "rb") as handle:
             raw = tomllib.load(handle)
     except FileNotFoundError:
-        return []
+        return [], []
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as err:
         raise AccountsError(f"{path}: {err}") from None
     if not isinstance(raw, dict):
@@ -145,12 +178,28 @@ def _read_file(path: str) -> list[Provider]:
         if provider.name in seen:
             raise AccountsError(f"{path}: [[provider]] {provider.name!r} appears twice")
         seen.add(provider.name)
-    return found
+    return found, _reader_paths(raw, path)
+
+
+@contextlib.contextmanager
+def _with_reader_path(dirs: list[str]):
+    """`dirs` prepended to `sys.path`, restored afterwards.
+
+    The only place that touches `sys.path`: readers import while the
+    dirs are present, and every other module never sees them.
+    """
+    saved = list(sys.path)
+    try:
+        sys.path[:] = [*dirs, *[entry for entry in saved if entry not in dirs]]
+        yield
+    finally:
+        sys.path[:] = saved
 
 
 def providers(config_dir: str | None = None) -> list[Provider]:
     """Every provider in the accounts file, in file order; [] when there is no file."""
-    return _read_file(accounts_path(config_dir))
+    found, _ = _load(accounts_path(config_dir))
+    return found
 
 
 def _resolve(entry: str, where: str) -> type:
@@ -171,14 +220,20 @@ def _resolve(entry: str, where: str) -> type:
     return target
 
 
-def load_reader(entry: str) -> Reader:
+def load_reader(entry: str, config_dir: str | None = None) -> Reader:
     """Build the reader named by `module:Class`; never a silent skip.
 
-    Raises AccountsError when the entry does not import or the class
-    cannot be built. A ReaderError from `read()` stays a ReaderError:
-    the reader loaded, the provider just did not answer.
+    The accounts file's `reader_path` dirs are on `sys.path` only for
+    the import, restored before returning. Raises AccountsError when
+    the file or a reader dir is unusable, when the entry does not
+    import, or when the class cannot be built. A ReaderError from
+    `read()` stays a ReaderError: the reader loaded, the provider just
+    did not answer.
     """
-    cls = _resolve(entry, "accounts")
+    path = accounts_path(config_dir)
+    _, dirs = _load(path)
+    with _with_reader_path(dirs):
+        cls = _resolve(entry, "accounts")
     try:
         return cls()
     except Exception as err:
@@ -186,21 +241,23 @@ def load_reader(entry: str) -> Reader:
 
 
 def check(config_dir: str | None = None) -> list[str]:
-    """Problems with the accounts file: parse, names, and reader imports.
+    """Problems with the accounts file: parse, names, reader dirs, and imports.
 
     [] means the pool is usable (a missing file counts as usable: the
-    pool is just empty). Importing never calls `read`.
+    pool is just empty). Importing never calls `read`, and `sys.path`
+    is restored before returning.
     """
     path = accounts_path(config_dir)
     try:
-        found = _read_file(path)
+        found, dirs = _load(path)
     except AccountsError as err:
         return [str(err)]
     problems = []
-    for provider in found:
-        where = f"{path} [[provider]] {provider.name!r}"
-        try:
-            _resolve(provider.reader, where)
-        except AccountsError as err:
-            problems.append(str(err))
+    with _with_reader_path(dirs):
+        for provider in found:
+            where = f"{path} [[provider]] {provider.name!r}"
+            try:
+                _resolve(provider.reader, where)
+            except AccountsError as err:
+                problems.append(str(err))
     return problems
