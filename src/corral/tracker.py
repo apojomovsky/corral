@@ -49,6 +49,7 @@ class TrackerItem(NamedTuple):
     from_fork: bool
     agent: str = ""  # derived from the agent:* label, else ""
     status: str = ""  # derived from the status:* label, else ""
+    extra: dict | None = None  # board concepts; normalized to {} on read
 
 
 class Tracker(Protocol):

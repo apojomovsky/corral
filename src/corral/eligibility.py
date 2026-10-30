@@ -92,7 +92,7 @@ def row_from_item(item: board.Item) -> TicketRow:
         number=item.number,
         title=item.title,
         labels=tuple(item.labels or ()),
-        priority=item.priority,
+        priority=board.effective_priority(item.priority, item.extra),
         state=item.state,
         agent=item.agent,
         status=item.status,
