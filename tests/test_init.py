@@ -182,6 +182,12 @@ class TestCommandCase(unittest.TestCase):
             "python3 -m unittest discover -s tests -t .",
         )
 
+    def test_detected_runner_suppresses_the_hint(self):
+        self.write("Makefile", "test:\n\ttrue\n")
+        self.write("tests/test_app.py", "")
+        self.assertEqual(detect.test_command(self.dir), "make test")
+        self.assertIsNone(detect.suggested_test_command(self.dir))
+
     def test_empty_dir_suggests_nothing(self):
         self.assertIsNone(detect.suggested_test_command(self.dir))
 

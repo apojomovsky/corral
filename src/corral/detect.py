@@ -116,6 +116,8 @@ def suggested_test_command(directory):
     A `tests/` directory holding `test_*.py` files proposes the plain
     `unittest` discovery command.
     """
+    if test_command(directory) is not None:
+        return None
     if _has_unittest_files(directory):
         return PLAIN_UNITTEST_COMMAND
     return None
