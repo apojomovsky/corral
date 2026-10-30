@@ -21,6 +21,7 @@ Synopsis (flags mirror `init` where they mean the same thing):
 ```bash
 corral new <name> [--path DIR] [--template NAME] [--template-dir DIR]
   [--ops [PATH]] [--ops-name NAME] [--create-remote] [--public]
+  [--owner OWNER] [--default-branch X]
   [--resume] [--plan] [--force]
   [--set key=value] [--runtime R] [--cap N] [--test-cmd CMD]
 ```
@@ -35,12 +36,18 @@ is non-empty, and is not a tree `new` can prove it created (section 5) is exit
 Steps, in order (each is re-runnable; section 5):
 
 1. **Remote pre-check, only with `--create-remote`.** Resolve the intended
-   `owner/name` and ask the forge whether it exists yet. When it exists, stop
-   with exit 4 before writing anything locally, so a refusal leaves nothing
-   behind. Section 3 decides the exact rules.
+   `owner/name` and ask the forge whether it exists yet. The owner has one
+   source: `--owner OWNER` when given, else the forge adapter's current-user
+   call (a new read on the forge interface, added in ticket 3, so ticket 3
+   does not invent a second resolver for identity). An owner that cannot be
+   resolved is exit 4 before anything is written. When the repository
+   exists, stop with exit 4 before writing anything locally, so a refusal
+   leaves nothing behind. Section 3 decides the exact rules.
 2. **Create and initialise the tree.** Create the directory, `git init -b`
    with the initial branch (`--default-branch X`, else `main`), and copy the
-   template files (section 2). Template files are created only when missing;
+   template files (section 2). `--default-branch` is a `new`-side flag that
+   passes through as `--set clone.default_branch=X`; it adds no input to
+   `init.collect` and changes no `init` behavior. Template files are created only when missing;
    an existing identical file is kept, an existing different scaffold file is
    left alone and reported (scaffold files belong to the user after the first
    run, exactly like `agents.overlay.md`).
@@ -59,13 +66,15 @@ Steps, in order (each is re-runnable; section 5):
    so the first agent must start from a committed base. The commit goes
    through the installed `commit-msg` hook like any other commit.
 5. **Remote and labels, only when asked.** Without `--create-remote`, `new`
-   prints the outward commands (`gh repo create ...`, then
-   `corral github setup`) and stops, exactly like `init` prints
-   `corral github setup` and never runs anything outward itself. With
-   `--create-remote`, `new` creates the repository through the forge
-   interface, sets it as `origin`, and runs the label bootstrap (section 4).
-   `new` never pushes: the operator reviews the tree, then runs
-   `corral push`.
+   prints the outward commands (the planned create command as rendered by
+   the forge, then `corral github setup`) and stops, exactly like `init`
+   prints `corral github setup` and never runs anything outward itself.
+   `new` never formats provider CLI syntax: the forge interface exposes a
+   plan/describe method, implemented once in the GitHub adapter, and `new`
+   prints the returned text verbatim. With `--create-remote`, `new` creates
+   the repository through the forge interface, sets it as `origin`, and runs
+   the label bootstrap (section 4). `new` never pushes: the operator reviews
+   the tree, then runs `corral push`.
 6. **Report the next step.** On success, print `next: corral doctor` (plus the
    outstanding outward commands when they were not run).
 
@@ -169,7 +178,11 @@ With `--create-remote`, creation goes through the forge interface
 (`corral/forge.py`), implemented once by the GitHub adapter; nothing in `new`
 calls `gh` or knows GitHub's URL shapes, per the design's section 2. The
 operation takes the injected forge object, so tests use a fake at the same
-seam as every other forge test.
+seam as every other forge test. The same holds for the plan-only print: the
+forge interface carries a plan/describe method (added in ticket 3,
+implemented once in the GitHub adapter) that renders the exact command
+`--create-remote` would run; `new` prints that text verbatim and never embeds
+provider CLI syntax itself.
 
 Rules, with reasons:
 
@@ -207,10 +220,18 @@ invent its own set: it bootstraps exactly the labels the rest of corral reads:
   `priority:*` suffixes are ignored, so this closed set is the whole
   vocabulary).
 
-`repo:<name>` labels are not bootstrapped: they are per-repository and
-unbounded, so triage creates them when a multi-repo ops root first needs one.
-`agent:*` and `status:*` labels are written by corral itself on first use and
-need no bootstrap either.
+`repo:<name>` labels are not bootstrapped and are created by no corral
+code: no writer of that prefix exists in `coord.py`, `board.py`, `launch.py`
+or `tracker.py` today. Per `01-onboarding.md`, the `repo:<name>` label is set
+at triage (the triage agent flow names which repository a ticket targets when
+several share one tracker), so it appears on first triage of a multi-repo
+ops root, never from `new` or `github setup`.
+`agent:*` and `status:*` labels are written by corral itself through
+`tracker.write` (`GithubTracker.write` adds the wanted `<field>:<value>`
+label, creating it on first use, and prunes the rest), so they appear on the
+first field write and need no bootstrap either. In short: `github setup`
+creates the fixed bootstrap set above; triage sets `repo:<name>`; corral
+writes `agent:*`/`status:*` on first use; nothing else creates labels.
 
 Creation goes through the tracker interface (`corral/tracker.py`), via one
 idempotent ensure operation implemented once in the GitHub adapter (create
@@ -253,10 +274,14 @@ state, so there is nothing stale to reconcile.
 `--resume` exists for exactly one case: an interrupted `--create-remote` run
 where the remote now exists. Plain re-run with `--create-remote` refuses when
 the remote exists (section 3). With `--resume`, `new` adopts the remote only
-when it is empty (no refs: nothing committed, nothing to lose, so the proof
-is trivial) and continues with setting `origin` and the label bootstrap. A
-non-empty remote is exit 4 even with `--resume`: its content cannot be proven
-ours. Local scaffold convergence never needs `--resume`.
+on POSITIVE proof that it is empty (a refs listing that succeeds and reports
+zero refs: nothing committed, nothing to lose, so the proof is trivial), and
+continues with setting `origin` and the label bootstrap. Anything short of
+that proof is never an adoption: an emptiness check that errors or times out
+is exit 3 (the forge is unreachable, and the check may be hiding someone
+else's repository), never a reading of "no refs". A non-empty remote is
+exit 4 even with `--resume`: its content cannot be proven ours. Local
+scaffold convergence never needs `--resume`.
 
 Exit codes (public interface, per `AGENTS.md`):
 
@@ -266,7 +291,7 @@ Exit codes (public interface, per `AGENTS.md`):
 | 1 | nothing to do (converged re-run), or a gate said no (a label refused) |
 | 2 | race lost (the remote appeared between pre-check and create) |
 | 3 | the forge, tracker or host is unreachable |
-| 4 | usage or configuration error (bad name, non-empty target, remote exists, bad template or placeholder, `--public` without `--create-remote`) |
+| 4 | usage or configuration error (bad name, non-empty target, remote exists, unresolvable owner, bad template or placeholder, `--public` without `--create-remote`) |
 | 75 | never used by `new` (it consumes no admission slot) |
 
 ## 6. Interaction with `init`, `uninit`, `takeoff`, `doctor`
@@ -322,9 +347,12 @@ Cases:
   without `--create-remote` is exit 4;
 - the pre-check refuses an existing remote with exit 4 before any local
   write (target still absent afterwards);
+- the owner resolves from `--owner` when given, else the forge
+  current-user call; an unresolvable owner is exit 4 before any local write;
 - a race between pre-check and create maps to exit 2;
 - `--resume` adopts an empty remote and continues to labels; a non-empty
-  remote is exit 4;
+  remote is exit 4; an emptiness check that errors or times out is exit 3
+  and never adopts (a failed check must not read as "no refs");
 - label ensure creates missing labels, leaves existing ones byte-identical,
   and reports refused ones with exit 1;
 - template genericness: every packaged render contains no host name, home
@@ -349,11 +377,14 @@ cover it.
    Acceptance: `init` on a `new` tree converges, `uninit` keeps scaffold
    files, split-layout `new --ops` writes only local git state into the
    clone.
-3. **`--create-remote` through the forge interface.** The create operation on
-   the forge interface plus the GitHub adapter implementation, private by
-   default, pre-check refusal (exit 4, nothing written), race mapping
-   (exit 2), unreachable mapping (exit 3), `--resume` adoption of an empty
-   remote only. Acceptance: fake-forge tests for every row of the exit table.
+3. **`--create-remote` through the forge interface.** The create operation
+   on the forge interface plus the GitHub adapter implementation, private by
+   default, the current-user read and the plan/describe render on the same
+   interface (both implemented once in the adapter), `--owner` plumbing,
+   pre-check refusal (exit 4, nothing written), race mapping (exit 2),
+   unreachable mapping (exit 3), `--resume` adoption only on positive proof
+   of an empty remote (a failed emptiness check is exit 3, never adoption).
+   Acceptance: fake-forge tests for every row of the exit table.
 4. **Label bootstrap and `corral github setup`.** The idempotent ensure
    operation on the tracker interface plus the adapter, the `github setup`
    verb, `new` printing it by default and invoking it after `--create-remote`,
