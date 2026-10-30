@@ -51,7 +51,9 @@ class SyncResult(NamedTuple):
 def _reading(item: iface.TrackerItem) -> board.Item:
     """One tracker item as a store reading. The tracker's ``agent`` and
     ``status`` labels ride along so the upsert can settle queued writes;
-    the upsert never originates corral-owned values from them."""
+    the upsert never originates corral-owned values from them. The board
+    concepts ride along in ``extra``, copied on read so no two rows share
+    one dict; a missing or foreign value reads as carrying nothing."""
     return board.Item(
         repo=item.repo,
         number=item.number,
@@ -68,6 +70,7 @@ def _reading(item: iface.TrackerItem) -> board.Item:
         from_fork=item.from_fork,
         agent=item.agent,
         status=item.status,
+        extra=dict(item.extra) if isinstance(item.extra, dict) else {},
     )
 
 

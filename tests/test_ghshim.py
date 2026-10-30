@@ -711,8 +711,13 @@ class ShimScriptTest(unittest.TestCase):
             return [json.loads(line) for line in handle if line.strip()]
 
     def _cooldown(self):
-        with mock.patch.dict(os.environ, {"CORRAL_STATE": self.tmp.name}):
-            return gh.pacer_cooldown_remaining()
+        # Read the tmp state dir the shim subprocess just wrote through an
+        # explicit pacer on that path. The default factory stays out of
+        # in-process tests: the board-fields guard tripwire forbids it,
+        # so a forgotten fake fails the run instead of reaching the file.
+        return gh.GraphqlPacer(
+            os.path.join(self.tmp.name, "graphql-pacing.json")
+        ).cooldown_remaining()
 
     def test_stdout_stderr_and_exit_pass_through(self):
         self._stub('#!/bin/sh\necho "out-$1-$2"\necho "err-$1" >&2\nexit 3\n')
@@ -982,8 +987,14 @@ class TimeoutTest(unittest.TestCase):
             self.assertTrue(os.path.isfile(wrapper))
             err = io.TextIOWrapper(io.BytesIO())
             out = io.TextIOWrapper(io.BytesIO())
+            # An explicit pacer on the tmp path the default factory would
+            # resolve (CORRAL_STATE is tmp here): the board-fields guard
+            # tripwire forbids the default factory in-process, and the
+            # cleared env would leave a reach unattributed.
+            pacer = gh.GraphqlPacer(os.path.join(tmp, "graphql-pacing.json"))
             with (
                 mock.patch.dict(os.environ, env, clear=True),
+                mock.patch.object(gh, "_pacer", return_value=pacer),
                 mock.patch.object(ghshim, "TIMEOUT_S", 0.5),
                 mock.patch.object(gh, "_KILL_AFTER_S", 2.0),
                 mock.patch("sys.stderr", err),
