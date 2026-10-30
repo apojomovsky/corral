@@ -1193,6 +1193,35 @@ class GiveUpOrderTest(unittest.TestCase):
         self.assertEqual(comments[0][3], comments[1][3])
         self.assertIsNone(store.claim_of("app", 7))
 
+    def test_a_repo_the_factory_does_not_know_defers_give_up_and_keeps_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+
+        def missing(repo):
+            raise KeyError(repo)
+
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+            fake_tracker=None,
+            tracker_factory=missing,
+            now=NOW + 10.0,
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("no tracker for this repo", err.getvalue())
+        self.assertIn("no tracker for this repo", out.getvalue())
+        self.assertIn("claim kept", out.getvalue())
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
+
 
 class StuckErrorBranchTest(unittest.TestCase):
     def setUp(self):

@@ -18,6 +18,7 @@ import sys
 import time
 
 from corral import board, settings, sync
+from corral import tracker as iface
 from corral.gitenv import clean_env
 from corral.github import forge as ghforge
 
@@ -41,14 +42,6 @@ def _git(args, cwd):
         )
     except (OSError, subprocess.SubprocessError):
         return None
-
-
-def _production_tracker():
-    """The live tracker over the production `gh` runner."""
-    from corral.github import tracker as ghtracker
-    from corral.github.gh import paced_run
-
-    return ghtracker.GithubTracker(paced_run)
 
 
 def _operators(configured, tracker_repo):
@@ -109,6 +102,39 @@ def repo_operators(root, names, git):
     return entries, None
 
 
+def _has_board_reader(tracker) -> bool:
+    """Whether ``tracker`` can run the board step, through the factory's
+    predicate. A board-variant repo whose tracker lacks this is a
+    configuration error, never a silent label-only run."""
+    from corral import trackers
+
+    return trackers.is_board_tracker(tracker)
+
+
+def _board_step(store, tracker, tracker_repo, *, operators, now):
+    """The board poll for one board repo, merged into the pass report.
+
+    Only the board's own failures are caught here (a live check the
+    budget or the board refused): the step records a board-outage line,
+    keeps the old cursor, and the pass continues on store data. Anything
+    else (a programming error, a store failure) propagates.
+    """
+    try:
+        schema = tracker.board_schema()
+    except (iface.TrackerError, settings.SettingsError) as err:
+        old = store.get_cursor(tracker_repo, sync.BOARD_CURSOR_NAME)
+        return sync.SyncResult(0, old, (f"{tracker_repo}: {err}",))
+    return sync.sync_board_repo(
+        store,
+        tracker,
+        schema,
+        tracker_repo,
+        operators=operators,
+        now=now,
+        max_pages=tracker.board_poll_pages,
+    )
+
+
 def sync_root(
     root,
     names,
@@ -123,9 +149,17 @@ def sync_root(
     out,
     err,
     push=False,
+    tracker_factory=None,
 ) -> int:
     """Sync each named repo entry (or every entry) and report. All seams
-    injected; exit codes follow the module docstring."""
+    injected; exit codes follow the module docstring.
+
+    ``tracker_factory`` maps a tracker repo to its tracker, built by the
+    one factory from the entry's resolved settings (labels or board);
+    when omitted the single ``tracker`` serves every repo. Board repos
+    run the feed step then the board step; a board-variant repo whose
+    tracker has no board reader is exit 4 naming the repo.
+    """
     try:
         wanted = settings.repo_names(root)
     except settings.SettingsError as problem:
@@ -142,19 +176,43 @@ def sync_root(
     if problem is not None:
         _err(problem, err)
         return USAGE
+    variants: dict = {}
+    for name in names or wanted:
+        try:
+            variants[name] = settings.load(root=root, repo=name)["tracker.variant"]
+        except settings.SettingsError as problem:
+            _err(str(problem), err)
+            return USAGE
     results: dict = {}
     mirror_ops: dict = {}
+    repo_trackers: dict = {}
     for name in names or wanted:
         tracker_repo, operators = entries[name]
+        if tracker_factory is not None:
+            try:
+                repo_tracker = tracker_factory(tracker_repo)
+            except KeyError:
+                _err(f"[[repo]] {name}: no tracker for {tracker_repo}", err)
+                return USAGE
+        else:
+            repo_tracker = tracker
+        repo_trackers[name] = repo_tracker
+        if variants[name] == "board" and not _has_board_reader(repo_tracker):
+            _err(
+                f"[[repo]] {name}: tracker.variant is 'board' but the tracker"
+                f" for {tracker_repo} has no board reader",
+                err,
+            )
+            return USAGE
         try:
             if resync:
                 result = sync.resync_repo(
-                    store, tracker, tracker_repo, operators=operators, now=now
+                    store, repo_tracker, tracker_repo, operators=operators, now=now
                 )
             elif audit is not None:
                 result = sync.audit_repo(
                     store,
-                    tracker,
+                    repo_tracker,
                     tracker_repo,
                     operators=operators,
                     now=now,
@@ -163,24 +221,36 @@ def sync_root(
             else:
                 result = sync.sync_repo(
                     store,
-                    tracker,
+                    repo_tracker,
                     tracker_repo,
                     operators=operators,
                     now=now,
                     cursor=store.get_cursor(tracker_repo, sync.CURSOR_NAME),
                 )
+            board_result = None
+            if variants[name] == "board":
+                board_result = _board_step(
+                    store, repo_tracker, tracker_repo, operators=operators, now=now
+                )
         except board.StoreError as problem:
             _err(str(problem), err)
             return USAGE
+        board_seen = board_result.items_seen if board_result is not None else 0
+        board_errors = list(board_result.errors) if board_result is not None else []
         results[name] = {
             "tracker": tracker_repo,
-            "seen": result.items_seen,
+            "seen": result.items_seen + board_seen,
             "cursor": result.cursor,
-            "errors": list(result.errors),
+            "errors": list(result.errors) + board_errors,
             "conflicts": list(result.conflicts),
         }
+        if board_result is not None:
+            results[name]["board_seen"] = board_seen
+            results[name]["board_cursor"] = board_result.cursor
         mirror_ops[tracker_repo] = operators
         for line in result.errors:
+            _err(line, err)
+        for line in board_errors:
             _err(line, err)
         for line in result.conflicts:
             _err(f"claim conflict: {line} (corral wins)", err)
@@ -191,7 +261,11 @@ def sync_root(
         from corral import mirror
 
         try:
-            outcome = mirror.push(store, tracker, operators=mirror_ops, now=now)
+            if tracker_factory is not None:
+                pairs = [(entries[name][0], repo_trackers[name]) for name in names or wanted]
+                outcome = mirror.push_repos(store, pairs, operators=mirror_ops, now=now)
+            else:
+                outcome = mirror.push(store, tracker, operators=mirror_ops, now=now)
         except board.StoreError as problem:
             _err(str(problem), err)
             return USAGE
@@ -212,7 +286,13 @@ def sync_root(
         out.write("\n")
     else:
         for name, row in results.items():
-            out.write(f"{name}: {row['seen']} applied, cursor {row['cursor'] or 'none'}\n")
+            out.write(f"{name}: {row['seen']} applied, cursor {row['cursor'] or 'none'}")
+            if "board_seen" in row:
+                out.write(
+                    f", board {row['board_seen']} applied,"
+                    f" board cursor {row['board_cursor'] or 'none'}"
+                )
+            out.write("\n")
         if pushed is not None:
             out.write(
                 f"mirror: {pushed['sent']} sent,"
@@ -231,6 +311,8 @@ def sync_root(
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
+    from corral import trackers
+
     root = settings.find_root(os.getcwd())
     if root is None:
         _err("no corral.toml above here", sys.stderr)
@@ -243,6 +325,18 @@ def cmd_sync(args: argparse.Namespace) -> int:
     except board.StoreError as problem:
         _err(str(problem), sys.stderr)
         return USAGE
+    try:
+        wanted = settings.repo_names(root)
+    except settings.SettingsError as problem:
+        _err(str(problem), sys.stderr)
+        return USAGE
+    mapping, problem = trackers.production_trackers(root, args.repo or wanted, git=_git)
+    if problem is not None:
+        _err(problem, sys.stderr)
+        return USAGE
+    by_repo = {}
+    for entry in mapping.values():
+        by_repo.setdefault(entry.tracker_repo, entry.tracker)
     with store:
         return sync_root(
             root,
@@ -250,13 +344,14 @@ def cmd_sync(args: argparse.Namespace) -> int:
             resync=args.resync,
             audit=args.audit,
             as_json=args.json,
-            tracker=_production_tracker(),
+            tracker=None,
             store=store,
             git=_git,
             now=time.time(),
             out=sys.stdout,
             err=sys.stderr,
             push=args.push,
+            tracker_factory=by_repo.__getitem__,
         )
 
 

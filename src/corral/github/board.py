@@ -342,32 +342,20 @@ class BoardReader:
             raise _fail("board page claims more items but names no cursor")
         return end, True
 
-    def _read_node(self, by_field, node):
-        """One board node as a ``TrackerItem``, ``None`` for a draft.
-
-        Anything short of the full shape is a ``TrackerError``; a draft
-        item (no issue behind it) is skipped, since it can never be a row.
-        """
-        if not isinstance(node, dict):
-            raise _fail(f"board item is not an object: {node!r}")
+    def _board_time(self, node):
+        """One board node's ``updatedAt`` as epoch seconds, else ``TrackerError``."""
         try:
-            board_time = iface.parse_cursor(node.get("updatedAt"))
+            return iface.parse_cursor(node.get("updatedAt"))
         except iface.TrackerError:
             raise _fail(f"bad board updatedAt {node.get('updatedAt')!r}") from None
-        content = node.get("content", {})
-        if content is None:
-            raise _fail("board item content is missing")
-        if not isinstance(content, dict):
-            raise _fail(f"bad board content {content!r}")
-        if content.get("__typename") == "DraftIssue" and "number" not in content:
-            return None
-        number = content.get("number")
-        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-            raise _fail(f"bad board content number {number!r}")
-        repo = content.get("repository")
-        repo = repo.get("nameWithOwner") if isinstance(repo, dict) else None
-        if not isinstance(repo, str) or "/" not in repo:
-            raise _fail(f"bad board content repo {repo!r}")
+
+    def _node_values(self, by_field, node):
+        """``(texts, selects)`` for one board node's field values, strict.
+
+        Shared by the poll path and the targeted single-item read: every
+        entry is validated through ``_read_value``, so anything short of
+        the value shape fails closed on both paths.
+        """
         values = node.get("fieldValues")
         entries = values.get("nodes") if isinstance(values, dict) else None
         if not isinstance(entries, list):
@@ -382,6 +370,32 @@ class BoardReader:
                 texts[concept] = value
             else:
                 selects[concept] = value
+        return texts, selects
+
+    def _read_node(self, by_field, node):
+        """One board node as a ``TrackerItem``, ``None`` for a draft.
+
+        Anything short of the full shape is a ``TrackerError``; a draft
+        item (no issue behind it) is skipped, since it can never be a row.
+        """
+        if not isinstance(node, dict):
+            raise _fail(f"board item is not an object: {node!r}")
+        board_time = self._board_time(node)
+        content = node.get("content", {})
+        if content is None:
+            raise _fail("board item content is missing")
+        if not isinstance(content, dict):
+            raise _fail(f"bad board content {content!r}")
+        if content.get("__typename") == "DraftIssue" and "number" not in content:
+            return None
+        number = content.get("number")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise _fail(f"bad board content number {number!r}")
+        repo = content.get("repository")
+        repo = repo.get("nameWithOwner") if isinstance(repo, dict) else None
+        if not isinstance(repo, str) or "/" not in repo:
+            raise _fail(f"bad board content repo {repo!r}")
+        texts, selects = self._node_values(by_field, node)
         item, milestone = self._issues.read_issue(repo, number)
         extra = self._concepts(selects, texts, milestone)
         return item._replace(

@@ -48,6 +48,7 @@ from corral import (
     registry,
     settings,
     sync,
+    trackers,
     units,
     worktrees,
 )
@@ -1019,49 +1020,81 @@ def production_operators(registered, git):
     return mapping, None
 
 
-def sync_all(store, tracker, *, operators, now):
-    """Sync every repo with cached rows from the tracker.
+def sync_all(store, tracker_factory, *, operators, now):
+    """Sync every repo with cached rows, each through its own tracker.
 
-    Returns (seen, errors): the rows applied and one line per failed
-    repo. A failed repo keeps its rows and its cursor (that is
-    `sync_repo`'s contract) and the pass moves on to the next repo.
-    With no tracker there is nothing to sync from: no rows move and no
+    ``tracker_factory`` maps a tracker repo to its tracker (labels or
+    board, built by the one factory); board repos run the feed step then
+    the board step. Returns (seen, errors): the rows applied and one line
+    per failed repo. A failed repo keeps its rows and its cursor (that is
+    `sync_repo`'s contract) and the pass moves on to the next repo; a
+    repo the factory does not know is an error line, never a silent skip.
+    With no factory there is nothing to sync from: no rows move and no
     errors are reported.
     """
-    if tracker is None:
+    if tracker_factory is None:
         return 0, []
     seen = 0
     errors = []
     for repo in sorted({item.repo for item in store.items()}):
+        try:
+            tracker = tracker_factory(repo)
+        except KeyError:
+            errors.append(f"{repo}: no tracker for this repo, skipped")
+            continue
+        ops = list(mirror._ops_for(operators, repo))
         result = sync.sync_repo(
             store,
             tracker,
             repo,
-            operators=list(mirror._ops_for(operators, repo)),
+            operators=ops,
             now=now,
             cursor=store.get_cursor(repo, sync.CURSOR_NAME),
         )
         seen += result.items_seen
         errors.extend(result.errors)
+        if not trackers.is_board_tracker(tracker):
+            continue
+        try:
+            schema = tracker.board_schema()
+        except (iface.TrackerError, settings.SettingsError) as err:
+            errors.append(f"{repo}: {err}")
+            continue
+        board_result = sync.sync_board_repo(
+            store,
+            tracker,
+            schema,
+            repo,
+            operators=ops,
+            now=now,
+            max_pages=tracker.board_poll_pages,
+        )
+        seen += board_result.items_seen
+        errors.extend(board_result.errors)
     return seen, errors
 
 
-def refresh_row(store, tracker, repo, number, *, operators, now, stale_after):
+def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_after):
     """The row to decide from: cached when fresh, live-checked when stale.
 
     Returns (item, None) on the row to use, or (None, reason) when a
     stale row could not be re-read live, or when the store itself could
     not be read: the claim path fails closed instead of deciding from
-    the stale row. With no tracker there is no live check to run, so
-    the cached row stands.
+    the stale row. With no factory there is no live check to run, so
+    the cached row stands. The live check goes through the repo's own
+    tracker from the factory, so a board row re-reads through the board.
     """
     ref = f"{repo}#{number}"
     try:
         found, fresh = store.item(repo, number, now=now, max_age=stale_after)
     except board.StoreError as err:
         return None, f"{ref}: store unreadable, claim refused ({err})"
-    if fresh or tracker is None:
+    if fresh or tracker_factory is None:
         return found, None
+    try:
+        tracker = tracker_factory(repo)
+    except KeyError:
+        return None, f"{ref}: no tracker for this repo, claim refused"
     try:
         live = tracker.item(repo, number)
     except iface.TrackerError as err:
@@ -1304,7 +1337,7 @@ def handle_stuck(
     stuck_project,
     stop_unit,
     restarter,
-    tracker,
+    tracker_factory,
     restarts_path,
     out,
     err,
@@ -1326,12 +1359,17 @@ def handle_stuck(
     budget allows it the row
     restarts (stop through the stop seam, launch again on the same
     claim and epoch reusing the identical agent id); past the budget
-    the loop posts through the decision-write seam, then releases. A
-    failed decision write keeps the claim for a later pass, and only
-    stop-plus-launch restarts are recorded, so resumes never consume the
-    budget. When `events` is a list, each restart and give-up appends
-    its journal entry through the pass journal writer. Store errors
-    propagate to the caller, like orphans.
+    the loop posts through the decision-write seam, then releases.
+    `tracker_factory` maps a tracker repo to its tracker (labels or
+    board, built by the one factory): the give-up decision writes use
+    the tracker the factory returns for the claim's repo. With no
+    factory, or for a repo the factory does not know, the give-up is
+    deferred and the claim is kept. A failed decision write keeps the
+    claim for a later pass, and only stop-plus-launch restarts are
+    recorded, so resumes never consume the budget. When `events` is a
+    list, each restart and give-up appends its journal entry through
+    the pass journal writer. Store errors propagate to the caller,
+    like orphans.
     """
     live = live_units if live_units is not None else frozenset()
     budgets = load_restarts(restarts_path) if restarts_path is not None else {}
@@ -1363,6 +1401,16 @@ def handle_stuck(
         key = f"{claim.repo}#{claim.number}"
         stamps = budgets.get(key, [])
         if not restart_allowed(stamps, now=now):
+            tracker = None
+            if tracker_factory is not None:
+                try:
+                    tracker = tracker_factory(claim.repo)
+                except KeyError:
+                    print(
+                        f"{ref}: no tracker for this repo, give-up deferred, claim kept",
+                        file=out,
+                    )
+                    continue
             give_up(
                 store,
                 claim,
@@ -1555,7 +1603,7 @@ def _claim_and_launch(
     store,
     gated_rows,
     *,
-    tracker,
+    tracker_factory,
     operators,
     launcher,
     host,
@@ -1619,7 +1667,7 @@ def _claim_and_launch(
             continue
         fresh, problem = refresh_row(
             store,
-            tracker,
+            tracker_factory,
             gated.repo,
             gated.number,
             operators=operators,
@@ -1874,7 +1922,7 @@ def _launching_pass(
     read_labels,
     hold_label,
     pool,
-    tracker,
+    tracker_factory,
     operators,
     launcher,
     host,
@@ -1948,7 +1996,7 @@ def _launching_pass(
     if journal_path is not None:
         journal_write({"event": "pass_start", "at": now, "host": host or ""})
     try:
-        seen, sync_errors = sync_all(store, tracker, operators=operators, now=now)
+        seen, sync_errors = sync_all(store, tracker_factory, operators=operators, now=now)
     except board.StoreError as problem:
         print(f"corral drive: {problem}", file=err)
         return finish(USAGE)
@@ -2069,7 +2117,7 @@ def _launching_pass(
     )
     if host is None:
         host = socket.gethostname()
-    if stale_after is None and tracker is not None:
+    if stale_after is None and tracker_factory is not None:
         try:
             stale_after = settings.load(root=None)["board.item_max_age_s"]
         except settings.SettingsError as problem:
@@ -2078,7 +2126,7 @@ def _launching_pass(
     final_rows, started, blocked, launched = _claim_and_launch(
         store,
         gated_rows,
-        tracker=tracker,
+        tracker_factory=tracker_factory,
         operators=operators,
         launcher=launcher,
         host=host,
@@ -2104,7 +2152,7 @@ def _launching_pass(
                 stuck_project=stuck_project,
                 stop_unit=stop_unit,
                 restarter=launch,
-                tracker=tracker,
+                tracker_factory=tracker_factory,
                 restarts_path=restarts_path,
                 out=out,
                 err=err,
@@ -2149,9 +2197,21 @@ def _launching_pass(
         if row.verdict == "skip":
             key = row.code or "skip"
             skipped[key] = skipped.get(key, 0) + 1
-    if tracker is not None:
+    if tracker_factory is not None:
         try:
-            outcome = mirror.push(store, tracker, operators=operators, now=now)
+            queued_repos = sorted({row.repo for row in store.queued_writes()})
+        except board.StoreError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return USAGE
+        pairs = []
+        for repo in queued_repos:
+            try:
+                pairs.append((repo, tracker_factory(repo)))
+            except KeyError:
+                print(f"corral drive: {repo}: no tracker for this repo, skipped", file=err)
+                continue
+        try:
+            outcome = mirror.push_repos(store, pairs, operators=operators, now=now)
         except board.StoreError as problem:
             print(f"corral drive: {problem}", file=err)
             return finish(USAGE, started=started, skipped=skipped)
@@ -2198,7 +2258,7 @@ def run_pass(
     read_labels=None,
     hold_label=None,
     pool=None,
-    tracker=None,
+    tracker_factory=None,
     operators=None,
     launcher=None,
     host=None,
@@ -2226,11 +2286,12 @@ def run_pass(
     provably-dead claims, and claims through the store transaction, then
     launches through `launcher` (the existing launch path in production;
     with no launcher the pass stops after claiming and records that),
-    handles stuck claims, and drains the mirror backlog through
-    `tracker`. `tracker` is the injected tracker double; with none there
-    is no sync, no freshness re-read, no mirror and no give-up post.
-    `operators` maps tracker repos to operator logins for the sync and
-    mirror steps; `host` names this host on its claims; `stale_after`
+    handles stuck claims, and drains the mirror backlog through the
+    per-repo trackers. `tracker_factory` maps a tracker repo to its
+    tracker (labels or board, built by the one factory); with none
+    there is no sync, no freshness re-read, no mirror and no give-up
+    post. `operators` maps tracker repos to operator logins for the sync
+    and mirror steps; `host` names this host on its claims; `stale_after`
     bounds the cached rows a claim may use without a live re-read.
     `present_agents` (ids with a live or stale registry entry),
     `live_units` ((repo, number) pairs with a live unit) and `gone_s`
@@ -2280,7 +2341,7 @@ def run_pass(
                 store,
                 out,
                 err,
-                tracker=tracker,
+                tracker_factory=tracker_factory,
                 operators=operators,
                 launcher=launcher,
                 host=host,
@@ -2337,6 +2398,23 @@ def cmd_drive(args: argparse.Namespace) -> int:
         if problem is not None:
             print(f"corral drive: {problem}", file=sys.stderr)
             return USAGE
+        by_repo: dict = {}
+        for project in registered:
+            try:
+                names = settings.repo_names(project.root)
+            except settings.SettingsError as err:
+                print(f"corral drive: {err}", file=sys.stderr)
+                return USAGE
+            mapping, problem = trackers.production_trackers(project.root, names, git=syncli._git)
+            if problem is not None:
+                print(f"corral drive: {problem}", file=sys.stderr)
+                return USAGE
+            for entry in mapping.values():
+                by_repo.setdefault(entry.tracker_repo, entry.tracker)
+
+        def tracker_factory(repo, _by_repo=by_repo):
+            return _by_repo[repo]
+
         try:
             stuck_states, stuck_stale = production_stuck_inputs(registered, now=time.time())
         except settings.SettingsError as problem:
@@ -2349,7 +2427,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             out=sys.stdout,
             err=sys.stderr,
             projects_fn=lambda: registered,
-            tracker=syncli._production_tracker(),
+            tracker_factory=tracker_factory,
             operators=operators,
             launcher=production_launcher(registered),
             agent_states=stuck_states,

@@ -32,6 +32,47 @@ def _ops_for(operators, repo: str) -> Sequence[str]:
     return kept or [repo.split("/")[0]]
 
 
+def push_repos(
+    store: board.Store,
+    pairs: Sequence[tuple[str, iface.Tracker]],
+    *,
+    operators,
+    now: float,
+    limit: int | None = None,
+) -> MirrorResult:
+    """One push per ``(repo, tracker)`` pair, merged into one outcome.
+
+    Each repo's queued rows go through its own tracker only: the pair's
+    scope is ``{repo: operators}``, so other repos' rows stay queued,
+    untouched. ``limit`` caps the total rows the pass takes and
+    decrements across repos. Every row one push takes lands in exactly
+    one bucket, so the merged counts are the sums.
+    """
+    sent = dropped = dirty = 0
+    errors: list[str] = []
+    stopped: float | None = None
+    remaining = limit
+    for repo, tracker in pairs:
+        if remaining is not None and remaining <= 0:
+            break
+        outcome = push(
+            store,
+            tracker,
+            operators={repo: list(_ops_for(operators, repo))},
+            now=now,
+            limit=remaining,
+        )
+        sent += outcome.sent
+        dropped += outcome.dropped
+        dirty += outcome.dirty
+        errors.extend(outcome.errors)
+        if stopped is None:
+            stopped = outcome.stopped
+        if remaining is not None:
+            remaining -= outcome.sent + outcome.dropped + outcome.dirty
+    return MirrorResult(sent, dropped, dirty, stopped, tuple(errors))
+
+
 def push(
     store: board.Store,
     tracker: iface.Tracker,

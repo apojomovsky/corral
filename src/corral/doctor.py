@@ -442,10 +442,15 @@ def production_list_fn(prefix: str) -> list:
 
 
 def production_board_fetch(board_config: settings.BoardConfig) -> object:
-    """The live board schema fetch. Only the CLI builds it; tests never call this."""
-    from corral.github import board as boardreader
+    """The live board schema fetch. Only the CLI builds it; tests never call this.
 
-    return boardreader.BoardReader(board_config, None, None).schema()
+    Routed through the one tracker factory, so the doctor reads the
+    board through the same construction as sync, mirror and drive.
+    """
+    from corral import trackers
+    from corral.github import gh
+
+    return trackers.board_schema_for(board_config, run=gh.run)
 
 
 def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
