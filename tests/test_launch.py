@@ -17,11 +17,13 @@ import subprocess
 import tempfile
 import unittest
 import uuid
+from types import SimpleNamespace
 from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import cli, hold, launch, launchcli, paths, registry, runtimes, settings, units
+from corral import accounts, cli, hold, launch, launchcli, models, paths, registry, runtimes
+from corral import settings, units
 from corral.runtimes import muse, omp, opencode
 from tests.test_reviewrecord import git_in
 
@@ -1040,6 +1042,30 @@ class StopUnprovenTest(OpsCase):
         self.assertEqual(code, 2)
         self.assertEqual(self.system.stopped, [])
         self.assertIn("corral-agent-lib-5-r7", err.getvalue())
+
+
+class ModelChainsFreshnessTest(unittest.TestCase):
+    def test_chains_use_the_minimum_bound_of_their_own_providers(self):
+        now = 1_800_000_000.0
+        resolved = settings.resolve(
+            project={"models": {"worker": {"chain": ["fresh/model"]}}}, env={}
+        )
+        tgt = SimpleNamespace(resolved=resolved)
+        pool = [
+            accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0),
+            accounts.Provider(name="other", reader="pkg:Reader", stale_after_s=30.0),
+        ]
+        ledger = {
+            "readings": {
+                "fresh": {
+                    "windows": {"hour": {"used_pct": 100, "resets_at": now + 3600}},
+                    "read_at": now - 120,
+                }
+            },
+            "marks": {},
+        }
+        with self.assertRaises(models.Exhausted):
+            launch._model_chains(tgt, pool, ledger, now)
 
 
 if __name__ == "__main__":
