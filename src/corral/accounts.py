@@ -196,9 +196,19 @@ def _with_reader_path(dirs: list[str]):
         sys.path[:] = saved
 
 
+def pool(config_dir: str | None = None) -> tuple[list[Provider], list[str]]:
+    """The providers and reader dirs in the accounts file, from one read.
+
+    A missing file is an empty pool with no reader dirs, never an error.
+    Callers that list the pool and then load its readers take both from
+    here, so the listing and the import cannot disagree.
+    """
+    return _load(accounts_path(config_dir))
+
+
 def providers(config_dir: str | None = None) -> list[Provider]:
     """Every provider in the accounts file, in file order; [] when there is no file."""
-    found, _ = _load(accounts_path(config_dir))
+    found, _ = pool(config_dir)
     return found
 
 
@@ -220,24 +230,27 @@ def _resolve(entry: str, where: str) -> type:
     return target
 
 
-def load_reader(entry: str, config_dir: str | None = None) -> Reader:
+def load_reader(
+    entry: str, config_dir: str | None = None, *, reader_dirs: list[str] | None = None
+) -> Reader:
     """Build the reader named by `module:Class`; never a silent skip.
 
-    The accounts file's `reader_path` dirs are on `sys.path` only for
-    the import, restored before returning. Raises AccountsError when
-    the file or a reader dir is unusable, when the entry does not
-    import, or when the class cannot be built. A ReaderError from
-    `read()` stays a ReaderError: the reader loaded, the provider just
-    did not answer.
+    The reader dirs are on `sys.path` only while the module imports
+    and the class builds, restored before returning. Pass the dirs
+    from `pool` when the caller already holds them, so the listing and
+    the import come from one read; otherwise they are read here.
+    Raises AccountsError when the file or a reader dir is unusable,
+    when the entry does not import, or when the class cannot be built.
+    A ReaderError from `read()` stays a ReaderError: the reader
+    loaded, the provider just did not answer.
     """
-    path = accounts_path(config_dir)
-    _, dirs = _load(path)
+    dirs = reader_dirs if reader_dirs is not None else pool(config_dir)[1]
     with _with_reader_path(dirs):
         cls = _resolve(entry, "accounts")
-    try:
-        return cls()
-    except Exception as err:
-        raise AccountsError(f"accounts: reader {entry!r} failed to build: {err}") from None
+        try:
+            return cls()
+        except Exception as err:
+            raise AccountsError(f"accounts: reader {entry!r} failed to build: {err}") from None
 
 
 def check(config_dir: str | None = None) -> list[str]:

@@ -19,7 +19,7 @@ stale_after = "15m"                 # a reading older than this is stale
 
 The file lists providers and how to read their usage. Logins and credentials stay with each runtime and the reader's own call-time lookup; corral stores none of them. `corral deps` and the doctor check that the file parses, that provider names are unique, that every `reader_path` entry exists and is readable (naming the entry when not), and that each reader imports.
 
-`reader_path` is a top-level list of directories, expanded (`~` and environment variables) and then required to be absolute: a relative entry is a configuration error, never resolved against the working directory. The entries are resolved in one place (`accounts.py`) and prepended to `sys.path` only while a reader imports, restored before the load returns, so no other module touches `sys.path`. Every corral verb that reads quota goes through that load, so `launch`, `drive`, `snapshot`, `quota` and the doctor all see the same readers with no `PYTHONPATH` export.
+`reader_path` is a top-level list of directories, expanded (`~` and environment variables) and then required to be absolute: a relative entry is a configuration error, never resolved against the working directory. The entries are resolved in one place (`accounts.py`) and prepended to `sys.path` only while a reader imports, restored before the load returns, so no other module touches `sys.path`. Every corral verb that reads quota goes through that load, so `launch`, `drive`, `snapshot`, `quota` and the doctor all see the same readers with no `PYTHONPATH` export. Earlier entries shadow later ones: when two entries contain the same module name, the reader imports from the first entry on the list.
 
 ## Readers
 

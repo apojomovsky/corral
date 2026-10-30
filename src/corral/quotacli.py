@@ -226,7 +226,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 
 
 def cmd_refresh(args: argparse.Namespace) -> int:
-    pool = accounts.providers()
+    pool, dirs = accounts.pool()
     targets = [
         provider
         for provider in pool
@@ -243,8 +243,11 @@ def cmd_refresh(args: argparse.Namespace) -> int:
         return OK
     results: dict = {}
 
+    def load(entry):
+        return accounts.load_reader(entry, reader_dirs=dirs)
+
     def change(ledger):
-        fresh, seen = refresh(pool, ledger, time.time(), only=args.provider)
+        fresh, seen = refresh(pool, ledger, time.time(), only=args.provider, load_reader=load)
         results.update(seen)
         return fresh
 

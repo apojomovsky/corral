@@ -389,13 +389,13 @@ def load_dep_results() -> tuple[list[deps.Result], str | None]:
 def load_readers(config_dir: str | None = None) -> list[tuple[str, str, str]]:
     """(provider, entry, error) for every reader that does not load."""
     try:
-        found = accounts.providers(config_dir)
+        found, dirs = accounts.pool(config_dir)
     except (accounts.AccountsError, paths.PathError) as err:
         return [("", "", str(err))]
     errors = []
     for provider in found:
         try:
-            accounts.load_reader(provider.reader, config_dir)
+            accounts.load_reader(provider.reader, reader_dirs=dirs)
         except accounts.AccountsError as err:
             errors.append((provider.name, provider.reader, str(err)))
     return errors

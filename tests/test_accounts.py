@@ -302,6 +302,53 @@ def write_reader_module(directory, name="fakereader"):
     return directory
 
 
+SIBLING_HELPER_MODULE = """\
+MARKER = "sibling-ok"
+"""
+
+SIBLING_READER_MODULE = '''\
+from corral import accounts
+
+
+class SiblingReader:
+    """A reader whose constructor imports a sibling top-level module."""
+
+    def __init__(self):
+        import sibling_helper
+
+        self.marker = sibling_helper.MARKER
+
+    def read(self, now):
+        return accounts.Reading(windows={"weekly": accounts.Window(used_pct=10.0, resets_at=None)})
+
+    def parse_limit_error(self, text, now):
+        return None
+'''
+
+SHADOW_READER_MODULE = '''\
+import shadowed
+from corral import accounts
+
+
+class ShadowReader:
+    """A reader that reports the shadowed module's value."""
+
+    def read(self, now):
+        return accounts.Reading(
+            windows={"weekly": accounts.Window(used_pct=shadowed.USED, resets_at=None)}
+        )
+
+    def parse_limit_error(self, text, now):
+        return None
+'''
+
+
+def write_module(directory, name, source):
+    with open(os.path.join(directory, f"{name}.py"), "w", encoding="utf-8") as handle:
+        handle.write(source)
+    return directory
+
+
 def config_with_reader_path(readers_dir, reader="fakereader:PathReader", name="provider-a"):
     directory = tempfile.mkdtemp(prefix="corral-accounts-")
     with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
@@ -419,6 +466,96 @@ class ReaderPath(unittest.TestCase):
         finally:
             self.assertEqual(list(sys.path), before)
             sys.modules.pop("fakereader", None)
+
+    def test_a_constructor_may_import_a_sibling_module_from_reader_path(self):
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        write_module(readers, "sibling_helper", SIBLING_HELPER_MODULE)
+        write_module(readers, "siblingreader", SIBLING_READER_MODULE)
+        directory = config_with_reader_path(readers, reader="siblingreader:SiblingReader")
+        before = list(sys.path)
+        try:
+            reader = accounts.load_reader("siblingreader:SiblingReader", directory)
+            self.assertEqual(getattr(reader, "marker"), "sibling-ok")
+            self.assertEqual(reader.read(1700000000.0).windows["weekly"].used_pct, 10.0)
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("siblingreader", None)
+            sys.modules.pop("sibling_helper", None)
+
+    def test_load_reader_reuses_already_resolved_dirs(self):
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        write_reader_module(readers)
+        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-dir")
+        before = list(sys.path)
+        try:
+            reader = accounts.load_reader("fakereader:PathReader", missing, reader_dirs=[readers])
+            self.assertEqual(reader.read(1700000000.0).windows["weekly"].used_pct, 10.0)
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_earlier_reader_path_entries_shadow_later_ones(self):
+        first = tempfile.mkdtemp(prefix="corral-readers-first-")
+        second = tempfile.mkdtemp(prefix="corral-readers-second-")
+        write_module(first, "shadowed", "USED = 10.0\n")
+        write_module(second, "shadowed", "USED = 90.0\n")
+        write_module(first, "shadowreader", SHADOW_READER_MODULE)
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                f'reader_path = ["{first}", "{second}"]\n'
+                '[[provider]]\nname = "provider-a"\nreader = "shadowreader:ShadowReader"\n'
+            )
+        before = list(sys.path)
+        try:
+            reader = accounts.load_reader("shadowreader:ShadowReader", directory)
+            self.assertEqual(reader.read(1700000000.0).windows["weekly"].used_pct, 10.0)
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("shadowreader", None)
+            sys.modules.pop("shadowed", None)
+
+    def test_a_dollar_var_entry_expands(self):
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        write_reader_module(readers)
+        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'reader_path = ["$CORRAL_TEST_READERS"]\n'
+                '[[provider]]\nname = "provider-a"\nreader = "fakereader:PathReader"\n'
+            )
+        before = list(sys.path)
+        try:
+            with mock.patch.dict(os.environ, {"CORRAL_TEST_READERS": readers}):
+                reader = accounts.load_reader("fakereader:PathReader", directory)
+                self.assertEqual(reader.read(1700000000.0).windows["weekly"].used_pct, 10.0)
+        finally:
+            self.assertEqual(list(sys.path), before)
+            sys.modules.pop("fakereader", None)
+
+    def test_an_unreadable_reader_path_is_a_configuration_error(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads everything")
+        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        os.chmod(readers, 0)
+        try:
+            directory = config_with_reader_path(readers)
+            with self.assertRaises(accounts.AccountsError):
+                accounts.providers(directory)
+            problems = accounts.check(directory)
+            self.assertEqual(len(problems), 1)
+            self.assertIn(readers, problems[0])
+        finally:
+            os.chmod(readers, 0o755)
+
+    def test_doctor_names_a_bad_reader_path(self):
+        from corral import doctor
+
+        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-readers")
+        directory = config_with_reader_path(missing)
+        errors = doctor.load_readers(directory)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(missing, errors[0][2])
 
     def test_only_accounts_touches_sys_path(self):
         root = os.path.join(os.path.dirname(__file__), "..", "src", "corral")
