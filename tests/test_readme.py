@@ -47,11 +47,19 @@ def table_tokens(section):
     return found
 
 
+def runtimes_bullet():
+    """The Headless runtimes bullet, the line that must name every runtime."""
+    text = (ROOT / "README.md").read_text(encoding="utf-8")
+    lines = [line for line in text.splitlines() if "Headless runtimes" in line]
+    return "\n".join(lines)
+
+
 class RegisteredRuntimes(unittest.TestCase):
     def test_readme_names_every_registered_runtime(self):
-        text = (ROOT / "README.md").read_text(encoding="utf-8")
+        bullet = runtimes_bullet()
+        self.assertTrue(bullet, "no Headless runtimes bullet in README.md")
         missing = [
-            name for name in runtimes.NAMES if not re.search(rf"\b{re.escape(name)}\b", text)
+            name for name in runtimes.NAMES if not re.search(rf"\b{re.escape(name)}\b", bullet)
         ]
         self.assertEqual(missing, [])
 

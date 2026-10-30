@@ -89,7 +89,7 @@ corral is a uv project. On a host, `uv tool install` puts the CLI in its own env
 ## 3. Milestone 1: one host
 
 1. Ground rules: skeleton, hooks, `make bootstrap`, `corral deps`, the API versioning rule.
-2. Runtimes, units, sessions. Exit: a fake project launches, resumes, tails and stops an omp and an opencode agent in tests, through fake seams.
+2. Runtimes, units, sessions. Exit: a fake project launches, resumes, tails and stops an omp, an opencode and a muse agent in tests, through fake seams.
 3. Accounts, models, quota. Exit: `corral quota` shows one view, and a launch whose chain is exhausted is refused or re-routed.
 4. Admission. Exit: with the total cap reached by one project, another gets only its floor.
 5. Host hygiene, run first in plan-only mode next to whatever it replaces.

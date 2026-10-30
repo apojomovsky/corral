@@ -6,8 +6,10 @@ are the three adapters; `get` returns one by name, and `record`/`recorded`
 keep the runtime a session started on, so a resume uses the same runtime.
 
 Every adapter writes only into the session directory it is given. It never
-reads or writes a user's home config (`~/.omp/`, `~/.config/opencode/`); each
-launch gets a full per-launch overlay instead.
+writes a user's home config (`~/.omp/`, `~/.config/opencode/`,
+`~/.config/muse/`); it reads the muse session logs under
+`~/.local/share/muse/sessions/`; each launch gets a full per-launch
+overlay instead.
 
 Binaries: each adapter resolves its binary once per process, from PATH, and
 falls back to its usual install location under the home directory when PATH
