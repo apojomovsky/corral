@@ -261,7 +261,8 @@ def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.T
         return BoardBackedTracker(
             board, gh.run if run is None else run, pacer=pacer, max_pages=max_pages
         )
-    raise ValueError(f"unknown tracker variant {variant!r} (want one of 'board', 'labels')")
+    want = ", ".join(repr(v) for v in sorted(VARIANTS))
+    raise ValueError(f"unknown tracker variant {variant!r} (want one of {want})")
 
 
 def board_schema_for(board_config, *, run, pacer=None) -> BoardSchema:
