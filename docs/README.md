@@ -8,6 +8,7 @@
 | [`03-muse-runtime.md`](03-muse-runtime.md) | design for the muse runtime adapter: argv, overlay, sessions, resume, errors, quota, sandbox, tests |
 | [`04-dispatch-loop.md`](04-dispatch-loop.md) | the dispatch loop: process model, eligibility, ordering, claims, lifecycle, safety |
 | [`05-dashboard-api.md`](05-dashboard-api.md) | design for the read-only dashboard API: routes, loopback HTTP plus SSE, token rules, schema stability, test plan, tickets |
+| [`06-corral-new.md`](06-corral-new.md) | design for `corral new`: scaffold templates, the `init` writer, the forge side, label bootstrap, idempotence, test plan, tickets |
 | [`07-board-fields.md`](07-board-fields.md) | the board-field tracker variant: project board fields behind the tracker interface, and the tickets to build it |
 | [`adr/`](adr/) | decision records; none yet |
 
