@@ -171,13 +171,14 @@ class FullDocument(unittest.TestCase):
                         {"path": cache, "total": 1000, "used": 400, "free": 600},
                     ]
                 },
+                "drive": {"error": "drive section not collected"},
             },
         )
 
     def test_top_level_key_order(self):
         self.assertEqual(
             list(doc_of()),
-            ["schema_version", "fleet_header", "agents", "quota", "capacity", "disk"],
+            ["schema_version", "fleet_header", "agents", "quota", "capacity", "disk", "drive"],
         )
 
     def test_agent_without_ticket_reads_null(self):
@@ -343,6 +344,7 @@ class CliExits(unittest.TestCase):
                 "registry.stale_s": 600,
                 "registry.gone_s": 3600,
                 "quota.low_pct": 80,
+                "drive.max_starts_per_day": 50,
             }
         out, err = io.StringIO(), io.StringIO()
         with (
@@ -350,6 +352,7 @@ class CliExits(unittest.TestCase):
             mock.patch("corral.accounts.providers", return_value=[]),
             mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
             mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.drive.drive_status", return_value={"last_exit": 0}),
             mock.patch("socket.gethostname", return_value=HOST),
             mock.patch("shutil.disk_usage", side_effect=lambda path: (1000, 400, 600)),
             redirect_stdout(out),
@@ -368,10 +371,11 @@ class CliExits(unittest.TestCase):
         doc = json.loads(out)
         self.assertEqual(
             list(doc),
-            ["schema_version", "fleet_header", "agents", "quota", "capacity", "disk"],
+            ["schema_version", "fleet_header", "agents", "quota", "capacity", "disk", "drive"],
         )
         self.assertEqual(doc["schema_version"], 1)
         self.assertEqual(len(doc["agents"]), 1)
+        self.assertEqual(doc["drive"], {"last_exit": 0})
 
     def test_ok_human_output(self):
         code, out, _ = self.run_main(["snapshot"])

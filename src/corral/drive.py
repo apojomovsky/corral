@@ -19,8 +19,10 @@ saturation is routine dispatch state, not an error.
 
 import argparse
 import contextlib
+import datetime
 import errno
 import fcntl
+import json
 import os
 import socket
 import sqlite3
@@ -54,7 +56,14 @@ from corral import tracker as iface
 from corral.eligibility import StartRequest, TicketRow
 from corral.github.tracker import NEEDS_DECISION, PRIORITIES
 
-OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
+OK, NO, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
+
+settings.register(
+    "drive.max_starts_per_day",
+    int,
+    50,
+    "real starts one dispatch pass may launch per calendar day (plans never count)",
+)
 
 #: The lock file inside the state dir.
 LOCK_NAME = "drive.lock"
@@ -356,6 +365,242 @@ def lock_path():
     The only path join for it (AGENTS.md, "One fact, one place").
     """
     return os.path.join(paths.state_dir(), LOCK_NAME)
+
+
+#: Safety and observability state. The journal lives in its own
+#: directory; the pause file and the day counter sit beside the lock in
+#: the state dir, each resolved here and nowhere else.
+DRIVE_DIRNAME = "drive"
+JOURNAL_NAME = "journal.jsonl"
+JOURNAL_ARCHIVE_PREFIX = "journal-"
+JOURNAL_MAX = 500
+ARCHIVE_KEEP_DAYS = 14
+PAUSE_NAME = "drive.pause"
+DAY_NAME = "drive.starts.json"
+
+
+class JournalError(Exception):
+    """Drive safety state is missing or unreadable (exit 4 at the loop)."""
+
+
+def drive_dir():
+    """The drive journal directory: inside the state dir."""
+    return os.path.join(paths.state_dir(), DRIVE_DIRNAME)
+
+
+def journal_path(base=None):
+    """The live drive journal file, under `base` or the drive dir."""
+    return os.path.join(base if base is not None else drive_dir(), JOURNAL_NAME)
+
+
+def pause_path():
+    """The pause file: inside the state dir."""
+    return os.path.join(paths.state_dir(), PAUSE_NAME)
+
+
+def day_path():
+    """The day counter file: inside the state dir."""
+    return os.path.join(paths.state_dir(), DAY_NAME)
+
+
+def _day_string(now):
+    """The UTC calendar date of `now`, the day counter's key."""
+    return datetime.datetime.fromtimestamp(now, datetime.timezone.utc).date().isoformat()
+
+
+def _archive_stamp(entry_at, today):
+    """The archive date for one journal line: its own date, else today."""
+    if isinstance(entry_at, bool):
+        return today
+    if isinstance(entry_at, (int, float)):
+        try:
+            return (
+                datetime.datetime.fromtimestamp(entry_at, datetime.timezone.utc).date().isoformat()
+            )
+        except (OverflowError, OSError, ValueError):
+            return today
+    return today
+
+
+def _rotate_journal(live, directory, today):
+    """Rotation inside the append: past the max, oldest move to archives.
+
+    Archives are `journal-YYYY-MM-DD.jsonl` by entry date; archives older
+    than two weeks are deleted. Unparseable lines keep today's date, so
+    rotation never drops what it cannot read.
+    """
+    pruned: list[str] = []
+    if len(live) <= JOURNAL_MAX:
+        return live, pruned
+    rest = live[: len(live) - JOURNAL_MAX]
+    kept = live[len(live) - JOURNAL_MAX :]
+    by_date: dict[str, list[str]] = {}
+    for line in rest:
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            entry = None
+        stamp = _archive_stamp(entry.get("at"), today) if isinstance(entry, dict) else today
+        by_date.setdefault(stamp, []).append(line)
+    for stamp, rows in sorted(by_date.items()):
+        path = os.path.join(directory, f"{JOURNAL_ARCHIVE_PREFIX}{stamp}.jsonl")
+        with open(path, "a", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(row + "\n")
+        pruned.append(os.path.basename(path))
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        names = []
+    for name in names:
+        if not (name.startswith(JOURNAL_ARCHIVE_PREFIX) and name.endswith(".jsonl")):
+            continue
+        stamp = name[len(JOURNAL_ARCHIVE_PREFIX) : -len(".jsonl")]
+        try:
+            file_day = datetime.date.fromisoformat(stamp)
+        except ValueError:
+            continue
+        if (datetime.date.fromisoformat(today) - file_day).days > ARCHIVE_KEEP_DAYS:
+            try:
+                os.remove(os.path.join(directory, name))
+            except OSError:
+                continue
+            pruned.append(name)
+    return kept, pruned
+
+
+def log_event(path, event):
+    """Append one JSON object line to the drive journal, rotating as needed."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            live = [line for line in handle.read().splitlines() if line.strip()]
+    except FileNotFoundError:
+        live = []
+    today = _archive_stamp(event.get("at"), _day_string(time.time()))
+    live.append(json.dumps(event, sort_keys=True))
+    live, _ = _rotate_journal(live, directory or ".", today)
+    paths.atomic_write_text(path, "".join(line + "\n" for line in live))
+
+
+def pause_reason(path):
+    """The pause file's first line, None when the file is absent."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    first = text.splitlines()[0].strip() if text.splitlines() else ""
+    return first if first else "paused by operator"
+
+
+def read_day_count(path, today):
+    """Starts already launched on `today`: 0 when absent or a prior date."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError) as err:
+        raise JournalError(f"day counter {path} is unreadable: {err}") from None
+    if not isinstance(data, dict) or data.get("date") != today:
+        return 0
+    starts = data.get("starts")
+    if isinstance(starts, bool) or not isinstance(starts, int) or starts < 0:
+        raise JournalError(f"day counter {path} is corrupt")
+    return starts
+
+
+def write_day_count(path, today, count):
+    """Record `count` starts launched on `today`, atomically."""
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    payload = json.dumps({"date": today, "starts": count}, sort_keys=True) + "\n"
+    paths.atomic_write_text(path, payload)
+
+
+def check_lock(path):
+    """Whether another pass holds the drive lock now: read-only.
+
+    A missing lock file means no holder. Only contention reads held;
+    any other lock failure raises.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return False
+    try:
+        _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as err:
+        os.close(fd)
+        if err.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+            return True
+        raise
+    os.close(fd)
+    return False
+
+
+def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_path):
+    """The `snapshot` drive section from host state (pure reads).
+
+    Raises JournalError when the journal is missing or corrupt, so the
+    section reports a section error instead of crashing. A missing day
+    counter reads as zero starts; a corrupt one raises too.
+    """
+    try:
+        with open(journal_path, encoding="utf-8") as handle:
+            raw = handle.read().splitlines()
+    except FileNotFoundError:
+        raise JournalError(f"no drive passes recorded yet ({journal_path})") from None
+    entries = []
+    for lineno, line in enumerate(raw, 1):
+        if not line.strip():
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            raise JournalError(f"drive journal {journal_path} line {lineno} is not JSON") from None
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("event"), str)
+            or isinstance(data.get("at"), bool)
+            or not isinstance(data.get("at"), (int, float))
+        ):
+            raise JournalError(
+                f"drive journal {journal_path} line {lineno} is not a drive entry"
+            ) from None
+        entries.append(data)
+    starts = [index for index, item in enumerate(entries) if item["event"] == "pass_start"]
+    if not starts:
+        raise JournalError(f"drive journal {journal_path} records no pass")
+    tail = entries[starts[-1] :]
+    ends = [item for item in tail if item["event"] == "pass_end"]
+    end = ends[-1] if ends else None
+    skipped: dict[str, int] = {}
+    for item in tail:
+        if item["event"] == "skip":
+            code = item.get("code") or "skip"
+            skipped[str(code)] = skipped.get(str(code), 0) + 1
+    today = _day_string(now)
+    used = read_day_count(day_path, today)
+    reason = pause_reason(pause_path)
+    return {
+        "last_pass_at": tail[0]["at"],
+        "last_exit": end["exit"] if end is not None else None,
+        "lock_held": check_lock(lock_path),
+        "paused": reason is not None,
+        "pause_reason": reason,
+        "starts_today": used,
+        "starts_remaining": max(0, max_starts - used),
+        "max_starts_per_day": max_starts,
+        "started": sum(1 for item in tail if item["event"] == "start"),
+        "skipped_by_reason": skipped,
+        "released": sum(1 for item in tail if item["event"] == "release"),
+        "gave_up": sum(1 for item in tail if item["event"] == "give_up"),
+    }
 
 
 #: The flock seam: production locks with fcntl, tests assign a fake.
@@ -854,7 +1099,7 @@ def is_orphan(claim, *, now, gone_s, present_agents, live_units) -> bool:
     return now - claim.claimed_at > 2 * gone_s
 
 
-def release_orphans(store, *, now, gone_s, present_agents, live_units, out) -> int:
+def release_orphans(store, *, now, gone_s, present_agents, live_units, out, events=None) -> int:
     """Release every provably-dead claim, one logbook line each.
 
     Returns the released count. Each claim's agent and epoch go
@@ -867,6 +1112,7 @@ def release_orphans(store, *, now, gone_s, present_agents, live_units, out) -> i
     next claim to mint, which fences a stale holder still acting on the
     old epoch; the worktree and branch stay untouched. Rows with no
     claim are left alone: adoption happens only in resync, never here.
+    When `events` is a list, each release appends its journal entry.
     """
     released = 0
     for item in store.items():
@@ -891,11 +1137,25 @@ def release_orphans(store, *, now, gone_s, present_agents, live_units, out) -> i
             f"{ref}: released dead claim by `{claim.agent}`, epoch {claim.epoch} kept",
             file=out,
         )
+        if events is not None:
+            events.append({"event": "release", "at": now, "ticket": ref, "agent": claim.agent})
         released += 1
     return released
 
 
-def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, now, stale_after):
+def _claim_and_launch(
+    store,
+    gated_rows,
+    *,
+    tracker,
+    operators,
+    launcher,
+    host,
+    now,
+    stale_after,
+    start_budget=None,
+    day_cap=None,
+):
     """Claim each proceeding candidate, launch each claim.
 
     Returns (rows, started, blocked): the verdict rows to print, the
@@ -906,7 +1166,10 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
     ticket. A lost race (exit 2 from the store) becomes a skip naming
     the holder and the pass moves on; a launch through `launcher`
     appends the unit or the failure to the row's reason. With no
-    `launcher` the pass stops after claiming and records that.
+    `launcher` the pass stops after claiming and records that. When
+    `start_budget` is not None, at most that many starts launch; further
+    starts become `cap` skips naming `day_cap`, and each launch spends
+    one from the local budget.
     """
     rows = []
     started = 0
@@ -928,6 +1191,19 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
                         f"{ref}: {gated.kind} handoff is owned by a later ticket, left unclaimed"
                     ),
                     code="claim",
+                )
+            )
+            continue
+        if start_budget is not None and start_budget <= 0:
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=gated.kind,
+                    verdict="skip",
+                    reason=f"{ref}: day cap reached ({day_cap}/day), not started",
+                    code="cap",
                 )
             )
             continue
@@ -1031,6 +1307,8 @@ def _claim_and_launch(store, gated_rows, *, tracker, operators, launcher, host, 
                 )
             )
             started += 1
+            if start_budget is not None:
+                start_budget -= 1
             continue
         rows.append(
             Gated(
@@ -1192,6 +1470,9 @@ def _launching_pass(
     present_agents,
     live_units,
     gone_s,
+    journal_path=None,
+    day_path=None,
+    max_starts=None,
 ) -> int:
     """One claiming pass: sync, release orphans, gate, claim, launch, mirror, print.
 
@@ -1205,16 +1486,55 @@ def _launching_pass(
     outbox holds, old backlog and new claims alike; what it cannot push
     stays queued for the next healthy pass. A pass that synced nothing
     at all exits 3; a pass that launched nothing because the service
-    manager was unreachable does too.
+    manager was unreachable does too. When `journal_path` is set, the
+    pass appends its start, every start, skip and release, and its end
+    with verdict counts; a journal write failure warns and the pass
+    continues. When `day_path` and `max_starts` are set, at most the
+    remaining starts launch and the pass ends with exit 1 once the cap
+    stops a start.
     """
+    events: list[dict] = []
+    released = 0
+
+    def note(entry):
+        if journal_path is not None:
+            events.append(entry)
+
+    def journal_write(entry):
+        if journal_path is None:
+            return
+        try:
+            log_event(journal_path, entry)
+        except OSError as problem:
+            print(f"corral drive: cannot write the journal: {problem}", file=err)
+
+    def finish(code, started=0, skipped=None):
+        if journal_path is not None:
+            for entry in events:
+                journal_write(entry)
+            journal_write(
+                {
+                    "event": "pass_end",
+                    "at": now,
+                    "exit": code,
+                    "started": started,
+                    "skipped_by_reason": skipped or {},
+                    "released": released,
+                    "gave_up": 0,
+                }
+            )
+        return code
+
+    if journal_path is not None:
+        journal_write({"event": "pass_start", "at": now, "host": host or ""})
     try:
         seen, sync_errors = sync_all(store, tracker, operators=operators, now=now)
     except board.StoreError as problem:
         print(f"corral drive: {problem}", file=err)
-        return USAGE
+        return finish(USAGE)
     except sqlite3.Error as problem:
         print(f"corral drive: cannot read the store: {problem}", file=err)
-        return USAGE
+        return finish(USAGE)
     for line in sync_errors:
         print(f"corral drive: {line}", file=err)
     ctx, fatal = _read_inputs(
@@ -1232,7 +1552,7 @@ def _launching_pass(
         pool=pool,
     )
     if fatal is not None:
-        return fatal
+        return finish(fatal)
     (
         _items,
         registered,
@@ -1244,13 +1564,27 @@ def _launching_pass(
         quota_for,
         pool,
     ) = ctx
+    day_today = None
+    day_used = 0
+    start_budget = None
+    if day_path is not None and max_starts is not None:
+        if max_starts < 0:
+            print("corral drive: drive.max_starts_per_day must not be negative", file=err)
+            return finish(USAGE)
+        day_today = _day_string(now)
+        try:
+            day_used = read_day_count(day_path, day_today)
+        except JournalError as problem:
+            print(f"corral drive: {problem}", file=err)
+            return finish(USAGE)
+        start_budget = max_starts - day_used
     skip_orphans = False
     if gone_s is None:
         try:
             present_agents, live_units, gone_s = production_orphan_inputs(registered, now=now)
         except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=err)
-            return USAGE
+            return finish(USAGE)
         except units.Unreachable as problem:
             print(
                 f"corral drive: cannot read live units, orphan recovery skipped ({problem})",
@@ -1262,13 +1596,14 @@ def _launching_pass(
         live_units = frozenset(live_units or ())
     if not skip_orphans:
         try:
-            release_orphans(
+            released = release_orphans(
                 store,
                 now=now,
                 gone_s=gone_s,
                 present_agents=present_agents,
                 live_units=live_units,
                 out=out,
+                events=events if journal_path is not None else None,
             )
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"corral drive: orphan recovery skipped ({problem})", file=err)
@@ -1276,10 +1611,10 @@ def _launching_pass(
             _items = store.items()
         except board.StoreError as problem:
             print(f"corral drive: {problem}", file=err)
-            return USAGE
+            return finish(USAGE)
         except sqlite3.Error as problem:
             print(f"corral drive: cannot read the store: {problem}", file=err)
-            return USAGE
+            return finish(USAGE)
     gated_rows, problems = _gate_all(
         _items,
         registered,
@@ -1300,7 +1635,7 @@ def _launching_pass(
             stale_after = settings.load(root=None)["board.item_max_age_s"]
         except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=err)
-            return USAGE
+            return finish(USAGE)
     final_rows, started, blocked = _claim_and_launch(
         store,
         gated_rows,
@@ -1310,13 +1645,51 @@ def _launching_pass(
         host=host,
         now=now,
         stale_after=stale_after,
+        start_budget=start_budget,
+        day_cap=max_starts,
     )
+    for row in final_rows:
+        ref = f"{row.repo}#{row.number}"
+        if row.verdict == "skip":
+            note(
+                {
+                    "event": "skip",
+                    "at": now,
+                    "project": row.project,
+                    "ticket": ref,
+                    "code": row.code,
+                    "reason": row.reason,
+                }
+            )
+        else:
+            note(
+                {
+                    "event": "start",
+                    "at": now,
+                    "project": row.project,
+                    "ticket": ref,
+                    "kind": row.kind,
+                }
+            )
+    capped = any(row.code == "cap" for row in final_rows)
+    if capped:
+        note({"event": "cap", "at": now, "max": max_starts})
+    if day_today is not None and day_path is not None:
+        try:
+            write_day_count(day_path, day_today, day_used + started)
+        except OSError as problem:
+            print(f"corral drive: cannot write the day counter: {problem}", file=err)
+    skipped: dict[str, int] = {}
+    for row in final_rows:
+        if row.verdict == "skip":
+            key = row.code or "skip"
+            skipped[key] = skipped.get(key, 0) + 1
     if tracker is not None:
         try:
             outcome = mirror.push(store, tracker, operators=operators, now=now)
         except board.StoreError as problem:
             print(f"corral drive: {problem}", file=err)
-            return USAGE
+            return finish(USAGE, started=started, skipped=skipped)
         for line in outcome.errors:
             print(f"corral drive: {line}", file=err)
     table = [
@@ -1334,12 +1707,14 @@ def _launching_pass(
     for problem in problems:
         print(problem, file=err)
     if problems:
-        return USAGE
+        return finish(USAGE, started=started, skipped=skipped)
     if sync_errors and seen == 0:
-        return UNREACHABLE
+        return finish(UNREACHABLE, started=started, skipped=skipped)
     if blocked and started == 0:
-        return UNREACHABLE
-    return OK
+        return finish(UNREACHABLE, started=started, skipped=skipped)
+    if capped:
+        return finish(NO, started=started, skipped=skipped)
+    return finish(OK, started=started, skipped=skipped)
 
 
 def run_pass(
@@ -1366,28 +1741,46 @@ def run_pass(
     present_agents=None,
     live_units=None,
     gone_s=None,
+    journal_path=None,
+    pause_path=None,
+    day_path=None,
+    max_starts=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
     `--plan` holds no lock and writes nothing: no sync, orphan release,
-    claim, mirror or launch, whatever seams are passed. The non-plan
-    pass takes the drive lock, releases provably-dead claims, and claims
-    through the store transaction, then launches through `launcher`
-    (the existing launch path in production; with no launcher the pass
-    stops after claiming and records that) and drains the mirror backlog
-    through `tracker`. `tracker` is the injected tracker double; with
-    none there is no sync, no freshness re-read and no mirror.
-    `operators` maps tracker repos to operator logins for the sync and
-    mirror steps; `host` names this host on its claims; `stale_after`
-    bounds the cached rows a claim may use without a live re-read.
-    `present_agents` (ids with a live or stale registry entry),
-    `live_units` ((repo, number) pairs with a live unit) and `gone_s`
-    feed orphan recovery; `gone_s=None` reads all three from the host
-    instead. `now` defaults to the wall clock; every other None means
-    the host default, so tests inject plain data or fakes at those
-    seams and production reads the host. Returns the exit code.
+    claim, mirror, journal or day-counter write, whatever seams are
+    passed. The non-plan pass takes the drive lock, releases
+    provably-dead claims, and claims through the store transaction, then
+    launches through `launcher` (the existing launch path in production;
+    with no launcher the pass stops after claiming and records that)
+    and drains the mirror backlog through `tracker`. `tracker` is the
+    injected tracker double; with none there is no sync, no freshness
+    re-read and no mirror. `operators` maps tracker repos to operator
+    logins for the sync and mirror steps; `host` names this host on its
+    claims; `stale_after` bounds the cached rows a claim may use without
+    a live re-read. `present_agents` (ids with a live or stale registry
+    entry), `live_units` ((repo, number) pairs with a live unit) and
+    `gone_s` feed orphan recovery; `gone_s=None` reads all three from
+    the host instead. When `pause_path` names an existing pause file,
+    either pass reports it and exits 1, starting nothing. When
+    `journal_path` is set, the non-plan pass journals its decisions;
+    when `day_path` and `max_starts` are set, starts beyond the day's
+    budget become `cap` skips and the pass ends with exit 1. `now`
+    defaults to the wall clock; every other None means the host
+    default, so tests inject plain data or fakes at those seams and
+    production reads the host. Returns the exit code.
     """
     moment = time.time() if now is None else now
+    if pause_path is not None:
+        try:
+            reason = pause_reason(pause_path)
+        except OSError as problem:
+            print(f"corral drive: cannot read the pause file: {problem}", file=err)
+            return USAGE
+        if reason is not None:
+            print(f"corral drive: paused: {reason}", file=err)
+            return NO
     args = {
         "now": moment,
         "projects_fn": projects_fn,
@@ -1415,6 +1808,9 @@ def run_pass(
                 present_agents=present_agents,
                 live_units=live_units,
                 gone_s=gone_s,
+                journal_path=journal_path,
+                day_path=day_path,
+                max_starts=max_starts,
                 **args,
             )
     except LockHeld as held:
@@ -1431,6 +1827,11 @@ def cmd_drive(args: argparse.Namespace) -> int:
     except board.StoreError as problem:
         print(f"corral drive: {problem}", file=sys.stderr)
         return USAGE
+    try:
+        max_starts = settings.load(root=None)["drive.max_starts_per_day"]
+    except settings.SettingsError as problem:
+        print(f"corral drive: {problem}", file=sys.stderr)
+        return USAGE
     with store:
         if args.plan:
             return run_pass(
@@ -1439,6 +1840,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 lock_path=lock_path(),
                 out=sys.stdout,
                 err=sys.stderr,
+                pause_path=pause_path(),
             )
         try:
             registered = projects.load_all()
@@ -1459,6 +1861,10 @@ def cmd_drive(args: argparse.Namespace) -> int:
             tracker=syncli._production_tracker(),
             operators=operators,
             launcher=production_launcher(registered),
+            journal_path=journal_path(),
+            pause_path=pause_path(),
+            day_path=day_path(),
+            max_starts=max_starts,
         )
 
 
