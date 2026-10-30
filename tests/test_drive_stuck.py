@@ -1174,5 +1174,72 @@ class StuckErrorBranchTest(unittest.TestCase):
         self.assertEqual(found.agent, "drive-host-1-19999-acme--app-7")
 
 
+class StuckJournalTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-journal-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.journal = os.path.join(self.tmp.name, "drive", "journal.jsonl")
+
+    def journal_entries(self):
+        with open(self.journal, encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle.read().splitlines() if line.strip()]
+
+    def test_a_restart_is_journaled_and_pass_end_counts_no_give_up(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+            journal_path=self.journal,
+        )
+        self.assertEqual(code, 0)
+        entries = self.journal_entries()
+        restarts = [entry for entry in entries if entry["event"] == "restart"]
+        self.assertEqual(len(restarts), 1)
+        self.assertEqual(restarts[0]["ticket"], "app#7")
+        self.assertEqual(restarts[0]["agent"], AGENT)
+        self.assertEqual(entries[-1]["event"], "pass_end")
+        self.assertEqual(entries[-1]["gave_up"], 0)
+
+    def test_a_give_up_is_journaled_and_counted_in_pass_end(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=FakeStop(),
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+            fake_tracker=fake,
+            journal_path=self.journal,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("gave up", out.getvalue())
+        entries = self.journal_entries()
+        give_ups = [entry for entry in entries if entry["event"] == "give_up"]
+        self.assertEqual(len(give_ups), 1)
+        self.assertEqual(give_ups[0]["ticket"], "app#7")
+        self.assertEqual(entries[-1]["event"], "pass_end")
+        self.assertEqual(entries[-1]["gave_up"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

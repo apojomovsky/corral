@@ -141,7 +141,7 @@ def _disk(usage_fn):
     return {"paths": out}
 
 
-def build(now, host, registry_view, quota_view, settings, usage_fn=None):
+def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_view=None):
     """The snapshot document from plain data (pure, except disk paths).
 
     `registry_view` is `[(entry, status)]` as `registry.visible` returns,
@@ -150,8 +150,10 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None):
     `settings` is a plain dict of the `admission.*` and
     `registry.count_toward_cap` values, or the exception reading it
     raised. `usage_fn(path)` reports `(total, used, free)` and defaults
-    to `shutil.disk_usage`. Sections fail independently: a broken one
-    reads `{"error": ...}` while the rest still print.
+    to `shutil.disk_usage`. `drive_view` is the dict `drive.drive_status`
+    returns, or the exception reading it raised; None reads as a section
+    error, since nothing collected it. Sections fail independently: a
+    broken one reads `{"error": ...}` while the rest still print.
     """
     if usage_fn is None:
         usage_fn = shutil.disk_usage
@@ -180,6 +182,14 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None):
         disk = _disk(usage_fn)
     except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
         disk = _section_error(exc)
+    if drive_view is None:
+        drive = _section_error(ValueError("drive section not collected"))
+    elif isinstance(drive_view, Exception):
+        drive = _section_error(drive_view)
+    elif isinstance(drive_view, dict):
+        drive = drive_view
+    else:
+        drive = _section_error(ValueError(f"drive section is {type(drive_view).__name__}"))
     return {
         "schema_version": SCHEMA_VERSION,
         "fleet_header": header,
@@ -187,6 +197,7 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None):
         "quota": quota,
         "capacity": capacity,
         "disk": disk,
+        "drive": drive,
     }
 
 
@@ -194,7 +205,7 @@ def _all_failed(doc):
     """Whether every readable section failed: nothing at all could be read."""
     return all(
         isinstance(doc.get(section), dict) and set(doc[section]) == {"error"}
-        for section in ("agents", "quota", "capacity", "disk")
+        for section in ("agents", "quota", "capacity", "disk", "drive")
     )
 
 
@@ -257,6 +268,27 @@ def _show(doc):
                 )
     else:
         _err(f"disk: {disk.get('error', 'unreadable') if isinstance(disk, dict) else 'unreadable'}")
+    drive = doc.get("drive")
+    if isinstance(drive, dict) and "error" not in drive:
+        skipped = drive.get("skipped_by_reason") or {}
+        skipped_total = sum(skipped.values())
+        print(
+            f"drive: last pass {drive.get('last_pass_at')} exit {drive.get('last_exit')},"
+            f" started {drive.get('started', 0)} skipped {skipped_total}"
+            f" released {drive.get('released', 0)} gave up {drive.get('gave_up', 0)}"
+        )
+        print(
+            f"  {drive.get('starts_today', 0)}/{drive.get('max_starts_per_day', 0)} starts today"
+            f" ({drive.get('starts_remaining', 0)} remaining)"
+            + ("  paused: " + str(drive.get("pause_reason")) if drive.get("paused") else "")
+            + ("  lock held" if drive.get("lock_held") else "")
+        )
+        for code in sorted(skipped):
+            print(f"  skip {code}: {skipped[code]}")
+    else:
+        _err(
+            f"drive: {drive.get('error', 'unreadable') if isinstance(drive, dict) else 'unreadable'}"
+        )
 
 
 def _settings_root(start):
@@ -321,7 +353,7 @@ def _below(path, parent):
 
 def cmd_snapshot(args: argparse.Namespace) -> int:
     """Run the `snapshot` verb."""
-    from corral import accounts, admission, paths, quota_ledger, quotacli, registry, settings
+    from corral import accounts, admission, drive, paths, quota_ledger, quotacli, registry, settings
 
     try:
         resolved = settings.load(root=_settings_root(os.getcwd()))
@@ -352,7 +384,18 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         )
     except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
         quota_view = exc
-    doc = build(now, host, registry_view, quota_view, plain, shutil.disk_usage)
+    try:
+        drive_view = drive.drive_status(
+            now=now,
+            max_starts=resolved["drive.max_starts_per_day"],
+            journal_path=drive.journal_path(),
+            pause_path=drive.pause_path(),
+            day_path=drive.day_path(),
+            lock_path=drive.lock_path(),
+        )
+    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+        drive_view = exc
+    doc = build(now, host, registry_view, quota_view, plain, shutil.disk_usage, drive_view)
     if _all_failed(doc):
         _err("nothing to report: every section failed")
         return UNREACHABLE
@@ -366,7 +409,8 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 def add_parser(sub) -> None:
     """Register `snapshot` on the top-level subparsers."""
     p = sub.add_parser(
-        "snapshot", help="one read-only view of the host: agents, quota, capacity, disks"
+        "snapshot",
+        help="one read-only view of the host: agents, quota, capacity, disks and drive",
     )
     p.add_argument("--json", action="store_true", help="print the stable machine-readable document")
     p.set_defaults(func=cmd_snapshot)

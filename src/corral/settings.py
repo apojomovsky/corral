@@ -73,6 +73,7 @@ PROVIDERS = (
     "corral.admission",
     "corral.detect",
     "corral.disk",
+    "corral.drive",
     "corral.hold",
     "corral.launch",
     "corral.prompts",
