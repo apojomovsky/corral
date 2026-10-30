@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/corral-logo.svg" alt="corral" width="240">
+</p>
+
 # corral
 
 An opinionated core for running fleets of headless coding agents on Linux hosts.
