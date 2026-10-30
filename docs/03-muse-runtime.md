@@ -4,7 +4,8 @@ Status: design, not built. This doc fixes the third adapter, `muse`
 (the Muse Code CLI), next to `omp` and `opencode` in
 `src/corral/runtimes/`. Nothing here changes the launch, resume, tail or
 stop flow in `src/corral/launch.py`, the unit model, the registry,
-admission, exit codes, or any CLI verb, so `README.md` needs no change.
+admission, exit codes, or any CLI verb. T9 names the muse runtime in
+`README.md` and in the design docs.
 The only index change is the row for this doc in `docs/README.md`.
 
 Conventions below: "observed" means the author ran it on the dev host
@@ -438,7 +439,9 @@ public interface beyond `agents.runtime: muse`.
   wording, and resume across a date roll. Acceptance: each gap in
   sections 1 to 5 is replaced by a fixture and a test, or restated
   with the blocking reason; no other code changes.
-- T9: takeoff. Run the full suite with `TEST=1`, `make check`, and
-  the takeoff ritual on a branch, then request review. Acceptance:
-  green gates and a review record; no README change (no new verb),
-  with the reason recorded in the PR body.
+- T9: README and docs name the muse runtime. List muse next to omp
+  and opencode in `README.md` (kept in step with `runtimes.NAMES` by
+  a test in `tests/test_readme.py`) and fix the same stale statement
+  in `docs/`. Acceptance: README and docs name all three runtimes;
+  the new test fails when `NAMES` gains a runtime the README does
+  not mention; gates green. No runtime code changes.
