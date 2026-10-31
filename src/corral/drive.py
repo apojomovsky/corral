@@ -23,6 +23,7 @@ import datetime
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import socket
@@ -1469,8 +1470,9 @@ def restart_allowed(stamps, *, now):
     """Whether another stop-plus-launch restart fits the budget. Pure.
 
     At most RESTART_BUDGET restarts per ticket in any sliding 24 hour
-    window. Only stop-plus-launch restarts are recorded, so only they
-    count: fix-round resumes never consume the budget.
+    window. Only stop-plus-launch restarts and fresh fix rounds are
+    recorded, so only they count: a fix-round resume reuses the session
+    and never consumes the budget.
     """
     return len(prune_restarts(stamps, now=now)) < RESTART_BUDGET
 
@@ -1479,7 +1481,8 @@ def record_restart(stamps, *, now):
     """The stamps after recording one stop-plus-launch restart. Pure.
 
     Prunes expired stamps, then appends now. Call only for restarts that
-    stopped and launched; anything else never consumes the budget.
+    stopped and launched, and for fresh fix rounds that launched;
+    anything else never consumes the budget.
     """
     return [*prune_restarts(stamps, now=now), now]
 
@@ -1549,27 +1552,43 @@ def give_up_body(repo, number, *, observed, restarts):
     )
 
 
-def release_finished(store, *, agent_states, now, out, events=None):
-    """Release claims whose managed holder has a finished registry entry.
+def _finished_claims(store, agent_states):
+    """Managed claims with a finished registry entry. Pure reads.
 
-    Returns the released count. Runs before the orphan rule, so a
-    finished worker always takes this completion path, never the orphan
-    one. A successful release clears the holder and leaves the epoch for
-    the next claim to mint, which fences the finished holder; the branch
-    and PR stay untouched for a later review. A `Claimed` there
-    means the row changed under the pass, so it is left held with a
-    logbook line, never retried in the same pass. When `events` is a
-    list, each release appends its journal entry. Foreign holders never
-    reach here. Store errors propagate to the caller, like orphans.
+    The one scan `release_finished` and `finished_holders` share: each
+    store row whose holder is a managed agent with a finished entry. A
+    missing state map reads as nothing finished.
     """
-    released = 0
+    states = agent_states or {}
+    found = []
     for item in store.items():
         claim = store.claim_of(item.repo, item.number)
         if claim is None or not claim.agent or not is_managed_agent(claim.agent):
             continue
-        seen = agent_states.get(claim.agent)
+        seen = states.get(claim.agent)
         if seen is None or seen[0] != registry.FINISHED:
             continue
+        found.append(claim)
+    return found
+
+
+def release_finished(store, *, agent_states, now, out, events=None):
+    """Release claims whose managed holder has a finished registry entry.
+
+    Returns the released count. Scans with `_finished_claims`, the same
+    predicate `finished_holders` reads; a missing state map releases
+    nothing. Runs before the orphan rule, so a finished worker always
+    takes this completion path, never the orphan one. A successful
+    release clears the holder and leaves the epoch for the next claim
+    to mint, which fences the finished holder; the branch and PR stay
+    untouched for a later review. A `Claimed` there means the row
+    changed under the pass, so it is left held with a logbook line,
+    never retried in the same pass. When `events` is a list, each
+    release appends its journal entry. Foreign holders never reach
+    here. Store errors propagate to the caller, like orphans.
+    """
+    released = 0
+    for claim in _finished_claims(store, agent_states):
         ref = f"{claim.repo}#{claim.number}"
         try:
             store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
@@ -1592,19 +1611,13 @@ def finished_holders(store, *, agent_states) -> dict:
     The same rows `release_finished` would release, without releasing
     them: the pass captures the pre-release worker ids before the
     release clears them from the rows, so a reviewer start in the same
-    pass can pass the worker id as its author. With no registry states
-    there is nothing finished, so the map is empty.
+    pass can pass the worker id as its author. Scans with
+    `_finished_claims`, the same predicate `release_finished` uses; a
+    missing state map reads as nothing finished, so the map is empty.
     """
-    found = {}
-    for item in store.items():
-        claim = store.claim_of(item.repo, item.number)
-        if claim is None or not claim.agent or not is_managed_agent(claim.agent):
-            continue
-        seen = (agent_states or {}).get(claim.agent)
-        if seen is None or seen[0] != registry.FINISHED:
-            continue
-        found[(claim.repo, claim.number)] = claim.agent
-    return found
+    return {
+        (claim.repo, claim.number): claim.agent for claim in _finished_claims(store, agent_states)
+    }
 
 
 def resolve_finished(finished_for, released) -> dict:
@@ -1633,8 +1646,8 @@ def fix_mode(holder, *, repo, number, agent_states, live_units) -> str:
     A fix round resumes the holder's session when the holder's registry
     entry is live or stale, or a live unit exists for the ticket; either
     proves something usable survived. Anything else restarts fresh on
-    the same ticket and branch. Only stop-plus-launch restarts consume
-    the restart budget; a resume reuses the session and never does.
+    the same ticket and branch. A fresh restart counts against the
+    restart budget; a resume reuses the session and never does.
     """
     seen = (agent_states or {}).get(holder)
     if seen is not None and seen[0] in (registry.LIVE, registry.STALE):
@@ -1736,8 +1749,9 @@ def handle_stuck(
     the tracker the factory returns for the claim's repo. With no
     factory, or for a repo the factory does not know, the give-up is
     deferred and the claim is kept. A failed decision write keeps the
-    claim for a later pass, and only stop-plus-launch restarts are
-    recorded, so resumes never consume the budget. When `events` is a
+    claim for a later pass, and only stop-plus-launch restarts (plus
+    fresh fix rounds in the claim path) are recorded, so resumes never
+    consume the budget. When `events` is a
     list, each restart and give-up appends its journal entry through
     the pass journal writer. Store errors propagate to the caller,
     like orphans.
@@ -2094,6 +2108,10 @@ def _claim_and_launch(
     finished=None,
     agent_states=None,
     live_units=None,
+    restarts_path=None,
+    out=None,
+    err=None,
+    events=None,
 ):
     """Claim each proceeding candidate, launch each claim.
 
@@ -2107,23 +2125,33 @@ def _claim_and_launch(
     the stuck sweep defers to it) and relaunches its session; `fix`
     resumes when the holder is still usable and otherwise releases and
     reclaims before restarting on the same branch, which the launch
-    path reuses. A lost race (exit 2 from the store) becomes a skip
-    naming the holder and the pass moves on; a launch through `launcher`
-    appends the unit or the failure to the row's reason. `released`
-    ({(repo, number): worker id} released this pass) and `finished`
-    (the newest finished entry per ticket) feed the reviewer author.
-    With no `launcher` the pass stops after claiming and records that,
-    so no row counts as launched. The day cap counts `start` launches
-    only: resumes reuse an existing claim, and reviewer and fix rounds
-    answer finished work rather than starting new work. When
-    `start_budget` is not None, at most that many starts launch; further
-    starts become `cap` skips naming `day_cap`, and each start spends
-    one from the local budget.
+    path reuses. A fresh restart first gates on the restart budget:
+    past the budget the row routes to the give-up path exactly as the
+    stuck sweep does (decision writes through `tracker_factory`, then
+    release; a failed write or a missing tracker keeps the claim), and
+    a fresh restart that launches records one stamp; a resume reuses
+    the session and never touches the budget. `restarts_path` persists
+    those stamps (in memory when None); `out`, `err` and `events` carry
+    the give-up lines, budget warnings and journal entries. A lost race
+    (exit 2 from the store) becomes a skip naming the holder and the
+    pass moves on; a launch through `launcher` appends the unit or the
+    failure to the row's reason. `released` ({(repo, number): worker
+    id} released this pass) and `finished` (the newest finished entry
+    per ticket) feed the reviewer author. With no `launcher` the pass
+    stops after claiming and records that, so no row counts as
+    launched. The day cap counts `start` launches only: resumes reuse
+    an existing claim, and reviewer and fix rounds answer finished work
+    rather than starting new work. When `start_budget` is not None, at
+    most that many starts launch; further starts become `cap` skips
+    naming `day_cap`, and each start spends one from the local budget.
     """
     rows: list = []
     started = 0
     blocked = False
     launched: set = set()
+    budgets = load_restarts(restarts_path) if restarts_path is not None else {}
+    stream = out if out is not None else io.StringIO()
+    trouble = err if err is not None else io.StringIO()
     for gated in gated_rows:
         if gated.verdict == "skip":
             rows.append(gated)
@@ -2249,6 +2277,8 @@ def _claim_and_launch(
                 live_units=live_units,
             )
             effective = "resume" if mode == "resume" else "fix"
+            key = f"{gated.repo}#{gated.number}"
+            stamps = budgets.get(key, [])
             if mode == "resume":
                 try:
                     store.refresh_claim(gated.repo, gated.number, holder, claim.epoch, now=now)
@@ -2285,6 +2315,61 @@ def _claim_and_launch(
                 title = current.title if current is not None and current.title else ref
                 agent = holder
             else:
+                if not restart_allowed(stamps, now=now):
+                    tracker = None
+                    if tracker_factory is not None:
+                        try:
+                            tracker = tracker_factory(gated.repo)
+                        except KeyError:
+                            print(
+                                f"{ref}: no tracker for this repo, give-up deferred, claim kept",
+                                file=stream,
+                            )
+                            rows.append(
+                                Gated(
+                                    project=gated.project,
+                                    repo=gated.repo,
+                                    number=gated.number,
+                                    kind=effective,
+                                    verdict="skip",
+                                    reason=(
+                                        f"{ref}: no tracker for this repo, "
+                                        "give-up deferred, claim kept"
+                                    ),
+                                    code="claim",
+                                )
+                            )
+                            continue
+                    give_up(
+                        store,
+                        claim,
+                        tracker,
+                        observed="fix round found no usable holder",
+                        restarts=len(prune_restarts(stamps, now=now)),
+                        now=now,
+                        out=stream,
+                        events=events,
+                    )
+                    try:
+                        current = store.claim_of(gated.repo, gated.number)
+                    except (board.StoreError, sqlite3.Error):
+                        current = claim
+                    if current is None:
+                        reason = f"{ref}: past the restart budget, gave up and released the claim"
+                    else:
+                        reason = f"{ref}: past the restart budget, give-up deferred, claim kept"
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind=effective,
+                            verdict="skip",
+                            reason=reason,
+                            code="claim",
+                        )
+                    )
+                    continue
                 title, skipped = _refresh_title(
                     store,
                     gated,
@@ -2378,6 +2463,16 @@ def _claim_and_launch(
                 )
             )
             launched.add((gated.project, gated.repo, gated.number))
+            if effective == "fix":
+                budgets[key] = record_restart(stamps, now=now)
+                if restarts_path is not None:
+                    try:
+                        save_restarts(restarts_path, budgets)
+                    except OSError as problem:
+                        print(
+                            f"corral drive: cannot save the restart budget: {problem}",
+                            file=trouble,
+                        )
             continue
         if start_budget is not None and start_budget <= 0:
             rows.append(
@@ -2911,6 +3006,10 @@ def _launching_pass(
         finished=finished,
         agent_states=agent_states,
         live_units=live_units,
+        restarts_path=restarts_path,
+        out=out,
+        err=err,
+        events=events if journal_path is not None else None,
     )
     if agent_states is not None:
         defaults = registry.default_config()

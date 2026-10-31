@@ -15,6 +15,7 @@ import tempfile
 import unittest
 
 from corral import board, drive, registry
+from corral.github.tracker import NEEDS_DECISION
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, HOST, NOW, OLD, claimed
@@ -81,6 +82,23 @@ class FinishedHoldersTest(unittest.TestCase):
         self.addCleanup(store.close)
         holders = drive.finished_holders(store, agent_states={WORKER: (FINISHED, NOW)})
         self.assertEqual(holders, {})
+
+    def test_a_missing_state_map_reads_as_no_finished_holder(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        self.assertEqual(drive.finished_holders(store, agent_states=None), {})
+
+    def test_a_missing_state_map_releases_nothing_and_keeps_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        out = io.StringIO()
+        self.assertEqual(drive.release_finished(store, agent_states=None, now=NOW, out=out), 0)
+        self.assertEqual(out.getvalue(), "")
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
 
 
 class ResolveFinishedTest(unittest.TestCase):
@@ -451,6 +469,159 @@ class FixPassTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(launcher.calls, [])
         self.assertIn("fix already landed", out)
+
+
+class FixBudgetTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-budget-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+
+    def run_fix(self, store, found, fake_tracker, launcher, **fields):
+        out, err = io.StringIO(), io.StringIO()
+        fields.setdefault("now", NOW)
+        fields.setdefault("restarts_path", self.budget)
+        code = review_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=found,
+            policy_dir=self.policies,
+            fake_tracker=fake_tracker,
+            launcher=launcher,
+            **fields,
+        )
+        return code, out.getvalue(), err.getvalue()
+
+    def reading(self):
+        return reading(repo="app", number=7, updated_at=NOW - 100.0)
+
+    def test_a_successful_fresh_fix_records_a_restart(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([self.reading()])
+        launcher = FakeLauncher()
+        code, _, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "fix")
+        self.assertEqual(drive.load_restarts(self.budget), {"app#7": [NOW]})
+
+    def test_a_resume_with_an_exhausted_budget_still_launches(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        fake = FakeTracker([self.reading()])
+        launcher = FakeLauncher()
+        code, _, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={WORKER: (registry.LIVE, NOW - 10.0)},
+            live_units=frozenset({("app", 7)}),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "resume")
+        self.assertEqual(launcher.calls[0][4], WORKER)
+        self.assertEqual(
+            drive.load_restarts(self.budget),
+            {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]},
+        )
+
+    def test_an_exhausted_budget_gives_up_through_the_decision_seam(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        fake = FakeTracker([self.reading()])
+        launcher = FakeLauncher()
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        self.assertIn(("add_label", "app", 7, NEEDS_DECISION), fake.calls)
+        self.assertTrue(any(call[0] == "comment" for call in fake.calls))
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertIn("gave up", out)
+        self.assertNotEqual(before.agent, "")
+
+    def test_an_exhausted_budget_without_a_tracker_keeps_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = review_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "fix")])],
+            policy_dir=self.policies,
+            fake_tracker=None,
+            launcher=launcher,
+            now=NOW,
+            restarts_path=self.budget,
+            agent_states={},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+        self.assertIn("claim kept", out.getvalue())
+
+    def test_fix_rounds_stop_after_the_budget_and_reach_give_up(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([self.reading()])
+        launcher = FakeLauncher()
+        for _ in range(3):
+            code, _, _ = self.run_fix(
+                store,
+                [("blue", [("app", 7, "fix")])],
+                fake,
+                launcher,
+                agent_states={},
+            )
+            self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 3)
+        self.assertTrue(all(call[3] == "fix" for call in launcher.calls))
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 3)
+        self.assertIn(("add_label", "app", 7, NEEDS_DECISION), fake.calls)
+        self.assertTrue(any(call[0] == "comment" for call in fake.calls))
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertIn("gave up", out)
 
 
 if __name__ == "__main__":
