@@ -187,6 +187,14 @@ itself contains no `/`; `start-seconds` is a wall-clock timestamp,
 not a fencing token). Fencing uses only `Claim.epoch`; the host
 field and the epoch are the tokens a future multi-host loop needs.
 
+Decision: the `<host>` segment never carries the raw hostname. The
+claim `agent` value is mirrored to the tracker as a label, so on a
+public tracker it would publish the deployment hostname. The segment
+comes from the `drive.agent_host` setting, resolved once per pass: a
+configured display name is used verbatim (with `/` replaced by `-`),
+and the default is a short stable hash of the hostname rather than
+the hostname itself. The id stays opaque and slash-free either way.
+
 - Lost race (exit 2, `Claimed`): re-read the row live. If another agent
   now holds it, record "race lost to `<agent>`" and continue with the
   next candidate. Never steal, never retry in the same pass.
