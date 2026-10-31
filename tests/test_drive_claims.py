@@ -66,7 +66,7 @@ def drive_pass(
             entries.append(
                 projects_mod.Project(
                     name=name,
-                    unit_prefix=name + "-agent",
+                    unit_prefix=name + "-agent-",
                     root=os.path.join(policy_dir, "ops", name),
                     eligibility=path + ":eligible",
                 )
@@ -500,11 +500,11 @@ class ProductionLauncherStartTest(unittest.TestCase):
         )
 
     def test_start_runs_a_unit_with_the_registered_prefix_and_registers_it(self):
-        project = projects_mod.Project(name="blue", unit_prefix="blue-agent", root=self.root)
+        project = projects_mod.Project(name="blue", unit_prefix="blue-agent-", root=self.root)
         launcher = drive.production_launcher([project])
         agent = drive.mint_agent("acme/app", 7, host="host-1", now=2000.0)
         unit = launcher("blue", "acme/app", 7, "start", agent, "Title 7", now=2000.0)
-        self.assertTrue(unit.startswith("blue-agent"))
+        self.assertEqual(unit, "blue-agent-app-7")
         self.assertEqual(len(self.started), 1)
         self.assertIn(f"--unit={unit}", self.started[0])
         entries = registry.load_all()

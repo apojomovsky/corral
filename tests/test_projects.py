@@ -117,7 +117,7 @@ class LoadTest(HostCase):
         found = projects.load_all()
         self.assertEqual([p.name for p in found], ["project-a", "project-b"])
         first = found[0]
-        self.assertEqual(first.unit_prefix, "project-a-agent")
+        self.assertEqual(first.unit_prefix, "project-a-agent-")
         self.assertEqual(first.root, self.roots["project-a"])
         self.assertEqual(first.floor, 0)
         self.assertIsNone(first.ceiling)
@@ -156,6 +156,13 @@ class LoadTest(HostCase):
     def test_a_duplicate_unit_prefix_names_the_second_file(self):
         self.write_project("project-a")
         second = self.write_project("project-b", unit_prefix="project-a-agent")
+        with self.assertRaises(projects.ProjectsError) as ctx:
+            projects.load_all()
+        self.assertIn(second, str(ctx.exception))
+
+    def test_prefixes_that_only_differ_by_the_separator_collide(self):
+        self.write_project("project-a", unit_prefix="shared-agent-")
+        second = self.write_project("project-b", unit_prefix="shared-agent")
         with self.assertRaises(projects.ProjectsError) as ctx:
             projects.load_all()
         self.assertIn(second, str(ctx.exception))
@@ -234,40 +241,40 @@ class AdmitAcrossProjectsTest(HostCase):
         self.write_project("project-b", ceiling=1, floor=1)
 
     def test_the_total_filled_by_one_project_leaves_the_other_its_floor(self):
-        self.add_units("project-a-agent", 1, 2, 3)
+        self.add_units("project-a-agent-", 1, 2, 3)
         launch.admit(self.target("project-b"), 9, list_fn=self.list_fn, usage=roomy)
 
     def test_beyond_the_floor_nothing_more_is_admitted(self):
-        self.add_units("project-a-agent", 1, 2, 3)
-        self.add_units("project-b-agent", 4)
+        self.add_units("project-a-agent-", 1, 2, 3)
+        self.add_units("project-b-agent-", 4)
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-b"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertIn("ceiling", str(ctx.exception))
 
     def test_a_project_at_its_ceiling_is_refused(self):
-        self.add_units("project-a-agent", 1, 2, 3)
+        self.add_units("project-a-agent-", 1, 2, 3)
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-a at 3 of 3 ceiling", str(ctx.exception))
 
     def test_two_projects_units_count_into_one_total(self):
-        self.add_units("project-a-agent", 1, 2)
-        self.add_units("project-b-agent", 3)
+        self.add_units("project-a-agent-", 1, 2)
+        self.add_units("project-b-agent-", 3)
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertIn("host full (3 of 3)", str(ctx.exception))
 
     def test_a_registry_ticket_counts_for_its_named_project(self):
         registry.register(
-            "worker-1", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
+            "worker-1", "omp", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-b"), 8, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
 
     def test_an_unnamed_registry_ticket_counts_for_the_launching_project(self):
-        registry.register("worker-1", "claude-code", ticket=registry.make_ticket("lib", 7))
+        registry.register("worker-1", "omp", ticket=registry.make_ticket("lib", 7))
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-b"), 8, list_fn=self.list_fn, usage=roomy)
         self.assertIn("project-b at 1 of 1 ceiling", str(ctx.exception))
@@ -276,7 +283,7 @@ class AdmitAcrossProjectsTest(HostCase):
     def test_a_foreign_registry_ticket_is_one_slot_not_two(self):
         self.write_project("project-a", ceiling=1)
         registry.register(
-            "worker-1", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
+            "worker-1", "omp", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
         launch.admit(self.target("project-a"), 5, list_fn=self.list_fn, usage=roomy)
 
@@ -284,12 +291,12 @@ class AdmitAcrossProjectsTest(HostCase):
         old = time.time() - 10_000
         registry.register(
             "worker-old",
-            "claude-code",
+            "omp",
             ticket=registry.make_ticket("lib", 7, project="project-a"),
             now=old,
         )
         registry.register(
-            "worker-new", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
+            "worker-new", "omp", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-b"), 8, list_fn=self.list_fn, usage=roomy)
@@ -303,21 +310,21 @@ class AdmitAcrossProjectsTest(HostCase):
         self.assertEqual(ctx.exception.exit_code, 4)
 
     def test_a_live_ticket_is_still_already_live_before_admission(self):
-        self.add_units("project-a-agent", 1, 2, 3)
+        self.add_units("project-a-agent-", 1, 2, 3)
         with self.assertRaises(units.UnitExists) as ctx:
             launch.admit(self.target("project-a"), 2, list_fn=self.list_fn, usage=roomy)
         self.assertEqual(ctx.exception.exit_code, 2)
 
     def test_a_differing_agents_cap_is_noted_not_an_error(self):
         self.make_root("project-a", cap=2)
-        self.add_units("project-a-agent", 1, 2, 3)
+        self.add_units("project-a-agent-", 1, 2, 3)
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertIn("agents.cap 2", str(ctx.exception))
         self.assertIn("the ceiling wins", str(ctx.exception))
 
     def test_a_matching_agents_cap_carries_no_note(self):
-        self.add_units("project-a-agent", 1, 2, 3)
+        self.add_units("project-a-agent-", 1, 2, 3)
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(self.target("project-a"), 9, list_fn=self.list_fn, usage=roomy)
         self.assertNotIn("agents.cap", str(ctx.exception))
@@ -347,21 +354,21 @@ class ProjectsVerbTest(HostCase):
         self.make_root("project-b")
         self.write_project("project-a", ceiling=3)
         self.write_project("project-b")
-        self.add_units("project-a-agent", 1)
+        self.add_units("project-a-agent-", 1)
         registry.register(
-            "worker-1", "claude-code", ticket=registry.make_ticket("lib", 7, project="project-b")
+            "worker-1", "omp", ticket=registry.make_ticket("lib", 7, project="project-b")
         )
         code, out = self.run_projects()
         self.assertEqual(code, 0)
         self.assertIn("project-a", out)
         self.assertIn("live=1", out)
         self.assertIn("project-b", out)
-        self.assertIn("prefix=project-b-agent", out)
+        self.assertIn("prefix=project-b-agent-", out)
 
     def test_projects_json_is_a_stable_document(self):
         self.make_root("project-a")
         self.write_project("project-a", ceiling=3, floor=1)
-        self.add_units("project-a-agent", 1)
+        self.add_units("project-a-agent-", 1)
         code, out = self.run_projects("--json")
         self.assertEqual(code, 0)
         (row,) = json.loads(out)["projects"]
@@ -373,7 +380,7 @@ class ProjectsVerbTest(HostCase):
                 "live": 1,
                 "name": "project-a",
                 "root": self.roots["project-a"],
-                "unit_prefix": "project-a-agent",
+                "unit_prefix": "project-a-agent-",
             },
         )
 

@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, registry as reg, settings
+from corral import cli, registry as reg, runtimes, settings
 
 T0 = 1_800_000_000.0
 HOST = "host-1"
@@ -34,7 +34,7 @@ class RegistryCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.path = os.path.join(tmp.name, "agents")
 
-    def register(self, agent_id="a1", runtime="claude-code", **kw):
+    def register(self, agent_id="a1", runtime="omp", **kw):
         kw.setdefault("now", T0)
         kw.setdefault("host", HOST)
         kw.setdefault("cfg", CFG)
@@ -151,6 +151,25 @@ class LifecycleTest(RegistryCase):
         with open(os.path.join(self.path, "junk.json"), "w", encoding="utf-8") as handle:
             handle.write("{nope")
         self.assertEqual([e["id"] for e in reg.load_all(self.path)], ["a1"])
+
+
+class RuntimeNamesTest(RegistryCase):
+    """The registry names runtimes the way the adapters do: one source."""
+
+    def test_every_adapter_name_round_trips_through_the_registry(self):
+        for name in runtimes.NAMES:
+            with self.subTest(runtime=name):
+                self.register(f"agent-{name}", runtime=name)
+                (found,) = [e for e in reg.load_all(self.path) if e["id"] == f"agent-{name}"]
+                self.assertEqual(found["runtime"], name)
+
+    def test_the_registry_names_start_with_the_adapter_names(self):
+        self.assertEqual(tuple(reg.RUNTIMES[: len(runtimes.NAMES)]), tuple(runtimes.NAMES))
+
+    def test_the_old_adapter_alias_is_refused(self):
+        self.assertNotIn("claude-code", reg.RUNTIMES)
+        with self.assertRaises(reg.RegistryError):
+            self.register("a1", runtime="claude-code")
 
 
 class LivenessTest(RegistryCase):

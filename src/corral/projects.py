@@ -73,6 +73,10 @@ def _project(stem: str, path: str, raw: object) -> Project:
     prefix = raw.get("unit_prefix")
     if not isinstance(prefix, str) or not prefix:
         raise _fail(path, "unit_prefix must be a non-empty string")
+    # The separator is part of the prefix: unit names read
+    # `<prefix><repo>-<number>`, as with the default `corral-agent-`.
+    if not prefix.endswith("-"):
+        prefix += "-"
     root = raw.get("root")
     if not isinstance(root, str) or not os.path.isabs(root):
         raise _fail(path, f"root {root!r} must be an absolute path")

@@ -1091,7 +1091,7 @@ class RegistrationCase(Fixture):
         self.assertEqual(len(found), 1)
         self.assertEqual(
             (found[0].name, found[0].unit_prefix, found[0].root, found[0].floor, found[0].ceiling),
-            (self.name, f"{self.name}-agent", os.path.realpath(self.root), 0, 1),
+            (self.name, f"{self.name}-agent-", os.path.realpath(self.root), 0, 1),
         )
 
     def test_cap_lands_in_the_ceiling(self):

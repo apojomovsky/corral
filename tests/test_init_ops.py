@@ -169,7 +169,7 @@ class FreshOpsCase(OpsFixture):
         found = projects.load_all()
         self.assertEqual(
             [(p.name, p.unit_prefix, p.root, p.floor, p.ceiling) for p in found],
-            [("proj_ops", "proj_ops-agent", os.path.realpath(self.ops), 0, 1)],
+            [("proj_ops", "proj_ops-agent-", os.path.realpath(self.ops), 0, 1)],
         )
 
     def test_ops_root_created_with_git_init(self):

@@ -31,11 +31,14 @@ import re
 import socket
 import time
 
-from corral import paths, settings
+from corral import paths, runtimes, settings
 
 DIR_NAME = "agents"
 LOCK_NAME = ".lock"
-RUNTIMES = ("claude-code", "omp", "opencode", "codex", "human")
+#: The runtimes the registry accepts: every adapter in `runtimes.NAMES`,
+#: in the same order, plus the names of agents corral never launches:
+#: `codex` for foreign agents and `human` for coordinators and reviewers.
+RUNTIMES = (*runtimes.NAMES, "codex", "human")
 OUTCOMES = ("ok", "failed", "stopped")
 #: A finished or gone file is deleted after this long.
 RETAIN_S = 24 * 60 * 60
