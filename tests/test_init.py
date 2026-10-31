@@ -251,6 +251,7 @@ TAIL = """# Defaults: uncomment to override.
 # disk.session_retention_days = 14  # days before a finished ticket's session dir is a reclaim candidate
 #
 # [drive]
+# drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 #
 # [git]
@@ -354,6 +355,7 @@ commits.conventional = false
 # disk.session_retention_days = 14  # days before a finished ticket's session dir is a reclaim candidate
 #
 # [drive]
+# drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 #
 # [git]

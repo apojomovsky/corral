@@ -7,8 +7,10 @@ double; the launcher is a recording fake standing in for the existing
 launch path. No `gh`, no systemd, no network, no real state dir.
 """
 
+import hashlib
 import io
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -842,6 +844,299 @@ class BoardExtraRefreshTest(unittest.TestCase):
         row, _ = store.item("app", 7, now=2000.0)
         self.assertEqual(row.agent, "")
         self.assertEqual(row.extra, {"priority": "urgent", "pool": "dispatch"})
+
+
+class ClaimSqliteTest(unittest.TestCase):
+    """A raw sqlite error at claim time fails that row closed, never the pass.
+
+    The store transaction rolls back and re-raises the raw error, so the
+    pass must treat it like a refused claim: skip the row, keep the other
+    rows moving, and stay on exit 0. A traceback with exit 1 would read
+    as "nothing to do", which is wrong for a transient lock.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-claimsqlite-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_claim_sqlite_error_fails_that_row_closed(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 9, "open")])
+        self.addCleanup(store.close)
+        original_claim = store.claim
+
+        def flaky_claim(repo, number, agent, host, *, now):
+            if (repo, number) == ("app", 7):
+                raise sqlite3.OperationalError("database is locked")
+            return original_claim(repo, number, agent, host, now=now)
+
+        store.claim = flaky_claim
+        try:
+            fake = FakeTracker(
+                [
+                    reading(repo="app", number=7, updated_at=1900.0),
+                    reading(repo="app", number=9, updated_at=1900.0),
+                ]
+            )
+            launcher = FakeLauncher()
+            out, err = io.StringIO(), io.StringIO()
+            code = drive_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                found=[("blue", [("app", 7, "start"), ("app", 9, "start")])],
+                policy_dir=self.policies,
+                fake_tracker=fake,
+                launcher=launcher,
+            )
+        finally:
+            store.claim = original_claim
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertIn("claim refused", out.getvalue())
+        self.assertIn("database is locked", out.getvalue())
+        started = {(repo, number) for _, repo, number, _, _, _ in launcher.calls}
+        self.assertEqual(started, {("app", 9)})
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.agent, "")
+
+    def test_claim_race_reread_sqlite_error_fails_that_row_closed(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        original_item = store.item
+        calls = []
+
+        def flaky_item(repo, number, **fields):
+            calls.append((repo, number))
+            if len(calls) >= 2:
+                raise sqlite3.OperationalError("database is locked")
+            return original_item(repo, number, **fields)
+
+        def racy_claim(repo, number, agent, host, *, now):
+            raise board.Claimed("item app#7 is claimed by drive-rival-1")
+
+        store.item = flaky_item
+        store.claim = racy_claim
+        try:
+            fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+            launcher = FakeLauncher()
+            out, err = io.StringIO(), io.StringIO()
+            code = drive_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                found=[("blue", [("app", 7, "start")])],
+                policy_dir=self.policies,
+                fake_tracker=fake,
+                launcher=launcher,
+            )
+        finally:
+            store.item = original_item
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("claim refused", out.getvalue())
+        self.assertIn("database is locked", out.getvalue())
+        row, _ = original_item("app", 7, now=2000.0)
+        self.assertEqual(row.agent, "")
+
+    def test_refresh_sqlite_error_fails_that_row_closed(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        original_item = store.item
+
+        def unreadable(repo, number, **fields):
+            raise sqlite3.OperationalError("database is locked")
+
+        store.item = unreadable
+        try:
+            fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+            launcher = FakeLauncher()
+            out, err = io.StringIO(), io.StringIO()
+            code = drive_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                found=[("blue", [("app", 7, "start")])],
+                policy_dir=self.policies,
+                fake_tracker=fake,
+                launcher=launcher,
+            )
+        finally:
+            store.item = original_item
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("claim refused", out.getvalue())
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.agent, "")
+
+
+class MirrorSqliteTest(unittest.TestCase):
+    """A raw sqlite error from a store touch inside the mirror step exits 4."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-mirrorsqlite-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_queued_writes_sqlite_error_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+
+        def locked():
+            raise sqlite3.OperationalError("database is locked")
+
+        store.queued_writes = locked
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err.getvalue())
+
+    def test_push_store_touch_sqlite_error_is_exit_four(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        original_sent = store.mark_sent
+
+        def locked(row_id):
+            raise sqlite3.OperationalError("database is locked")
+
+        store.mark_sent = locked
+        try:
+            fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+            launcher = FakeLauncher()
+            out, err = io.StringIO(), io.StringIO()
+            code = drive_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                found=[("blue", [("app", 7, "start")])],
+                policy_dir=self.policies,
+                fake_tracker=fake,
+                launcher=launcher,
+            )
+        finally:
+            store.mark_sent = original_sent
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive:", err.getvalue())
+
+
+class AgentHostTest(unittest.TestCase):
+    """The agent id host segment never carries the raw hostname.
+
+    Claim agent values are mirrored to the tracker as labels, so a raw
+    hostname there would publish the deployment on a public tracker.
+    The segment comes from the `drive.agent_host` setting, resolved once
+    per pass; empty means a short stable hash of the hostname.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-agenthost-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_empty_config_hashes_the_hostname(self):
+        segment = drive.agent_host_segment("", hostname="host-1")
+        self.assertEqual(segment, hashlib.sha256(b"host-1").hexdigest()[:8])
+        self.assertNotIn("host-1", segment)
+        self.assertNotIn("/", segment)
+
+    def test_the_default_hash_is_stable(self):
+        self.assertEqual(
+            drive.agent_host_segment("", hostname="host-1"),
+            drive.agent_host_segment("", hostname="host-1"),
+        )
+
+    def test_configured_display_name_is_used_sanitized(self):
+        self.assertEqual(drive.agent_host_segment("fleet/a", hostname="host-1"), "fleet-a")
+
+    def test_blank_config_falls_back_to_the_hash(self):
+        self.assertEqual(
+            drive.agent_host_segment("   ", hostname="host-1"),
+            drive.agent_host_segment("", hostname="host-1"),
+        )
+
+    def test_minted_id_with_the_default_segment_carries_no_hostname(self):
+        segment = drive.agent_host_segment("", hostname="raw-host-9")
+        minted = drive.mint_agent("acme/app", 7, host=segment, now=2000.0)
+        self.assertTrue(drive.is_managed_agent(minted))
+        self.assertNotIn("/", minted)
+        self.assertNotIn("raw-host-9", minted)
+
+    def test_agent_host_setting_defaults_to_empty(self):
+        from corral import settings
+
+        resolved = settings.resolve(host={}, project={}, env={})
+        self.assertEqual(resolved["drive.agent_host"], "")
+
+    def run_pass_without_host(self, agent_host):
+        from corral import settings
+
+        real_load = settings.load
+
+        def fake_load(*args, **kwargs):
+            root = kwargs.get("root", args[0] if args else None)
+            if root is None:
+                return {"drive.agent_host": agent_host}
+            return real_load(*args, **kwargs)
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive.settings, "load", side_effect=fake_load),
+            mock.patch.object(drive.socket, "gethostname", return_value="raw-host-9"),
+        ):
+            code = drive_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                found=[("blue", [("app", 7, "start")])],
+                policy_dir=self.policies,
+                fake_tracker=fake,
+                launcher=launcher,
+                host=None,
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(len(launcher.calls), 1)
+        return launcher.calls[0][4]
+
+    def test_pass_with_no_host_uses_the_hashed_hostname(self):
+        agent = self.run_pass_without_host("")
+        hashed = hashlib.sha256(b"raw-host-9").hexdigest()[:8]
+        self.assertEqual(agent, f"drive-{hashed}-2000-app-7")
+        self.assertNotIn("raw-host-9", agent)
+
+    def test_pass_with_no_host_uses_the_configured_display_name(self):
+        agent = self.run_pass_without_host("fleet/a")
+        self.assertEqual(agent, "drive-fleet-a-2000-app-7")
 
 
 if __name__ == "__main__":
