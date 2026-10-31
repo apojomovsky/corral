@@ -41,16 +41,38 @@ def _override(var, env):
     return os.path.normpath(path)
 
 
+def _xdg_base(xdg_var, xdg_default, env):
+    """The XDG base dir: the absolute `xdg_var` value, else the default.
+
+    A relative value is invalid and ignored, per the XDG spec. The
+    default carries `~` and is expanded. Normalized, without any
+    application suffix. Every XDG-based dir resolves its base here, so
+    the fallback agrees in one place.
+    """
+    base = env.get(xdg_var)
+    if not base or not os.path.isabs(base):
+        # The XDG spec says a relative value is invalid and must be ignored.
+        base = os.path.expanduser(xdg_default)
+    return os.path.normpath(base)
+
+
 def _resolve(override_var, xdg_var, xdg_default, env):
     env = os.environ if env is None else env
     override = _override(override_var, env)
     if override:
         return override
-    base = env.get(xdg_var)
-    if not base or not os.path.isabs(base):
-        # The XDG spec says a relative value is invalid and must be ignored.
-        base = os.path.expanduser(xdg_default)
-    return os.path.normpath(os.path.join(base, "corral"))
+    return os.path.normpath(os.path.join(_xdg_base(xdg_var, xdg_default, env), "corral"))
+
+
+def config_home(env=None):
+    """The XDG config home: `XDG_CONFIG_HOME`, else `~/.config`.
+
+    The base for the systemd user unit dir. Unlike `config_dir`, it
+    never applies the `CORRAL_CONFIG` override and carries no `corral`
+    suffix.
+    """
+    env = os.environ if env is None else env
+    return _xdg_base("XDG_CONFIG_HOME", "~/.config", env)
 
 
 def state_dir(env=None):

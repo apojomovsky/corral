@@ -673,6 +673,175 @@ def drive_lock(path):
         os.close(fd)
 
 
+#: The user timer that repeats the dispatch pass, and the service it
+#: starts. One fact, one place: the doctor names the same timer, and the
+#: install step writes these exact file names.
+TIMER_NAME = "corral-drive.timer"
+SERVICE_NAME = "corral-drive.service"
+
+#: How often the installed timer wakes a pass: every five minutes, the
+#: cadence the design sets. An operator changes it by editing the
+#: installed unit file; corral never rewrites an installed unit.
+TIMER_ON_CALENDAR = "*:0/5"
+
+#: The corral binary the shipped service starts, in systemd specifier
+#: form: the `make install` location. An install elsewhere edits the
+#: installed unit, never this default.
+TIMER_CORRAL_BIN = "%h/.local/bin/corral"
+
+#: Timeout for the read-only `systemctl is-enabled` query and for the
+#: install step's `daemon-reload` and `enable` calls.
+TIMER_TIMEOUT_S = 30
+
+
+class TimerError(ValueError):
+    """A timer unit could not be written, read back or enabled (exit 4)."""
+
+    exit_code = 4
+
+
+def service_text(corral_bin=TIMER_CORRAL_BIN) -> str:
+    """The shipped service unit: one `corral drive` pass, then exit. Pure.
+
+    `corral_bin` is the binary the unit starts; the default is the
+    `make install` location. The pass itself never installs or enables
+    anything: only the explicit `install-timer` step writes units.
+    """
+    return (
+        "[Unit]\n"
+        "Description=corral dispatch pass (one shot, exits when done)\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart={corral_bin} drive\n"
+    )
+
+
+def timer_text() -> str:
+    """The shipped timer unit: wake the pass, catching up one missed tick. Pure."""
+    return (
+        "[Unit]\n"
+        "Description=run the corral dispatch pass every five minutes\n"
+        "\n"
+        "[Timer]\n"
+        f"OnCalendar={TIMER_ON_CALENDAR}\n"
+        "Persistent=true\n"
+        "\n"
+        "[Install]\n"
+        "WantedBy=timers.target\n"
+    )
+
+
+def timer_dir(env=None) -> str:
+    """The systemd user unit dir: `systemd/user` under the XDG config home.
+
+    The base resolves through `paths.config_home`, so the fallback and
+    the relative-value rule agree with every other XDG dir in one
+    place. `env` maps `XDG_CONFIG_HOME`. This is systemd's dir, not one
+    of corral's, so only this join lives here.
+    """
+    return os.path.normpath(os.path.join(paths.config_home(env), "systemd", "user"))
+
+
+def unit_paths(env=None) -> tuple:
+    """(service path, timer path) the install step writes. Pure."""
+    directory = timer_dir(env)
+    return os.path.join(directory, SERVICE_NAME), os.path.join(directory, TIMER_NAME)
+
+
+def timer_state(run=units.default_run) -> str:
+    """Whether the user timer is enabled: one of "enabled", "disabled",
+    "masked" or "missing". Pure over the `run` seam.
+
+    A manager that cannot be asked raises `units.Unreachable` (exit 3):
+    a missing `systemctl`, a dead bus, or an answered state outside the
+    known words. Anything else the manager answers that is not an
+    enabled, disabled or masked state reads as "missing".
+    """
+    import subprocess
+
+    try:
+        proc = run(["systemctl", "--user", "is-enabled", TIMER_NAME], timeout=TIMER_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {err}") from err
+    if proc.returncode == 127:
+        detail = (proc.stderr or "").strip() or "systemctl not found (exit 127)"
+        raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {detail}")
+    out = ((proc.stdout or "").strip().split() or [""])[0]
+    err_text = (proc.stderr or "").strip()
+    if proc.returncode == 0 and out in ("enabled", "enabled-runtime"):
+        return "enabled"
+    low = f"{out} {err_text}".lower()
+    if "failed to connect to bus" in low or "no medium found" in low:
+        raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {err_text or out}")
+    if out in ("masked", "masked-runtime"):
+        return "masked"
+    if proc.returncode == 0 or out in (
+        "disabled",
+        "static",
+        "indirect",
+        "generated",
+        "transient",
+    ):
+        return "disabled"
+    if (
+        "failed to get unit file state" in low
+        or "could not be found" in low
+        or "no such file" in low
+    ):
+        return "missing"
+    raise units.Unreachable(
+        f"cannot read the {TIMER_NAME} state: {(err_text or out or proc.returncode)}"
+    )
+
+
+def _timer_systemctl(args, run):
+    """Run one `systemctl --user` step of the install: raise on failure.
+
+    A dead bus or a missing binary raises `units.Unreachable` (exit 3);
+    any other failure raises `TimerError` (exit 4) naming the step.
+    """
+    import subprocess
+
+    argv = ["systemctl", "--user", *args]
+    try:
+        proc = run(argv, timeout=TIMER_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError) as err:
+        raise units.Unreachable(f"cannot run {' '.join(argv)}: {err}") from err
+    if proc.returncode == 127:
+        detail = (proc.stderr or "").strip() or "systemctl not found (exit 127)"
+        raise units.Unreachable(f"cannot run {' '.join(argv)}: {detail}")
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
+        if "failed to connect to bus" in tail.lower() or "no medium found" in tail.lower():
+            raise units.Unreachable(f"cannot run {' '.join(argv)}: {tail}")
+        raise TimerError(f"cannot run {' '.join(argv)}: {tail}")
+
+
+def install_timer(*, env=None, run=units.default_run, corral_bin=TIMER_CORRAL_BIN) -> tuple:
+    """Install and enable the user timer: the one explicit operator step.
+
+    Writes the service and timer units, reloads the manager, then
+    `enable --now` the timer. Returns the (service, timer) paths. Only
+    this function writes or enables units: passes never call it, and the
+    CLI reaches it only through `corral drive install-timer`.
+    """
+    directory = timer_dir(env)
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as err:
+        raise TimerError(f"cannot create {directory}: {err}") from None
+    service_path, timer_path = unit_paths(env)
+    try:
+        paths.atomic_write_text(service_path, service_text(corral_bin))
+        paths.atomic_write_text(timer_path, timer_text())
+    except OSError as err:
+        raise TimerError(f"cannot write the timer units: {err}") from None
+    _timer_systemctl(["daemon-reload"], run)
+    _timer_systemctl(["enable", "--now", TIMER_NAME], run)
+    return service_path, timer_path
+
+
 def _default_live(registered):
     """Live (project, repo, number) triples from units and the registry."""
     return launch.admission_state(registered, units.list_units, registry.config(), "")
@@ -2415,7 +2584,34 @@ def run_pass(
         return USAGE
 
 
+def cmd_install_timer(args: argparse.Namespace) -> int:
+    """Install and enable the user timer: the explicit operator step.
+
+    The only path that writes or enables units. Passes never reach it:
+    `cmd_drive` calls it only for the `install-timer` verb.
+    """
+    _ = args
+    try:
+        service_path, timer_path = install_timer()
+    except units.Unreachable as problem:
+        print(f"corral drive: {problem}", file=sys.stderr)
+        return UNREACHABLE
+    except TimerError as problem:
+        print(f"corral drive: {problem}", file=sys.stderr)
+        return USAGE
+    sys.stdout.write(f"installed {service_path}\ninstalled {timer_path}\nenabled {TIMER_NAME}\n")
+    return OK
+
+
 def cmd_drive(args: argparse.Namespace) -> int:
+    if getattr(args, "drive_verb", None) == "install-timer":
+        if getattr(args, "plan", False):
+            print(
+                "corral drive: --plan changes nothing, install-timer installs; pick one",
+                file=sys.stderr,
+            )
+            return USAGE
+        return cmd_install_timer(args)
     try:
         store = board.open_store()
     except board.StoreError as problem:
@@ -2496,5 +2692,10 @@ def add_parser(sub) -> None:
         "--plan",
         action="store_true",
         help="print the candidate table and change nothing",
+    )
+    verbs = p.add_subparsers(dest="drive_verb", required=False)
+    verbs.add_parser(
+        "install-timer",
+        help="install and enable the user timer that repeats the pass",
     )
     p.set_defaults(func=cmd_drive)

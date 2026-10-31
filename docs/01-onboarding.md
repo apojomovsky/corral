@@ -54,7 +54,23 @@ corral new my-repo             # or a new project: scaffold, then init
 
 corral doctor                  # is this project ready to run agents?
 corral launch 42               # the first agent, on issue #42
+corral drive install-timer   # repeat the pass every five minutes (explicit; nothing enables it for you)
+corral drive --plan          # what the next pass would do, without changing anything
 ```
+
+The timer is the one explicit operator step for repeating the pass:
+`install-timer` writes `corral-drive.service` and `corral-drive.timer`
+into `~/.config/systemd/user/`, reloads the manager, and enables the
+timer starting now. Nothing in corral installs or enables units on its
+own, and no pass touches the timer. The timer wakes one pass every five
+minutes and catches up one missed tick after a reboot (`Persistent`).
+It starts `corral drive` from the `make install` location; when corral
+lives elsewhere, edit the installed `ExecStart` line, which corral
+never rewrites. A different cadence is the same edit, on the installed
+`OnCalendar` line. The timer runs while the user manager runs, so keep
+linger on (the doctor checks that too). `corral doctor` reports a
+missing or disabled timer, a bad project registration, and a policy
+entry that does not resolve.
 
 Every step is safe to re-run. `init` and `new` show what they would write and ask before writing. `--yes` accepts the detected defaults and `--set key=value` overrides one, so an agent can onboard a project headless.
 
