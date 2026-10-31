@@ -1461,7 +1461,7 @@ def handle_stuck(
         except board.Claimed:
             print(f"{ref}: restart raced a re-claim, left held", file=out)
             continue
-        except (board.ExternalItem, board.StoreError) as problem:
+        except (board.ExternalItem, board.StoreError, sqlite3.Error) as problem:
             print(f"{ref}: restart claim refused ({problem}), left held", file=out)
             continue
         had = key in budgets
