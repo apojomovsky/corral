@@ -473,5 +473,81 @@ class FailClosed(unittest.TestCase):
         )
 
 
+class DriveRows(unittest.TestCase):
+    def test_no_reading_means_no_drive_rows(self):
+        self.assertEqual(names(doctor.run_checks(env())), names(doctor.run_checks(env())))
+        found = [check for check in doctor.run_checks(env()) if check.name.startswith("drive")]
+        self.assertEqual(found, [])
+
+    def test_an_enabled_timer_is_ok(self):
+        checks = doctor.run_checks(env(timer_state="enabled"))
+        found = [check for check in checks if check.name == "drive-timer"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertIn("corral-drive.timer", found[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_missing_timer_warns_with_the_install_command(self):
+        checks = doctor.run_checks(env(timer_state="missing"))
+        found = [check for check in checks if check.name == "drive-timer"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("corral drive install-timer", found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_disabled_timer_warns_with_the_install_command(self):
+        checks = doctor.run_checks(env(timer_state="disabled"))
+        found = [check for check in checks if check.name == "drive-timer"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("corral drive install-timer", found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_masked_timer_warns_with_the_unmask_command(self):
+        checks = doctor.run_checks(env(timer_state="masked"))
+        found = [check for check in checks if check.name == "drive-timer"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("unmask", found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_an_unreachable_timer_fails_with_exit_3(self):
+        checks = doctor.run_checks(env(timer_state="unreachable: no bus"))
+        found = [check for check in checks if check.name == "drive-timer"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 3)
+
+    def test_no_project_problems_is_an_ok_row(self):
+        checks = doctor.run_checks(env(project_problems=()))
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_bad_registration_fails_naming_the_file(self):
+        checks = doctor.run_checks(
+            env(project_problems=("config/projects.d/blue.toml: cannot read the registration",))
+        )
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertIn("blue.toml", found[0].detail)
+        self.assertTrue(found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_an_unreadable_policy_module_fails_naming_the_project(self):
+        checks = doctor.run_checks(
+            env(
+                project_problems=(
+                    "project blue: eligibility 'blue_policy:eligible' does not import: boom",
+                )
+            )
+        )
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertIn("blue", found[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_drive_rows_come_after_the_manager_row(self):
+        checks = doctor.run_checks(env(timer_state="enabled", project_problems=()))
+        ordered = names(checks)
+        self.assertLess(ordered.index("user-manager"), ordered.index("drive-timer"))
+        self.assertLess(ordered.index("drive-timer"), ordered.index("drive-projects"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,7 +21,18 @@ import time
 import tomllib
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
-from corral import accounts, boarddoctor, deps, paths, prompts, registry, settings, units
+from corral import (
+    accounts,
+    boarddoctor,
+    deps,
+    drive,
+    paths,
+    projects,
+    prompts,
+    registry,
+    settings,
+    units,
+)
 from corral import board as store
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
@@ -71,6 +82,14 @@ class Env(NamedTuple):
     board_open_store: Callable[[], store.Store] | None = None
     #: The board assembly itself failed: one failing `board` row.
     board_error: str | None = None
+    #: Problems with the project registry (bad registration files and
+    #: policy entries that do not resolve): None means the caller has
+    #: no reading, and then the report carries no `drive-projects` row.
+    project_problems: Sequence[str] | None = None
+    #: The drive timer state ("enabled", "disabled", "masked",
+    #: "missing", or "unreachable: ..."): None means the caller has no
+    #: reading, and then the report carries no `drive-timer` row.
+    timer_state: str | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -163,6 +182,75 @@ def _check_manager(prefix: str, list_fn: Callable[[str], list]) -> Check:
             "fix `agents.unit_prefix` in the host config, then run `corral doctor` again",
         )
     return Check("user-manager", "ok", f"the user manager answers ({len(found)} units)", "")
+
+
+def _check_drive_timer(state: str | None) -> list[Check]:
+    """The drive timer row: no row without a reading, warn when the pass
+    would never wake on its own, fail when the manager cannot be asked."""
+    if state is None:
+        return []
+    if state == "enabled":
+        return [
+            Check(
+                "drive-timer",
+                "ok",
+                f"the user timer {drive.TIMER_NAME} is enabled",
+                "",
+            )
+        ]
+    if state == "disabled":
+        return [
+            Check(
+                "drive-timer",
+                "warn",
+                f"the user timer {drive.TIMER_NAME} is installed but not enabled",
+                "run `corral drive install-timer`",
+            )
+        ]
+    if state == "masked":
+        return [
+            Check(
+                "drive-timer",
+                "warn",
+                f"the user timer {drive.TIMER_NAME} is masked and cannot start",
+                f"run `systemctl --user unmask {drive.TIMER_NAME}`, "
+                "then `corral drive install-timer`",
+            )
+        ]
+    if state.startswith("unreachable:"):
+        return [Check("drive-timer", "fail", state, _MANAGER_BUS_FIX)]
+    return [
+        Check(
+            "drive-timer",
+            "warn",
+            f"the user timer {drive.TIMER_NAME} is not installed ({state})",
+            "run `corral drive install-timer`",
+        )
+    ]
+
+
+def _check_drive_projects(problems: Sequence[str] | None) -> list[Check]:
+    """The registry row: no row without a reading, one fail row joining
+    every bad registration and every unreadable policy entry."""
+    if problems is None:
+        return []
+    if not problems:
+        return [
+            Check(
+                "drive-projects",
+                "ok",
+                "every registration loads and every policy entry resolves",
+                "",
+            )
+        ]
+    return [
+        Check(
+            "drive-projects",
+            "fail",
+            "; ".join(problems),
+            "fix the named registration file or policy entry, then run `corral doctor` again",
+        )
+    ]
 
 
 def _check_readers(errors: Sequence[tuple[str, str, str]]) -> list[Check]:
@@ -298,6 +386,8 @@ def run_checks(env: Env) -> list[Check]:
         _check_state_dirs(env.state_error),
         _check_linger(env.user, env.run),
         _check_manager(env.unit_prefix, env.list_fn),
+        *_check_drive_timer(env.timer_state),
+        *_check_drive_projects(env.project_problems),
         *_check_readers(env.reader_errors),
         _check_registry(env.registry_rows, env.registry_error),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
@@ -319,6 +409,8 @@ def exit_code(checks: Sequence[Check]) -> int:
         if check.name == "linger":
             return UNREACHABLE
         if check.name == "user-manager" and check.fix == _MANAGER_BUS_FIX:
+            return UNREACHABLE
+        if check.name == "drive-timer" and check.fix == _MANAGER_BUS_FIX:
             return UNREACHABLE
     if any(c.status == "fail" for c in checks):
         return 1
@@ -510,6 +602,26 @@ def load_disk_pressure(resolved) -> str:
         return _disk.UNKNOWN
 
 
+def load_project_problems() -> list[str]:
+    """The registry problems for the live report: bad files and policy
+    entries that do not resolve. A gathering failure is one problem
+    naming it, never a traceback."""
+    try:
+        return list(projects.check())
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
+        return [str(err)]
+
+
+def load_timer_state() -> str:
+    """The live drive timer state for the report: the vocabulary the
+    timer row reads, or `unreachable: ...` when the manager cannot
+    be asked. Only the CLI calls this; tests never call this."""
+    try:
+        return drive.timer_state()
+    except units.Unreachable as err:
+        return f"unreachable: {err}"
+
+
 def production_env() -> Env:
     """The live environment. Only the CLI calls this; tests never call this.
 
@@ -545,6 +657,8 @@ def production_env() -> Env:
     prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
     disk_pressure = load_disk_pressure(resolved)
     board_sites, board_error = load_board_sites(settings_error)
+    project_problems = load_project_problems()
+    timer_state = load_timer_state()
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,
@@ -566,6 +680,8 @@ def production_env() -> Env:
         board_fetch=production_board_fetch,
         board_open_store=store.open_store,
         board_error=board_error,
+        project_problems=project_problems,
+        timer_state=timer_state,
     )
 
 

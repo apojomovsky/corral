@@ -567,6 +567,9 @@ class SealTest(unittest.TestCase):
                 ("units.py", "systemctl", "list_units"),
                 ("units.py", "systemctl", STOP_NAME),
                 ("units.py", "systemd-run", "unit_argv"),
+                ("drive.py", "systemctl", "timer_state"),
+                ("drive.py", "systemctl", "_timer_systemctl"),
+                ("doctor.py", "systemctl", "_check_drive_timer"),
             },
         )
 
