@@ -11,6 +11,7 @@ network, no real state dir.
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -1279,6 +1280,31 @@ class StuckErrorBranchTest(unittest.TestCase):
             self.assertEqual(launcher.calls, [])
             row, _ = store.item("app", 7, now=NOW)
             self.assertEqual(row.agent, AGENT)
+
+    def test_a_refresh_sqlite_error_leaves_the_row_held(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 9, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        claimed(store, "app", 9)
+        original_refresh = store.refresh_claim
+
+        def flaky_refresh(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7):
+                raise sqlite3.OperationalError("database is locked")
+            return original_refresh(repo, number, agent, epoch, now=now)
+
+        store.refresh_claim = flaky_refresh
+        try:
+            code, text, stop, launcher = self.run_stuck(store)
+        finally:
+            store.refresh_claim = original_refresh
+        self.assertEqual(code, 0)
+        self.assertIn("restart claim refused", text)
+        self.assertIn("database is locked", text)
+        self.assertEqual(stop.calls, [("app", 9)])
+        self.assertEqual(len(launcher.calls), 1)
+        row, _ = store.item("app", 7, now=NOW)
+        self.assertEqual(row.agent, AGENT)
 
     def test_a_give_up_release_race_leaves_the_row_held(self):
         store = stored(self.db, [("app", 7, "open")])
