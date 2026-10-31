@@ -197,6 +197,52 @@ class RoleSessions(unittest.TestCase):
             ],
         )
 
+    def test_ticket_sessions_lists_a_damaged_legacy_role_without_raising(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        self.write(ticket, name="role", text="auditor\n")
+        found = paths.ticket_sessions("lib", 5, root=self.root)
+        self.assertEqual([(s.path, s.role, s.gen) for s in found], [(ticket, "auditor", 0)])
+
+    def test_newest_matches_the_ticket_sessions_filtering(self):
+        ticket = self.ticket()
+        self.write(ticket, name="role", text="reviewer\n")
+        self.write(os.path.join(ticket, "reviewer-0"))
+        reviewer1 = os.path.join(ticket, "reviewer-1")
+        self.write(reviewer1)
+        self.assertEqual(paths.newest_session("lib", 5, "reviewer", root=self.root), reviewer1)
+        self.assertIsNone(paths.newest_session("lib", 5, "worker", root=self.root))
+
+
+class LeafTicket(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-leaf-"))
+
+    def test_a_legacy_candidate_under_a_ticket_named_sessions_root(self):
+        root = os.path.join(self.tmp, "demo-7")
+        self.assertEqual(paths.leaf_ticket(os.path.join(root, "lib-5")), ("lib", 5))
+
+    def test_a_role_leaf_with_a_later_generation_stays_with_its_ticket(self):
+        root = os.path.join(self.tmp, "sessions")
+        self.assertEqual(paths.leaf_ticket(os.path.join(root, "lib-5", "worker-1")), ("lib", 5))
+
+    def test_a_first_generation_leaf_stays_with_its_ticket(self):
+        root = os.path.join(self.tmp, "sessions")
+        self.assertEqual(paths.leaf_ticket(os.path.join(root, "lib-5", "worker-0")), ("lib", 5))
+
+    def test_a_legacy_dir_under_a_plain_sessions_root(self):
+        root = os.path.join(self.tmp, "sessions")
+        self.assertEqual(paths.leaf_ticket(os.path.join(root, "lib-5")), ("lib", 5))
+
+    def test_a_leaf_under_a_ticket_named_sessions_root(self):
+        root = os.path.join(self.tmp, "demo-7")
+        self.assertEqual(paths.leaf_ticket(os.path.join(root, "lib-5", "reviewer-1")), ("lib", 5))
+
+    def test_a_name_that_parses_as_nothing_is_no_ticket(self):
+        root = os.path.join(self.tmp, "sessions")
+        self.assertIsNone(paths.leaf_ticket(os.path.join(root, "lib-5", "reviews")))
+        self.assertIsNone(paths.leaf_ticket(os.path.join(root, "nonsense")))
+
 
 class AtomicWrite(unittest.TestCase):
     def test_replace_is_all_or_nothing_with_no_litter(self):

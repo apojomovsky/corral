@@ -323,6 +323,21 @@ class SessionTest(DiskCase):
         self.assertEqual(rows[0].kind, "unproven")
         self.assertFalse(rows[0].safe)
 
+    def test_mixed_ticket_reclaims_each_leaf_once_with_exact_bytes(self):
+        ticket = self.make_session("demo", 7)
+        worker = self.make_leaf("demo", 7, "worker", 0)
+        reviewer = self.make_leaf("demo", 7, "reviewer", 0)
+        old = T0 - 20 * 24 * 3600
+        os.utime(ticket, (old, old))
+        sizes = {worker: 100, reviewer: 200, ticket: 999}
+        planned = self.plan(entries=[finished_entry("demo", 7)], walk=lambda p: sizes.get(p, 0))
+        rows = {c.path: c for c in planned.candidates if c.kind == "session"}
+        self.assertEqual(set(rows), {worker, reviewer})
+        self.assertEqual(rows[worker].bytes, 100)
+        self.assertEqual(rows[reviewer].bytes, 200)
+        self.assertEqual(sum(c.bytes for c in rows.values()), 300)
+        self.assertTrue(all(c.safe for c in rows.values()))
+
 
 class WorktreeTest(DiskCase):
     def wt_plan(self, **overrides):

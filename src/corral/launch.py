@@ -308,20 +308,26 @@ def unproven(tgt, number, *, list_fn):
     at all the ticket root stands in: its missing log proves nothing,
     so every live unit reads unproven, and the listing still runs, so
     an unreachable manager still fails closed. `stop` leaves these
-    running; the CLI reports them.
+    running; the CLI reports them. Every leaf filters one shared live
+    snapshot: re-listing per leaf could mix views of the manager.
     """
     leaves = _leaves(tgt, number)
     if not leaves:
         return units.unproven(
             tgt.prefix, tgt.repo, number, session_dir=_ticket_root(tgt, number), list_fn=list_fn
         )
+    listing = list_fn(tgt.prefix)
+
+    def snapshot(prefix):
+        return listing
+
     logged = set()
     for session in leaves:
         logged.update(units.started_units(session.path))
     seen = []
     for session in leaves:
         for name in units.unproven(
-            tgt.prefix, tgt.repo, number, session_dir=session.path, list_fn=list_fn
+            tgt.prefix, tgt.repo, number, session_dir=session.path, list_fn=snapshot
         ):
             if name not in logged and name not in seen:
                 seen.append(name)
@@ -735,13 +741,25 @@ def stop(tgt, number, *, list_fn, stop_fn):
     """Stop every live unit of ticket `number` that a session log proves it started.
 
     Returns the unit names stopped, possibly none. `list_fn` and `stop_fn`
-    are required; see `units.stop`. A stopped unit's registry entry is
-    marked done, so the ticket is startable again at once; an entry the
-    registry does not know is left alone. Every stopped unit is closed
-    even when one close fails; the failures raise once at the end.
+    are required; see `units.stop`. Every leaf filters one shared live
+    snapshot. An unreachable manager propagates as `Unreachable`
+    (exit 3), never wrapped into a usage error. A stopped unit's
+    registry entry is marked done, so the ticket is startable again at
+    once; an entry the registry does not know is left alone. Every
+    stopped unit is closed even when one close fails; the failures raise
+    once at the end.
     """
     stopped = []
-    for session in _leaves(tgt, number):
+    leaves = _leaves(tgt, number)
+    # One live snapshot shared by every leaf: re-listing per leaf could
+    # mix views of the manager. With no leaves at all the listing never
+    # runs: there is nothing proven to stop.
+    listing = list_fn(tgt.prefix) if leaves else []
+
+    def snapshot(prefix):
+        return listing
+
+    for session in leaves:
         try:
             stopped.extend(
                 units.stop(
@@ -749,10 +767,12 @@ def stop(tgt, number, *, list_fn, stop_fn):
                     tgt.repo,
                     number,
                     session_dir=session.path,
-                    list_fn=list_fn,
+                    list_fn=snapshot,
                     stop_fn=stop_fn,
                 )
             )
+        except units.Unreachable:
+            raise
         except units.UnitsError as err:
             if not stopped:
                 raise
