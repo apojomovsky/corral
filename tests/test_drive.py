@@ -64,7 +64,7 @@ def project_named(name, entry=None, root=None):
     """A registered project, optionally naming a policy entry."""
     return projects_mod.Project(
         name=name,
-        unit_prefix=name + "-agent",
+        unit_prefix=name + "-agent-",
         root=root or os.path.join(tempfile.gettempdir(), "corral-drive-ops", name),
         eligibility=entry,
     )

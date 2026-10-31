@@ -51,12 +51,6 @@ AGENT_ID_VAR = "CORRAL_AGENT_ID"
 #: and for sessions launched before roles were recorded.
 ROLE_FILE = "role"
 
-#: Launch runtimes to registry runtimes. The runtime adapters and the
-#: registry name one runtime differently; unknown names pass through and
-#: the registry refuses them, so a new adapter without a mapping here is
-#: a loud error, never a silent rename.
-_RUNTIME_NAMES = {"muse": "claude-code"}
-
 settings.register("clone.path", str, "", "the repository's main clone (relative to the ops root)")
 settings.register("clone.default_branch", str, "main", "the default branch of the clone")
 
@@ -408,7 +402,7 @@ def _register_started(tgt, unit, number, model, role=None):
     try:
         registry.register(
             unit,
-            _RUNTIME_NAMES.get(tgt.runtime, tgt.runtime),
+            tgt.runtime,
             ticket=ticket,
             model=model,
             role=role,

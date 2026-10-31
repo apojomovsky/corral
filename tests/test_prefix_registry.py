@@ -50,16 +50,20 @@ class PrefixOps(OpsCase):
 
 class PrefixTest(PrefixOps):
     def test_registered_root_resolves_the_registered_prefix(self):
-        self.assertEqual(launch.target(self.root, "lib").prefix, "ops-agent")
+        self.assertEqual(launch.target(self.root, "lib").prefix, "ops-agent-")
 
     def test_projects_unit_prefix_is_the_single_place(self):
         resolved = settings.load(root=self.root, repo="lib")
-        self.assertEqual(projects.unit_prefix(self.root, resolved), "ops-agent")
+        self.assertEqual(projects.unit_prefix(self.root, resolved), "ops-agent-")
         self.assertEqual(projects.unit_prefix(self.root, resolved, registered=[]), "corral-agent-")
+
+    def test_a_registered_prefix_without_a_separator_gains_one(self):
+        (found,) = projects.load_all()
+        self.assertEqual(found.unit_prefix, "ops-agent-")
 
     def test_the_unit_name_starts_with_the_prefix_projects_counts_by(self):
         unit, _ = self.start()
-        self.assertTrue(unit.startswith("ops-agent"))
+        self.assertEqual(unit, "ops-agent-lib-5")
         registered = projects.load_all()
         counts = launch.project_live_counts(registered, self.system.list_fn, registry.config())
         self.assertEqual(counts, {"ops": 1})
@@ -92,7 +96,7 @@ class LaunchRegistersTest(PrefixOps):
         with mock.patch.object(muse, "binary", return_value="/fake/muse"):
             unit, _ = self.start(runtime="muse")
         found = {entry["id"]: entry for entry, state in self.visible()}
-        self.assertEqual(found[unit]["runtime"], "claude-code")
+        self.assertEqual(found[unit]["runtime"], "muse")
 
     def test_the_agent_stays_visible_to_admission_while_it_runs(self):
         self.start(number=5)
@@ -124,7 +128,7 @@ class LaunchRegistersTest(PrefixOps):
             run=self.system.run,
             usage=roomy,
         )
-        self.assertEqual(resumed, "ops-agentlib-5-r1")
+        self.assertEqual(resumed, "ops-agent-lib-5-r1")
         states = {entry["id"]: state for entry, state in self.visible()}
         self.assertEqual(states[unit], registry.FINISHED)
         self.assertEqual(states[resumed], registry.LIVE)
@@ -151,7 +155,7 @@ class LaunchRegistersTest(PrefixOps):
         )
         self.system.finish(unit)
         relaunched, _ = self.start()
-        self.assertEqual(relaunched, "ops-agentlib-5-r1")
+        self.assertEqual(relaunched, "ops-agent-lib-5-r1")
         self.assertIn(relaunched, self.live_ids())
 
 
@@ -256,7 +260,7 @@ class RegisterBeforeStartTest(PrefixOps):
         self.assertEqual(self.live_units(), [])
         states = {entry["id"]: state for entry, state in self.visible()}
         self.assertEqual(states[unit], registry.FINISHED)
-        resumed = units.unit_name("ops-agent", "lib", 5, 1)
+        resumed = units.unit_name("ops-agent-", "lib", 5, 1)
         self.assertEqual(states[resumed], registry.FINISHED)
 
 
@@ -317,7 +321,7 @@ class HeartbeatForEveryPromptTest(PrefixOps):
 class StopClosesEveryEntryTest(PrefixOps):
     def test_stop_continues_through_a_failing_close(self):
         unit, _ = self.start()
-        second = units.unit_name("ops-agent", "lib", 5, 1)
+        second = units.unit_name("ops-agent-", "lib", 5, 1)
         registry.register(second, "omp", ticket=registry.make_ticket("lib", 5, "ops"))
         self.system.units[second] = "active"
         with open(os.path.join(self.leaf("lib", 5), "units.log"), "a", encoding="utf-8") as h:

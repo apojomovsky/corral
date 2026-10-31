@@ -465,7 +465,7 @@ class PassWiringTest(unittest.TestCase):
     def project(self, name, entry=None, root=None):
         return projects.Project(
             name=name,
-            unit_prefix=name + "-agent",
+            unit_prefix=name + "-agent-",
             root=root or os.path.join(self.tmp, "ops", name),
             eligibility=entry,
         )

@@ -953,7 +953,7 @@ def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, op
             raise InitError(str(err)) from None
         if not any(
             p.name == reg_name
-            and p.unit_prefix == f"{reg_name}-agent"
+            and p.unit_prefix == f"{reg_name}-agent-"
             and p.root == os.path.normpath(reg_root)
             and p.floor == 0
             and p.ceiling == cap

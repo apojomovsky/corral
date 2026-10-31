@@ -227,7 +227,7 @@ class AdmitTest(OpsCase):
         self.assertEqual(ctx.exception.exit_code, 75)
 
     def test_a_registered_worker_on_this_host_holds_a_slot(self):
-        registry.register("worker-1", "claude-code", ticket=registry.make_ticket("my-repo", 9))
+        registry.register("worker-1", "omp", ticket=registry.make_ticket("my-repo", 9))
         tgt = dataclasses.replace(self.target(), cap=1)
         with self.assertRaises(launch.CapFull):
             launch.admit(tgt, 5, list_fn=lambda prefix: [], usage=roomy)
@@ -1304,8 +1304,8 @@ class RegistryCapTest(OpsCase):
     """Admission counts registered agents under the target's own resolved settings."""
 
     def holders(self):
-        registry.register("worker-1", "claude-code", ticket=registry.make_ticket("my-repo", 9))
-        registry.register("worker-2", "claude-code", ticket=registry.make_ticket("lib", 9))
+        registry.register("worker-1", "omp", ticket=registry.make_ticket("my-repo", 9))
+        registry.register("worker-2", "omp", ticket=registry.make_ticket("lib", 9))
 
     def test_registered_workers_fill_the_cap_by_default(self):
         self.holders()
@@ -1320,7 +1320,7 @@ class RegistryCapTest(OpsCase):
         launch.admit(tgt, 5, list_fn=lambda prefix: [], usage=roomy)
 
     def test_a_registered_live_ticket_refuses_with_the_registry_note(self):
-        registry.register("worker-1", "claude-code", ticket=registry.make_ticket("lib", 5))
+        registry.register("worker-1", "omp", ticket=registry.make_ticket("lib", 5))
         with self.assertRaises(units.UnitExists) as ctx:
             launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
         self.assertEqual(
