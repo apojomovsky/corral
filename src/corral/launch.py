@@ -131,11 +131,36 @@ def target(root, repo, env=None, flags=None):
     )
 
 
-def _session(tgt, number):
+def _leaves(tgt, number):
+    """Every leaf session of the ticket, through the one session resolver."""
     try:
-        return paths.ticket_session_dir(tgt.repo, number)
+        return paths.ticket_sessions(tgt.repo, number)
     except paths.PathError as err:
         raise LaunchError(str(err)) from None
+
+
+def _newest(tgt, number, role):
+    """The ticket's newest session dir of `role`, or None."""
+    try:
+        return paths.newest_session(tgt.repo, number, role)
+    except paths.PathError as err:
+        raise LaunchError(str(err)) from None
+
+
+def _next_role_gen(leaves, role):
+    """The generation a fresh launch of `role` takes: past its highest."""
+    gens = [session.gen for session in leaves if session.role == role]
+    return (max(gens) + 1) if gens else 0
+
+
+def _next_unit_gen(leaves):
+    """The generation the next unit takes: past the highest ticket-wide.
+
+    Unit names carry no role, so generations stay unique across roles:
+    the max over every leaf session, 0 when none launched yet.
+    """
+    gens = [units.next_gen(session.path) for session in leaves]
+    return max(gens) if gens else 0
 
 
 def _adapter(name):
@@ -274,14 +299,39 @@ def admit(tgt, number, *, list_fn, usage):
         raise CapFull(verdict.reason + note)
 
 
-def unproven(tgt, number, *, list_fn):
-    """Live units that parse to this ticket but that its units.log does not prove ours.
+def _ticket_root(tgt, number):
+    """The ticket's session root, for the no-leaf fallback below."""
+    try:
+        return paths.ticket_session_dir(tgt.repo, number)
+    except paths.PathError as err:
+        raise LaunchError(str(err)) from None
 
-    `stop` leaves these running; the CLI reports them.
+
+def unproven(tgt, number, *, list_fn):
+    """Live units that parse to this ticket but that no session log proves ours.
+
+    A unit counts as proven when any leaf session logs it. With no leaf
+    at all the ticket root stands in: its missing log proves nothing,
+    so every live unit reads unproven, and the listing still runs, so
+    an unreachable manager still fails closed. `stop` leaves these
+    running; the CLI reports them.
     """
-    return units.unproven(
-        tgt.prefix, tgt.repo, number, session_dir=_session(tgt, number), list_fn=list_fn
-    )
+    leaves = _leaves(tgt, number)
+    if not leaves:
+        return units.unproven(
+            tgt.prefix, tgt.repo, number, session_dir=_ticket_root(tgt, number), list_fn=list_fn
+        )
+    logged = set()
+    for session in leaves:
+        logged.update(units.started_units(session.path))
+    seen = []
+    for session in leaves:
+        for name in units.unproven(
+            tgt.prefix, tgt.repo, number, session_dir=session.path, list_fn=list_fn
+        ):
+            if name not in logged and name not in seen:
+                seen.append(name)
+    return seen
 
 
 def _env(adapter, session, unit):
@@ -321,7 +371,11 @@ def _close_previous(tgt, number, list_fn):
     before launch wrote registry entries relaunches cleanly. Returns the
     units closed.
     """
-    logged = units.started_units(_session(tgt, number))
+    logged = []
+    for session in _leaves(tgt, number):
+        for unit in units.started_units(session.path):
+            if unit not in logged:
+                logged.append(unit)
     if not logged:
         return []
     live = {name for name, active, _sub in list_fn(tgt.prefix) if active in units.LIVE_STATES}
@@ -422,20 +476,22 @@ def launch(
     reviewer role selects both the reviewer prompt and the runtime's
     read-only mode (`reviewer=True` in `adapter.argv`); it is recorded in
     the session and the registry entry, so a resume keeps the same mode
-    and snapshot shows reviewer vs worker.
+    and snapshot shows reviewer vs worker. A launch without a role runs
+    as the worker role and writes its own worker generation, so it never
+    touches the reviewer's record either.
     """
     factory = prompt if callable(prompt) else None
     if factory is None:
         _check_text(prompt, "prompt")
     role = _check_role(role)
     reviewer = role == "reviewer"
+    session_role = role or prompts.DEFAULT_ROLE
     model = _check_model(model)
     if title is not None and not isinstance(title, str):
         raise LaunchError("title must be a string")
     if runtime_config is not None and not isinstance(runtime_config, dict):
         raise LaunchError("runtime config must be a JSON object")
     adapter = _adapter(tgt.runtime)
-    session = _session(tgt, number)
     chains = _model_chains(
         tgt,
         (pool_fn or accounts.providers)(),
@@ -462,11 +518,18 @@ def launch(
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
         prompt = prompts.with_heartbeat(prompt)
+        leaves = _leaves(tgt, number)
+        try:
+            session = paths.role_session_dir(
+                tgt.repo, number, session_role, _next_role_gen(leaves, session_role)
+            )
+        except paths.PathError as err:
+            raise LaunchError(str(err)) from None
         session_id = _write_session(
             session, adapter, tgt.runtime, prompt, runtime_config, chains, role
         )
         try:
-            unit = units.unit_name(tgt.prefix, tgt.repo, number, units.next_gen(session))
+            unit = units.unit_name(tgt.prefix, tgt.repo, number, _next_unit_gen(leaves))
             try:
                 if session_id is None:
                     command = adapter.argv(
@@ -542,10 +605,11 @@ def _recorded_role(session):
 def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None, role=None):
     """The prompt, the runtime and role records and the per-launch config.
 
-    Writes into the session dir. Returns the fresh muse session id for a
-    muse launch, else None. The id is generated here, recorded here and
-    passed to `argv` by the caller, so the recorded id and the run's id
-    cannot differ.
+    Writes into a fresh role generation dir, so no record is ever
+    inherited from another role's session. Returns the fresh muse
+    session id for a muse launch, else None. The id is generated here,
+    recorded here and passed to `argv` by the caller, so the recorded
+    id and the run's id cannot differ.
     """
     try:
         os.makedirs(session, exist_ok=True)
@@ -553,16 +617,6 @@ def _write_session(session, adapter, runtime, prompt, runtime_config, chains=Non
         runtimes.record(session, runtime)
         if role is not None:
             paths.atomic_write_text(os.path.join(session, ROLE_FILE), role + "\n")
-        else:
-            # A relaunch without a role must not inherit the previous
-            # generation's: a stale reviewer record would resume read-only.
-            # Only a missing file is fine; any other removal failure
-            # reaches the LaunchError below instead of leaving the
-            # stale record behind silently.
-            try:
-                os.remove(os.path.join(session, ROLE_FILE))
-            except FileNotFoundError:
-                pass
         config = runtime_config or {}
         if chains:
             config = adapter.with_models(config, chains)
@@ -576,20 +630,29 @@ def _write_session(session, adapter, runtime, prompt, runtime_config, chains=Non
         raise LaunchError(f"cannot write the agent's session: {err}") from None
 
 
+def _no_session(tgt, number, role, verb):
+    """The refusal when the ticket holds no session of `role` to resume or tail."""
+    return LaunchError(
+        f"#{number} of {tgt.repo} has no {runtimes.DEFAULT_RUNTIME} {verb} for role {role!r}"
+    )
+
+
 def resume(
     tgt,
     number,
     message,
     *,
     hold_reason_fn,
+    role=None,
     model=None,
     list_fn,
     run,
     usage,
     git=worktrees.git,
 ):
-    """Resume ticket `number`'s newest runtime session in a new unit. Returns `(unit, workdir)`.
+    """Resume ticket `number`'s newest session of `role` in a new unit.
 
+    Returns `(unit, workdir)`. `role` None resumes the worker session.
     The runtime is the one the session recorded at launch, and the
     reviewer mode is the one the launch ran with: a resumed reviewer
     stays read-only. Raises LaunchError when there is no session to
@@ -603,12 +666,17 @@ def resume(
         raise HeldError(reason)
     _check_text(message, "message")
     model = _check_model(model)
-    session = _session(tgt, number)
+    role = _check_role(role) or prompts.DEFAULT_ROLE
+    session = _newest(tgt, number, role)
+    if session is None:
+        raise _no_session(tgt, number, role, "session to resume")
     adapter = _adapter(runtimes.recorded(session))
-    role = _recorded_role(session)
+    recorded = _recorded_role(session)
     handle = adapter.resume_handle(session)
     if handle is None:
-        raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} session to resume")
+        raise LaunchError(
+            f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
+        )
     _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
@@ -624,16 +692,28 @@ def resume(
 
     with units.spawn_lock():
         admit(tgt, number, list_fn=list_fn, usage=usage)
-        # A concurrent launch of this ticket may have replaced the
-        # session between the pre-lock read and this lock: re-read the
-        # role here, so the mode started is the mode recorded.
-        role = _recorded_role(session)
+        # A concurrent launch of this ticket may have added a newer
+        # generation between the pre-lock read and this lock: resolve
+        # the newest session again here, so the mode started is the
+        # mode recorded.
+        session = _newest(tgt, number, role)
+        if session is None:
+            raise _no_session(tgt, number, role, "session to resume")
+        adapter = _adapter(runtimes.recorded(session))
+        recorded = _recorded_role(session)
+        handle = adapter.resume_handle(session)
+        if handle is None:
+            raise LaunchError(
+                f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
+            )
         if adapter.name == muse.NAME:
             try:
                 muse.write_message(session, message)
             except OSError as err:
                 raise LaunchError(f"cannot write the agent's session: {err}") from None
-        unit = units.unit_name(tgt.prefix, tgt.repo, number, max(units.next_gen(session), 1))
+        unit = units.unit_name(
+            tgt.prefix, tgt.repo, number, max(_next_unit_gen(_leaves(tgt, number)), 1)
+        )
         try:
             command = adapter.argv(
                 session,
@@ -641,14 +721,14 @@ def resume(
                 model=model,
                 resume=handle,
                 max_time=runtimes.DEFAULT_MAX_TIME,
-                reviewer=(role == "reviewer"),
+                reviewer=(recorded == "reviewer"),
             )
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(
             unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
         )
-        _register_started(tgt, unit, number, model, role)
+        _register_started(tgt, unit, number, model, recorded)
         try:
             units.start(argv, session, unit, run=run)
         except Exception:
@@ -658,7 +738,7 @@ def resume(
 
 
 def stop(tgt, number, *, list_fn, stop_fn):
-    """Stop every live unit of ticket `number` that its session's log proves it started.
+    """Stop every live unit of ticket `number` that a session log proves it started.
 
     Returns the unit names stopped, possibly none. `list_fn` and `stop_fn`
     are required; see `units.stop`. A stopped unit's registry entry is
@@ -666,14 +746,23 @@ def stop(tgt, number, *, list_fn, stop_fn):
     registry does not know is left alone. Every stopped unit is closed
     even when one close fails; the failures raise once at the end.
     """
-    stopped = units.stop(
-        tgt.prefix,
-        tgt.repo,
-        number,
-        session_dir=_session(tgt, number),
-        list_fn=list_fn,
-        stop_fn=stop_fn,
-    )
+    stopped = []
+    for session in _leaves(tgt, number):
+        try:
+            stopped.extend(
+                units.stop(
+                    tgt.prefix,
+                    tgt.repo,
+                    number,
+                    session_dir=session.path,
+                    list_fn=list_fn,
+                    stop_fn=stop_fn,
+                )
+            )
+        except units.UnitsError as err:
+            if not stopped:
+                raise
+            raise units.UnitsError(f"stopped {', '.join(stopped)}; {err}") from err
     failed = []
     for unit in stopped:
         try:
@@ -709,9 +798,10 @@ def _tail_text(path):
         return handle.read().decode("utf-8", "replace")
 
 
-def tail(tgt, number, last=None, out=None, *, pool_fn=None, note_fn=None, now_fn=None):
-    """Print the ticket's agent activity from its session file. Returns the new offset.
+def tail(tgt, number, last=None, out=None, *, role=None, pool_fn=None, note_fn=None, now_fn=None):
+    """Print the ticket's agent activity from its newest session of `role`.
 
+    Returns the new offset. `role` None tails the worker session.
     Raises LaunchError when the session has no activity file yet. The tail
     also feeds the recent session output to each quota reader: a provider
     whose reader parses it as a limit error gets a reactive mark, through
@@ -722,11 +812,16 @@ def tail(tgt, number, last=None, out=None, *, pool_fn=None, note_fn=None, now_fn
     """
     from corral import quotacli
 
-    session = _session(tgt, number)
+    role = _check_role(role) or prompts.DEFAULT_ROLE
+    session = _newest(tgt, number, role)
+    if session is None:
+        raise _no_session(tgt, number, role, "activity yet")
     adapter = _adapter(runtimes.recorded(session))
     path = adapter.activity_file(session)
     if path is None:
-        raise LaunchError(f"#{number} of {tgt.repo} has no {adapter.name} activity yet")
+        raise LaunchError(
+            f"#{number} of {tgt.repo} has no {adapter.name} activity yet for role {role!r}"
+        )
     shown = runtime_tail.show(path, last=last, out=out)
     try:
         pool = (pool_fn or accounts.providers)()

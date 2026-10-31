@@ -22,7 +22,7 @@ The test: **if a second project would need it unchanged, it belongs in corral.**
 
 1. **Runtimes.** One adapter per headless agent runtime (omp, opencode, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors. A reviewer launch asks the runtime for its read-only mode (muse adds `--disable-write`); adapters with no read-only flag accept the request and rely on the reviewer prompt's read-only rule.
 2. **Units.** Transient `systemd --user` units: spawn lock, liveness, stop, naming. The unit prefix is set per project.
-3. **Sessions.** One session root per host, one directory per `<project>/<ticket>`.
+3. **Sessions.** One session root per host, one directory per `<project>/<ticket>`, with one leaf per role generation (`<role>-<n>`) below it, so a reviewer launch never overwrites the worker's record. Resume and tail read the newest leaf of a role; a legacy single-directory session reads as generation 0.
 4. **Accounts and models.** One accounts file per host lists providers, accounts and their quota readers. Each project declares its own models (roles, fallback chains, sub-agent overrides), naming only providers from that pool. The user's home runtime config is never edited.
 5. **Quota.** Readers, reactive rate-limit marks, cooldowns, the gate, pacing, outage probes. The gate is evaluated per project's model chains against **one shared ledger**: a project whose chains avoid an exhausted provider keeps running.
 6. **Admission.** A total cap for the host, a floor and ceiling per project, and a disk ceiling, all under one lock. Each project decides what it wants to start; corral decides whether it may start now.

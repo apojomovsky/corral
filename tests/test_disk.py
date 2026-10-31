@@ -282,6 +282,47 @@ class SessionTest(DiskCase):
         self.assertFalse(rows[0].safe)
         self.assertTrue(any("unreadable" in n for n in planned.notes))
 
+    def make_leaf(self, repo, number, role, gen, age_s=20 * 24 * 3600):
+        leaf = os.path.join(self.sessions, f"{repo}-{number}", f"{role}-{gen}")
+        os.makedirs(leaf, exist_ok=True)
+        with open(os.path.join(leaf, "prompt.md"), "w", encoding="utf-8") as handle:
+            handle.write("do the thing")
+        old = T0 - age_s
+        for root, dirs, files in os.walk(leaf):
+            for name in dirs + files:
+                os.utime(os.path.join(root, name), (old, old))
+            os.utime(root, (old, old))
+        return leaf
+
+    def test_role_leaves_are_separate_safe_candidates(self):
+        worker = self.make_leaf("demo", 7, "worker", 0)
+        reviewer = self.make_leaf("demo", 7, "reviewer", 0)
+        planned = self.plan(entries=[finished_entry("demo", 7)], walk=lambda p: 6)
+        rows = {c.path: c for c in planned.candidates if c.kind == "session"}
+        self.assertEqual(set(rows), {worker, reviewer})
+        self.assertTrue(all(c.safe for c in rows.values()))
+        self.assertTrue(all(c.bytes == 6 for c in rows.values()))
+
+    def test_a_live_ticket_keeps_every_leaf(self):
+        self.make_leaf("demo", 7, "worker", 0)
+        self.make_leaf("demo", 7, "reviewer", 0)
+        planned = self.plan(entries=[finished_entry("demo", 7)], list_fn=lambda: {("demo", 7)})
+        rows = [c for c in planned.candidates if c.kind == "session"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(not c.safe for c in rows))
+        self.assertTrue(all("live unit" in c.proof for c in rows))
+
+    def test_a_ticket_dir_with_only_reviews_is_never_safe(self):
+        ticket = os.path.join(self.sessions, "demo-7")
+        os.makedirs(os.path.join(ticket, "reviews"), exist_ok=True)
+        with open(os.path.join(ticket, "reviews", "review-abc.json"), "w") as handle:
+            handle.write("{}")
+        planned = self.plan(entries=[finished_entry("demo", 7)], walk=lambda p: 1)
+        rows = [c for c in planned.candidates if ticket in c.path]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].kind, "unproven")
+        self.assertFalse(rows[0].safe)
+
 
 class WorktreeTest(DiskCase):
     def wt_plan(self, **overrides):
