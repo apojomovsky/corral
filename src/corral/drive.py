@@ -735,15 +735,12 @@ def timer_text() -> str:
 def timer_dir(env=None) -> str:
     """The systemd user unit dir: `systemd/user` under the XDG config home.
 
-    `env` maps `XDG_CONFIG_HOME`; a missing or relative value reads as
-    the default `~/.config`. This is systemd's dir, not one of corral's,
-    so it resolves here and nowhere else.
+    The base resolves through `paths.config_home`, so the fallback and
+    the relative-value rule agree with every other XDG dir in one
+    place. `env` maps `XDG_CONFIG_HOME`. This is systemd's dir, not one
+    of corral's, so only this join lives here.
     """
-    env = os.environ if env is None else env
-    base = env.get("XDG_CONFIG_HOME")
-    if not base or not os.path.isabs(base):
-        base = os.path.expanduser("~/.config")
-    return os.path.normpath(os.path.join(base, "systemd", "user"))
+    return os.path.normpath(os.path.join(paths.config_home(env), "systemd", "user"))
 
 
 def unit_paths(env=None) -> tuple:
@@ -767,6 +764,9 @@ def timer_state(run=units.default_run) -> str:
         proc = run(["systemctl", "--user", "is-enabled", TIMER_NAME], timeout=TIMER_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as err:
         raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {err}") from err
+    if proc.returncode == 127:
+        detail = (proc.stderr or "").strip() or "systemctl not found (exit 127)"
+        raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {detail}")
     out = ((proc.stdout or "").strip().split() or [""])[0]
     err_text = (proc.stderr or "").strip()
     if proc.returncode == 0 and out in ("enabled", "enabled-runtime"):
@@ -808,6 +808,9 @@ def _timer_systemctl(args, run):
         proc = run(argv, timeout=TIMER_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError) as err:
         raise units.Unreachable(f"cannot run {' '.join(argv)}: {err}") from err
+    if proc.returncode == 127:
+        detail = (proc.stderr or "").strip() or "systemctl not found (exit 127)"
+        raise units.Unreachable(f"cannot run {' '.join(argv)}: {detail}")
     if proc.returncode != 0:
         tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
         if "failed to connect to bus" in tail.lower() or "no medium found" in tail.lower():

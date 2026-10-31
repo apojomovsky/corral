@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import cli, drive, units
+from corral import cli, drive, paths, units
 
 
 def proc(stdout="", stderr="", returncode=0):
@@ -74,6 +74,25 @@ class TimerDir(unittest.TestCase):
             directory = drive.timer_dir({"XDG_CONFIG_HOME": "relative/path"})
         self.assertEqual(directory, os.path.join("/srv/user", "systemd", "user"))
 
+    def test_the_dir_agrees_with_the_paths_config_home(self):
+        for env in (
+            {},
+            {"XDG_CONFIG_HOME": "/x/config"},
+            {"XDG_CONFIG_HOME": "relative/path"},
+            {"XDG_CONFIG_HOME": "/x/./config/"},
+        ):
+            with self.subTest(env=env):
+                self.assertEqual(
+                    drive.timer_dir(env),
+                    os.path.join(paths.config_home(env), "systemd", "user"),
+                )
+
+    def test_the_dir_uses_the_same_home_fallback_as_paths(self):
+        with mock.patch.object(os.path, "expanduser", return_value="/srv/user") as home:
+            directory = drive.timer_dir({})
+        home.assert_called_once_with("~/.config")
+        self.assertEqual(directory, os.path.join("/srv/user", "systemd", "user"))
+
 
 class TimerState(unittest.TestCase):
     def test_enabled_reads_as_enabled(self):
@@ -113,6 +132,13 @@ class TimerState(unittest.TestCase):
 
         with self.assertRaises(units.Unreachable):
             drive.timer_state(run=run)
+
+    def test_an_absent_systemctl_is_unreachable_through_the_real_seam(self):
+        empty = tempfile.mkdtemp(prefix="corral-no-systemctl-")
+        with mock.patch.dict(os.environ, {"PATH": empty}):
+            with self.assertRaises(units.Unreachable) as ctx:
+                drive.timer_state()
+        self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_the_query_names_the_shipped_timer(self):
         seen = []
@@ -187,6 +213,13 @@ class InstallTimer(unittest.TestCase):
 
         with self.assertRaises(units.Unreachable) as ctx:
             drive.install_timer(env=home_env(), run=run)
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_an_absent_systemctl_is_unreachable_through_the_real_seam(self):
+        empty = tempfile.mkdtemp(prefix="corral-no-systemctl-")
+        with mock.patch.dict(os.environ, {"PATH": empty}):
+            with self.assertRaises(units.Unreachable) as ctx:
+                drive.install_timer(env=home_env(), run=units.default_run)
         self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_an_unwritable_home_is_exit_4(self):
