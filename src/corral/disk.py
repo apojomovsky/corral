@@ -336,7 +336,13 @@ def plan(
                 )
             )
             continue
-        leaves = [s.path for s in paths.ticket_sessions(*parsed, root=sessions_dir)]
+        found = paths.ticket_sessions(*parsed, root=sessions_dir)
+        if len(found) > 1:
+            # A legacy root that also holds role leaves is skipped: its
+            # walk covers the leaves, so planning it too would
+            # double-count their bytes and offer a redundant removal.
+            found = [s for s in found if s.path != path]
+        leaves = [s.path for s in found]
         if not leaves:
             candidates.append(
                 Candidate(
