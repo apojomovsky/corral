@@ -30,7 +30,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from corral import (
     accounts,
@@ -249,14 +249,31 @@ def _skip(candidate, kind, code, reason) -> Gated:
     )
 
 
-def gate(candidate, *, read_labels, hold_label, live, limits, quota_source, ledger, now) -> Gated:
+def gate(
+    candidate,
+    *,
+    read_labels,
+    hold_label,
+    live,
+    limits,
+    quota_source,
+    ledger,
+    now,
+    finished=None,
+) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
     Row state first (missing, non-open, external, withdrawn), then claim
-    routing by request kind against the row's holder, then the hold and
-    decision labels, then admission, then the quota gate. Every input is
-    plain data or an injected seam (`read_labels`); nothing is launched,
-    claimed or written.
+    routing by request kind against the row's holder, then the reviewer
+    and fix-round readiness from `finished` ({(repo, number): (agent id,
+    role)} for the newest finished entry per ticket), then the hold and
+    decision labels, then admission, then the quota gate. A review
+    proceeds only for PR-ready rows: unclaimed with a finished worker
+    behind them, whose id the reviewer passes as its author. Rows
+    reviewed since the last work are merge-ready and ignored, and a fix
+    round requested after the fix already landed is skipped. Every input
+    is plain data or an injected seam (`read_labels`); nothing is
+    launched, claimed or written.
     """
     if candidate.request is None:
         row = candidate.row
@@ -299,6 +316,31 @@ def gate(candidate, *, read_labels, hold_label, live, limits, quota_source, ledg
                 kind,
                 "claim",
                 f"{ref}: foreign claim by `{holder}`, never touched",
+            )
+
+    if not holder and request.kind in ("review", "fix", "resume"):
+        newest = (finished or {}).get((row.repo, row.number))
+        if request.kind == "review":
+            if newest is None:
+                return _skip(
+                    candidate,
+                    kind,
+                    "row",
+                    f"{ref}: no finished worker, nothing to review, skipped",
+                )
+            if newest[1] == "reviewer":
+                return _skip(
+                    candidate,
+                    kind,
+                    "row",
+                    f"{ref}: already reviewed since the last work, merge-ready, skipped",
+                )
+        elif newest is not None and newest[1] == "worker":
+            return _skip(
+                candidate,
+                kind,
+                "row",
+                f"{ref}: fix already landed, skipped",
             )
 
     held = hold.reason(
@@ -1021,16 +1063,26 @@ def _gate_all(
     ledger_data,
     read_labels,
     hold_label,
+    released=None,
+    finished=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
     Returns (gated_rows, problems): one `Gated` per candidate in section
     3 order, and one error line per project whose policy or quota
     settings failed. A project with no eligibility entry prints its
-    logbook line to `out`. Nothing is written.
+    logbook line to `out`. `released` ({(repo, number): worker id}
+    released this pass) simulates the post-release rows, so a plan over
+    still-claimed rows gates what the real pass would gate after the
+    release; `finished` carries the newest finished entry per ticket for
+    the reviewer and fix-round readiness. Nothing is written.
     """
     rows = eligibility.rows_from_items(items)
     by_key = {(row.repo, row.number): row for row in rows}
+    for key in released or ():
+        prior = by_key.get(key)
+        if prior is not None:
+            by_key[key] = replace(prior, agent="")
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     problems = []
     candidates = []
@@ -1063,6 +1115,8 @@ def _gate_all(
         if item.state != "open" or not item.agent:
             continue
         if (item.repo, item.number) in requested_keys:
+            continue
+        if released is not None and (item.repo, item.number) in released:
             continue
         key = (item.repo, item.number)
         candidates.append(GateInput("", None, by_key.get(key), waits.get(key, 0.0)))
@@ -1107,6 +1161,7 @@ def _gate_all(
             quota_source=quota_for.get(candidate.project, EMPTY_QUOTA),
             ledger=ledger_data,
             now=now,
+            finished=finished,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1129,12 +1184,17 @@ def _pass(
     read_labels,
     hold_label,
     pool,
+    agent_states=None,
+    finished_for=None,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
     Nothing is synced, claimed, enqueued, started, mirrored or journaled.
     A project whose policy or quota settings fail is skipped with one
     error line; the pass still gates every other project and exits 4.
+    `agent_states` and `finished_for` feed the reviewer and fix-round
+    readiness exactly like the claiming pass, so the plan shows the
+    verdicts the real pass would print; both are reads only.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1163,6 +1223,10 @@ def _pass(
         quota_for,
         pool,
     ) = ctx
+    released = (
+        finished_holders(store, agent_states=agent_states) if agent_states is not None else {}
+    )
+    finished = resolve_finished(finished_for, released)
     gated_rows, problems = _gate_all(
         items,
         registered,
@@ -1175,6 +1239,8 @@ def _pass(
         ledger_data=ledger_data,
         read_labels=read_labels,
         hold_label=hold_label,
+        released=released,
+        finished=finished,
     )
     table = [
         Candidate(
@@ -1520,6 +1586,116 @@ def release_finished(store, *, agent_states, now, out, events=None):
     return released
 
 
+def finished_holders(store, *, agent_states) -> dict:
+    """{(repo, number): worker id} for finished managed holders. Pure reads.
+
+    The same rows `release_finished` would release, without releasing
+    them: the pass captures the pre-release worker ids before the
+    release clears them from the rows, so a reviewer start in the same
+    pass can pass the worker id as its author. With no registry states
+    there is nothing finished, so the map is empty.
+    """
+    found = {}
+    for item in store.items():
+        claim = store.claim_of(item.repo, item.number)
+        if claim is None or not claim.agent or not is_managed_agent(claim.agent):
+            continue
+        seen = (agent_states or {}).get(claim.agent)
+        if seen is None or seen[0] != registry.FINISHED:
+            continue
+        found[(claim.repo, claim.number)] = claim.agent
+    return found
+
+
+def resolve_finished(finished_for, released) -> dict:
+    """{(repo, number): (agent id, role)} newest finished entry per ticket. Pure.
+
+    `finished_for` is the cross-pass map from finished registry entries
+    (agent id to role, `None` when the entry records none); `released`
+    is this pass's {(repo, number): worker id} capture. A same-pass
+    release always wins: it just happened, so it is the newest event.
+    It keeps the cross-pass role only for the same agent id, else its
+    role is unknown (`None`), which the gate reads as unreviewed work.
+    """
+    resolved = dict(finished_for or {})
+    for ticket, agent in (released or {}).items():
+        role = None
+        prior = resolved.get(ticket)
+        if prior is not None and prior[0] == agent:
+            role = prior[1]
+        resolved[ticket] = (agent, role)
+    return resolved
+
+
+def fix_mode(holder, *, repo, number, agent_states, live_units) -> str:
+    """`"resume"` when the holder is still usable, else `"fresh"`. Pure.
+
+    A fix round resumes the holder's session when the holder's registry
+    entry is live or stale, or a live unit exists for the ticket; either
+    proves something usable survived. Anything else restarts fresh on
+    the same ticket and branch. Only stop-plus-launch restarts consume
+    the restart budget; a resume reuses the session and never does.
+    """
+    seen = (agent_states or {}).get(holder)
+    if seen is not None and seen[0] in (registry.LIVE, registry.STALE):
+        return "resume"
+    if (repo, number) in (live_units or frozenset()):
+        return "resume"
+    return "fresh"
+
+
+def reviewer_author_block(author) -> str:
+    """The prompt block naming the change's author for the reviewer. Pure.
+
+    The reviewer learns the pre-release worker id here and passes it as
+    `review record --author`: the record refuses author==reviewer, so a
+    reviewer that cannot name its author cannot record. A blank author
+    raises ValueError before any launch.
+    """
+    worker = str(author or "").strip()
+    if not worker:
+        raise ValueError("a reviewer launch needs the pre-release worker id as author")
+    return (
+        f"\nThe change under review was written by agent `{worker}`. When you record "
+        "your verdict (`corral review record ... --author ...`), pass that id as "
+        "`--author`: a record naming its own reviewer is refused. Never record a "
+        "verdict with your own agent id as the author."
+    )
+
+
+def fix_message(repo, number) -> str:
+    """The message a fix-round resume carries into the worker's session. Pure."""
+    return (
+        f"Address the review findings for {repo}#{number}: read the latest review "
+        "record for this ticket, fix every finding it states, and push the branch "
+        "so a later pass can schedule a re-review."
+    )
+
+
+def production_finished_for(*, now, cfg=None, path=None) -> dict:
+    """{(repo, number): (agent id, role)} for the newest finished entry. Reads only.
+
+    Built from the host registry: finished entries kept for RETAIN_S,
+    newest first by end time, entries without a ticket skipped. `cfg`
+    and `path` are the registry seams tests inject; production reads
+    the host registry. The role is `""` for entries that record none;
+    the gate treats only a known reviewer role as reviewed.
+    """
+    found: dict = {}
+    for entry, state in registry.visible(now, cfg, path):
+        if state != registry.FINISHED:
+            continue
+        ticket = registry.ticket_of(entry)
+        if ticket is None:
+            continue
+        at = entry.get("ended_at") or entry.get("last_seen") or 0
+        prior = found.get(ticket)
+        if prior is not None and prior[2] >= at:
+            continue
+        found[ticket] = (entry["id"], entry.get("role") or "", at)
+    return {ticket: (agent, role) for ticket, (agent, role, _) in found.items()}
+
+
 def handle_stuck(
     store,
     *,
@@ -1794,6 +1970,114 @@ def production_stopper(registered):
     return stop_unit
 
 
+def _skip_as(gated, kind, reason, code):
+    """The skip verdict for a gated row under an effective kind."""
+    return Gated(
+        project=gated.project,
+        repo=gated.repo,
+        number=gated.number,
+        kind=kind,
+        verdict="skip",
+        reason=reason,
+        code=code,
+    )
+
+
+def _refresh_title(store, gated, *, tracker_factory, operators, now, stale_after, kind=None):
+    """The board title to launch under, or the skip row telling why not.
+
+    Refreshes the stale row live first, failing closed when it cannot
+    be re-read: a claim path never decides from a stale row. `kind`
+    overrides the reported kind for effective-kind rows (a resume that
+    restarts reports as a fix).
+    """
+    title_kind = kind if kind is not None else gated.kind
+    fresh, problem = refresh_row(
+        store,
+        tracker_factory,
+        gated.repo,
+        gated.number,
+        operators=operators,
+        now=now,
+        stale_after=stale_after,
+    )
+    if problem is not None:
+        return None, _skip_as(gated, title_kind, problem, "claim")
+    ref = f"{gated.repo}#{gated.number}"
+    title = fresh.title if fresh is not None and fresh.title else ref
+    return title, None
+
+
+def _mint_claim(store, gated, *, host, now, kind=None):
+    """The fresh id claimed for a gated row, or the skip row telling why not.
+
+    Mints with `mint_agent` and claims it. A lost race names the
+    holder; any other refusal names itself. `kind` overrides the
+    reported kind for effective-kind rows.
+    """
+    title_kind = kind if kind is not None else gated.kind
+    ref = f"{gated.repo}#{gated.number}"
+    agent = mint_agent(gated.repo, gated.number, host=host, now=now)
+    try:
+        store.claim(gated.repo, gated.number, agent, host, now=now)
+    except board.Claimed:
+        try:
+            current, _ = store.item(gated.repo, gated.number, now=now)
+        except (board.StoreError, sqlite3.Error) as err:
+            return None, _skip_as(gated, title_kind, f"{ref}: claim refused ({err})", "claim")
+        seen = current.agent if current is not None else ""
+        return None, _skip_as(
+            gated, title_kind, f"{ref}: race lost to `{seen}`, the pass moves on", "claim"
+        )
+    except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
+        return None, _skip_as(gated, title_kind, f"{ref}: claim refused ({err})", "claim")
+    return agent, None
+
+
+def _fresh_claim(store, gated, *, tracker_factory, operators, host, now, stale_after):
+    """The (agent, title) claimed for a gated row, or the skip row telling why not.
+
+    Refreshes the stale row live first (failing closed when it cannot
+    be re-read), then mints a fresh id and claims it. A fix round that
+    replaces its holder refreshes first, releases, and only then mints,
+    so it never claims against its own held row.
+    """
+    title, skipped = _refresh_title(
+        store,
+        gated,
+        tracker_factory=tracker_factory,
+        operators=operators,
+        now=now,
+        stale_after=stale_after,
+    )
+    if skipped is not None:
+        return None, None, skipped
+    agent, skipped = _mint_claim(store, gated, host=host, now=now)
+    if skipped is not None:
+        return None, None, skipped
+    return agent, title, None
+
+
+def _start_unit(launcher, *, project, repo, number, kind, agent, title, now, author=None):
+    """`(unit, note, code, blocked)` for one launch-handoff attempt.
+
+    `unit` is None when the launch failed; `note` appends to the gate
+    reason, `code` is `""` on success else `"launch"`, and `blocked` is
+    True only when the service manager was unreachable. Every launcher
+    call carries the author (None except for reviewers), so the seam
+    stays one shape for every kind.
+    """
+    try:
+        unit = launcher(project, repo, number, kind, agent, title, now=now, author=author)
+    except units.UnitExists as err:
+        return None, f"race lost, already live ({err})", "launch", False
+    except units.Unreachable as err:
+        return None, f"not started: {err}", "launch", True
+    except Exception as err:
+        return None, f"not started: {err}", "launch", False
+    return unit, f"started {unit}", "", False
+
+
 def _claim_and_launch(
     store,
     gated_rows,
@@ -1806,22 +2090,35 @@ def _claim_and_launch(
     stale_after,
     start_budget=None,
     day_cap=None,
+    released=None,
+    finished=None,
+    agent_states=None,
+    live_units=None,
 ):
     """Claim each proceeding candidate, launch each claim.
 
     Returns (rows, started, blocked, launched): the verdict rows to
-    print, the launched count, whether a launch failed because the
+    print, the start launches, whether a launch failed because the
     service manager was unreachable, and the (project, repo, number) of
-    every row the launcher actually launched. Only `start` claims and
-    launches, minting a fresh id with `mint_agent`; any other proceeding
-    kind is left unclaimed with a skip line, since its scheduling belongs
-    to a later ticket. A lost race (exit 2 from the store) becomes a skip
+    every row the launcher actually launched. `start` claims a fresh id
+    with `mint_agent` and launches a worker; `review` claims a fresh
+    reviewer id and launches a reviewer with the pre-release worker id
+    as its author; `resume` reuses the holder's claim (refreshed, so
+    the stuck sweep defers to it) and relaunches its session; `fix`
+    resumes when the holder is still usable and otherwise releases and
+    reclaims before restarting on the same branch, which the launch
+    path reuses. A lost race (exit 2 from the store) becomes a skip
     naming the holder and the pass moves on; a launch through `launcher`
-    appends the unit or the failure to the row's reason. With no
-    `launcher` the pass stops after claiming and records that, so no row
-    counts as launched. When `start_budget` is not None, at most that
-    many starts launch; further starts become `cap` skips naming
-    `day_cap`, and each launch spends one from the local budget.
+    appends the unit or the failure to the row's reason. `released`
+    ({(repo, number): worker id} released this pass) and `finished`
+    (the newest finished entry per ticket) feed the reviewer author.
+    With no `launcher` the pass stops after claiming and records that,
+    so no row counts as launched. The day cap counts `start` launches
+    only: resumes reuse an existing claim, and reviewer and fix rounds
+    answer finished work rather than starting new work. When
+    `start_budget` is not None, at most that many starts launch; further
+    starts become `cap` skips naming `day_cap`, and each start spends
+    one from the local budget.
     """
     rows: list = []
     started = 0
@@ -1832,20 +2129,255 @@ def _claim_and_launch(
             rows.append(gated)
             continue
         ref = f"{gated.repo}#{gated.number}"
-        if gated.kind != "start":
+        key = (gated.repo, gated.number)
+        if gated.kind == "review":
+            author = (released or {}).get(key)
+            if author is None:
+                newest = (finished or {}).get(key)
+                author = newest[0] if newest is not None else None
+            if not author:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{ref}: finished worker id lost, review skipped",
+                        code="claim",
+                    )
+                )
+                continue
+            agent, title, skipped = _fresh_claim(
+                store,
+                gated,
+                tracker_factory=tracker_factory,
+                operators=operators,
+                host=host,
+                now=now,
+                stale_after=stale_after,
+            )
+            if skipped is not None:
+                rows.append(skipped)
+                continue
+            if launcher is None:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict=gated.verdict,
+                        reason=f"{gated.reason}; launch skipped (no launcher)",
+                        code=gated.code,
+                    )
+                )
+                continue
+            unit, note, code, unreachable = _start_unit(
+                launcher,
+                project=gated.project,
+                repo=gated.repo,
+                number=gated.number,
+                kind="review",
+                agent=agent,
+                title=title,
+                now=now,
+                author=author,
+            )
+            blocked = blocked or unreachable
+            if unit is None:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{gated.reason}; {note}",
+                        code=code,
+                    )
+                )
+                continue
             rows.append(
                 Gated(
                     project=gated.project,
                     repo=gated.repo,
                     number=gated.number,
                     kind=gated.kind,
-                    verdict="skip",
-                    reason=(
-                        f"{ref}: {gated.kind} handoff is owned by a later ticket, left unclaimed"
-                    ),
-                    code="claim",
+                    verdict=gated.kind,
+                    reason=f"{gated.reason}; {note}",
+                    code="",
                 )
             )
+            launched.add((gated.project, gated.repo, gated.number))
+            continue
+        if gated.kind in ("resume", "fix"):
+            try:
+                claim = store.claim_of(gated.repo, gated.number)
+            except (board.StoreError, sqlite3.Error) as err:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{ref}: claim unreadable, fix refused ({err})",
+                        code="claim",
+                    )
+                )
+                continue
+            holder = claim.agent if claim is not None else ""
+            if not holder or not is_managed_agent(holder):
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{ref}: claim changed under the pass, left held",
+                        code="claim",
+                    )
+                )
+                continue
+            mode = fix_mode(
+                holder,
+                repo=gated.repo,
+                number=gated.number,
+                agent_states=agent_states,
+                live_units=live_units,
+            )
+            effective = "resume" if mode == "resume" else "fix"
+            if mode == "resume":
+                try:
+                    store.refresh_claim(gated.repo, gated.number, holder, claim.epoch, now=now)
+                except board.Claimed:
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind=effective,
+                            verdict="skip",
+                            reason=f"{ref}: resume raced a re-claim, left held",
+                            code="claim",
+                        )
+                    )
+                    continue
+                except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind=effective,
+                            verdict="skip",
+                            reason=f"{ref}: resume claim refused ({err}), left held",
+                            code="claim",
+                        )
+                    )
+                    continue
+                try:
+                    current, _ = store.item(gated.repo, gated.number, now=now)
+                except (board.StoreError, sqlite3.Error):
+                    current = None
+                title = current.title if current is not None and current.title else ref
+                agent = holder
+            else:
+                title, skipped = _refresh_title(
+                    store,
+                    gated,
+                    tracker_factory=tracker_factory,
+                    operators=operators,
+                    now=now,
+                    stale_after=stale_after,
+                    kind=effective,
+                )
+                if skipped is not None:
+                    rows.append(skipped)
+                    continue
+                try:
+                    store.release(gated.repo, gated.number, holder, claim.epoch, now=now)
+                except board.Claimed:
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind=effective,
+                            verdict="skip",
+                            reason=f"{ref}: fix release raced a re-claim, left held",
+                            code="claim",
+                        )
+                    )
+                    continue
+                except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind=effective,
+                            verdict="skip",
+                            reason=f"{ref}: fix release refused ({err}), left held",
+                            code="claim",
+                        )
+                    )
+                    continue
+                agent, skipped = _mint_claim(store, gated, host=host, now=now, kind=effective)
+                if skipped is not None:
+                    rows.append(skipped)
+                    continue
+            if launcher is None:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=effective,
+                        verdict=effective,
+                        reason=f"{gated.reason}; launch skipped (no launcher)",
+                        code="",
+                    )
+                )
+                continue
+            unit, note, code, unreachable = _start_unit(
+                launcher,
+                project=gated.project,
+                repo=gated.repo,
+                number=gated.number,
+                kind=effective,
+                agent=agent,
+                title=title,
+                now=now,
+            )
+            blocked = blocked or unreachable
+            if unit is None:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=effective,
+                        verdict="skip",
+                        reason=f"{gated.reason}; {note}",
+                        code=code,
+                    )
+                )
+                continue
+            rows.append(
+                Gated(
+                    project=gated.project,
+                    repo=gated.repo,
+                    number=gated.number,
+                    kind=effective,
+                    verdict=effective,
+                    reason=f"{gated.reason}; {note}",
+                    code="",
+                )
+            )
+            launched.add((gated.project, gated.repo, gated.number))
             continue
         if start_budget is not None and start_budget <= 0:
             rows.append(
@@ -1860,72 +2392,17 @@ def _claim_and_launch(
                 )
             )
             continue
-        fresh, problem = refresh_row(
+        agent, title, skipped = _fresh_claim(
             store,
-            tracker_factory,
-            gated.repo,
-            gated.number,
+            gated,
+            tracker_factory=tracker_factory,
             operators=operators,
+            host=host,
             now=now,
             stale_after=stale_after,
         )
-        if problem is not None:
-            rows.append(
-                Gated(
-                    project=gated.project,
-                    repo=gated.repo,
-                    number=gated.number,
-                    kind=gated.kind,
-                    verdict="skip",
-                    reason=problem,
-                    code="claim",
-                )
-            )
-            continue
-        agent = mint_agent(gated.repo, gated.number, host=host, now=now)
-        try:
-            store.claim(gated.repo, gated.number, agent, host, now=now)
-        except board.Claimed:
-            try:
-                current, _ = store.item(gated.repo, gated.number, now=now)
-            except (board.StoreError, sqlite3.Error) as err:
-                rows.append(
-                    Gated(
-                        project=gated.project,
-                        repo=gated.repo,
-                        number=gated.number,
-                        kind=gated.kind,
-                        verdict="skip",
-                        reason=f"{ref}: claim refused ({err})",
-                        code="claim",
-                    )
-                )
-                continue
-            seen = current.agent if current is not None else ""
-            rows.append(
-                Gated(
-                    project=gated.project,
-                    repo=gated.repo,
-                    number=gated.number,
-                    kind=gated.kind,
-                    verdict="skip",
-                    reason=f"{ref}: race lost to `{seen}`, the pass moves on",
-                    code="claim",
-                )
-            )
-            continue
-        except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
-            rows.append(
-                Gated(
-                    project=gated.project,
-                    repo=gated.repo,
-                    number=gated.number,
-                    kind=gated.kind,
-                    verdict="skip",
-                    reason=f"{ref}: claim refused ({err})",
-                    code="claim",
-                )
-            )
+        if skipped is not None:
+            rows.append(skipped)
             continue
         if launcher is None:
             rows.append(
@@ -1940,43 +2417,29 @@ def _claim_and_launch(
                 )
             )
             continue
-        title = fresh.title if fresh is not None and fresh.title else ref
-        try:
-            unit = launcher(
-                gated.project,
-                gated.repo,
-                gated.number,
-                gated.kind,
-                agent,
-                title,
-                now=now,
-            )
-        except units.UnitExists as err:
-            note = f"{gated.reason}; race lost, already live ({err})"
-            code = "launch"
-        except units.Unreachable as err:
-            blocked = True
-            note = f"{gated.reason}; not started: {err}"
-            code = "launch"
-        except Exception as err:
-            note = f"{gated.reason}; not started: {err}"
-            code = "launch"
-        else:
+        unit, note, code, unreachable = _start_unit(
+            launcher,
+            project=gated.project,
+            repo=gated.repo,
+            number=gated.number,
+            kind=gated.kind,
+            agent=agent,
+            title=title,
+            now=now,
+        )
+        blocked = blocked or unreachable
+        if unit is None:
             rows.append(
                 Gated(
                     project=gated.project,
                     repo=gated.repo,
                     number=gated.number,
                     kind=gated.kind,
-                    verdict=gated.kind,
-                    reason=f"{gated.reason}; started {unit}",
-                    code="",
+                    verdict="skip",
+                    reason=f"{gated.reason}; {note}",
+                    code=code,
                 )
             )
-            launched.add((gated.project, gated.repo, gated.number))
-            started += 1
-            if start_budget is not None:
-                start_budget -= 1
             continue
         rows.append(
             Gated(
@@ -1984,11 +2447,15 @@ def _claim_and_launch(
                 repo=gated.repo,
                 number=gated.number,
                 kind=gated.kind,
-                verdict="skip",
-                reason=note,
-                code=code,
+                verdict=gated.kind,
+                reason=f"{gated.reason}; {note}",
+                code="",
             )
         )
+        launched.add((gated.project, gated.repo, gated.number))
+        started += 1
+        if start_budget is not None:
+            start_budget -= 1
     return rows, started, blocked, launched
 
 
@@ -2079,28 +2546,115 @@ def production_orphan_inputs(registered, *, now):
     return present, tickets, cfg["gone_s"]
 
 
-def production_launcher(registered):
+def _reviewer_prompt(root, tgt, number, title, author):
+    """A `(workdir, branch) -> text` renderer for the reviewer role.
+
+    The worker id rides in the prompt text: the reviewer passes it as
+    `review record --author`, and the record refuses a self-review. A
+    blank author raises LaunchError before anything is claimed, since a
+    reviewer that cannot record is a wasted run. Validated before the
+    launch makes anything, so a bad override never leaves a stray branch
+    behind. The heartbeat lines go on in `launch.launch`, not here.
+    """
+    worker = str(author or "").strip()
+    if not worker:
+        raise launch.LaunchError(
+            f"{tgt.repo}#{number}: a reviewer launch needs the pre-release worker id as author"
+        )
+    block = reviewer_author_block(worker)
+    agents_md = os.path.join(tgt.clone, "AGENTS.md")
+    base = {
+        "issue": str(number),
+        "title": title,
+        "checks.test": tgt.resolved["checks.test"],
+        "overlay": _overlay_text(root),
+        "project_agents_md": (agents_md if os.path.isfile(agents_md) else "AGENTS.md (none found)"),
+    }
+    try:
+        prompts.render("reviewer", {**base, "worktree": "-", "branch": "-"}, ops_root=root)
+    except prompts.PromptsError as err:
+        raise launch.LaunchError(str(err)) from None
+
+    def render_prompt(workdir, branch):
+        try:
+            text = prompts.render(
+                "reviewer", {**base, "worktree": workdir, "branch": branch}, ops_root=root
+            )
+        except prompts.PromptsError as err:
+            raise launch.LaunchError(str(err)) from None
+        return text + block
+
+    return render_prompt
+
+
+def production_launcher(registered, *, store=None, hold_label=None):
     """The launch handoff over the existing launch path.
 
     Returns `launch_one(project, repo, number, kind, agent, title, *,
-    now)`: the unit name of the started agent. Only `start` launches;
-    any other kind stays with a later ticket. The target resolves from
-    the project's ops root, the prompt renders the worker role with the
-    board title, and the unit starts through `launch.launch` with the
-    production seams. Failures raise with the public exit code.
+    now, author=None)`: the unit name of the started agent. `start` and
+    `fix` launch a worker (a fix reuses the ticket's branch through the
+    launch path); `review` launches with the reviewer role and the
+    worker id as its author, which the prompt carries to record time;
+    `resume` relaunches the holder's session with the fix message. The
+    target resolves from the project's ops root, and the unit starts
+    through `launch.launch` (or `launch.resume`) with the production
+    seams. A review without an author, a resume without the store-backed
+    hold check, and an unknown project all raise `LaunchError` before
+    anything is made. Failures raise with the public exit code.
     """
 
-    def launch_one(project, repo, number, kind, agent, title, *, now):
+    def launch_one(project, repo, number, kind, agent, title, *, now, author=None):
         _ = (agent, now)
-        if kind != "start":
+        if kind not in ("start", "review", "resume", "fix"):
+            raise launch.LaunchError(f"{repo}#{number}: unknown drive kind {kind!r}")
+        if kind == "review" and not (author or "").strip():
             raise launch.LaunchError(
-                f"{repo}#{number}: {kind} handoff is owned by a later ticket, claim kept"
+                f"{repo}#{number}: a reviewer launch needs the pre-release worker id as author"
             )
+        if kind == "resume" and (store is None or hold_label is None):
+            raise launch.LaunchError(f"{repo}#{number}: a resume needs the store hold check")
         entry = next((item for item in registered if item.name == project), None)
         if entry is None:
             raise launch.LaunchError(f"unknown project {project!r} for {repo}#{number}")
         local = _local_repo(entry.root, repo)
         tgt = launch.target(entry.root, local)
+
+        def list_fn(prefix):
+            return units.list_units(prefix, run=units.default_run)
+
+        if kind == "review":
+            factory = _reviewer_prompt(entry.root, tgt, number, title, author)
+            unit, _ = launch.launch(
+                tgt,
+                number,
+                factory,
+                title=title,
+                role="reviewer",
+                list_fn=list_fn,
+                run=units.default_run,
+                usage=disk.production_usage,
+            )
+            return unit
+        if kind == "resume":
+            # Validated above: a resume always has the store hold check.
+
+            def hold_reason_fn(resume_tgt, resume_number):
+                _ = (resume_tgt, resume_number)
+                return hold.reason(
+                    _store_labels(store, now), (repo, number), (), hold_label=hold_label
+                )
+
+            unit, _ = launch.resume(
+                tgt,
+                number,
+                fix_message(repo, number),
+                hold_reason_fn=hold_reason_fn,
+                list_fn=list_fn,
+                run=units.default_run,
+                usage=disk.production_usage,
+                git=worktrees.git,
+            )
+            return unit
         factory = _worker_prompt(entry.root, tgt, number, title)
         unit, _ = launch.launch(
             tgt,
@@ -2108,7 +2662,7 @@ def production_launcher(registered):
             factory,
             title=title,
             role="worker",
-            list_fn=lambda prefix: units.list_units(prefix, run=units.default_run),
+            list_fn=list_fn,
             run=units.default_run,
             usage=disk.production_usage,
         )
@@ -2145,6 +2699,7 @@ def _launching_pass(
     restarter,
     restarts_path,
     stuck_project,
+    finished_for=None,
     journal_path=None,
     day_path=None,
     max_starts=None,
@@ -2271,6 +2826,8 @@ def _launching_pass(
     else:
         present_agents = frozenset(present_agents or ())
         live_units = frozenset(live_units or ())
+    authors = finished_holders(store, agent_states=agent_states) if agent_states is not None else {}
+    finished = resolve_finished(finished_for, authors)
     if agent_states is not None:
         try:
             release_finished(
@@ -2323,6 +2880,8 @@ def _launching_pass(
         ledger_data=ledger_data,
         read_labels=read_labels,
         hold_label=hold_label,
+        released=authors,
+        finished=finished,
     )
     if host is None:
         try:
@@ -2348,6 +2907,10 @@ def _launching_pass(
         stale_after=stale_after,
         start_budget=start_budget,
         day_cap=max_starts,
+        released=authors,
+        finished=finished,
+        agent_states=agent_states,
+        live_units=live_units,
     )
     if agent_states is not None:
         defaults = registry.default_config()
@@ -2486,6 +3049,7 @@ def run_pass(
     restarter=None,
     restarts_path=None,
     stuck_project=None,
+    finished_for=None,
     journal_path=None,
     pause_path=None,
     day_path=None,
@@ -2518,7 +3082,10 @@ def run_pass(
     `launcher` when None) relaunches it, `restarts_path` persists the
     budget (in memory when None), and `stuck_project(repo, number)`
     names the owning project. With no stop or launch seam a stuck row is
-    left held; a failed seam keeps the claim. When `pause_path` names an
+    left held; a failed seam keeps the claim. `finished_for`
+    ({(repo, number): (agent id, role)} for the newest finished entry per
+    ticket) feeds the reviewer and fix-round readiness alongside the
+    same-pass releases. When `pause_path` names an
     existing pause file, either pass reports it and exits 1, starting
     nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
@@ -2550,7 +3117,15 @@ def run_pass(
         "pool": pool,
     }
     if plan:
-        return _pass(store, out, err, label="plan", **args)
+        return _pass(
+            store,
+            out,
+            err,
+            label="plan",
+            agent_states=agent_states,
+            finished_for=finished_for,
+            **args,
+        )
     try:
         with drive_lock(lock_path):
             return _launching_pass(
@@ -2571,6 +3146,7 @@ def run_pass(
                 restarter=restarter,
                 restarts_path=restarts_path,
                 stuck_project=stuck_project,
+                finished_for=finished_for,
                 journal_path=journal_path,
                 day_path=day_path,
                 max_starts=max_starts,
@@ -2618,12 +3194,26 @@ def cmd_drive(args: argparse.Namespace) -> int:
         print(f"corral drive: {problem}", file=sys.stderr)
         return USAGE
     try:
-        max_starts = settings.load(root=None)["drive.max_starts_per_day"]
+        host_settings = settings.load(root=None)
+        max_starts = host_settings["drive.max_starts_per_day"]
+        hold_label = host_settings["board.hold_label"]
     except settings.SettingsError as problem:
         print(f"corral drive: {problem}", file=sys.stderr)
         return USAGE
     with store:
         if args.plan:
+            try:
+                registered = projects.load_all()
+            except projects.ProjectsError as problem:
+                print(f"corral drive: {problem}", file=sys.stderr)
+                return USAGE
+            moment = time.time()
+            try:
+                planned_states, _ = production_stuck_inputs(registered, now=moment)
+                planned_finished = production_finished_for(now=moment)
+            except settings.SettingsError as problem:
+                print(f"corral drive: {problem}", file=sys.stderr)
+                return USAGE
             return run_pass(
                 plan=True,
                 store=store,
@@ -2631,6 +3221,8 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 out=sys.stdout,
                 err=sys.stderr,
                 pause_path=pause_path(),
+                agent_states=planned_states,
+                finished_for=planned_finished,
             )
         try:
             registered = projects.load_all()
@@ -2658,8 +3250,10 @@ def cmd_drive(args: argparse.Namespace) -> int:
         def tracker_factory(repo, _by_repo=by_repo):
             return _by_repo[repo]
 
+        moment = time.time()
         try:
-            stuck_states, stuck_stale = production_stuck_inputs(registered, now=time.time())
+            stuck_states, stuck_stale = production_stuck_inputs(registered, now=moment)
+            finished_for = production_finished_for(now=moment)
         except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=sys.stderr)
             return USAGE
@@ -2672,12 +3266,13 @@ def cmd_drive(args: argparse.Namespace) -> int:
             projects_fn=lambda: registered,
             tracker_factory=tracker_factory,
             operators=operators,
-            launcher=production_launcher(registered),
+            launcher=production_launcher(registered, store=store, hold_label=hold_label),
             agent_states=stuck_states,
             stale_s=stuck_stale,
             stop_unit=production_stopper(registered),
             restarts_path=restarts_path(),
             stuck_project=lambda repo, number: production_stuck_project(registered, repo),
+            finished_for=finished_for,
             journal_path=journal_path(),
             pause_path=pause_path(),
             day_path=day_path(),

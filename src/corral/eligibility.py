@@ -98,8 +98,9 @@ class StartRequest:
 
 def row_from_item(item: board.Item) -> TicketRow:
     """The policy view of one board store item. Pure."""
-    # pulls stays empty here; the reviewer-scheduling pass (ticket 6 of
-    # docs/04-dispatch-loop.md) populates it from linked pull requests.
+    # pulls stays empty here: no provider-neutral link joins a store row
+    # to its pull requests, so only policies and tests set it. A linked
+    # pull the store cannot serve fails the drive hold gate closed.
     # Board concepts ride along in extra, copied on read so no two rows
     # share one dict; a missing value reads as carrying nothing.
     return TicketRow(

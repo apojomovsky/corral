@@ -276,9 +276,30 @@ class ClaimRoutingTest(unittest.TestCase):
         gated = gate(entry(kind="start"))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
-    def test_an_unclaimed_review_proceeds(self):
-        gated = gate(entry(kind="review"))
+    def test_an_unclaimed_review_with_a_finished_worker_proceeds(self):
+        gated = gate(entry(kind="review"), finished={("app", 7): ("drive-w-1", "worker")})
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+        self.assertIn("review slot", gated.reason)
+
+    def test_a_review_without_a_finished_worker_is_not_pr_ready(self):
+        gated = gate(entry(kind="review"))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("nothing to review", gated.reason)
+
+    def test_a_review_after_a_review_is_merge_ready(self):
+        gated = gate(entry(kind="review"), finished={("app", 7): ("drive-r-1", "reviewer")})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_fix_after_the_fix_landed_is_skipped(self):
+        gated = gate(entry(kind="fix"), finished={("app", 7): ("drive-w-2", "worker")})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("fix already landed", gated.reason)
+
+    def test_a_fix_after_a_review_starts_fresh(self):
+        gated = gate(entry(kind="fix"), finished={("app", 7): ("drive-r-1", "reviewer")})
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+        self.assertIn("fresh start", gated.reason)
 
 
 class HoldGateTest(unittest.TestCase):

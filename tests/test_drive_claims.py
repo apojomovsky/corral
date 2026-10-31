@@ -33,8 +33,8 @@ class FakeLauncher:
         self.calls = []
         self.errors = {}
 
-    def __call__(self, project, repo, number, kind, agent, title, *, now):
-        self.calls.append((project, repo, number, kind, agent, title))
+    def __call__(self, project, repo, number, kind, agent, title, *, now, author=None):
+        self.calls.append((project, repo, number, kind, agent, title, author))
         if (repo, number) in self.errors:
             raise self.errors[(repo, number)]
         return f"{agent}-unit"
@@ -156,7 +156,7 @@ class ClaimLaunchTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         self.assertEqual(len(launcher.calls), 1)
-        project, repo, number, kind, agent, title = launcher.calls[0]
+        project, repo, number, kind, agent, title, _author = launcher.calls[0]
         self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "start"))
         self.assertTrue(agent.startswith("drive-"))
         self.assertNotIn("/", agent)
@@ -177,7 +177,7 @@ class ClaimLaunchTest(unittest.TestCase):
         self.assertEqual(store.queued_writes(), [])
         self.assertIn(("write", "app", 7, "agent", launcher.calls[0][4]), fake.calls)
 
-    def test_a_gated_review_is_left_unclaimed_for_a_later_ticket(self):
+    def test_a_review_without_a_finished_worker_stays_unclaimed(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
@@ -188,7 +188,7 @@ class ClaimLaunchTest(unittest.TestCase):
         row, _ = store.item("app", 7, now=2000.0)
         self.assertEqual(row.agent, "")
         self.assertEqual(store.queued_writes(), [])
-        self.assertIn("later ticket", out)
+        self.assertIn("nothing to review", out)
 
     def test_plan_with_a_tracker_and_launcher_writes_nothing(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -339,7 +339,7 @@ class RaceTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err.getvalue(), "")
         self.assertIn("race lost to `drive-rival-1`", out.getvalue())
-        started = {(repo, number) for _, repo, number, _, _, _ in launcher.calls}
+        started = {(repo, number) for _, repo, number, _, _, _, _ in launcher.calls}
         self.assertEqual(started, {("app", 9)})
 
 
@@ -400,13 +400,29 @@ class LaunchFailureTest(unittest.TestCase):
 
 
 class ProductionLauncherTest(unittest.TestCase):
-    def test_non_start_kinds_stay_with_a_later_ticket(self):
+    def test_an_unknown_kind_is_refused(self):
+        from corral import launch
+
+        launcher = drive.production_launcher([])
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launcher("blue", "app", 7, "reboot", "drive-x", "Title", now=2000.0)
+        self.assertIn("reboot", str(ctx.exception))
+
+    def test_a_review_without_an_author_is_refused_before_any_launch(self):
+        from corral import launch
+
+        launcher = drive.production_launcher([])
+        with self.assertRaises(launch.LaunchError) as ctx:
+            launcher("blue", "app", 7, "review", "drive-x", "Title", now=2000.0)
+        self.assertIn("author", str(ctx.exception))
+
+    def test_a_resume_without_the_hold_check_is_refused(self):
         from corral import launch
 
         launcher = drive.production_launcher([])
         with self.assertRaises(launch.LaunchError) as ctx:
             launcher("blue", "app", 7, "resume", "drive-x", "Title", now=2000.0)
-        self.assertIn("later ticket", str(ctx.exception))
+        self.assertIn("hold check", str(ctx.exception))
 
     def test_unknown_project_is_a_launch_error(self):
         from corral import launch
@@ -665,7 +681,7 @@ class OutageTest(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn("connection refused", err.getvalue())
-        started = {(repo, number) for _, repo, number, _, _, _ in launcher.calls}
+        started = {(repo, number) for _, repo, number, _, _, _, _ in launcher.calls}
         self.assertEqual(started, {("app", 7), ("other", 9)})
         self.assertIsNone(store.get_cursor("other", sync.CURSOR_NAME))
 
@@ -899,7 +915,7 @@ class ClaimSqliteTest(unittest.TestCase):
         self.assertEqual(err.getvalue(), "")
         self.assertIn("claim refused", out.getvalue())
         self.assertIn("database is locked", out.getvalue())
-        started = {(repo, number) for _, repo, number, _, _, _ in launcher.calls}
+        started = {(repo, number) for _, repo, number, _, _, _, _ in launcher.calls}
         self.assertEqual(started, {("app", 9)})
         row, _ = store.item("app", 7, now=2000.0)
         self.assertEqual(row.agent, "")
