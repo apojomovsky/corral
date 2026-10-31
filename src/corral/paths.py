@@ -133,14 +133,22 @@ def leaf_ticket(path):
 
     A `<ticket>/<role>-<gen>` leaf belongs to its parent ticket; a
     legacy leaf is its own ticket root. Hygiene re-verifies the proof
-    against this ticket just before deleting.
+    against this ticket just before deleting. The parent parse wins only
+    when the base cannot name a ticket dir itself, or names a known role
+    (a genuine leaf): otherwise a sessions root whose own basename parses
+    as `<repo>-<m>` would steal a legacy candidate for the parent's
+    ticket.
     """
+    from corral import prompts  # Lazy: settings imports paths at load time.
+
     base = os.path.basename(path)
     parent = os.path.basename(os.path.dirname(path))
     if _ROLE_SESSION_RE.fullmatch(base):
-        parsed = parse_ticket_dirname(parent)
-        if parsed is not None:
-            return parsed
+        parent_ticket = parse_ticket_dirname(parent)
+        if parent_ticket is not None and (
+            parse_ticket_dirname(base) is None or base.rpartition("-")[0] in prompts.ROLES
+        ):
+            return parent_ticket
     return parse_ticket_dirname(base)
 
 
@@ -177,41 +185,35 @@ def _legacy_session(ticket):
     return any(os.path.isfile(os.path.join(ticket, name)) for name in names)
 
 
-def _legacy_role(ticket):
+def _legacy_role(ticket, *, on_error="strict"):
     """The role a legacy ticket root was launched with.
 
-    Missing reads as worker, the worker behaviour. An unreadable or
-    unknown role record is a usage error: failing open would resume a
-    reviewer with write access, or a worker read-only.
+    Missing reads as worker, the worker behaviour. `on_error` decides
+    what a damaged record does: "strict" raises a usage error (resume
+    and tail fail closed: resuming a reviewer with write access, or a
+    worker read-only, must be impossible), "lenient" keeps the record
+    as-is, worker when it is missing or empty (stop and listings union
+    over every leaf they can prove; a damaged record must not hide a
+    session's units). Anything else is a programmer error.
     """
     from corral import prompts  # Lazy: settings imports paths at load time.
 
+    if on_error not in ("strict", "lenient"):
+        raise ValueError(f"on_error must be 'strict' or 'lenient', not {on_error!r}")
     try:
         with open(os.path.join(ticket, "role"), encoding="utf-8") as handle:
             role = handle.read().strip()
     except FileNotFoundError:
         return prompts.DEFAULT_ROLE
     except OSError as err:
+        if on_error == "lenient":
+            return prompts.DEFAULT_ROLE
         raise PathError(f"cannot read the agent's role: {err}") from None
     if role not in prompts.ROLES:
+        if on_error == "lenient":
+            return role or prompts.DEFAULT_ROLE
         raise PathError(f"unknown role {role!r}: expected one of {', '.join(prompts.ROLES)}")
     return role
-
-
-def _legacy_role_lenient(ticket):
-    """The legacy role for listings: never raises, never skips.
-
-    Stop, close-previous and hygiene union over every leaf they can
-    prove; a damaged record must not hide a session's units from them.
-    The resume decision uses `_legacy_role` instead and fails closed.
-    """
-    from corral import prompts  # Lazy: settings imports paths at load time.
-
-    try:
-        with open(os.path.join(ticket, "role"), encoding="utf-8") as handle:
-            return handle.read().strip() or prompts.DEFAULT_ROLE
-    except OSError:
-        return prompts.DEFAULT_ROLE
 
 
 def _role_leaves(ticket):
@@ -246,31 +248,38 @@ def ticket_sessions(repo, number, env=None, root=None):
     ticket = ticket_session_dir(repo, number, env=env, root=root)
     found = []
     if _legacy_session(ticket):
-        found.append(Session(ticket, _legacy_role_lenient(ticket), 0))
+        found.append(Session(ticket, _legacy_role(ticket, on_error="lenient"), 0))
     return found + _role_leaves(ticket)
 
 
 def newest_session(repo, number, role=None, env=None, root=None):
     """The newest session dir of one ticket and role, or None.
 
-    `role` None reads as worker, the worker behaviour. A role
-    generation dir wins over the legacy dir; the highest generation
-    wins. The legacy dir matches only its recorded role. An unreadable
-    or unknown legacy role record is a usage error.
+    A filter over `ticket_sessions`: `role` None reads as worker, the
+    worker behaviour. A role generation dir wins over the legacy dir;
+    the highest generation wins. The legacy dir matches only its
+    recorded role, checked strictly, but only when the legacy dir is
+    the selected leaf: an unreadable or unknown role record next to a
+    healthy role leaf does not block that leaf. On the legacy dir the
+    record is a usage error.
     """
     from corral import prompts  # Lazy: settings imports paths at load time.
 
     want = str(role or "") or prompts.DEFAULT_ROLE
     ticket = ticket_session_dir(repo, number, env=env, root=root)
     best = None
-    for session in _role_leaves(ticket):
+    legacy = False
+    for session in ticket_sessions(repo, number, env=env, root=root):
+        if session.path == ticket:
+            legacy = True
+            continue
         if session.role == want and (best is None or session.gen > best.gen):
             best = session
     if best is not None:
         return best.path
-    if not _legacy_session(ticket):
+    if not legacy:
         return None
-    if _legacy_role(ticket) != want:
+    if _legacy_role(ticket, on_error="strict") != want:
         return None
     return ticket
 

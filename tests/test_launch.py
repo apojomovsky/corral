@@ -1391,6 +1391,79 @@ class StopUnprovenTest(OpsCase):
         self.assertEqual(self.system.stopped, [])
         self.assertIn("corral-agent-lib-5-r7", err.getvalue())
 
+    def start_two_roles(self):
+        worker_unit, _ = launch.launch(
+            self.target("lib"),
+            5,
+            "worker prompt",
+            title="feat: worker",
+            role="worker",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.system.finish(worker_unit)
+        reviewer_unit, _ = launch.launch(
+            self.target("lib"),
+            5,
+            "reviewer prompt",
+            title="feat: reviewer",
+            role="reviewer",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.system.units[worker_unit] = "active"
+        return worker_unit, reviewer_unit
+
+    def test_stop_reads_the_live_listing_once(self):
+        tgt = self.target("lib")
+        worker_unit, reviewer_unit = self.start_two_roles()
+        calls = []
+
+        def counting(prefix):
+            calls.append(prefix)
+            return self.system.list_fn(prefix)
+
+        stopped = launch.stop(tgt, 5, list_fn=counting, stop_fn=self.system.stop_fn)
+        self.assertEqual(sorted(stopped), sorted([worker_unit, reviewer_unit]))
+        self.assertEqual(calls, [tgt.prefix])
+
+    def test_stop_lets_an_unreachable_through_unwrapped(self):
+        tgt = self.target("lib")
+        self.start_two_roles()
+        calls = []
+
+        def counting(prefix):
+            calls.append(prefix)
+            return self.system.list_fn(prefix)
+
+        seen = []
+
+        def flaky_stop(unit):
+            seen.append(unit)
+            if len(seen) > 1:
+                raise units.Unreachable("bus gone")
+            self.system.stop_fn(unit)
+
+        with self.assertRaises(units.Unreachable) as ctx:
+            launch.stop(tgt, 5, list_fn=counting, stop_fn=flaky_stop)
+        self.assertIs(type(ctx.exception), units.Unreachable)
+        self.assertEqual(ctx.exception.exit_code, 3)
+        self.assertEqual(calls, [tgt.prefix])
+
+    def test_unproven_reads_the_live_listing_once(self):
+        tgt = self.target("lib")
+        self.start_two_roles()
+        calls = []
+
+        def counting(prefix):
+            calls.append(prefix)
+            return self.system.list_fn(prefix)
+
+        self.assertEqual(launch.unproven(tgt, 5, list_fn=counting), [])
+        self.assertEqual(calls, [tgt.prefix])
+
 
 class ModelChainsFreshnessTest(unittest.TestCase):
     def test_chains_use_the_minimum_bound_of_their_own_providers(self):
