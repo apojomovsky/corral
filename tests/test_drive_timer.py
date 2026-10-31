@@ -64,15 +64,15 @@ class TimerDir(unittest.TestCase):
         self.assertTrue(drive.timer_dir(env).endswith(os.path.join("systemd", "user")))
 
     def test_home_config_is_the_default_base(self):
-        with mock.patch.object(os.path, "expanduser", return_value="/home/someone") as home:
+        with mock.patch.object(os.path, "expanduser", return_value="/srv/user") as home:
             directory = drive.timer_dir({})
         home.assert_called_once_with("~/.config")
-        self.assertEqual(directory, os.path.join("/home/someone", "systemd", "user"))
+        self.assertEqual(directory, os.path.join("/srv/user", "systemd", "user"))
 
     def test_a_relative_config_base_is_ignored(self):
-        with mock.patch.object(os.path, "expanduser", return_value="/home/someone"):
+        with mock.patch.object(os.path, "expanduser", return_value="/srv/user"):
             directory = drive.timer_dir({"XDG_CONFIG_HOME": "relative/path"})
-        self.assertEqual(directory, os.path.join("/home/someone", "systemd", "user"))
+        self.assertEqual(directory, os.path.join("/srv/user", "systemd", "user"))
 
 
 class TimerState(unittest.TestCase):
