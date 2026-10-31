@@ -1302,7 +1302,7 @@ def give_up_body(repo, number, *, observed, restarts):
 
     Pure. The body carries the tail of what the pass observed, so the
     human taking over sees why the loop walked away. It never names the
-    agent id: the id carries the host name and this body is posted to
+    agent id: the id carries the host segment (a hash or a display name) and this body is posted to
     the tracker, so it stays out of every give-up comment.
     """
     ref = f"{repo}#{number}"
