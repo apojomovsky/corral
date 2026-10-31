@@ -265,9 +265,7 @@ class LaunchModels(OpsCase):
         )
 
     def overlay(self, repo="lib", number=5):
-        with open(
-            os.path.join(self.session(repo, number), "overlay.yml"), encoding="utf-8"
-        ) as handle:
+        with open(os.path.join(self.leaf(repo, number), "overlay.yml"), encoding="utf-8") as handle:
             return handle.read()
 
     def test_a_launch_routes_around_an_exhausted_provider(self):

@@ -212,11 +212,6 @@ def _done_tickets(entries, now):
     }
 
 
-def _session_dirname(ticket):
-    repo, number = ticket
-    return f"{repo}-{number}"
-
-
 def plan(
     *,
     state_dir,
@@ -317,17 +312,19 @@ def plan(
         if not is_dir:
             continue
         session_names.add(name)
+        parsed = paths.parse_ticket_dirname(name)
         ticket = None
-        for known in done:
-            if _session_dirname(known) == name:
-                ticket = known
-                break
-        if ticket is None:
-            for entry in entries:
-                held = registry.ticket_of(entry)
-                if held is not None and _session_dirname(held) == name:
-                    ticket = held
+        if parsed is not None:
+            for known in done:
+                if known == parsed:
+                    ticket = known
                     break
+            if ticket is None:
+                for entry in entries:
+                    held = registry.ticket_of(entry)
+                    if held == parsed:
+                        ticket = held
+                        break
         if ticket is None:
             candidates.append(
                 Candidate(
@@ -339,36 +336,49 @@ def plan(
                 )
             )
             continue
-        state = "done" if ticket in done else "open"
-        is_live = live is not None and ticket in live
-        latest = newest_mtime(path)
-        old = latest is not None and latest < cutoff
-        reasons = []
-        if state != "done":
-            reasons.append("the registry entry is still open")
-        if live is None:
-            reasons.append("the live listing failed")
-        elif is_live:
-            reasons.append("a live unit holds it")
-        if latest is None:
-            reasons.append("its modification time is unreadable")
-        elif not old:
-            reasons.append("it was modified within the retention")
-        if state == "done" and not is_live and live is not None and old:
+        leaves = [s.path for s in paths.ticket_sessions(*parsed, root=sessions_dir)]
+        if not leaves:
             candidates.append(
                 Candidate(
-                    SESSION,
+                    UNPROVEN,
                     path,
                     walk(path),
-                    f"registry {state}; no live unit; "
-                    f"untouched since retention ({session_retention_days}d)",
-                    True,
+                    f"ticket dir {name} holds no session: cannot prove nothing is lost",
+                    False,
                 )
             )
-        else:
-            candidates.append(
-                Candidate(SESSION, path, walk(path), f"kept: {'; '.join(reasons)}", False)
-            )
+            continue
+        state = "done" if ticket in done else "open"
+        is_live = live is not None and ticket in live
+        for leaf in leaves:
+            latest = newest_mtime(leaf)
+            old = latest is not None and latest < cutoff
+            reasons = []
+            if state != "done":
+                reasons.append("the registry entry is still open")
+            if live is None:
+                reasons.append("the live listing failed")
+            elif is_live:
+                reasons.append("a live unit holds it")
+            if latest is None:
+                reasons.append("its modification time is unreadable")
+            elif not old:
+                reasons.append("it was modified within the retention")
+            if state == "done" and not is_live and live is not None and old:
+                candidates.append(
+                    Candidate(
+                        SESSION,
+                        leaf,
+                        walk(leaf),
+                        f"registry {state}; no live unit; "
+                        f"untouched since retention ({session_retention_days}d)",
+                        True,
+                    )
+                )
+            else:
+                candidates.append(
+                    Candidate(SESSION, leaf, walk(leaf), f"kept: {'; '.join(reasons)}", False)
+                )
 
     for gc_path, proof, planned in gc_rows:
         if not planned:
@@ -469,12 +479,8 @@ def apply(candidates, *, remove, roots, session_retention_days, now, entries, li
             if not is_dir:
                 result.kept.append((candidate.path, "not a directory"))
                 continue
-            name = os.path.basename(candidate.path)
-            ticket = next(
-                (known for known in done if _session_dirname(known) == name),
-                None,
-            )
-            if ticket is None:
+            ticket = paths.leaf_ticket(candidate.path)
+            if ticket is None or ticket not in done:
                 result.kept.append((candidate.path, "registry entry is no longer done"))
                 continue
             if live is None:

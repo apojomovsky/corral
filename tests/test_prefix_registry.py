@@ -113,7 +113,7 @@ class LaunchRegistersTest(PrefixOps):
     def test_resume_retires_the_old_entry_and_registers_the_new(self):
         unit, _ = self.start()
         self.system.finish(unit)
-        with open(os.path.join(self.session("lib", 5), "chat.jsonl"), "w") as h:
+        with open(os.path.join(self.leaf("lib", 5), "chat.jsonl"), "w") as h:
             h.write("{}\n")
         resumed, _ = launch.resume(
             launch.target(self.root, "lib"),
@@ -206,7 +206,7 @@ class RegisterBeforeStartTest(PrefixOps):
 
     def finish_and_seed_session(self, unit, number=5):
         self.system.finish(unit)
-        with open(os.path.join(self.session("lib", number), "chat.jsonl"), "w") as handle:
+        with open(os.path.join(self.leaf("lib", number), "chat.jsonl"), "w") as handle:
             handle.write("{}\n")
 
     def live_units(self):
@@ -273,7 +273,7 @@ class HeartbeatForEveryPromptTest(PrefixOps):
             run=self.system.run,
             usage=roomy,
         )
-        with open(os.path.join(self.session(repo, number), "prompt.md"), encoding="utf-8") as h:
+        with open(os.path.join(self.leaf(repo, number), "prompt.md"), encoding="utf-8") as h:
             return h.read()
 
     def test_no_builtin_carries_its_own_heartbeat_copy(self):
@@ -320,7 +320,7 @@ class StopClosesEveryEntryTest(PrefixOps):
         second = units.unit_name("ops-agent", "lib", 5, 1)
         registry.register(second, "omp", ticket=registry.make_ticket("lib", 5, "ops"))
         self.system.units[second] = "active"
-        with open(os.path.join(self.session("lib", 5), "units.log"), "a", encoding="utf-8") as h:
+        with open(os.path.join(self.leaf("lib", 5), "units.log"), "a", encoding="utf-8") as h:
             h.write(second + "\n")
         calls = []
         real_done = registry.done

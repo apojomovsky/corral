@@ -13,7 +13,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import board, doctor, launchcli, prompts, promptscli, settings
+from corral import board, doctor, launchcli, paths, prompts, promptscli, settings
 from tests.test_board import reading
 from tests.test_doctor import env as doctor_env
 from tests.test_launch import OpsCase
@@ -351,9 +351,9 @@ class LaunchRoleTest(OpsCase):
             code = launchcli.run_verb([*argv, "--root", self.root], seams)
         return code, out.getvalue(), err.getvalue()
 
-    def prompt_of(self, repo, number):
+    def prompt_of(self, repo, number, role="worker"):
         with open(
-            os.path.join(self.session(repo, number), "prompt.md"), encoding="utf-8"
+            os.path.join(paths.newest_session(repo, number, role), "prompt.md"), encoding="utf-8"
         ) as handle:
             return handle.read()
 
@@ -407,7 +407,7 @@ class LaunchRoleTest(OpsCase):
             board_fn=lambda repo, number: item,
         )
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("Seam title", self.prompt_of("lib", 8))
+        self.assertIn("Seam title", self.prompt_of("lib", 8, role="reviewer"))
 
     def test_role_without_a_title_names_the_flag(self):
         code, _, err = self.run_launch(["launch", "lib", "7", "--role", "worker"])

@@ -145,6 +145,10 @@ class OpsCase(unittest.TestCase):
     def session(self, repo, number):
         return paths.ticket_session_dir(repo, number)
 
+    def leaf(self, repo, number, role="worker"):
+        """The ticket's newest session leaf of `role`; None when never launched."""
+        return paths.newest_session(repo, number, role)
+
     def worktrees_of(self, repo):
         clone = os.path.join(self.root, "clones", repo)
         return (
@@ -261,7 +265,7 @@ class LaunchTest(OpsCase):
         )
         self.assertTrue(os.path.isdir(workdir))
 
-        session = self.session("lib", 5)
+        session = self.leaf("lib", 5)
         with open(os.path.join(session, "prompt.md"), encoding="utf-8") as h:
             text = h.read()
         self.assertTrue(text.startswith("do the thing\n\n"))
@@ -394,7 +398,7 @@ class LaunchTest(OpsCase):
 
     def test_the_runtime_config_is_written_into_the_session(self):
         self.start("opencode", runtime_config={"model": "provider-a/model-1"})
-        with open(os.path.join(self.session("lib", 5), "opencode.json"), encoding="utf-8") as h:
+        with open(os.path.join(self.leaf("lib", 5), "opencode.json"), encoding="utf-8") as h:
             self.assertEqual(json.load(h), {"model": "provider-a/model-1"})
 
     def test_a_bad_model_in_the_runtime_config_is_a_configuration_error(self):
@@ -431,7 +435,7 @@ class LaunchTest(OpsCase):
         self.system.fail = "Unit corral-agent-lib-5.service already exists."
         with self.assertRaises(units.UnitExists):
             self.start("omp")
-        self.assertFalse(os.path.exists(os.path.join(self.session("lib", 5), units.UNITS_LOG)))
+        self.assertFalse(os.path.exists(os.path.join(self.leaf("lib", 5), units.UNITS_LOG)))
 
     def test_bad_inputs_are_configuration_errors_before_anything_runs(self):
         for kwargs in (
@@ -465,11 +469,9 @@ class LaunchTest(OpsCase):
             usage=roomy,
             run=self.system.run,
         )
-        self.assertNotEqual(self.session("lib", 5), self.session("my-repo", 5))
-        self.assertEqual(units.started_units(self.session("lib", 5)), ["corral-agent-lib-5"])
-        self.assertEqual(
-            units.started_units(self.session("my-repo", 5)), ["corral-agent-my-repo-5"]
-        )
+        self.assertNotEqual(self.leaf("lib", 5), self.leaf("my-repo", 5))
+        self.assertEqual(units.started_units(self.leaf("lib", 5)), ["corral-agent-lib-5"])
+        self.assertEqual(units.started_units(self.leaf("my-repo", 5)), ["corral-agent-my-repo-5"])
         self.assertEqual(
             launch.stop(
                 self.target("lib"), 5, list_fn=self.system.list_fn, stop_fn=self.system.stop_fn
@@ -497,7 +499,7 @@ class MuseSessionTest(OpsCase):
             usage=roomy,
         )
         self.assertEqual(unit, "corral-agent-lib-5")
-        session = self.session("lib", 5)
+        session = self.leaf("lib", 5)
         with open(os.path.join(session, "muse_session_id"), encoding="utf-8") as h:
             recorded = h.read().strip()
         self.assertEqual(str(uuid.UUID(recorded, version=4)), recorded)
@@ -534,7 +536,7 @@ class MuseSessionTest(OpsCase):
             usage=roomy,
         )
         self.system.finish(unit)
-        os.remove(os.path.join(self.session("lib", 5), "muse_session_id"))
+        os.remove(os.path.join(self.leaf("lib", 5), "muse_session_id"))
         with self.assertRaisesRegex(launch.LaunchError, "no muse session to resume"):
             launch.resume(
                 self.target("lib"),
@@ -560,7 +562,7 @@ class MuseSessionTest(OpsCase):
                 usage=roomy,
             )
         self.assertEqual(ctx.exception.exit_code, 3)
-        session = self.session("lib", 5)
+        session = self.leaf("lib", 5)
         self.assertFalse(os.path.exists(os.path.join(session, "muse_session_id")))
         self.assertTrue(os.path.exists(os.path.join(session, "prompt.md")))
         self.assertTrue(os.path.exists(os.path.join(session, "muse.json")))
@@ -676,7 +678,7 @@ class ReviewerWiringTest(OpsCase):
 
     def test_the_role_is_recorded_for_the_resume_and_the_registry(self):
         fake, unit = self.start("reviewer")
-        session = self.session("lib", 5)
+        session = self.leaf("lib", 5, "reviewer")
         with open(os.path.join(session, "role"), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "reviewer\n")
         (found,) = [e for e in registry.load_all() if e["id"] == unit]
@@ -684,7 +686,7 @@ class ReviewerWiringTest(OpsCase):
 
     def test_a_launch_without_a_role_records_no_role(self):
         _, unit = self.start(None)
-        self.assertFalse(os.path.exists(os.path.join(self.session("lib", 5), "role")))
+        self.assertFalse(os.path.exists(os.path.join(self.leaf("lib", 5), "role")))
         (found,) = [e for e in registry.load_all() if e["id"] == unit]
         self.assertIsNone(found["role"])
 
@@ -712,7 +714,7 @@ class ReviewerWiringTest(OpsCase):
     def test_resume_with_an_unknown_recorded_role_is_refused(self):
         _, unit = self.start("worker")
         self.system.finish(unit)
-        with open(os.path.join(self.session("lib", 5), "role"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.leaf("lib", 5), "role"), "w", encoding="utf-8") as handle:
             handle.write("auditor\n")
         before = len(self.system.started)
         with self.assertRaisesRegex(launch.LaunchError, "unknown role"):
@@ -730,7 +732,7 @@ class ReviewerWiringTest(OpsCase):
     def test_resume_with_an_unreadable_role_record_is_refused(self):
         _, unit = self.start(None)
         self.system.finish(unit)
-        os.mkdir(os.path.join(self.session("lib", 5), "role"))
+        os.mkdir(os.path.join(self.leaf("lib", 5), "role"))
         before = len(self.system.started)
         with self.assertRaisesRegex(launch.LaunchError, "cannot read the agent's role"):
             launch.resume(
@@ -744,24 +746,15 @@ class ReviewerWiringTest(OpsCase):
             )
         self.assertEqual(len(self.system.started), before)
 
-    def test_a_relaunch_without_a_role_clears_a_reviewer_record(self):
+    def test_a_relaunch_without_a_role_leaves_the_reviewer_record_alone(self):
         _, unit = self.start("reviewer")
         self.system.finish(unit)
         _, relaunched = self.start(None)
-        self.assertFalse(os.path.exists(os.path.join(self.session("lib", 5), "role")))
+        with open(os.path.join(self.leaf("lib", 5, "reviewer"), "role"), encoding="utf-8") as h:
+            self.assertEqual(h.read(), "reviewer\n")
+        self.assertFalse(os.path.exists(os.path.join(self.leaf("lib", 5), "role")))
         (found,) = [e for e in registry.load_all() if e["id"] == relaunched]
         self.assertIsNone(found["role"])
-
-    def test_a_relaunch_that_cannot_clear_the_role_record_is_refused(self):
-        _, unit = self.start("reviewer")
-        self.system.finish(unit)
-        role_path = os.path.join(self.session("lib", 5), "role")
-        os.remove(role_path)
-        os.mkdir(role_path)
-        before = len(self.system.started)
-        with self.assertRaisesRegex(launch.LaunchError, "cannot write the agent's session"):
-            self.start(None)
-        self.assertEqual(len(self.system.started), before)
 
     def test_resume_uses_the_role_reread_under_the_spawn_lock(self):
         class ResumableAdapter(FakeAdapter):
@@ -835,12 +828,15 @@ class MuseReviewerLaunchTest(OpsCase):
     def test_a_resume_keeps_the_recorded_reviewer_mode(self):
         unit, _ = self.start("reviewer")
         self.system.finish(unit)
-        with open(os.path.join(self.session("lib", 5), "out.log"), "w", encoding="utf-8") as h:
+        with open(
+            os.path.join(self.leaf("lib", 5, "reviewer"), "out.log"), "w", encoding="utf-8"
+        ) as h:
             h.write("{}\n")
         resumed, _ = launch.resume(
             self.target("lib"),
             5,
             "keep going",
+            role="reviewer",
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
@@ -854,7 +850,7 @@ class MuseReviewerLaunchTest(OpsCase):
     def test_a_worker_resume_stays_writable(self):
         unit, _ = self.start("worker", number=6)
         self.system.finish(unit)
-        with open(os.path.join(self.session("lib", 6), "out.log"), "w", encoding="utf-8") as h:
+        with open(os.path.join(self.leaf("lib", 6), "out.log"), "w", encoding="utf-8") as h:
             h.write("{}\n")
         launch.resume(
             self.target("lib"),
@@ -981,7 +977,7 @@ class HoldResumeTest(OpsCase):
             run=self.system.run,
         )
         self.system.finish("corral-agent-held-5")
-        with open(os.path.join(self.session("held", 5), "chat.jsonl"), "w", encoding="utf-8") as h:
+        with open(os.path.join(self.leaf("held", 5), "chat.jsonl"), "w", encoding="utf-8") as h:
             h.write("{}\n")
         code, out, _ = self.verb("held", 5, lambda kind, repo, number: [])
         self.assertEqual(code, 0)
@@ -1047,6 +1043,80 @@ class CliTest(OpsCase):
         with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             code = launchcli.run_verb([*argv, "--root", self.root], self.system.seams())
         return code, out.getvalue(), err.getvalue()
+
+    def test_resume_and_tail_default_to_the_worker_role(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            'name = "lib"\nclone = { path = "clones/lib" }',
+            'name = "lib"\nclone = { path = "clones/lib" }\ntracker.repo = "example/lib"',
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        worker, _ = launch.launch(
+            self.target("lib"),
+            5,
+            "do the thing",
+            title="feat: go",
+            role="worker",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.system.finish(worker)
+        reviewer, _ = launch.launch(
+            self.target("lib"),
+            5,
+            "review it",
+            title="feat: go",
+            role="reviewer",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+        self.system.finish(reviewer)
+        for session, text in (
+            (self.leaf("lib", 5, "worker"), "worker work"),
+            (self.leaf("lib", 5, "reviewer"), "review notes"),
+        ):
+            with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as h:
+                h.write(
+                    json.dumps(
+                        {
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "toolCall",
+                                        "name": "bash",
+                                        "intent": text,
+                                        "arguments": {},
+                                    }
+                                ],
+                            }
+                        }
+                    )
+                    + "\n"
+                )
+        code, out, _ = self.verb("resume", "lib", "5", "--message", "go on")
+        self.assertEqual(code, 0)
+        self.assertIn("resumed as corral-agent-lib-5-r2", out)
+        (found,) = [e for e in registry.load_all() if e["id"] == "corral-agent-lib-5-r2"]
+        self.assertEqual(found["role"], "worker")
+        self.system.finish("corral-agent-lib-5-r2")
+
+        code, out, _ = self.verb("resume", "lib", "5", "--message", "go on", "--role", "reviewer")
+        self.assertEqual(code, 0)
+        self.assertIn("resumed as corral-agent-lib-5-r3", out)
+
+        code, out, _ = self.verb("tail", "lib", "5", "--last", "1")
+        self.assertEqual(code, 0)
+        self.assertIn("worker work", out)
+
+        code, out, _ = self.verb("tail", "lib", "5", "--last", "1", "--role", "reviewer")
+        self.assertEqual(code, 0)
+        self.assertIn("review notes", out)
 
     def test_launch_stop_and_stop_again_map_to_exit_codes(self):
         pf = self.prompt_file()
@@ -1155,7 +1225,7 @@ class RaceTest(OpsCase):
             run=self.system.run,
         )
         self.system.finish("corral-agent-lib-5")
-        session = self.session("lib", 5)
+        session = self.leaf("lib", 5)
         before = {
             name: _read(os.path.join(session, name))
             for name in ("prompt.md", "runtime", "overlay.yml")
@@ -1189,7 +1259,6 @@ class RaceTest(OpsCase):
         self.assertEqual(len(self.system.started), started)
 
     def test_two_sequential_resumes_take_generations_one_and_two(self):
-        session = self.session("lib", 5)
         launch.launch(
             self.target("lib"),
             5,
@@ -1199,6 +1268,7 @@ class RaceTest(OpsCase):
             usage=roomy,
             run=self.system.run,
         )
+        session = self.leaf("lib", 5)
         self.system.finish("corral-agent-lib-5")
         with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
             handle.write("{}\n")
@@ -1344,6 +1414,119 @@ class ModelChainsFreshnessTest(unittest.TestCase):
         }
         with self.assertRaises(models.Exhausted):
             launch._model_chains(tgt, pool, ledger, now)
+
+
+class RoleSessionIsolationTest(OpsCase):
+    """A reviewer launch must not overwrite the worker's session. Fakes only."""
+
+    def start(self, role, number=5, prompt="do the thing"):
+        return launch.launch(
+            self.target("lib"),
+            number,
+            prompt,
+            title="feat: add the thing",
+            role=role,
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+        )
+
+    def read(self, session, name):
+        with open(os.path.join(session, name), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_a_reviewer_launch_keeps_the_worker_session(self):
+        worker_unit, _ = self.start("worker", prompt="worker prompt")
+        worker_session = paths.newest_session("lib", 5, "worker")
+        self.assertIsNotNone(worker_session)
+        self.system.finish(worker_unit)
+        _, _ = self.start("reviewer", prompt="reviewer prompt")
+        reviewer_session = paths.newest_session("lib", 5, "reviewer")
+        self.assertIsNotNone(reviewer_session)
+        self.assertNotEqual(worker_session, reviewer_session)
+        self.assertEqual(self.read(worker_session, "prompt.md").splitlines()[0], "worker prompt")
+        self.assertEqual(self.read(worker_session, "role"), "worker\n")
+        self.assertEqual(self.read(reviewer_session, "role"), "reviewer\n")
+
+    def test_resume_defaults_to_the_worker_session(self):
+        worker_unit, _ = self.start("worker")
+        self.system.finish(worker_unit)
+        reviewer_unit, _ = self.start("reviewer")
+        self.system.finish(reviewer_unit)
+        with open(os.path.join(paths.newest_session("lib", 5, "worker"), "chat.jsonl"), "w") as h:
+            h.write(json.dumps({"message": {"role": "assistant", "content": "worker work"}}) + "\n")
+        resumed, _ = launch.resume(
+            self.target("lib"),
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
+        )
+        (found,) = [e for e in registry.load_all() if e["id"] == resumed]
+        self.assertEqual(found["role"], "worker")
+
+    def test_resume_with_a_role_resumes_that_role(self):
+        worker_unit, _ = self.start("worker")
+        self.system.finish(worker_unit)
+        reviewer_unit, _ = self.start("reviewer")
+        self.system.finish(reviewer_unit)
+        with open(os.path.join(paths.newest_session("lib", 5, "reviewer"), "chat.jsonl"), "w") as h:
+            h.write(
+                json.dumps({"message": {"role": "assistant", "content": "review notes"}}) + "\n"
+            )
+        resumed, _ = launch.resume(
+            self.target("lib"),
+            5,
+            "keep going",
+            role="reviewer",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
+        )
+        (found,) = [e for e in registry.load_all() if e["id"] == resumed]
+        self.assertEqual(found["role"], "reviewer")
+
+    def test_unit_names_stay_unique_across_roles(self):
+        worker_unit, _ = self.start("worker")
+        self.system.finish(worker_unit)
+        reviewer_unit, _ = self.start("reviewer")
+        self.assertEqual(worker_unit, "corral-agent-lib-5")
+        self.assertEqual(reviewer_unit, "corral-agent-lib-5-r1")
+
+    def test_stop_finds_the_live_unit_whichever_role_holds_it(self):
+        worker_unit, _ = self.start("worker")
+        self.assertEqual(
+            launch.stop(
+                self.target("lib"), 5, list_fn=self.system.list_fn, stop_fn=self.system.stop_fn
+            ),
+            [worker_unit],
+        )
+        reviewer_unit, _ = self.start("reviewer")
+        self.assertEqual(
+            launch.stop(
+                self.target("lib"), 5, list_fn=self.system.list_fn, stop_fn=self.system.stop_fn
+            ),
+            [reviewer_unit],
+        )
+
+    def test_a_legacy_single_dir_session_resumes_as_the_worker(self):
+        worker_unit, _ = self.start("worker")
+        self.system.finish(worker_unit)
+        with open(os.path.join(paths.newest_session("lib", 5, "worker"), "chat.jsonl"), "w") as h:
+            h.write(json.dumps({"message": {"role": "assistant", "content": "legacy work"}}) + "\n")
+        resumed, _ = launch.resume(
+            self.target("lib"),
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            run=self.system.run,
+        )
+        self.assertEqual(resumed, "corral-agent-lib-5-r1")
 
 
 if __name__ == "__main__":

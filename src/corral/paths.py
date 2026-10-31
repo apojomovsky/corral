@@ -11,10 +11,23 @@ paths built by joining onto it.
 
 import os
 import re
+from typing import NamedTuple
 
 
 class PathError(ValueError):
     """A directory override is unusable (exit 4, configuration error)."""
+
+
+class Session(NamedTuple):
+    """One leaf session of a ticket: its directory, role and generation.
+
+    A legacy single-directory session reads as generation 0, its role
+    from the role record or worker.
+    """
+
+    path: str
+    role: str
+    gen: int
 
 
 def _override(var, env):
@@ -73,11 +86,15 @@ def plain_repo_name(repo):
 
 
 def ticket_session_dir(repo, number, env=None, root=None):
-    """One ticket's session dir, `<sessions>/<repo>-<number>`.
+    """One ticket's session root, `<sessions>/<repo>-<number>`.
 
-    `root` replaces the sessions dir (tests, a reviewer outside the
-    host's session tree). A repo name that could leave the root, or a
-    number that is not a positive integer, is a usage error.
+    Each role generation lives in its own leaf below it
+    (`role_session_dir`); a legacy single-directory session keeps its
+    files directly here and reads as generation 0. Review records live
+    here too, beside the leaves. `root` replaces the sessions dir
+    (tests, a reviewer outside the host's session tree). A repo name
+    that could leave the root, or a number that is not a positive
+    integer, is a usage error.
     """
     repo = str(repo or "")
     if not plain_repo_name(repo):
@@ -85,6 +102,177 @@ def ticket_session_dir(repo, number, env=None, root=None):
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise PathError(f"ticket number {number!r} must be a positive integer")
     return os.path.join(root or sessions_dir(env), f"{repo}-{number}")
+
+
+#: One role generation below a ticket root: `<role>-<gen>`.
+_ROLE_SESSION_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*-[0-9]+")
+
+#: One ticket root directly under the sessions dir: `<repo>-<number>`.
+_TICKET_DIR_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*-[1-9][0-9]*")
+
+
+def parse_ticket_dirname(name):
+    """`(repo, number)` for a ticket root dirname, else None.
+
+    The repo is the longest leading part that leaves a trailing
+    `-<number>`, the same split as unit names, so a repo with hyphens
+    still splits one way.
+    """
+    if not isinstance(name, str):
+        return None
+    if not _TICKET_DIR_RE.fullmatch(name):
+        return None
+    repo, _, number = name.rpartition("-")
+    if not plain_repo_name(repo):
+        return None
+    return repo, int(number)
+
+
+def leaf_ticket(path):
+    """`(repo, number)` the session leaf at `path` belongs to, else None.
+
+    A `<ticket>/<role>-<gen>` leaf belongs to its parent ticket; a
+    legacy leaf is its own ticket root. Hygiene re-verifies the proof
+    against this ticket just before deleting.
+    """
+    base = os.path.basename(path)
+    parent = os.path.basename(os.path.dirname(path))
+    if _ROLE_SESSION_RE.fullmatch(base):
+        parsed = parse_ticket_dirname(parent)
+        if parsed is not None:
+            return parsed
+    return parse_ticket_dirname(base)
+
+
+def role_session_dir(repo, number, role, gen, env=None, root=None):
+    """One role generation's session dir, `<ticket>/<role>-<gen>`.
+
+    A launch writes here instead of the ticket root, so a reviewer
+    launch never overwrites the worker's record. A bad role or a
+    generation that is not an integer of 0 or more is a usage error.
+    """
+    role = str(role or "")
+    if not plain_repo_name(role):
+        raise PathError(f"role name {role!r} is not a plain role name")
+    if isinstance(gen, bool) or not isinstance(gen, int) or gen < 0:
+        raise PathError(f"session generation {gen!r} must be an integer of 0 or more")
+    return os.path.join(ticket_session_dir(repo, number, env=env, root=root), f"{role}-{gen}")
+
+
+def _legacy_session(ticket):
+    """Whether the ticket root itself holds a legacy session.
+
+    Any direct child file proves it: every launch writes `prompt.md`
+    there, and hygiene seeds `activity.jsonl`. An empty root reads as
+    an empty legacy session: there is nothing to lose, so the usual
+    proof still reclaims it. A root holding only role leaves and the
+    reviews dir is not one.
+    """
+    try:
+        names = os.listdir(ticket)
+    except OSError:
+        return False
+    if not names:
+        return True
+    return any(os.path.isfile(os.path.join(ticket, name)) for name in names)
+
+
+def _legacy_role(ticket):
+    """The role a legacy ticket root was launched with.
+
+    Missing reads as worker, the worker behaviour. An unreadable or
+    unknown role record is a usage error: failing open would resume a
+    reviewer with write access, or a worker read-only.
+    """
+    from corral import prompts  # Lazy: settings imports paths at load time.
+
+    try:
+        with open(os.path.join(ticket, "role"), encoding="utf-8") as handle:
+            role = handle.read().strip()
+    except FileNotFoundError:
+        return prompts.DEFAULT_ROLE
+    except OSError as err:
+        raise PathError(f"cannot read the agent's role: {err}") from None
+    if role not in prompts.ROLES:
+        raise PathError(f"unknown role {role!r}: expected one of {', '.join(prompts.ROLES)}")
+    return role
+
+
+def _legacy_role_lenient(ticket):
+    """The legacy role for listings: never raises, never skips.
+
+    Stop, close-previous and hygiene union over every leaf they can
+    prove; a damaged record must not hide a session's units from them.
+    The resume decision uses `_legacy_role` instead and fails closed.
+    """
+    from corral import prompts  # Lazy: settings imports paths at load time.
+
+    try:
+        with open(os.path.join(ticket, "role"), encoding="utf-8") as handle:
+            return handle.read().strip() or prompts.DEFAULT_ROLE
+    except OSError:
+        return prompts.DEFAULT_ROLE
+
+
+def _role_leaves(ticket):
+    """`[Session]` for each generation dir holding a session, oldest first."""
+    try:
+        names = sorted(os.listdir(ticket))
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        if not _ROLE_SESSION_RE.fullmatch(name):
+            continue
+        role, _, gen = name.rpartition("-")
+        path = os.path.join(ticket, name)
+        if not os.path.isdir(path):
+            continue
+        if not os.path.isfile(os.path.join(path, "prompt.md")):
+            continue
+        found.append(Session(path, role, int(gen)))
+    found.sort(key=lambda s: (s.gen, s.role))
+    return found
+
+
+def ticket_sessions(repo, number, env=None, root=None):
+    """Every leaf session of one ticket, legacy first, then oldest first.
+
+    The legacy single-directory session, when present, reads as
+    generation 0 with its recorded role. One listing, one place: resume
+    picks the newest of a role from it, stop and close-previous union
+    over it, hygiene enumerates it.
+    """
+    ticket = ticket_session_dir(repo, number, env=env, root=root)
+    found = []
+    if _legacy_session(ticket):
+        found.append(Session(ticket, _legacy_role_lenient(ticket), 0))
+    return found + _role_leaves(ticket)
+
+
+def newest_session(repo, number, role=None, env=None, root=None):
+    """The newest session dir of one ticket and role, or None.
+
+    `role` None reads as worker, the worker behaviour. A role
+    generation dir wins over the legacy dir; the highest generation
+    wins. The legacy dir matches only its recorded role. An unreadable
+    or unknown legacy role record is a usage error.
+    """
+    from corral import prompts  # Lazy: settings imports paths at load time.
+
+    want = str(role or "") or prompts.DEFAULT_ROLE
+    ticket = ticket_session_dir(repo, number, env=env, root=root)
+    best = None
+    for session in _role_leaves(ticket):
+        if session.role == want and (best is None or session.gen > best.gen):
+            best = session
+    if best is not None:
+        return best.path
+    if not _legacy_session(ticket):
+        return None
+    if _legacy_role(ticket) != want:
+        return None
+    return ticket
 
 
 def atomic_write_text(target, text):

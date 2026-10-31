@@ -101,6 +101,103 @@ class Resolvers(unittest.TestCase):
                 self.assertFalse(fn().startswith(os.path.join(HOME, ".")), fn())
 
 
+class RoleSessions(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-sessions-"))
+        self.root = os.path.join(self.tmp, "sessions")
+        os.makedirs(self.root)
+
+    def ticket(self, repo="lib", number=5):
+        return paths.ticket_session_dir(repo, number, root=self.root)
+
+    def write(self, path, name="prompt.md", text="do the thing"):
+        os.makedirs(path, exist_ok=True)
+        with open(os.path.join(path, name), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_role_session_dir_names_role_and_generation(self):
+        self.assertEqual(
+            paths.role_session_dir("lib", 5, "worker", 0, root=self.root),
+            os.path.join(self.ticket(), "worker-0"),
+        )
+        self.assertEqual(
+            paths.role_session_dir("lib", 5, "reviewer", 12, root=self.root),
+            os.path.join(self.ticket(), "reviewer-12"),
+        )
+
+    def test_role_session_dir_refuses_a_bad_role_or_generation(self):
+        for role, gen in (("", 0), ("a/b", 0), ("worker", -1), ("worker", True)):
+            with self.subTest(role=role, gen=gen), self.assertRaises(paths.PathError):
+                paths.role_session_dir("lib", 5, role, gen, root=self.root)
+
+    def test_no_session_when_the_ticket_was_never_launched(self):
+        self.assertIsNone(paths.newest_session("lib", 5, "worker", root=self.root))
+        self.assertIsNone(paths.newest_session("lib", 5, root=self.root))
+
+    def test_a_legacy_dir_reads_as_generation_zero_of_its_role(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        self.assertEqual(paths.newest_session("lib", 5, "worker", root=self.root), ticket)
+        self.assertIsNone(paths.newest_session("lib", 5, "reviewer", root=self.root))
+
+    def test_a_legacy_reviewer_dir_matches_only_the_reviewer(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        self.write(ticket, name="role", text="reviewer\n")
+        self.assertEqual(paths.newest_session("lib", 5, "reviewer", root=self.root), ticket)
+        self.assertIsNone(paths.newest_session("lib", 5, "worker", root=self.root))
+
+    def test_a_role_dir_wins_over_the_legacy_dir(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        worker0 = os.path.join(ticket, "worker-0")
+        self.write(worker0)
+        self.assertEqual(paths.newest_session("lib", 5, "worker", root=self.root), worker0)
+
+    def test_the_newest_generation_wins(self):
+        ticket = self.ticket()
+        self.write(os.path.join(ticket, "reviewer-0"))
+        reviewer1 = os.path.join(ticket, "reviewer-1")
+        self.write(reviewer1)
+        self.assertEqual(paths.newest_session("lib", 5, "reviewer", root=self.root), reviewer1)
+
+    def test_reviews_and_junk_are_not_sessions(self):
+        ticket = self.ticket()
+        os.makedirs(os.path.join(ticket, "reviews"))
+        os.makedirs(os.path.join(ticket, "worker-x"))
+        self.write(os.path.join(ticket, "worker-2"), name="out.log")
+        self.assertIsNone(paths.newest_session("lib", 5, "worker", root=self.root))
+
+    def test_an_unknown_legacy_role_is_refused(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        self.write(ticket, name="role", text="auditor\n")
+        with self.assertRaisesRegex(paths.PathError, "unknown role"):
+            paths.newest_session("lib", 5, "worker", root=self.root)
+
+    def test_an_unreadable_legacy_role_is_refused(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        os.mkdir(os.path.join(ticket, "role"))
+        with self.assertRaisesRegex(paths.PathError, "cannot read the agent's role"):
+            paths.newest_session("lib", 5, "worker", root=self.root)
+
+    def test_ticket_sessions_lists_legacy_first_then_role_generations(self):
+        ticket = self.ticket()
+        self.write(ticket)
+        self.write(os.path.join(ticket, "reviewer-0"))
+        self.write(os.path.join(ticket, "worker-1"))
+        found = paths.ticket_sessions("lib", 5, root=self.root)
+        self.assertEqual(
+            [(s.path, s.role, s.gen) for s in found],
+            [
+                (ticket, "worker", 0),
+                (os.path.join(ticket, "reviewer-0"), "reviewer", 0),
+                (os.path.join(ticket, "worker-1"), "worker", 1),
+            ],
+        )
+
+
 class AtomicWrite(unittest.TestCase):
     def test_replace_is_all_or_nothing_with_no_litter(self):
         tmp = tempfile.TemporaryDirectory()

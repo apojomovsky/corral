@@ -276,6 +276,7 @@ def cmd_resume(args, seams: Seams) -> int:
         args.number,
         args.message,
         hold_reason_fn=hold_reason_fn,
+        role=args.role,
         model=args.model,
         list_fn=seams.list_fn,
         run=seams.run,
@@ -307,7 +308,7 @@ def cmd_tail(args, seams: Seams) -> int:
     if args.last is not None and args.last < 1:
         raise launch.LaunchError("--last must be 1 or more")
     tgt = _target(args)
-    launch.tail(tgt, args.number, last=args.last)
+    launch.tail(tgt, args.number, last=args.last, role=args.role)
     return OK
 
 
@@ -353,6 +354,12 @@ def add_parser(sub, seams: Seams) -> None:
     _common(p)
     p.add_argument("--message", required=True, help="what the resumed agent is told")
     p.add_argument("--model", default=None, help="the model the runtime should use")
+    p.add_argument(
+        "--role",
+        default=prompts.DEFAULT_ROLE,
+        choices=list(prompts.ROLES),
+        help="which role's newest session to resume (default: %(default)s)",
+    )
     p.set_defaults(func=_verb(cmd_resume, seams))
 
     p = sub.add_parser("stop", help="stop the ticket's live agents")
@@ -362,6 +369,12 @@ def add_parser(sub, seams: Seams) -> None:
     p = sub.add_parser("tail", help="show the ticket's agent activity")
     _common(p)
     p.add_argument("--last", type=int, default=None, help="only the last K lines")
+    p.add_argument(
+        "--role",
+        default=prompts.DEFAULT_ROLE,
+        choices=list(prompts.ROLES),
+        help="which role's newest session to show (default: %(default)s)",
+    )
     p.set_defaults(func=_verb(cmd_tail, seams))
 
 

@@ -21,6 +21,11 @@ from corral import settings
 #: The roles with a built-in template. Anything else is a PromptsError.
 ROLES = ("worker", "reviewer", "triage")
 
+#: The role a launch without `--role` runs as, and the role resume and
+#: tail assume unless told otherwise. One name, one place: session
+#: resolution, launch allocation and the CLI default all read this.
+DEFAULT_ROLE = "worker"
+
 #: The only placeholders a template may use.
 ALLOWED = frozenset(
     {
