@@ -222,6 +222,25 @@ class ProductionFinishedForTest(unittest.TestCase):
         self.assertEqual(found, {("app", 7): ("old-1", "")})
 
 
+class ProductionAgentRolesTest(unittest.TestCase):
+    def test_roles_map_visible_entries_with_a_role(self):
+        from unittest import mock
+
+        entries = [
+            ({"id": "worker-1", "role": "worker"}, registry.LIVE),
+            ({"id": "reviewer-1", "role": "reviewer"}, registry.LIVE),
+            ({"id": "norole-1"}, registry.LIVE),
+        ]
+        with (
+            mock.patch.object(drive.registry, "config", return_value={}),
+            mock.patch.object(drive.registry, "visible", return_value=entries),
+        ):
+            self.assertEqual(
+                drive.production_agent_roles(now=NOW),
+                {"worker-1": "worker", "reviewer-1": "reviewer"},
+            )
+
+
 class FixMessageTest(unittest.TestCase):
     def test_the_message_names_the_ticket_and_the_next_review(self):
         message = drive.fix_message("app", 7)
@@ -623,6 +642,147 @@ class FixBudgetTest(unittest.TestCase):
         self.assertTrue(any(call[0] == "comment" for call in fake.calls))
         self.assertIsNone(store.claim_of("app", 7))
         self.assertIn("gave up", out)
+
+
+class FreshFixSaveTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-save-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def run_fix(self, store, found, fake_tracker, launcher, **fields):
+        out, err = io.StringIO(), io.StringIO()
+        fields.setdefault("now", NOW)
+        code = review_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=found,
+            policy_dir=self.policies,
+            fake_tracker=fake_tracker,
+            launcher=launcher,
+            **fields,
+        )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_an_unsavable_budget_skips_the_fix_with_the_claim_kept(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        blocked = os.path.join(self.tmp.name, "restarts-dir")
+        os.makedirs(blocked)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=NOW - 100.0)])
+        launcher = FakeLauncher()
+        code, out, err = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+            restarts_path=blocked,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+        self.assertIn("restart budget", out + err)
+        self.assertIn("claim kept", out)
+        self.assertFalse(any(call[0] in ("comment", "add_label") for call in fake.calls))
+
+    def test_a_failed_fresh_fix_launch_leaves_the_budget_alone(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        budget = os.path.join(self.tmp.name, "restarts.json")
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=NOW - 100.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = RuntimeError("boom")
+        code, _, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+            restarts_path=budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(drive.load_restarts(budget), {})
+
+
+class FixBehindReviewerTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-reviewer-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def run_fix(self, store, found, fake_tracker, launcher, **fields):
+        out, err = io.StringIO(), io.StringIO()
+        fields.setdefault("now", NOW)
+        code = review_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=found,
+            policy_dir=self.policies,
+            fake_tracker=fake_tracker,
+            launcher=launcher,
+            **fields,
+        )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_fix_behind_a_live_reviewer_is_skipped_with_the_claim_kept(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7, agent=REVIEWER)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=NOW - 100.0)])
+        launcher = FakeLauncher()
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={REVIEWER: (registry.LIVE, NOW - 10.0)},
+            live_units=frozenset({("app", 7)}),
+            agent_roles={REVIEWER: "reviewer"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+        self.assertIn("waits for release", out)
+
+    def test_a_fix_proceeds_once_the_reviewer_is_released(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7, agent=REVIEWER)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=NOW - 100.0)])
+        launcher = FakeLauncher()
+        code, _, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={REVIEWER: (FINISHED, NOW - 10.0)},
+            finished_for={("app", 7): (REVIEWER, "reviewer")},
+            agent_roles={REVIEWER: "reviewer"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "start")
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual(after.agent, launcher.calls[0][4])
 
 
 class ReviewFixDayCapTest(unittest.TestCase):

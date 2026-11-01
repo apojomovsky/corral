@@ -1947,6 +1947,21 @@ def production_stuck_inputs(registered, *, now):
     return states, cfg["stale_s"]
 
 
+def production_agent_roles(*, now):
+    """`{agent id: role}` for visible registry entries that record one.
+
+    Reads only. The claim path consults it to serialize a fix behind a
+    reviewer holder; entries without a role read as unknown and never
+    block a fix. Raises SettingsError for bad registry settings.
+    """
+    cfg = registry.config()
+    return {
+        entry["id"]: entry["role"]
+        for entry, _state in registry.visible(now, cfg)
+        if entry.get("role")
+    }
+
+
 def production_stuck_project(registered, repo):
     """The registered project name owning tracker repo `repo`, or None.
 
@@ -2109,6 +2124,7 @@ def _claim_and_launch(
     agent_states=None,
     live_units=None,
     restarts_path=None,
+    agent_roles=None,
     out=None,
     err=None,
     events=None,
@@ -2125,14 +2141,22 @@ def _claim_and_launch(
     the stuck sweep defers to it) and relaunches its session; `fix`
     resumes when the holder is still usable and otherwise releases and
     reclaims before restarting on the same branch, which the launch
-    path reuses. A fresh restart first gates on the day cap, then on
-    the restart budget: past the budget the row routes to the give-up
-    path exactly as the stuck sweep does (decision writes through
-    `tracker_factory`, then release; a failed write or a missing
-    tracker keeps the claim), and a fresh restart that launches
-    records one stamp; a resume reuses the session and never touches
-    either budget. `restarts_path` persists those stamps (in memory
-    when None); `out`, `err` and `events` carry the give-up lines,
+    path reuses. A fix or resume behind a reviewer holder waits: when the
+    current holder's role (from `agent_roles`) is a reviewer, the row
+    is skipped with the claim kept, and the fix is scheduled on a
+    later pass after the reviewer finishes and is released. A fresh
+    restart first gates on the day cap, then on the restart budget:
+    past the budget the row routes to the give-up path exactly as the
+    stuck sweep does (decision writes through `tracker_factory`, then
+    release; a failed write or a missing tracker keeps the claim). A
+    fresh restart that fits the budget persists one stamp before it
+    releases, reclaims or launches anything, exactly as the stuck
+    sweep does: a stamp the pass cannot persist skips the row with
+    the claim kept and never launches, and a release, reclaim or
+    launch failure rolls the stamp back, so only launches consume the
+    budget. A resume reuses the session and never touches either
+    budget. `restarts_path` persists those stamps (in memory when
+    None); `out`, `err` and `events` carry the give-up lines,
     budget warnings and journal entries. A lost race (exit 2 from the
     store) becomes a skip naming the holder and the pass moves on; a
     launch through `launcher` appends the unit or the failure to the
@@ -2286,6 +2310,22 @@ def _claim_and_launch(
                     )
                 )
                 continue
+            if (agent_roles or {}).get(holder) == "reviewer":
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=(
+                            f"{ref}: reviewer `{holder}` still holds the claim, "
+                            "fix waits for release"
+                        ),
+                        code="claim",
+                    )
+                )
+                continue
             mode = fix_mode(
                 holder,
                 repo=gated.repo,
@@ -2296,6 +2336,7 @@ def _claim_and_launch(
             effective = "resume" if mode == "resume" else "fix"
             key = f"{gated.repo}#{gated.number}"
             stamps = budgets.get(key, [])
+            unrecord = None
             if mode == "resume":
                 try:
                     store.refresh_claim(gated.repo, gated.number, holder, claim.epoch, now=now)
@@ -2412,9 +2453,54 @@ def _claim_and_launch(
                 if skipped is not None:
                     rows.append(skipped)
                     continue
+                had = key in budgets
+                stamped = record_restart(stamps, now=now)
+                budgets[key] = stamped
+                if restarts_path is not None:
+                    try:
+                        save_restarts(restarts_path, budgets)
+                    except OSError as problem:
+                        if had:
+                            budgets[key] = stamps
+                        else:
+                            budgets.pop(key, None)
+                        print(
+                            f"corral drive: cannot save the restart budget: {problem}",
+                            file=trouble,
+                        )
+                        rows.append(
+                            Gated(
+                                project=gated.project,
+                                repo=gated.repo,
+                                number=gated.number,
+                                kind=effective,
+                                verdict="skip",
+                                reason=f"{ref}: restart budget save failed ({problem}), claim kept",
+                                code="claim",
+                            )
+                        )
+                        continue
+
+                def unrecord():
+                    if had:
+                        budgets[key] = stamps
+                    else:
+                        budgets.pop(key, None)
+                    if restarts_path is None:
+                        return
+                    try:
+                        save_restarts(restarts_path, budgets)
+                    except OSError as problem:
+                        print(
+                            f"corral drive: cannot save the restart budget: {problem}",
+                            file=trouble,
+                        )
+                        budgets[key] = stamped
+
                 try:
                     store.release(gated.repo, gated.number, holder, claim.epoch, now=now)
                 except board.Claimed:
+                    unrecord()
                     rows.append(
                         Gated(
                             project=gated.project,
@@ -2428,6 +2514,7 @@ def _claim_and_launch(
                     )
                     continue
                 except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
+                    unrecord()
                     rows.append(
                         Gated(
                             project=gated.project,
@@ -2442,6 +2529,7 @@ def _claim_and_launch(
                     continue
                 agent, skipped = _mint_claim(store, gated, host=host, now=now, kind=effective)
                 if skipped is not None:
+                    unrecord()
                     rows.append(skipped)
                     continue
             if launcher is None:
@@ -2469,6 +2557,8 @@ def _claim_and_launch(
             )
             blocked = blocked or unreachable
             if unit is None:
+                if unrecord is not None:
+                    unrecord()
                 rows.append(
                     Gated(
                         project=gated.project,
@@ -2497,15 +2587,6 @@ def _claim_and_launch(
                 started += 1
                 if start_budget is not None:
                     start_budget -= 1
-                budgets[key] = record_restart(stamps, now=now)
-                if restarts_path is not None:
-                    try:
-                        save_restarts(restarts_path, budgets)
-                    except OSError as problem:
-                        print(
-                            f"corral drive: cannot save the restart budget: {problem}",
-                            file=trouble,
-                        )
             continue
         if start_budget is not None and start_budget <= 0:
             rows.append(
@@ -2827,6 +2908,7 @@ def _launching_pass(
     restarter,
     restarts_path,
     stuck_project,
+    agent_roles=None,
     finished_for=None,
     journal_path=None,
     day_path=None,
@@ -3040,6 +3122,7 @@ def _launching_pass(
         agent_states=agent_states,
         live_units=live_units,
         restarts_path=restarts_path,
+        agent_roles=agent_roles,
         out=out,
         err=err,
         events=events if journal_path is not None else None,
@@ -3181,6 +3264,7 @@ def run_pass(
     restarter=None,
     restarts_path=None,
     stuck_project=None,
+    agent_roles=None,
     finished_for=None,
     journal_path=None,
     pause_path=None,
@@ -3217,7 +3301,9 @@ def run_pass(
     left held; a failed seam keeps the claim. `finished_for`
     ({(repo, number): (agent id, role)} for the newest finished entry per
     ticket) feeds the reviewer and fix-round readiness alongside the
-    same-pass releases. When `pause_path` names an
+    same-pass releases. `agent_roles` ({agent id: role} for visible
+    entries) serializes a fix behind a reviewer holder; unknown
+    holders proceed as before. When `pause_path` names an
     existing pause file, either pass reports it and exits 1, starting
     nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
@@ -3278,6 +3364,7 @@ def run_pass(
                 restarter=restarter,
                 restarts_path=restarts_path,
                 stuck_project=stuck_project,
+                agent_roles=agent_roles,
                 finished_for=finished_for,
                 journal_path=journal_path,
                 day_path=day_path,
@@ -3387,6 +3474,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
         try:
             stuck_states, stuck_stale = production_stuck_inputs(registered, now=moment)
             finished_for = production_finished_for(now=moment)
+            agent_roles = production_agent_roles(now=moment)
         except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=sys.stderr)
             return USAGE
@@ -3406,6 +3494,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             stop_unit=production_stopper(registered),
             restarts_path=restarts_path(),
             stuck_project=lambda repo, number: production_stuck_project(registered, repo),
+            agent_roles=agent_roles,
             finished_for=finished_for,
             journal_path=journal_path(),
             pause_path=pause_path(),
