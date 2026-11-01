@@ -512,12 +512,24 @@ def registration_text(name, root, cap):
             "# `corral uninit` removes this file while its content still matches",
             "# what `corral init` would write; edit it and `uninit` leaves it alone.",
             f"name = {_toml(name)}",
-            f"unit_prefix = {_toml(f'{name}-agent')}",
+            f"unit_prefix = {_toml(f'{name}-agent-')}",
             f"root = {_toml(root)}",
             "floor = 0",
             f"ceiling = {_toml(cap)}",
             "",
         ]
+    )
+
+
+def _legacy_registration_text(name, root, cap):
+    """The registration text `init` wrote before the separator joined the prefix.
+
+    `uninit` still removes a file with this content: it proves `init`
+    wrote it, only with the older spelling.
+    """
+    return registration_text(name, root, cap).replace(
+        f"unit_prefix = {_toml(f'{name}-agent-')}",
+        f"unit_prefix = {_toml(f'{name}-agent')}",
     )
 
 
@@ -545,7 +557,10 @@ def _registration_conflicts(directory, target, name, prefix, root):
         if not isinstance(raw, dict):
             raise InitError(f"{path}: the file must hold a TOML table")
         stem = entry[: -len(".toml")]
-        if raw.get("unit_prefix") == prefix:
+        seen = raw.get("unit_prefix")
+        # Raw text: normalize the spelling the way every load does, so a
+        # cross-spelling collision still reads as one prefix.
+        if isinstance(seen, str) and projects.terminated(seen) == prefix:
             raise InitError(
                 f"{target}: unit_prefix {prefix!r} is already "
                 f"registered by project {stem!r} ({path})"
@@ -836,7 +851,7 @@ def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, op
                 projects.projects_dir(),
                 reg_target,
                 reg_name,
-                f"{reg_name}-agent",
+                f"{reg_name}-agent-",
                 reg_root,
             )
     need_hooks = not foreign_hooks and (
@@ -1122,12 +1137,12 @@ def _unapply(opts, remove, git):
     else:
         reg_name = registration_name(clone_root)
         reg_target = os.path.join(projects.projects_dir(), f"{reg_name}.toml")
-        expected = registration_text(
-            reg_name, os.path.realpath(clone_root), _expected_ceiling(clone_root, git)
-        )
+        ceiling = _expected_ceiling(clone_root, git)
+        expected = registration_text(reg_name, os.path.realpath(clone_root), ceiling)
+        legacy = _legacy_registration_text(reg_name, os.path.realpath(clone_root), ceiling)
         reg_current = _read_text(reg_target)
         if reg_current is not None:
-            if reg_current == expected:
+            if reg_current == expected or reg_current == legacy:
                 if opts.plan:
                     planned.append(reg_target)
                 else:
