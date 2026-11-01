@@ -171,6 +171,14 @@ class LoadTest(HostCase):
         self.assertEqual(projects.ProjectsError.exit_code, 4)
 
 
+class TerminatedTest(unittest.TestCase):
+    def test_a_prefix_without_a_separator_gains_one(self):
+        self.assertEqual(projects.terminated("project-a-agent"), "project-a-agent-")
+
+    def test_a_terminated_prefix_is_unchanged(self):
+        self.assertEqual(projects.terminated("project-a-agent-"), "project-a-agent-")
+
+
 class ForRootTest(HostCase):
     def test_roots_resolve_by_realpath(self):
         self.write_project("project-a")

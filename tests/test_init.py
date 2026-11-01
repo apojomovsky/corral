@@ -845,7 +845,7 @@ def registration_golden(name, root, cap=1):
         "# `corral uninit` removes this file while its content still matches\n"
         "# what `corral init` would write; edit it and `uninit` leaves it alone.\n"
         f'name = "{name}"\n'
-        f'unit_prefix = "{name}-agent"\n'
+        f'unit_prefix = "{name}-agent-"\n'
         f'root = "{root}"\n'
         "floor = 0\n"
         f"ceiling = {cap}\n"
@@ -1126,18 +1126,24 @@ class RegistrationCase(Fixture):
             )
 
     def test_conflicting_prefix_is_always_4(self):
-        other = os.path.join(self.config_dir, "projects.d", "zeta.toml")
-        os.makedirs(os.path.dirname(other), exist_ok=True)
-        with open(other, "w", encoding="utf-8") as handle:
-            handle.write(
-                registration_golden("zeta", os.path.realpath(self.root) + "-elsewhere").replace(
-                    'unit_prefix = "zeta-agent"', f'unit_prefix = "{self.name}-agent"'
-                )
-            )
-        code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
-        self.assertEqual(code, 4)
-        code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
-        self.assertEqual(code, 4)
+        for spelling in ("-agent", "-agent-"):
+            with self.subTest(spelling=spelling):
+                other = os.path.join(self.config_dir, "projects.d", "zeta.toml")
+                os.makedirs(os.path.dirname(other), exist_ok=True)
+                with open(other, "w", encoding="utf-8") as handle:
+                    handle.write(
+                        registration_golden(
+                            "zeta", os.path.realpath(self.root) + "-elsewhere"
+                        ).replace(
+                            'unit_prefix = "zeta-agent-"',
+                            f'unit_prefix = "{self.name}{spelling}"',
+                        )
+                    )
+                code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
+                self.assertEqual(code, 4)
+                code, _, _ = self.run_cli("--test-cmd", "make check", "--force", self.root)
+                self.assertEqual(code, 4)
+                os.remove(other)
 
     def test_conflicting_root_is_always_4(self):
         other = os.path.join(self.config_dir, "projects.d", "zeta.toml")
@@ -1258,6 +1264,20 @@ class UninitCase(Fixture):
     def test_cap_three_registration_round_trips_through_uninit(self):
         self.assertEqual(self.run_cli("--test-cmd", "make check", "--cap", "3", self.root)[0], 0)
         self.assertTrue(os.path.isfile(self.reg_target()))
+        code, out, _ = self.run_uninit(self.root)
+        self.assertEqual(code, 0, out)
+        self.assertFalse(os.path.exists(self.reg_target()))
+
+    def test_uninit_removes_a_legacy_spelling_registration(self):
+        self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
+        with open(self.reg_target(), encoding="utf-8") as handle:
+            text = handle.read()
+        legacy = text.replace(
+            f'unit_prefix = "{self.name}-agent-"', f'unit_prefix = "{self.name}-agent"'
+        )
+        self.assertNotEqual(legacy, text)
+        with open(self.reg_target(), "w", encoding="utf-8") as handle:
+            handle.write(legacy)
         code, out, _ = self.run_uninit(self.root)
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.exists(self.reg_target()))

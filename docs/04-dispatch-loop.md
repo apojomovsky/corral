@@ -64,7 +64,7 @@ Decision: each project names an entry point in its registration file:
 
 ```toml
 name = "blue"
-unit_prefix = "blue-agent"
+unit_prefix = "blue-agent-"
 root = "/srv/ops/blue_ops"
 eligibility = "blue_policy:eligible"
 ```
