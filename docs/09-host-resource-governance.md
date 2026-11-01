@@ -1,4 +1,4 @@
-# 08: host resource governance across projects on one host
+# 09: host resource governance across projects on one host
 
 Status: proposed 2026-11-01, re-scoped after review round 1 to one
 corral per machine. Design only; no code ships with this doc.
@@ -332,8 +332,11 @@ external touch, mirroring the existing seams:
 ## 8. Containers
 
 Resource limits do not need containers. The kernel already enforces CPU,
-memory and pids through cgroups, and systemd slices compose with the
-transient units corral already starts; a container would add image builds,
+memory and pids through cgroups. UNVERIFIED: that systemd slices compose
+with the transient units corral already starts; learn on a scratch host
+with `systemd-run --user --slice=test-gov.slice
+--property=MemoryMax=1G ...` and read the leaf `cgroup.controllers`.
+A container would add image builds,
 layer storage, a daemon dependency and a second identity scheme for no new
 enforcement primitive. Docker stays what it is in corral: a seam for
 placement (attached hardware, a daemon a project needs), not for limits.
@@ -353,8 +356,10 @@ section 7.
 1. Pure budget core. `resources.admit` plus validation, shaped like
    `admission.py`. Criteria: the section 7 pure rows pass; floors, ceilings,
    weights, role costs and foreign subtraction each have a boundary test.
-2. Settings surface. The `[resources]` tables through `settings.resolve`
-   with strict keys, plus `corral.resources` in the provider list.
+2. Settings surface. The `[resources]` settings keys through
+   `settings.resolve` with strict keys; settings keys only, no CLI
+   surface here (any CLI surface is decided with O5 and lands in
+   ticket 7).
    Criteria: the documented tables load; every validation in section 5 is a
    `SettingsError` naming file and key; defaults leave current behavior
    byte-identical.
