@@ -16,10 +16,11 @@ API has no second resolver for any fact. Shapes quoted from those
 modules were read from the tree; anything needing a live run is marked
 UNVERIFIED with a safe way to learn it.
 
-This doc is step 1 of milestone 2 in `00-design.md`, section 4 ("Put
-the local API in front of everything on one host"). The peer pull and
-the log follow later; this doc keeps every choice they need (host
-identity, cursors, Bearer token) without designing them.
+This doc was step 1 of milestone 2 ("Put
+the local API in front of everything on one host"). The hub
+design in `08-hub-multihost.md` follows instead of the old peer
+plan; this doc keeps every choice the hub needs (host
+identity, cursors, Bearer token) without designing the hub.
 
 ## 0. Where it fits
 
@@ -122,9 +123,8 @@ library. Two alternatives were considered and rejected:
   it), but it is a consumer choice, not the interface.
 - A unix socket: browsers cannot speak HTTP over a unix socket, and
   dashboards are often browser pages. HTTP serves both a local page
-  and a future peer pull over the same routes, which milestone 2
-  already assumes (`00-design.md`, section 4: peers pull each other's
-  logs over the API).
+  and the hub's snapshot push, which reuses the snapshot document
+  shape over its own routes (`08-hub-multihost.md`, section 5).
 
 Polling is the base contract: every GET is cheap, cacheable, and
 carries its own freshness (`now`, `read_at`/`stale`,
@@ -243,9 +243,9 @@ this API for anything new. What it needs is already in the shapes:
   reuses the same cursor shape for log replication, which is why the
   cursor is opaque from day one rather than a documented index.
 
-Nothing else about aggregation is designed here: no fan-out proxy,
-no shared duty split, no claim acks. Those belong to the milestone 2
-peer design.
+Nothing else about aggregation is designed here: no fan-out proxy
+and no shared duty split. Claim and merge routes belong to the hub
+design in `08-hub-multihost.md`.
 
 ## 6. Performance: bounded reads, cached snapshot, honest staleness
 
