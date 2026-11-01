@@ -1709,6 +1709,15 @@ def production_finished_for(*, now, cfg=None, path=None) -> dict:
     return {ticket: (agent, role) for ticket, (agent, role, _) in found.items()}
 
 
+def cap_label(day_cap) -> str:
+    """The cap suffix for day-cap lines. Pure.
+
+    Names the cap as `(N/day)`; with no cap configured it reads
+    `(day cap)`, so a line never prints `None`.
+    """
+    return f"({day_cap}/day)" if day_cap is not None else "(day cap)"
+
+
 def handle_stuck(
     store,
     *,
@@ -1726,8 +1735,10 @@ def handle_stuck(
     out,
     err,
     events=None,
+    start_budget=None,
+    day_cap=None,
 ):
-    """Restart or give up on stuck managed claims. Returns restarted count.
+    """Restart or give up on stuck managed claims. Returns (restarted, capped).
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
@@ -1751,7 +1762,15 @@ def handle_stuck(
     deferred and the claim is kept. A failed decision write keeps the
     claim for a later pass, and only stop-plus-launch restarts (plus
     fresh fix rounds in the claim path) are recorded, so resumes never
-    consume the budget. When `events` is a
+    consume the budget. `start_budget` is the day's remaining starts
+    (None means no day cap): each stop-plus-launch restart spends one.
+    The day cap gates after the restart budget, the project gate and
+    the seam gates: a row past its restart budget still gives up and
+    releases at the cap, and only a row that would actually have
+    restarted is left held with a day-cap line. `day_cap` names the
+    cap in that line (`cap_label` renders it when it is None).
+    `capped` is True when at least one would-be restart was refused
+    by the day cap. When `events` is a
     list, each restart and give-up appends its journal entry through
     the pass journal writer. Store errors propagate to the caller,
     like orphans.
@@ -1759,6 +1778,7 @@ def handle_stuck(
     live = live_units if live_units is not None else frozenset()
     budgets = load_restarts(restarts_path) if restarts_path is not None else {}
     restarted = 0
+    capped = False
     for item in store.items():
         claim = store.claim_of(item.repo, item.number)
         if claim is None or not claim.agent or not is_managed_agent(claim.agent):
@@ -1814,6 +1834,10 @@ def handle_stuck(
         launch = restarter
         if stop_unit is None or launch is None:
             print(f"{ref}: stuck but the stop or launch seam is missing, left held", file=out)
+            continue
+        if start_budget is not None and start_budget - restarted <= 0:
+            print(f"{ref}: day cap reached {cap_label(day_cap)}, not restarted", file=out)
+            capped = True
             continue
         try:
             claim = store.refresh_claim(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
@@ -1891,7 +1915,7 @@ def handle_stuck(
         if events is not None:
             events.append({"event": "restart", "at": now, "ticket": ref, "agent": claim.agent})
         restarted += 1
-    return restarted
+    return restarted, capped
 
 
 def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None):
@@ -2209,7 +2233,7 @@ def _claim_and_launch(
                         number=gated.number,
                         kind=gated.kind,
                         verdict="skip",
-                        reason=f"{ref}: day cap reached ({day_cap}/day), not started",
+                        reason=f"{ref}: day cap reached {cap_label(day_cap)}, not started",
                         code="cap",
                     )
                 )
@@ -2381,7 +2405,7 @@ def _claim_and_launch(
                             number=gated.number,
                             kind=effective,
                             verdict="skip",
-                            reason=f"{ref}: day cap reached ({day_cap}/day), not started",
+                            reason=f"{ref}: day cap reached {cap_label(day_cap)}, not started",
                             code="cap",
                         )
                     )
@@ -2596,7 +2620,7 @@ def _claim_and_launch(
                     number=gated.number,
                     kind=gated.kind,
                     verdict="skip",
-                    reason=f"{ref}: day cap reached ({day_cap}/day), not started",
+                    reason=f"{ref}: day cap reached {cap_label(day_cap)}, not started",
                     code="cap",
                 )
             )
@@ -2924,7 +2948,10 @@ def _launching_pass(
     old cursor stand, and the pass continues on store data. A claim whose
     stale row cannot be re-read live fails closed instead. The stuck
     sweep restarts or gives up on managed claims the registry has lost,
-    after the fresh claims launch. The mirror drains whatever the
+    after the fresh claims launch, spending the day budget the fresh
+    claims leave over (floored at zero): each
+    restart counts toward the cap and an exhausted cap leaves the row
+    held. The mirror drains whatever the
     outbox holds, old backlog and new claims alike; what it cannot push
     stays queued for the next healthy pass. A pass that synced nothing
     at all exits 3; a pass that launched nothing because the service
@@ -3127,13 +3154,17 @@ def _launching_pass(
         err=err,
         events=events if journal_path is not None else None,
     )
+    stuck_capped = False
     if agent_states is not None:
         defaults = registry.default_config()
         stale = stale_s if stale_s is not None else defaults["stale_s"]
         gone = gone_s if gone_s is not None else defaults["gone_s"]
         launch = restarter if restarter is not None else launcher
+        stuck_budget = None
+        if start_budget is not None:
+            stuck_budget = max(0, start_budget - started)
         try:
-            handle_stuck(
+            stuck_restarted, stuck_capped = handle_stuck(
                 store,
                 agent_states=agent_states,
                 stale_s=stale,
@@ -3149,7 +3180,12 @@ def _launching_pass(
                 out=out,
                 err=err,
                 events=events if journal_path is not None else None,
+                start_budget=stuck_budget,
+                day_cap=max_starts,
             )
+            started += stuck_restarted
+            if start_budget is not None:
+                start_budget -= stuck_restarted
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"corral drive: stuck handling skipped ({problem})", file=err)
     for row in final_rows:
@@ -3176,7 +3212,7 @@ def _launching_pass(
                     "kind": row.kind,
                 }
             )
-    capped = any(row.code == "cap" for row in final_rows)
+    capped = any(row.code == "cap" for row in final_rows) or stuck_capped
     if capped:
         note({"event": "cap", "at": now, "max": max_starts})
     if day_today is not None and day_path is not None:

@@ -18,7 +18,7 @@ import unittest
 from corral import board, drive, registry
 from corral import tracker as iface
 from corral.github.tracker import NEEDS_DECISION
-from tests.test_drive import stored
+from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_tracker import FakeTracker, reading
 
@@ -1395,6 +1395,179 @@ class StuckJournalTest(unittest.TestCase):
         self.assertEqual(give_ups[0]["ticket"], "app#7")
         self.assertEqual(entries[-1]["event"], "pass_end")
         self.assertEqual(entries[-1]["gave_up"], 1)
+
+
+class CapLabelTest(unittest.TestCase):
+    def test_a_configured_cap_names_its_limit(self):
+        self.assertEqual(drive.cap_label(50), "(50/day)")
+
+    def test_a_missing_cap_never_prints_none(self):
+        self.assertEqual(drive.cap_label(None), "(day cap)")
+
+
+class StuckDayCapTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-daycap-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.day = os.path.join(self.tmp.name, "starts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def day_starts(self):
+        with open(self.day, encoding="utf-8") as handle:
+            return json.load(handle)["starts"]
+
+    def test_a_stuck_restart_spends_one_from_the_day_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        drive.write_day_count(self.day, drive._day_string(NOW), 0)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_a_stuck_restart_at_the_cap_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        drive.write_day_count(self.day, drive._day_string(NOW), 1)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("day cap", out.getvalue())
+        self.assertEqual(self.day_starts(), 1)
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_fresh_start_fills_the_cap_so_the_stuck_row_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 9, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 9, agent="drive-host-1-16000-acme--app-9")
+        drive.write_day_count(self.day, drive._day_string(NOW), 0)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        stop, launcher, restarter = FakeStop(), FakeLauncher(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+            agent_states={},
+            stop_unit=stop,
+            restarter=restarter,
+            restarts_path=self.budget,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][1:4], ("app", 7, "start"))
+        self.assertEqual(restarter.calls, [])
+        self.assertEqual(stop.calls, [])
+        self.assertIn("day cap", out.getvalue())
+        self.assertEqual(self.day_starts(), 1)
+        found = store.claim_of("app", 9)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_give_up_past_the_restart_budget_still_releases_at_the_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        drive.write_day_count(self.day, drive._day_string(NOW), 1)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        stop, restarter = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=restarter,
+            restarts_path=self.budget,
+            fake_tracker=fake,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(restarter.calls, [])
+        self.assertIn("gave up", out.getvalue())
+        self.assertNotIn("day cap", out.getvalue())
+        self.assertIn(("add_label", "app", 7, NEEDS_DECISION), fake.calls)
+        self.assertTrue(any(call[0] == "comment" for call in fake.calls))
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_one_free_slot_restarts_the_first_row_and_caps_the_second(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        claimed(store, "app", 8, agent="drive-host-1-16000-acme--app-8")
+        drive.write_day_count(self.day, drive._day_string(NOW), 0)
+        stop, restarter = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=restarter,
+            restarts_path=self.budget,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(restarter.calls), 1)
+        self.assertEqual(restarter.calls[0][1:4], ("app", 7, "start"))
+        self.assertIn("day cap", out.getvalue())
+        self.assertEqual(self.day_starts(), 1)
 
 
 if __name__ == "__main__":
