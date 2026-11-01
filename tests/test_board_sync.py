@@ -7,6 +7,7 @@ is a temporary file. No ``gh``, no GraphQL, no network, no real state dir.
 """
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from typing import Any
@@ -314,6 +315,32 @@ class BoardPollTest(BoardCase):
             FakeBoardReader([reading(repo=REPO, number=1, updated_at=T0, extra={"blocked_by": []})])
         )
         self.assertEqual(self.stored(1).extra, {"pool": "a"})
+
+    def test_poll_reports_a_corrupt_row_and_applies_the_rest(self):
+        self.seed(1, T0 - 100, {"priority": "high"})
+        self.seed(2, T0 - 100, {"pool": "a"})
+        raw = sqlite3.connect(os.path.join(self.tmp.name, "board.sqlite"))
+        try:
+            raw.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                ("{{{broken", REPO, 1),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        result = self.poll(
+            FakeBoardReader(
+                [
+                    reading(repo=REPO, number=1, updated_at=T0, extra={"pool": "b"}),
+                    reading(repo=REPO, number=2, updated_at=T0, extra={"pool": "c"}),
+                ]
+            )
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn(f"{REPO}#1", result.errors[0])
+        self.assertEqual(self.stored(2).extra, {"pool": "c"})
+        self.assertEqual(result.cursor, tracker.format_cursor(T0))
 
 
 class CursorPairTest(BoardCase):

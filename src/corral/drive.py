@@ -1288,11 +1288,12 @@ def sync_all(store, tracker_factory, *, operators, now):
     ``tracker_factory`` maps a tracker repo to its tracker (labels or
     board, built by the one factory); board repos run the feed step then
     the board step. Returns (seen, errors): the rows applied and one line
-    per failed repo. A failed repo keeps its rows and its cursor (that is
-    `sync_repo`'s contract) and the pass moves on to the next repo; a
-    repo the factory does not know is an error line, never a silent skip.
-    With no factory there is nothing to sync from: no rows move and no
-    errors are reported.
+    per failure (a failed repo, or a row a step could not apply). A
+    failed repo keeps its rows and its cursor (that is `sync_repo`'s
+    contract) and the pass moves on to the next repo; a repo the factory
+    does not know is an error line, never a silent skip. With no factory
+    there is nothing to sync from: no rows move and no errors are
+    reported.
     """
     if tracker_factory is None:
         return 0, []

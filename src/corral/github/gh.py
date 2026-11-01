@@ -453,7 +453,10 @@ def graphql(query: str, run=None, pacer=None, **variables) -> dict:
 
     `run` and `pacer` are injected for tests and default to the real
     ones: `run(args, paced=True)` runs `gh`, and the pacer meters the
-    shared bucket. Only GraphQL variable names may follow them."""
+    shared bucket. Their names are reserved for these seams and are
+    never sent as variables: every other keyword becomes a `-f`/`-F`
+    variable, so a query needing variables named `run` or `pacer`
+    cannot go through this function as written."""
     active_pacer = _pacer() if pacer is None else pacer
     # The parameter shadows the module's `run`: fall back to it by name,
     # so tests patching the module attribute still steer the default.

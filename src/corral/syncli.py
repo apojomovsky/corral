@@ -116,8 +116,10 @@ def _board_step(store, tracker, tracker_repo, *, operators, now):
 
     Only the board's own failures are caught here (a live check the
     budget or the board refused): the step records a board-outage line,
-    keeps the old cursor, and the pass continues on store data. Anything
-    else (a programming error, a store failure) propagates.
+    keeps the old cursor, and the pass continues on store data. A row
+    the poll cannot apply is already a line in the board result, not a
+    raise. Anything else (a programming error, any other store failure)
+    propagates.
     """
     try:
         schema = tracker.board_schema()

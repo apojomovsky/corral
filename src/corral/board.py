@@ -245,10 +245,12 @@ def _reading_value(item, field):
 def effective_priority(label_priority, extra):
     """The rank eligibility reads: the board rank wins when present,
     else the label-derived rank. Pure, and the only place that decides
-    between the two sources."""
+    between the two sources. Only a non-empty string wins: any other
+    board value (a list, a number, None) keeps the label rank, so a
+    foreign value never reaches the policy row's string field."""
     if isinstance(extra, dict):
         board_priority = extra.get("priority")
-        if board_priority:
+        if isinstance(board_priority, str) and board_priority:
             return board_priority
     return label_priority or ""
 
@@ -257,9 +259,10 @@ def merge_extra(stored, reading):
     """The stored board concepts plus one reading's carried keys.
 
     A reading overwrites only the concepts it carries: an absent key
-    keeps the stored value, while the cleared encoding removes it (None
-    clears a scalar key, an empty list clears a list key). A reading
-    that is not a dict carries nothing. Pure."""
+    keeps the stored value, while the cleared encoding removes the key
+    whatever the stored type (None or an empty list both clear, whether
+    the stored value is a scalar or a list). A reading that is not a
+    dict carries nothing. Pure."""
     merged = dict(stored)
     if not isinstance(reading, dict):
         return merged
@@ -479,8 +482,11 @@ class Store:
         """Apply a tracker reading. People-owned fields always take the
         tracker's value, while board concepts in ``extra`` merge by key:
         a reading overwrites only the concepts it carries, and only the
-        cleared encoding (None for a scalar, an empty list for a list)
-        removes one. Corral-owned fields are never originated here:
+        cleared encoding (None or an empty list, whatever the stored
+        type) removes one. A stored row whose ``extra`` is corrupt or
+        not an object raises ``StoreError`` naming the item instead of
+        healing by overwrite, so the damage stays visible. Corral-owned
+        fields are never originated here:
         the reading only settles queued writes. A fresh tracker value
         echoing a queued write marks it sent, a fresh different value
         drops it as overridden, and a reading that says nothing (an empty
