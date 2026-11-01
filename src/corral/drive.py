@@ -2125,25 +2125,26 @@ def _claim_and_launch(
     the stuck sweep defers to it) and relaunches its session; `fix`
     resumes when the holder is still usable and otherwise releases and
     reclaims before restarting on the same branch, which the launch
-    path reuses. A fresh restart first gates on the restart budget:
-    past the budget the row routes to the give-up path exactly as the
-    stuck sweep does (decision writes through `tracker_factory`, then
-    release; a failed write or a missing tracker keeps the claim), and
-    a fresh restart that launches records one stamp; a resume reuses
-    the session and never touches the budget. `restarts_path` persists
-    those stamps (in memory when None); `out`, `err` and `events` carry
-    the give-up lines, budget warnings and journal entries. A lost race
-    (exit 2 from the store) becomes a skip naming the holder and the
-    pass moves on; a launch through `launcher` appends the unit or the
-    failure to the row's reason. `released` ({(repo, number): worker
-    id} released this pass) and `finished` (the newest finished entry
-    per ticket) feed the reviewer author. With no `launcher` the pass
-    stops after claiming and records that, so no row counts as
-    launched. The day cap counts `start` launches only: resumes reuse
-    an existing claim, and reviewer and fix rounds answer finished work
-    rather than starting new work. When `start_budget` is not None, at
-    most that many starts launch; further starts become `cap` skips
-    naming `day_cap`, and each start spends one from the local budget.
+    path reuses. A fresh restart first gates on the day cap, then on
+    the restart budget: past the budget the row routes to the give-up
+    path exactly as the stuck sweep does (decision writes through
+    `tracker_factory`, then release; a failed write or a missing
+    tracker keeps the claim), and a fresh restart that launches
+    records one stamp; a resume reuses the session and never touches
+    either budget. `restarts_path` persists those stamps (in memory
+    when None); `out`, `err` and `events` carry the give-up lines,
+    budget warnings and journal entries. A lost race (exit 2 from the
+    store) becomes a skip naming the holder and the pass moves on; a
+    launch through `launcher` appends the unit or the failure to the
+    row's reason. `released` ({(repo, number): worker id} released
+    this pass) and `finished` (the newest finished entry per ticket)
+    feed the reviewer author. With no `launcher` the pass stops after
+    claiming and records that, so no row counts as launched. The day
+    cap counts `start`, `review` and fresh `fix` launches: each one
+    starts a new agent. A `resume` reuses the holder's claim and stays
+    exempt. When `start_budget` is not None, at most that many launch;
+    further ones become `cap` skips naming `day_cap`, and each launch
+    spends one from the local budget.
     """
     rows: list = []
     started = 0
@@ -2173,6 +2174,19 @@ def _claim_and_launch(
                         verdict="skip",
                         reason=f"{ref}: finished worker id lost, review skipped",
                         code="claim",
+                    )
+                )
+                continue
+            if start_budget is not None and start_budget <= 0:
+                rows.append(
+                    Gated(
+                        project=gated.project,
+                        repo=gated.repo,
+                        number=gated.number,
+                        kind=gated.kind,
+                        verdict="skip",
+                        reason=f"{ref}: day cap reached ({day_cap}/day), not started",
+                        code="cap",
                     )
                 )
                 continue
@@ -2238,6 +2252,9 @@ def _claim_and_launch(
                 )
             )
             launched.add((gated.project, gated.repo, gated.number))
+            started += 1
+            if start_budget is not None:
+                start_budget -= 1
             continue
         if gated.kind in ("resume", "fix"):
             try:
@@ -2315,6 +2332,19 @@ def _claim_and_launch(
                 title = current.title if current is not None and current.title else ref
                 agent = holder
             else:
+                if start_budget is not None and start_budget <= 0:
+                    rows.append(
+                        Gated(
+                            project=gated.project,
+                            repo=gated.repo,
+                            number=gated.number,
+                            kind=effective,
+                            verdict="skip",
+                            reason=f"{ref}: day cap reached ({day_cap}/day), not started",
+                            code="cap",
+                        )
+                    )
+                    continue
                 if not restart_allowed(stamps, now=now):
                     tracker = None
                     if tracker_factory is not None:
@@ -2464,6 +2494,9 @@ def _claim_and_launch(
             )
             launched.add((gated.project, gated.repo, gated.number))
             if effective == "fix":
+                started += 1
+                if start_budget is not None:
+                    start_budget -= 1
                 budgets[key] = record_restart(stamps, now=now)
                 if restarts_path is not None:
                     try:
@@ -3319,6 +3352,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 lock_path=lock_path(),
                 out=sys.stdout,
                 err=sys.stderr,
+                hold_label=hold_label,
                 pause_path=pause_path(),
                 agent_states=planned_states,
                 finished_for=planned_finished,
@@ -3362,6 +3396,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             lock_path=lock_path(),
             out=sys.stdout,
             err=sys.stderr,
+            hold_label=hold_label,
             projects_fn=lambda: registered,
             tracker_factory=tracker_factory,
             operators=operators,

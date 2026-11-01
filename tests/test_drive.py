@@ -448,5 +448,81 @@ class CmdDriveTest(unittest.TestCase):
         self.assertEqual(code, 4)
 
 
+class HoldLabelWiringTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-hold-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_passed_hold_label_skips_the_host_defaults(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(
+            drive, "_default_host_inputs", side_effect=AssertionError("must not resolve")
+        ):
+            code = hermetic_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                found=[("blue", [("app", 7, "start")])],
+                policy_dir=self.policies,
+            )
+        self.assertEqual(code, 0)
+
+    def passing_cmd(self, plan):
+        seen = {}
+        launcher_seen = {}
+
+        def fake_run_pass(**kwargs):
+            seen.update(kwargs)
+            return 0
+
+        store = mock.MagicMock()
+        host_settings = {"drive.max_starts_per_day": 50, "board.hold_label": "paused"}
+        old = os.environ.get("CORRAL_STATE")
+        os.environ["CORRAL_STATE"] = self.tmp.name
+        try:
+            with (
+                mock.patch.object(drive.board, "open_store", return_value=store),
+                mock.patch.object(drive.settings, "load", return_value=host_settings) as loaded,
+                mock.patch.object(drive.projects, "load_all", return_value=[]),
+                mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0)),
+                mock.patch.object(drive, "production_finished_for", return_value={}),
+                mock.patch.object(drive, "production_operators", return_value=({}, None)),
+                mock.patch.object(
+                    drive,
+                    "production_launcher",
+                    side_effect=lambda *args, **kwargs: launcher_seen.update(kwargs),
+                ),
+                mock.patch.object(drive, "production_stopper", return_value=None),
+                mock.patch.object(drive, "run_pass", side_effect=fake_run_pass),
+            ):
+                code = drive.cmd_drive(argparse.Namespace(plan=plan, drive_verb=None))
+        finally:
+            if old is None:
+                del os.environ["CORRAL_STATE"]
+            else:
+                os.environ["CORRAL_STATE"] = old
+        return code, seen, launcher_seen, loaded
+
+    def test_a_plan_reads_the_hold_label_once_and_passes_it_in(self):
+        code, seen, _, loaded = self.passing_cmd(plan=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen.get("hold_label"), "paused")
+        self.assertEqual(loaded.call_count, 1)
+
+    def test_a_claiming_pass_reads_the_hold_label_once_and_passes_it_in(self):
+        code, seen, launcher_seen, loaded = self.passing_cmd(plan=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen.get("hold_label"), "paused")
+        self.assertEqual(launcher_seen.get("hold_label"), "paused")
+        self.assertEqual(loaded.call_count, 1)
+
+
 if __name__ == "__main__":
     unittest.main()

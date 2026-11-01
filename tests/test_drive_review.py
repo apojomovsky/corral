@@ -10,6 +10,7 @@ stub policies, injected registry states and a recording launcher. No
 """
 
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -622,6 +623,144 @@ class FixBudgetTest(unittest.TestCase):
         self.assertTrue(any(call[0] == "comment" for call in fake.calls))
         self.assertIsNone(store.claim_of("app", 7))
         self.assertIn("gave up", out)
+
+
+class ReviewFixDayCapTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-review-day-cap-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+        self.day = os.path.join(self.tmp.name, "starts.json")
+
+    def run_capped(self, store, found, fake_tracker, launcher, *, day_used, max_starts, **fields):
+        drive.write_day_count(self.day, drive._day_string(NOW), day_used)
+        out, err = io.StringIO(), io.StringIO()
+        fields.setdefault("now", NOW)
+        code = review_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=found,
+            policy_dir=self.policies,
+            fake_tracker=fake_tracker,
+            launcher=launcher,
+            day_path=self.day,
+            max_starts=max_starts,
+            **fields,
+        )
+        return code, out.getvalue(), err.getvalue()
+
+    def day_starts(self):
+        with open(self.day, encoding="utf-8") as handle:
+            return json.load(handle)["starts"]
+
+    def test_a_reviewer_is_skipped_at_the_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        code, out, _ = self.run_capped(
+            store,
+            [("blue", [("app", 7, "review")])],
+            fake,
+            launcher,
+            day_used=1,
+            max_starts=1,
+            agent_states={WORKER: (FINISHED, NOW - 10.0)},
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("day cap", out)
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_a_reviewer_launch_spends_one_from_the_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        code, _, _ = self.run_capped(
+            store,
+            [("blue", [("app", 7, "review")])],
+            fake,
+            launcher,
+            day_used=0,
+            max_starts=1,
+            agent_states={WORKER: (FINISHED, NOW - 10.0)},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "review")
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_a_fresh_fix_is_skipped_at_the_cap_and_keeps_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        code, out, _ = self.run_capped(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            day_used=1,
+            max_starts=1,
+            agent_states={},
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("day cap", out)
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_a_fresh_fix_launch_spends_one_from_the_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        code, _, _ = self.run_capped(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            day_used=0,
+            max_starts=1,
+            agent_states={},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "fix")
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_a_resume_reusing_the_live_unit_stays_exempt_at_the_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        code, _, _ = self.run_capped(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            day_used=1,
+            max_starts=1,
+            agent_states={WORKER: (registry.LIVE, NOW - 10.0)},
+            live_units=frozenset({("app", 7)}),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "resume")
+        self.assertEqual(self.day_starts(), 1)
 
 
 if __name__ == "__main__":
