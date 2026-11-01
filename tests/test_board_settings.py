@@ -4,6 +4,8 @@ Pure: everything goes through ``settings.resolve`` with plain dicts, so no
 file, subprocess or network is touched.
 """
 
+import os
+import tempfile
 import unittest
 
 from corral import settings
@@ -169,8 +171,10 @@ class ScalarCoexistence(unittest.TestCase):
 
 class VariantValidation(unittest.TestCase):
     def test_a_typo_names_the_repo_and_the_key(self):
+        # A typo next to a complete [repo.board] table still fails here,
+        # instead of silently running label mode forever.
         with self.assertRaisesRegex(settings.SettingsError, "app.*tracker\\.variant.*bord"):
-            resolve(project=project(board=None, variant="bord"), repo="app")
+            resolve(project=project(documented_board(), variant="bord"), repo="app")
 
     def test_every_entry_is_checked_not_only_the_selected_one(self):
         other = {"name": "other", "tracker": {"variant": "carrier-pigeon"}}
@@ -226,6 +230,7 @@ class TableErrors(unittest.TestCase):
             dict(base, project_number=True),
             dict(base, project_number=0),
             dict(base, project_id=""),
+            dict(base, project_id=3),
             dict(base, agent_field=""),
             dict(base, status_column=3),
             dict(base, priority_map=[]),
@@ -252,6 +257,70 @@ class TableErrors(unittest.TestCase):
     def test_a_board_table_never_reads_as_a_setting(self):
         with self.assertRaisesRegex(settings.SettingsError, "unknown setting"):
             resolve(host={"board": {"priority_map": {"x": "high"}}})
+
+    def test_board_tables_are_checked_with_no_selected_repo(self):
+        # Entry validation runs for every [[repo]] entry, not only the
+        # selected one: a bad board table fails even when no repo is read.
+        with self.assertRaisesRegex(settings.SettingsError, "app.*frobnicate"):
+            resolve(project=project(documented_board(frobnicate="nope")))
+        resolved = resolve(project=project(documented_board()))
+        self.assertIsNone(resolved.board)
+
+
+class KeyLinkage(unittest.TestCase):
+    def test_columns_are_a_subset_of_keys(self):
+        self.assertLessEqual(set(settings._BOARD_COLUMNS), set(settings._BOARD_KEYS))
+
+    def test_keys_are_address_columns_and_map(self):
+        self.assertEqual(
+            set(settings._BOARD_KEYS),
+            set(settings._BOARD_ADDRESS) | set(settings._BOARD_COLUMNS) | {"priority_map"},
+        )
+
+    def test_board_config_fields_match_keys(self):
+        self.assertEqual(set(settings.BoardConfig._fields), set(settings._BOARD_KEYS))
+
+
+class TomlText(unittest.TestCase):
+    def test_repo_board_headers_resolve_from_toml_text(self):
+        text = (
+            "[[repo]]\n"
+            'name = "app"\n'
+            "\n"
+            "[repo.tracker]\n"
+            'repo = "example/demo"\n'
+            'variant = "board"\n'
+            "\n"
+            "[repo.board]\n"
+            'project_owner = "example"\n'
+            "project_number = 3\n"
+            'agent_field = "Agent"\n'
+            'status_column = "Status"\n'
+            'priority_column = "Priority"\n'
+            "\n"
+            "[repo.board.priority_map]\n"
+            '"opt-p0-id" = "urgent"\n'
+            '"opt-p1-id" = "high"\n'
+        )
+        with tempfile.TemporaryDirectory(prefix="corral-board-settings-") as tmp:
+            config = os.path.join(tmp, "config")
+            os.makedirs(config)
+            root = os.path.join(tmp, "ops")
+            os.makedirs(root)
+            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+                handle.write(text)
+            resolved = settings.load(root=root, repo="app", env={"CORRAL_CONFIG": config})
+        self.assertEqual(resolved["tracker.variant"], "board")
+        self.assertEqual(resolved["tracker.repo"], "example/demo")
+        board = resolved.board
+        self.assertEqual(board.project_owner, "example")
+        self.assertEqual(board.project_number, 3)
+        self.assertIsNone(board.project_id)
+        self.assertEqual(board.agent_field, "Agent")
+        self.assertEqual(board.status_column, "Status")
+        self.assertEqual(board.priority_column, "Priority")
+        self.assertEqual(board.status_field, "")
+        self.assertEqual(board.priority_map, {"opt-p0-id": "urgent", "opt-p1-id": "high"})
 
 
 if __name__ == "__main__":
