@@ -201,7 +201,7 @@ class CoordApiTest(unittest.TestCase):
                 1: {"comm": "init", "argv0": "init", "ppid": 0, "start": "4"},
             }
         )
-        self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "claude-code"))
+        self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "muse"))
 
     def test_find_holder_matches_rewritten_process_title(self):
         # A Claude Code background session's comm is its version
@@ -214,7 +214,7 @@ class CoordApiTest(unittest.TestCase):
                 1: {"comm": "init", "argv0": "init", "ppid": 0, "start": "4"},
             }
         )
-        self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "claude-code"))
+        self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "muse"))
 
     def test_runtime_of_ignores_names_merely_containing_claude(self):
         self.assertIsNone(coord._runtime_of("x", "claude-helper run"))

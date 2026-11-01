@@ -39,7 +39,9 @@ LEASE_DIRNAME = "coord"
 LEASE_NAME = "lease.json"
 LOCK_NAME = "lease.lock"
 
-_RUNTIME_NAMES = {"claude": "claude-code", "omp": "omp"}
+# Parent-process names to registry runtime names: the holder's runtime reads
+# the way the agent registry records it, so one namespace names every agent.
+_RUNTIME_NAMES = {"claude": "muse", "omp": "omp"}
 
 
 class LeaseHeldError(Exception):
@@ -171,7 +173,7 @@ class RealProc:
 
 
 def _runtime_of(comm, argv0):
-    """Runtime for one process: claude->claude-code, omp->omp, else None."""
+    """Runtime for one process: claude->muse, omp->omp, else None."""
     names = set()
     if comm:
         names.add(comm.strip())
@@ -193,7 +195,7 @@ def find_holder(self_pid=None, proc=None):
     """Nearest ancestor that is a coordinator runtime, or (None, None).
 
     Walks parents from `self_pid` (default: this process). Returns
-    ``(pid, runtime)``; runtime is ``claude-code`` or ``omp``.
+    ``(pid, runtime)``; runtime is ``muse`` or ``omp``.
     """
     table = proc if proc is not None else RealProc()
     current = self_pid if self_pid is not None else os.getpid()
