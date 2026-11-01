@@ -128,7 +128,7 @@ library only, authenticated per host with bearer tokens.
 - **If the hub is unreachable, no new claim is made.** Work on
   claims already held continues (work, commit, push, open PRs,
   resume). Removing a host is an operator action
-  (`corral hub remove-host <host>`): it bumps the membership epoch
+  (`corral hub remove-host --id <host>`): it bumps the membership epoch
   and releases the removed host's claims. A removed host that comes
   back sees the newer epoch, stops its agents, drops their claims,
   and does nothing until it is added again. Worktrees stay under

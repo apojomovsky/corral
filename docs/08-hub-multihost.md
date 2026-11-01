@@ -133,8 +133,14 @@ carries the snapshot push (section 5): one call per interval, not
 two. The heartbeat body carries a `renewals` list beside the
 snapshot, one entry per held claim:
 `{"renewals": [{"repo": ..., "number": ..., "agent": ..., "epoch": ...}]}`.
-The heartbeat reply answers each entry with granted or `409`, same
-semantics as the single-claim route. Suggested defaults, tunable as
+The heartbeat reply answers each entry with granted or `409`. A
+`409` on any renewal, whether in a heartbeat batch or on the
+single-renew route, means another owner holds the ticket: the host
+stops the ticket's units through the injected stop seam, drops its
+local claim state without touching the hub row, and logs, exactly
+like the reconnect rule in the stale-holder paragraph below. No
+resume, no same-pass re-propose; the next pass may propose only
+tickets the hub shows as unclaimed. Suggested defaults, tunable as
 `hub.lease_ttl_s` and `hub.heartbeat_s`: heartbeat every 30 seconds,
 lease 3 times that.
 UNVERIFIED until run: whether 30 seconds keeps hub write load trivial
@@ -148,6 +154,15 @@ epoch is kept, so the next grant mints `epoch+1` and fences a stale
 holder still acting on the old epoch. This mirrors the local
 `Store.release` contract (`agent`/`host` cleared, epoch left for the
 next claim to mint).
+
+Membership routes: `POST /v1/register` with `host_id`, `address`,
+`capacity`, and `constraints`; `POST /v1/heartbeat` with `host_id`,
+the `renewals` list from above, and the `snapshot` document
+(section 5). Both replies carry the current `membership_epoch`
+(section 1); the heartbeat reply additionally carries one
+granted-or-`409` answer per renewal entry. Registration and
+heartbeat are the only calls that report capacity and constraints;
+claims never carry them.
 
 Fencing epochs: every actor that stops or restarts work checks the
 epoch first. A unit whose claim epoch is older than the hub's row for
@@ -275,9 +290,10 @@ replaces per-host reads.
   `project=all` as the default, and per-project slices by name.
   Filter values come from the hub's projects table; an unknown
   project is `404`, never an empty merge that hides a typo.
-- Push, not pull, for snapshots. Each host POSTs its host-local
-  snapshot document to the hub on the heartbeat interval (one call
-  carries heartbeat, lease renewals, and the snapshot). Push needs
+- Push, not pull, for snapshots. Each host pushes its host-local
+  snapshot document with `POST /v1/heartbeat` on the heartbeat
+  interval (one call carries heartbeat, lease renewals, and the
+  snapshot; section 2 names the fields). Push needs
   only outbound connectivity from hosts, matches the hub-down
   detection the hosts already do, and gives the hub a document to
   serve while a host is down. Pull (hub scraping hosts) was
@@ -355,7 +371,9 @@ replaces per-host reads.
   including epochs; `corral hub import` loads it into a fresh hub.
   Epochs are preserved across the move, so fencing continuity
   survives it. Snapshots are excluded by design: hosts re-push on
-  their next heartbeat.
+  their next heartbeat. Token hashes are excluded: after an import
+  the operator re-runs `add-host` or `rotate-token` for each host
+  and installs the minted tokens, so no secret crosses the export.
 - Loss and rebuild: the tracker stays the durable record. A hub
   that loses its database rebuilds membership from re-registering
   hosts and claims from the tracker's in-flight labels (the
@@ -399,6 +417,7 @@ on ephemeral ports and speak to them in-process.
 | Grant atomicity: two racing proposes, one wins with `epoch+1` | temp hub DB, two fake hub clients over loopback |
 | Conflict names holder; loser skips to next candidate | temp hub DB plus temp board store |
 | Renewal moves lease, keeps epoch; wrong epoch gets `409`; heartbeat carries the `renewals` list from section 2 | fake clock, temp hub DB, heartbeat body shape assertion |
+| Renewal `409` in a heartbeat batch or on the single-renew route stops the units, drops the local claim, and logs; no resume, no same-pass re-propose | fake clock, temp hub DB, superseded epoch; stop seam must be called, next-pass propose counter stays zero |
 | Release clears holder, keeps epoch; next grant fences | temp hub DB, epoch assertions |
 | Crash: lease lapse re-grants to another host with bumped epoch | fake clock advanced past `lease_ttl_s` |
 | Partition: holder keeps running locally, cannot claim, reconciles stale-first on reconnect | fake hub client scripted unreachable, then live hub with superseded epoch; stop seam must be called |
@@ -500,8 +519,9 @@ Options:
 2. 10s heartbeat, lease 3 heartbeats.
 3. 60s heartbeat, lease 3 heartbeats.
 
-**D2: doctor on a non-private hub bind address.** Warn keeps the
-hub up where the operator knows best; refuse fails closed.
+**D2: hub startup behavior on a non-private bind address.** Warn
+keeps the hub up where the operator knows best; refuse fails
+closed.
 
 Options:
 1. Warn on stderr, keep serving (recommended).

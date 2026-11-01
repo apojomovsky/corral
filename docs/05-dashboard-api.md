@@ -123,8 +123,8 @@ library. Two alternatives were considered and rejected:
   it), but it is a consumer choice, not the interface.
 - A unix socket: browsers cannot speak HTTP over a unix socket, and
   dashboards are often browser pages. HTTP serves both a local page
-  and the hub's snapshot push over the same routes, which the hub
-  design reuses (`08-hub-multihost.md`, section 5).
+  and the hub's snapshot push, which reuses the snapshot document
+  shape over its own routes (`08-hub-multihost.md`, section 5).
 
 Polling is the base contract: every GET is cheap, cacheable, and
 carries its own freshness (`now`, `read_at`/`stale`,
