@@ -1,15 +1,22 @@
-# 08: host resource governance across projects and instances
+# 08: host resource governance across projects on one host
 
-Status: proposed 2026-11-01. Design only; no code ships with this doc.
+Status: proposed 2026-11-01, re-scoped after review round 1 to one
+corral per machine. Design only; no code ships with this doc.
 
 Admission today counts agents (`admission.admit`, `registry.counted_tickets`).
-It knows nothing about CPU or memory, and nothing about another corral
-instance on the same machine with its own state and config dirs. Test suites
-and builds run by agents can saturate a small host and starve everything else
-on it, including other fleets. This doc designs the budget layer that sits
-next to the count layer: a host budget every instance shares, divided per
-instance, per project and per agent, enforced by the kernel through nested
-systemd slices.
+It knows nothing about CPU or memory. Test suites and builds run by agents
+can saturate a small host and starve everything else on it, including other
+fleets. This doc designs the budget layer that sits next to the count layer:
+a host budget divided per project and per agent, enforced by the kernel
+through nested systemd slices.
+
+One corral per machine: one state directory, one host-wide ledger that every
+project on the host registers to. Coordination between separate state
+directories on the same host is not a goal; a guard refuses a second
+instance pointed at a different state directory (section 2). The host is the
+only authority on its CPU and memory. A hub (separate design) never admits
+on a host's behalf; it only learns the host's capacity and load through a
+read-only capacity report (section 2), and it never writes the ledger.
 
 It decides the nine points the ticket lists, with reasoning. Where it changes
 a public surface (a setting, a launch flag, a CLI verb) it says so;
@@ -25,10 +32,11 @@ Verified on one host while writing: the machine exposes
 
 ## 0. Scope and non-goals
 
-The slice adds: a four-level budget (host, instance, project, agent), a
-host-level ledger shared by instances, a pure budget-admission function
-composed with the existing count cap and quota gate, per-role cost charges,
-pressure backoff, doctor rows, and a rollout of small implementation tickets.
+The slice adds: a three-level budget (host, project, agent), a host-level
+ledger keyed by project, a single-instance guard, a pure budget-admission
+function composed with the existing count cap and quota gate, per-role cost
+charges, pressure backoff, a read-only capacity report for the hub, doctor
+rows, and a rollout of small implementation tickets.
 
 Non-goals: disk (the `disk.py` pressure gate already owns it), network and
 GPU limits, placement across hosts (per-host budgets only; the `00-design.md`
@@ -38,18 +46,16 @@ milestone 2 peer model is untouched), several login users on one host
 
 ## 1. Resource hierarchy
 
-Four levels, each resolved in exactly one place (AGENTS.md, one fact one
+Three levels, each resolved in exactly one place (AGENTS.md, one fact one
 place):
 
-1. **Host budget.** The operator-set machine total, shared by every instance
-   on the host: millicores of CPU, megabytes of memory, max pids.
-2. **Instance share.** Each corral instance's portion of the host budget,
-   recorded in the host ledger (section 2).
-3. **Project share.** Each registered project's portion of its instance:
+1. **Host budget.** The operator-set machine total: millicores of CPU,
+   megabytes of memory, max pids.
+2. **Project share.** Each registered project's portion of the host budget:
    a guaranteed floor plus a weight for the remainder plus an optional
    ceiling, mirroring the count floors and ceilings in `admission.py` so the
    two compose without a second mental model.
-4. **Per-agent charge.** Each launch is charged by role (worker, reviewer,
+3. **Per-agent charge.** Each launch is charged by role (worker, reviewer,
    triage): a fixed CPU and memory cost, like a price tag, decided before
    anything is measured.
 
@@ -58,9 +64,8 @@ Enforcement maps to nested slices under the user manager:
 ```text
 user.slice
   corral.slice                          host budget (MemoryMax, CPUQuota)
-    corral-<instance>.slice             instance share
-      corral-<project>.slice            project share
-        corral-agent-<repo>-<n>         per-agent unit (MemoryMax, CPUQuota, TasksMax)
+    corral-<project>.slice              project share
+      corral-agent-<repo>-<n>           per-agent unit (MemoryMax, CPUQuota, TasksMax)
 ```
 
 The launch path extends the existing `units.unit_argv` builder (which already
@@ -93,54 +98,58 @@ controller present reads ok, a missing optional one reads as unavailable, a
 missing required one fails the `resources` row and every launch refuses until
 it returns.
 
-## 2. Coordination between instances
+## 2. One ledger, one instance, keyed by project
 
-Two instances on one host have separate state and config dirs by definition,
-so neither dir can hold the shared record. The ledger lives at one fixed
-host path both instances derive without consulting any override:
-`<xdg-state-base>/corral/host-resources.json`, where the base is the XDG
-state base (`~/.local/share` by default) read straight from the environment,
-ignoring `CORRAL_STATE`. This is the one deliberate exception to the override
-rule, documented next to the resolver: an override-sensitive path could never
-be shared, and a shared path must not move under a running fleet.
+Every project on the host registers to a single host-wide ledger. There is
+no per-instance layer: no instance shares, no instance weights, no
+cross-instance heartbeats, no peer expiry.
 
-**Identity.** Each instance mints a stable random id once and keeps it in
-its own config dir (`instance.id`). The resolver that reads it is the single
-owner of instance identity. Collisions are not handled beyond 128 bits of
-randomness; a duplicate id fails closed because two writers would share one
-heartbeat slot and each would read the other's heartbeat as its own, so the
-ledger refuses entries whose id already holds a live heartbeat from a
-different boot nonce (each boot mints a nonce, stored next to the id only in
-memory).
+**Location.** The ledger lives at
+`<xdg-state-base>/corral/host-resources.json`, resolved by a new
+`paths.host_ledger_path()` helper built on
+`_xdg_base("XDG_STATE_HOME", "~/.local/state", env)` on the `config_home()`
+precedent: the XDG state base directly, never `CORRAL_STATE`, and never read
+straight from the environment by any caller. This is the one deliberate
+exception to the override rule, documented next to the resolver: an
+override-sensitive path could never be shared, and a shared path must not
+move under a running fleet. A test asserts the copies agree: the helper is
+the only resolver, and its result matches the documented location even with
+`CORRAL_STATE` set.
 
-**Format.** Versioned JSON, mirroring the `quota_ledger.py` shape:
+**Guard.** A canonical state-directory marker sits beside the ledger, in the
+same directory: a small file holding the state dir that created this host's
+ledger. It is written once, under the ledger lock, when the ledger is first
+created. Every launch resolves `paths.state_dir()` and compares it to the
+marker; a launch against a different state directory on the same host refuses
+with exit 4, stderr naming both dirs and pointing at the marker. The marker
+is never updated by a launch: moving a host to a new state dir is an operator
+action (stop the fleet, move the marker by hand, start again), not something
+two fleets negotiate.
+
+**Format.** Versioned JSON, mirroring the `quota_ledger.py` shape, keyed by
+project:
 
 ```json
 {"version": 1, "host_budget": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
- "instances": {"<id>": {"cpu_m": 4000, "memory_mb": 8000, "heartbeat_at": 0.0,
-   "pid": 123, "nonce": "abc", "projects": {"<name>": {"weight": 1}}}},
- "foreign": [{"name": "desktop", "cpu_m": 1000, "memory_mb": 2000, "heartbeat_at": 0.0}]}
+ "projects": {"<name>": {"weight": 1, "cpu_floor_m": 500, "memory_floor_mb": 1024}},
+ "foreign": [{"name": "desktop", "cpu_m": 1000, "memory_mb": 2000, "claimed_at": 0.0}]}
 ```
 
 **Locking.** One flock sidecar plus atomic write (`paths.atomic_write_text`),
 the exact `quota_ledger.py` precedent: every read-modify-write holds the
 lock, writers never leave a torn file, readers tolerate a missing file only
 by creating it under the lock. A present-but-corrupt file is never
-reinitialized: the launch refuses (section 6).
+reinitialized: the launch refuses (section 6). The quota ledger's lock blocks
+without a timeout, so the ledger ticket (rollout 3) adds a timed variant: a
+non-blocking flock with a retry loop against a monotonic deadline; a lock
+still busy past the timeout refuses with exit 75.
 
-**Staleness and crash recovery.** Every instance refreshes `heartbeat_at` on
-each admit path and on each drive pass. An entry whose heartbeat is older
-than `resources.gone_s` (default 10 minutes, same scale as
-`registry.gone_s`) is dead and its share returns to the pool. A dead pid
-(`kill(pid, 0)` failing, the `registry.pid_alive` precedent) plus any stale
-heartbeat reclaims immediately; a live pid with a stale heartbeat still waits
-out the bound, because a paused event loop is not a dead instance. No manual
-removal exists: unlike the `00-design.md` cross-host peers, same-host
-instances share a kernel, so liveness is checkable and expiry is automatic.
-
-**Peer disappears without releasing.** It cannot hold anything: expiry is by
-time and pid liveness, not by a release message. The worst case is a share
-reserved until `gone_s` passes, bounded and visible in the doctor row.
+**Staleness and crash recovery.** There is nothing to expire: charged usage
+is recomputed from the live registry on every admit (section 3), so a crash
+holds no share and recovery is automatic. The only time-bounded entries are
+foreign claims, which expire under `resources.gone_s` (default 10 minutes,
+same scale as `registry.gone_s`); an expired foreign claim is ignored with a
+doctor warn row, never held against the pool.
 
 **Same user only.** Several login users on one host are out of scope. The
 user manager, the delegation and the `$HOME`-relative ledger path are all
@@ -149,19 +158,36 @@ never touches (`make bootstrap` never uses sudo). Two users running corral on
 one host today simply do not see each other; the foreign-claim mechanism
 (section 4) is the only bridge offered, declared by hand.
 
+**Capacity report (read-only, for the hub).** The hub learns capacity and
+load through one stable shape, never by reading or writing the ledger
+itself:
+
+```json
+{"schema_version": 1, "host_budget": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
+ "charged": {"cpu_m": 2500, "memory_mb": 5120, "pids": 120},
+ "by_project": {"<name>": {"cpu_m": 2000, "memory_mb": 4096, "pids": 100}},
+ "pressure": {"load_per_cpu": 0.4, "mem_available_pct": 55.0, "saturated": false}}
+```
+
+`charged` and `by_project` sum the static role tags of live agents;
+`pressure` carries the measured readings from section 4. The hub never
+writes the ledger and never admits on the host's behalf; the report shape is
+kept compatible with the multi-host hub design by versioning it
+(`schema_version`) and adding keys only.
+
 ## 3. Admission by budget, not by count
 
 A pure function `resources.admit`, shaped like `admission.admit`: plain data
-in, a verdict with a reason string out. Inputs are the host budget, the live
-ledger shares, the project weights with floors and ceilings, the role costs,
-and the charged usage (the sum of role costs of live agents, from the same
-`registry.visible` plus `units` listing the count gate already reads).
+in, a verdict with a reason string out. Inputs are the host budget, the
+project shares with floors, weights and ceilings, the role costs, the foreign
+claims, and the charged usage (the sum of role costs of live agents, from the
+same `registry.visible` plus `units` listing the count gate already reads).
 Charged usage is static by design: measured use is noisy and gameable, so
 measurement informs the doctor and the snapshot while admission prices from
 the tag.
 
 Fair share between projects: each project is guaranteed its floor; the
-remainder of the instance share splits by weight; a ceiling caps even an idle
+remainder of the host budget splits by weight; a ceiling caps even an idle
 project's neighbor from taking more. A project below its floor is admitted
 past a full pool, exactly like the count floor in `admission.admit`.
 
@@ -172,8 +198,8 @@ version one: it would need a second ordering over tickets that projects own
 Queueing versus refusal: refusal with exit 75, no queue. A queue would need a
 waiter, a wakeup and an ordering across headless processes that never meet;
 exit 75 already means "no free slot, try later" and the drive pass retries.
-The verdict reason names the level that refused (host, instance, project or
-role cost) with the numbers, the same way `admission.Verdict.reason` does.
+The verdict reason names the level that refused (host, project or role cost)
+with the numbers, the same way `admission.Verdict.reason` does.
 
 Composition with the count cap and the quota gate: `launch.admit` evaluates
 in this order and the first refusal wins: disk pressure, agent count,
@@ -205,7 +231,7 @@ wait.
 
 An external fleet can declare a claim on the ledger: a `foreign` entry with
 a name and an explicit CPU and memory reservation. Foreign claims subtract
-from the pool exactly like an instance share and expire under the same
+from the pool exactly like a project share and expire under the same
 `gone_s` bound; an expired foreign claim is ignored with a doctor warn row,
 never held against the pool. The claim is advisory and self-reported:
 corral cannot verify it, so it trusts the declarer and shows the numbers in
@@ -220,12 +246,9 @@ and the key):
 
 ```toml
 [resources.host]
-cpu_m = 8000            # millicores for every instance together
+cpu_m = 8000            # millicores for every project together
 memory_mb = 16000
 pids = 4096
-
-[resources.instance]
-weight = 1              # this instance's share weight against its peers
 
 [resources.project]     # in projects.d/<name>.toml, beside floor/ceiling
 cpu_floor_m = 500
@@ -239,6 +262,9 @@ memory_mb = 2048
 cpu_m = 500
 memory_mb = 1024
 ```
+
+There is no `[resources.instance]` table and no instance weight: with one
+corral per machine the host budget divides directly between projects.
 
 Plus launch flags for one-off overrides: `--cpu-m` and `--memory-mb`,
 validated positive integers, exit 4 otherwise. The stopgap `--slice` flag
@@ -254,10 +280,10 @@ protect them. Enforcement starts the moment the operator sets
 `[resources.host]`; from then on every failure in section 6 refuses.
 
 Validation (exit 4, each message naming the offending numbers): negative
-charges or budgets; a floor above its ceiling; floors summing above the
-instance share or shares above the host budget (the
-`admission.validate_limits` precedent); unknown role names; a weight of zero
-with a positive floor is allowed (floor only, no share of the remainder).
+charges or budgets; a floor above its ceiling; floors summing above the host
+budget (the `admission.validate_limits` precedent); unknown role names; a
+weight of zero with a positive floor is allowed (floor only, no share of the
+remainder).
 
 README impact: none in this design (no verb, flag or config file ships with
 a doc). Each implementation ticket that adds surface updates `README.md` in
@@ -273,8 +299,9 @@ than running unlimited.
 | --- | --- | --- |
 | Manager refuses a property, or a required controller is not delegated | Refuse, stderr naming the property or controller and the doctor row to run | 4 |
 | Ledger present but corrupt, or version newer than this corral | Refuse, stderr naming the file | 4 |
+| State dir differs from the marker beside the ledger | Refuse, stderr naming both dirs and the marker | 4 |
 | User manager bus unreachable | Refuse, existing `Unreachable` path | 3 |
-| Host, instance or project budget exhausted, or host saturated | Refuse, reason with the numbers | 75 |
+| Host or project budget exhausted, or host saturated | Refuse, reason with the numbers | 75 |
 | Ledger lock busy past a short timeout | Refuse, try later | 75 |
 | Pressure or slice-use file unreadable | Reads unknown; admission continues on charged tags, doctor warns | 0, with notes |
 | Foreign claim expired | Ignored, doctor warns | 0, with notes |
@@ -295,8 +322,10 @@ external touch, mirroring the existing seams:
 | `unit_argv` carries `Slice=`, `MemoryMax=`, `CPUQuota=`, `TasksMax=`; unknown controller skipped | pure argv builder, string assertions |
 | Slice creation order (parents before children) and property-refusal mapping | fake `run` recording argv |
 | Pure `resources.admit`: weights, floors, ceilings, role costs, foreign subtraction, staleness bounds | plain data, no seam |
-| Ledger read-modify-write under lock; corrupt file refused, never reset; dead-peer expiry by time and pid | temp-dir store path plus fake `now` and fake `alive` (the `registry` precedent) |
+| Ledger read-modify-write under the timed lock; corrupt file refused, never reset; guard refuses a foreign state dir | temp-dir store path plus fake `now` and a fake monotonic clock for the lock deadline |
+| `paths.host_ledger_path()` is the only ledger resolver; result matches the documented location with overrides set | env-matrix unit test (the copies-agree rule) |
 | Controller delegation parse; pressure parse with absent files reading unknown | fake file readers returning fixture text |
+| Capacity report shape: budget, charged totals, pressure, schema version; hub path never writes | golden-file test plus a write-attempt refusal test |
 | Doctor `resources` rows for each failure in section 6 | fake readers plus temp ledger |
 | Guard: no test reaches a real `systemd-run`, `systemctl`, `/proc` or `/sys` | the existing `suiteguard.py` plus a test asserting the new module never imports a live seam |
 
@@ -329,17 +358,23 @@ section 7.
    Criteria: the documented tables load; every validation in section 5 is a
    `SettingsError` naming file and key; defaults leave current behavior
    byte-identical.
-3. Host ledger. Identity, format, flock plus atomic write, heartbeat,
-   expiry and crash recovery. Criteria: the section 7 ledger rows pass;
-   a corrupt file refuses and is never reset; a dead peer's share returns.
+3. Host ledger and guard. Marker file, versioned format, timed lock, atomic
+   write: a `_locked` helper using non-blocking flock with a retry loop
+   against a monotonic deadline (the quota ledger's blocking lock has no
+   timeout and is not reused). Criteria: the section 7 ledger rows pass; a
+   corrupt file refuses and is never reset; a foreign state dir refuses with
+   exit 4; `paths.host_ledger_path()` is the only resolver and agrees with
+   the documented location under an env matrix.
 4. Launch wiring. Slice creation order, `unit_argv` properties, admit
    composition order, every section 6 exit code. Criteria: fake-`run` tests
    assert the argv; each failure row produces its exit code.
-5. Doctor rows. Delegation, ledger health, pressure, foreign claims.
-   Criteria: each failure in section 6 renders its named row.
-6. Snapshot and registry carriage. Charged versus measured columns per
-   agent, project and instance. Criteria: snapshot JSON gains stable keys
-   with golden-file tests.
+5. Doctor rows. Delegation, ledger health, guard marker, pressure, foreign
+   claims. Criteria: each failure in section 6 renders its named row.
+6. Snapshot, registry carriage and capacity report. Charged versus measured
+   columns per agent and per project, plus the read-only report from
+   section 2. Criteria: snapshot JSON gains stable keys with golden-file
+   tests; the capacity report carries its schema version; a test proves the
+   hub path cannot write the ledger.
 7. Foreign claims and pressure backoff. Claim channel from O5 plus the
    saturation refusal. Criteria: an expired claim frees the pool with a
    warn row; saturation refuses with 75 while shares are free.
@@ -350,11 +385,13 @@ section 7.
 Manual stopgap, replaced by the rollout: one slice unit file plus one
 launch flag. The operator installs
 `~/.config/systemd/user/corral-cap.slice` with `MemoryMax=` and `CPUQuota=`
-under `[Slice]`, enables linger so it persists, and launches with
+under `[Slice]`, and launches with
 `corral launch ... --slice corral-cap.slice`, a passthrough flag validated
 to end in `.slice` (exit 4 otherwise) that appends one `--slice=` line to
-the `systemd-run` argv. It caps the aggregate coarsely with no per-project
-fairness and no cross-instance view; tickets 1 to 4 replace it.
+the `systemd-run` argv. UNVERIFIED: whether linger must be on for the user
+slice to outlive logout; the read-only check is
+`loginctl show-user "$USER" --property=Linger`. It caps the aggregate
+coarsely with no per-project fairness; tickets 1 to 4 replace it.
 
 ## 10. Open decisions
 
@@ -362,10 +399,10 @@ Options blocks, one per decision, each line under 60 characters:
 
 O1. Ledger location:
 Options:
-1. Fixed `$HOME` path ignoring overrides (recommended)
+1. paths.host_ledger_path(), fixed file (recommended)
 2. Next to the state dir with a symlink farm
 3. XDG_RUNTIME_DIR with rebuild on boot
-4. One instance owns it, peers ask over its API
+4. One project owns it, peers ask over its API
 
 O2. Share model between projects:
 Options:
@@ -401,4 +438,3 @@ Options:
 2. Board rank maps to budget priority
 3. Launch flag names a priority class
 4. Project policy hook decides order
-
