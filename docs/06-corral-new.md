@@ -48,8 +48,11 @@ Steps, in order (each is re-runnable; section 5):
 2. **Create and initialise the tree.** Create the directory, `git init -b`
    with the effective initial branch, and copy the template files
    (section 2). The effective branch is resolved once: `--default-branch X`
-   when given, else `--set clone.default_branch=Y` when given, else `main`;
-   giving both with different values is exit 4 (two answers for one fact).
+   when given, else `--set clone.default_branch=Y` when given, else the
+   settings registry default for `clone.default_branch` (the same fallback
+   `init.collect` uses, so `new` and `init` cannot disagree if the default
+   changes); giving both with different values is exit 4 (two answers for
+   one fact).
    Both the `git init -b` argument and the `collect` input use it (`new`
    passes the `--set` through, injecting it when the flag supplied it), so
    the checked-out branch and `corral.toml` can never disagree. It adds no
@@ -297,7 +300,9 @@ that proof is never an adoption: an emptiness check that errors or times out
 is exit 3 (the forge is unreachable, and the check may be hiding someone
 else's repository), never a reading of "no refs". A non-empty remote is
 exit 4 even with `--resume`: its content cannot be proven ours. Local
-scaffold convergence never needs `--resume`.
+scaffold convergence never needs `--resume`. A bare `--resume` without
+`--create-remote` is exit 4 (it would mean nothing), the same rule as
+`--public` without `--create-remote`.
 
 Exit codes (public interface, per `AGENTS.md`):
 
@@ -307,7 +312,7 @@ Exit codes (public interface, per `AGENTS.md`):
 | 1 | nothing to do (converged re-run), or a gate said no (a label refused) |
 | 2 | race lost (the remote appeared between pre-check and create) |
 | 3 | the forge, tracker or host is unreachable |
-| 4 | usage or configuration error (bad name, foreign target with a differing scaffold file, conflicting branch inputs, remote exists, unresolvable owner, bad template or placeholder, `--public` without `--create-remote`) |
+| 4 | usage or configuration error (bad name, foreign target with a differing scaffold file, conflicting branch inputs, remote exists, unresolvable owner, bad template or placeholder, `--public` or `--resume` without `--create-remote`) |
 | 75 | never used by `new` (it consumes no admission slot) |
 
 ## 6. Interaction with `init`, `uninit`, `takeoff`, `doctor`
@@ -366,6 +371,9 @@ Cases:
   `trunk` and writes that same branch to `corral.toml` (never branch `main`
   with `corral.toml` saying `trunk`); `--default-branch X` combined with a
   differing `--set clone.default_branch=Y` is exit 4;
+- with neither branch flag, `new` checks out the registry default of
+  `clone.default_branch` (the same fallback `init` uses), so the two agree
+  when the default changes;
 - `init` on a `new` tree converges (exit 1, no diff);
 - `uninit` removes hooks and registration, keeps `corral.toml`, the overlay
   and every scaffold file;
@@ -379,6 +387,8 @@ Cases:
 - `--resume` adopts an empty remote and continues to labels; a non-empty
   remote is exit 4; an emptiness check that errors or times out is exit 3
   and never adopts (a failed check must not read as "no refs");
+- `--resume` without `--create-remote` is exit 4 (like `--public` without
+  `--create-remote`), before any local write;
 - label ensure creates missing labels, leaves existing ones byte-identical,
   and reports refused ones with exit 1;
 - template genericness: every packaged render contains no host name, home
