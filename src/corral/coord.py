@@ -7,7 +7,8 @@ Lease: one JSON file, ``coord/lease.json`` under the project root,
 guarded by ``fcntl.flock`` on ``coord/lease.lock`` for every
 read-modify-write; writes are atomic (temp file plus ``os.replace``). The
 holder is the nearest ancestor of the calling process whose
-``comm``/argv[0] basename is ``claude`` or ``omp``; ``pid_start`` is
+``comm``/argv[0] basename is ``claude``, ``muse`` (or the launcher's
+versioned ``muse-bin-<version>``) or ``omp``; ``pid_start`` is
 ``/proc/<pid>/stat`` field 22 so a reused pid is never mistaken for the
 holder.
 
@@ -33,6 +34,7 @@ import re
 import tempfile
 
 from corral import paths
+from corral.runtimes import muse as muse_adapter
 
 COORD_TTL_S = 900
 LEASE_DIRNAME = "coord"
@@ -41,7 +43,7 @@ LOCK_NAME = "lease.lock"
 
 # Parent-process names to registry runtime names: the holder's runtime reads
 # the way the agent registry records it, so one namespace names every agent.
-_RUNTIME_NAMES = {"claude": "muse", "omp": "omp"}
+_RUNTIME_NAMES = {"claude": "muse", "muse": "muse", "omp": "omp"}
 
 
 class LeaseHeldError(Exception):
@@ -173,7 +175,12 @@ class RealProc:
 
 
 def _runtime_of(comm, argv0):
-    """Runtime for one process: claude->muse, omp->omp, else None."""
+    """Runtime for one process: claude/muse->muse, omp->omp, else None.
+
+    `muse` matches exactly, as does the launcher's versioned binary
+    (`muse_adapter.BINARY_PREFIX` plus the version): a mere substring
+    never matches, so `muse-helper` is still unknown.
+    """
     names = set()
     if comm:
         names.add(comm.strip())
@@ -184,8 +191,10 @@ def _runtime_of(comm, argv0):
         head = argv0.split()
         if head:
             names.add(os.path.basename(head[0]))
-    if "claude" in names:
-        return _RUNTIME_NAMES["claude"]
+    if "claude" in names or "muse" in names:
+        return _RUNTIME_NAMES["muse"]
+    if any(name.startswith(muse_adapter.BINARY_PREFIX) for name in names):
+        return _RUNTIME_NAMES["muse"]
     if "omp" in names:
         return _RUNTIME_NAMES["omp"]
     return None

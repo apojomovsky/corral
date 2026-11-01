@@ -216,8 +216,41 @@ class CoordApiTest(unittest.TestCase):
         )
         self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "muse"))
 
+    def test_find_holder_matches_plain_muse_process(self):
+        table = FakeProc(
+            {
+                100: {"comm": "x", "argv0": "x", "ppid": 60, "start": "1"},
+                60: {"comm": "muse", "argv0": "muse", "ppid": 1, "start": "2"},
+                1: {"comm": "init", "argv0": "init", "ppid": 0, "start": "3"},
+            }
+        )
+        self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "muse"))
+
+    def test_find_holder_matches_versioned_muse_binary(self):
+        # The muse launcher runs coordinators under a versioned binary
+        # (`muse-bin-<version>`); comm truncates it to 15 characters
+        # while argv0 keeps the full name.
+        table = FakeProc(
+            {
+                100: {"comm": "python3", "argv0": "python3", "ppid": 90, "start": "1"},
+                90: {"comm": "bash", "argv0": "/bin/bash", "ppid": 60, "start": "2"},
+                60: {
+                    "comm": "muse-bin-1.4.14",
+                    "argv0": "/usr/local/bin/muse-bin-1.4.14-R7309.1 exec --json",
+                    "ppid": 1,
+                    "start": "3",
+                },
+                1: {"comm": "init", "argv0": "init", "ppid": 0, "start": "4"},
+            }
+        )
+        self.assertEqual(coord.find_holder(self_pid=100, proc=table), (60, "muse"))
+
     def test_runtime_of_ignores_names_merely_containing_claude(self):
         self.assertIsNone(coord._runtime_of("x", "claude-helper run"))
+
+    def test_runtime_of_ignores_names_merely_containing_muse(self):
+        self.assertIsNone(coord._runtime_of("x", "muse-helper run"))
+        self.assertIsNone(coord._runtime_of("musex", None))
 
 
 class CoordCliTest(unittest.TestCase):
