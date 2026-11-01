@@ -770,6 +770,27 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertTrue(os.path.isfile(path))
 
+    def test_non_contention_flock_error_is_a_usage_error(self):
+        def bad_flock(fd, flags):
+            raise OSError(errno.EINVAL, "Invalid argument")
+
+        clock = _FakeClock()
+        self.patch_lock_seams(bad_flock, clock)
+        with self.assertRaises(takeoff.TakeoffError):
+            with takeoff.suite_lock(takeoff.suite_lock_path(), 10):
+                pass
+        self.assertEqual(clock.sleeps, [])
+
+    def test_lock_open_failure_is_a_usage_error(self):
+        path = takeoff.suite_lock_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.isfile(path):
+            os.unlink(path)
+        os.makedirs(path, exist_ok=True)
+        with self.assertRaisesRegex(takeoff.TakeoffError, "cannot open the suite lock"):
+            with takeoff.suite_lock(path, 10):
+                pass
+
     def test_a_dead_holder_releases_the_lock(self):
         path = takeoff.suite_lock_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1011,6 +1032,26 @@ class TakeoffCliCase(unittest.TestCase):
             code = args.func(args)
         self.assertEqual(code, 75)
         self.assertIn("takeoff checks: FAIL", out.getvalue())
+        self.assertEqual(self.case.cmd_calls, [])
+
+    def test_cli_lock_setup_failure_exits_4(self):
+        from corral import takeoffcli
+        import argparse
+
+        blocker = os.path.join(self.case.tmp, "blocker")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("not a directory\n")
+        bad = os.path.join(blocker, takeoff.SUITE_LOCK_NAME)
+        with mock.patch.object(takeoff, "suite_lock_path", return_value=bad):
+            parser = argparse.ArgumentParser(prog="corral")
+            sub = parser.add_subparsers(dest="command", required=True)
+            takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+            args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                code = args.func(args)
+        self.assertEqual(code, 4)
+        self.assertIn("cannot set up the suite lock", err.getvalue())
         self.assertEqual(self.case.cmd_calls, [])
 
     def test_verb_is_on_the_corral_parser(self):
