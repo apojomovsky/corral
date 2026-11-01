@@ -50,7 +50,7 @@ to the tracker or forge interfaces.
 
 The hub holds one SQLite database, WAL mode, in its own state dir
 (section 7). Every hub write that decides goes through a single
-transaction. Four tables:
+transaction. Four tables plus one meta row:
 
 - **hosts**: one row per host serving at least one project.
   `host_id` (stable, operator-assigned, for example `host-1`; never a
@@ -81,6 +81,13 @@ transaction. Four tables:
   same `snapshot.build`), plus `host_now` (the serving host's clock
   at build time) and `received_at` (hub clock). Snapshots are data,
   never decisions: the hub never admits, gates, or claims from them.
+- **meta**: a single row holding `membership_epoch` (integer, starts
+  at 0, bumped by every `remove-host`). It is not a table of rows;
+  it is the one membership counter the hub owns. Both the register
+  reply and every heartbeat reply carry the current
+  `membership_epoch`, so a host learns the newest epoch on its next
+  contact after a removal (section 2, operator verbs; section 3,
+  step 1).
 
 Why the hub stores snapshots instead of proxying: the dashboard must
 answer during a host outage, showing that host's last push honestly
@@ -123,8 +130,13 @@ Lease renewal: a holder renews with `POST /v1/claims/renew`
 moves `lease_expires` only; the epoch never changes on renew, so a
 renew can never fence. Renewal rides on the heartbeat that already
 carries the snapshot push (section 5): one call per interval, not
-two. Suggested defaults, tunable as `hub.lease_ttl_s` and
-`hub.heartbeat_s`: heartbeat every 30 seconds, lease 3 times that.
+two. The heartbeat body carries a `renewals` list beside the
+snapshot, one entry per held claim:
+`{"renewals": [{"repo": ..., "number": ..., "agent": ..., "epoch": ...}]}`.
+The heartbeat reply answers each entry with granted or `409`, same
+semantics as the single-claim route. Suggested defaults, tunable as
+`hub.lease_ttl_s` and `hub.heartbeat_s`: heartbeat every 30 seconds,
+lease 3 times that.
 UNVERIFIED until run: whether 30 seconds keeps hub write load trivial
 at ten hosts; safe to learn with a loopback hub and scripted
 heartbeats counting transactions per second, no hosts needed.
@@ -139,9 +151,11 @@ next claim to mint).
 
 Fencing epochs: every actor that stops or restarts work checks the
 epoch first. A unit whose claim epoch is older than the hub's row for
-that ticket is stale and must not act: the drive's stuck handling
-(section 5 of `04-dispatch-loop.md`) compares the stored epoch
-before any stop-plus-launch, and a stale epoch skips instead of
+that ticket is stale and must not act. This check before the stuck
+restart's stop-plus-launch is NEW hub-mode behavior: `04-dispatch-loop.md`
+section 5 has no epoch check (the epoch guard today lives only in the
+section 4 orphan rule). In hub mode the stuck path compares the stored
+epoch against the hub row first, and a stale epoch skips instead of
 restarting.
 
 Crash recovery, two cases:
@@ -171,11 +185,14 @@ Operator verbs (all client commands against the hub, all logged):
 
 - `corral hub add-host --id host-1`: mints the host id and its
   bearer token (section 6), prints the token once.
-- `corral hub remove-host --id host-1`: bumps the membership epoch
-  and releases that host's claims (epochs kept for the next mint).
-  A removed host that comes back sees a newer epoch, stops its
-  agents, drops their claims, and does nothing until added again.
-  Same rule as the peer plan's removal, minus the ack roundtrip.
+- `corral hub remove-host --id host-1`: bumps `membership_epoch`
+  in the meta row and releases that host's claims (epochs kept for
+  the next mint). The bump is visible to a rejoining host through
+  the register and heartbeat replies, which both carry the current
+  `membership_epoch` (section 1): a host whose stored epoch is older
+  than the reply's stops its agents, drops their claims, and does
+  nothing until added again. Same rule as the peer plan's removal,
+  minus the ack roundtrip.
 - `corral hub release <repo> <number>`: force-releases one claim
   (operator override, logged with reason).
 - `corral hub rotate-token --id host-1`: revokes and re-mints one
@@ -206,7 +223,11 @@ A reconnecting host reconciles in this order, and only in this
 order:
 
 1. Register and heartbeat: prove identity (token), refresh
-   `last_seen`, report current capacity and constraints.
+   `last_seen`, report current capacity and constraints, and read
+   the reply's `membership_epoch`. A newer epoch than the host's
+   stored one means the host was removed while away: it stops all
+   its agents, drops all local claim state, and does nothing until
+   added again (section 2, `remove-host`).
 2. Fetch the hub claims table and compare, ticket by ticket,
    against locally held claims.
 3. Fence the stale: for every local claim the hub shows under a
@@ -214,9 +235,10 @@ order:
    through the injected stop seam and drop the local claim state.
 4. Re-adopt the live: for every local claim the hub still shows
    under this host with the same epoch (lease lapsed but no new
-   owner), re-grant and adopt the bumped epoch; for hub rows naming
-   this host that the host no longer holds locally, release them
-   if the epoch matches, else leave them for lease expiry.
+   owner), re-grant and adopt the bumped epoch; hub rows naming
+   this host for which the host has no local record are released
+   unconditionally (the host holds nothing for them, so releasing
+   is safe).
 5. Resume renewals and snapshot pushes, then allow new claims.
 
 Steps 3 before 4 is load-bearing: a host must never renew or
@@ -265,9 +287,10 @@ replaces per-host reads.
 - Staleness is shown honestly per host. Every merged section keeps
   its host's `now`, `read_at`/`fetched_at`, and confidence fields
   untouched; the hub adds only `received_at` (hub clock) and a
-  `stale` flag per host when `received_at` is older than three
-  heartbeat intervals. A host that stops pushing keeps its last
-  rows visible with a growing "as of" age; rows are never dropped
+  `stale` flag per host when `received_at` is older than the one
+  named hub setting `hub.stale_after_s` (default three heartbeat
+  intervals). A host that stops pushing keeps its last rows
+  visible with a growing "as of" age; rows are never dropped
   silently and never presented as current.
 - Clock skew is shown as data. The hub never compares timestamps
   across hosts and never orders merged rows by time. Each host's
@@ -282,10 +305,14 @@ replaces per-host reads.
 - Token model: the bearer model from `05-dashboard-api.md`
   section 3, extended to one token per host. `corral hub add-host`
   mints a random token (stdlib `secrets`), prints it once, and
-  stores only its hash hub-side. The host keeps it in its config
-  dir token file (`0600`, same rule as the API token). Every hub
-  request needs `Authorization: Bearer <token>`; failures answer
-  `401` and log only the fact, never the presented value.
+  stores only a salted hash hub-side (stdlib `hashlib`, salt beside
+  the hash). The host keeps its token in `<config_dir>/hub-token`
+  (`0600`, same rule as the API token), resolved by exactly one
+  helper (`paths.hub_token_path`, next to `paths.api_token_path`
+  from `05-dashboard-api.md`); the hub token file is never the API
+  token file. Every hub request needs
+  `Authorization: Bearer <token>`; failures answer `401` and log
+  only the fact, never the presented value.
   Constant-time comparison, read at call time, never stored in
   logs or settings.
 - Remote bind rules: the hub binds loopback by default. A
@@ -348,14 +375,18 @@ replaces per-host reads.
 Only the hooks, as decided. Each host advertises constraints at
 registration and on every heartbeat (docker present, attached
 hardware, free disk, clones it serves). A start request carries
-constraints as today; a host proposes a hub claim only for tickets
+constraints as today; a host proposes a hub claim for tickets
 whose constraints it satisfies. **A resume always runs on the host
-that holds the session**: resume requests are proposed only by the
-host whose registry and session dir hold the ticket's session, and
-sessions never move. Remote launch and stop (one host starting or
-stopping work on another) are a later phase and are not designed
-here; nothing in this doc assumes them, and no route in section 5
-stops, launches, or edits settings.
+that holds the session**: the host whose registry and session dir
+hold the ticket's session resumes it there, and sessions never move.
+Resume takes no hub claim: a claim may lapse while its session lives
+on in the same host, and that residual race is allowed, bounded by
+the lease and the host heartbeat. If another host was granted the
+ticket meanwhile, fencing catches the stale holder at its next
+renew, and the reconnect rules (section 2) stop it. Remote launch
+and stop (one host starting or stopping work on another) are a later
+phase and are not designed here; nothing in this doc assumes them,
+and no route in section 5 stops, launches, or edits settings.
 
 ## 9. Testing
 
@@ -367,7 +398,7 @@ on ephemeral ports and speak to them in-process.
 | --- | --- |
 | Grant atomicity: two racing proposes, one wins with `epoch+1` | temp hub DB, two fake hub clients over loopback |
 | Conflict names holder; loser skips to next candidate | temp hub DB plus temp board store |
-| Renewal moves lease, keeps epoch; wrong epoch gets `409` | fake clock, temp hub DB |
+| Renewal moves lease, keeps epoch; wrong epoch gets `409`; heartbeat carries the `renewals` list from section 2 | fake clock, temp hub DB, heartbeat body shape assertion |
 | Release clears holder, keeps epoch; next grant fences | temp hub DB, epoch assertions |
 | Crash: lease lapse re-grants to another host with bumped epoch | fake clock advanced past `lease_ttl_s` |
 | Partition: holder keeps running locally, cannot claim, reconciles stale-first on reconnect | fake hub client scripted unreachable, then live hub with superseded epoch; stop seam must be called |
@@ -393,18 +424,22 @@ registry first, the aggregated dashboard last.
   (stdlib HTTP plus SQLite), `hub.url` setting, `corral hub
   add-host`, atomic grant with epochs, `409` conflicts.
   Acceptance: the grant-atomicity and conflict tests pass; `make
-  check` green.
+  check` green. H1 updates `README.md` for the new `corral hub`
+  verbs and `hub.url` (the only README change this design needs).
 - H2: leases, renewal, release, crash recovery. Renew and release
   routes, `lease_ttl_s` and `heartbeat_s` settings, expiry
   re-grant with bumped epoch, stale-holder stop-and-drop on
-  reconnect. Acceptance: the lease, fencing, and recovery tests
-  pass; `make check` green.
+  reconnect, and the NEW stuck-restart epoch check from section 2
+  (stale epoch skips instead of stop-plus-launch). Acceptance: the
+  lease, fencing, stuck-restart, and recovery tests pass; `make
+  check` green.
 - H3: drive composition and single-host mode. Hub claim first,
   hub-epoch adoption in the local store, hub-unreachable skips
   with exit 3, reconnect reconcile in section 3 order, zero hub
-  calls without `hub.url`. Acceptance: the composition,
-  hub-down, order, and single-host tests pass; `make check`
-  green.
+  calls without `hub.url`, and the stuck path honoring the hub
+  epoch from section 2. Acceptance: the composition,
+  hub-down, order, stuck-epoch, and single-host tests pass; `make
+  check` green.
 - H4: operator verbs. `remove-host` (membership epoch, claim
   release), per-ticket `release`, `rotate-token`. Acceptance: one
   test per verb, including the removed-host-rejoins rule;
@@ -412,8 +447,8 @@ registry first, the aggregated dashboard last.
 - H5: snapshot push and the aggregated dashboard. Heartbeat
   carrying renewals plus the snapshot document, hub merge routes
   (`/v1/hosts`, `/v1/snapshot?project=` with `all`), per-host
-  staleness and clocks-as-data. The host-local API from
-  `05-dashboard-api.md` is unchanged. Acceptance: the merge,
+  staleness under `hub.stale_after_s` and clocks-as-data. The
+  host-local API from `05-dashboard-api.md` is unchanged. Acceptance: the merge,
   filter, `404`, staleness, and skew tests pass; `make check`
   green.
 - H6: hub operations. State-dir path helper, backup and
@@ -423,9 +458,9 @@ registry first, the aggregated dashboard last.
   pass; `make check` green.
 - H7: takeoff. Full suite with `TEST=1`, `make check`, and the
   takeoff ritual on a branch, then review. Acceptance: green
-  gates and a review record. No README change is expected (no
-  new user-visible verb beyond `corral hub`, which ships in H1;
-  record the reason in the H1 PR body).
+  gates and a review record. No further README change is expected
+  (H1 already covered the `corral hub` verbs and `hub.url`);
+  record that reason in the H7 PR body.
 
 ## 11. What the hub owns versus resource governance (issue 195)
 
@@ -452,8 +487,22 @@ is a bug.
 
 ## 12. Open decisions
 
-1. One token per host rather than one shared hub token (recommended).
-2. Hub serves the merged dashboard itself, no separate process (recommended).
-3. Export format is JSON with epochs preserved (recommended).
-4. Heartbeat 30s with lease at 3 heartbeats (recommended).
-5. Doctor warns, not refuses, on non-private hub bind (recommended).
+Decided (no options; do not reopen): one token per host rather
+than one shared hub token; the hub serves the merged dashboard
+itself with no separate process; export format is JSON with epochs
+preserved. Two choices remain genuinely open:
+
+**D1: heartbeat and lease defaults.** Tunable either way; the
+question is only the shipped default.
+
+Options:
+1. 30s heartbeat, lease 3 heartbeats (recommended).
+2. 10s heartbeat, lease 3 heartbeats.
+3. 60s heartbeat, lease 3 heartbeats.
+
+**D2: doctor on a non-private hub bind address.** Warn keeps the
+hub up where the operator knows best; refuse fails closed.
+
+Options:
+1. Warn on stderr, keep serving (recommended).
+2. Refuse to start with exit 4.
