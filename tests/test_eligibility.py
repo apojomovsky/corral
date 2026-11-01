@@ -190,6 +190,20 @@ class LoaderTest(unittest.TestCase):
             policy.eligible([], now=2000.0)
         self.assertIn("blue", str(ctx.exception))
 
+    def test_a_module_raising_at_import_names_the_project_and_entry(self):
+        module_path = os.path.join(self.tmp, "boom.py")
+        with open(module_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "from corral.eligibility import EligibilityError\n"
+                'raise EligibilityError("top-level boom")\n'
+            )
+        entry = module_path + ":eligible"
+        with self.assertRaises(eligibility.EligibilityError) as ctx:
+            eligibility.load_policy(entry, project="blue")
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertIn("blue", str(ctx.exception))
+        self.assertIn(entry, str(ctx.exception))
+
     def test_relative_path_entry_resolves_against_base_not_cwd(self):
         ops_root = os.path.join(self.tmp, "ops")
         os.makedirs(os.path.join(ops_root, "policies"))
