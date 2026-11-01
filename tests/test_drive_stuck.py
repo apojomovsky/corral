@@ -275,7 +275,7 @@ class RestartPassTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(stop.calls, [("app", 7)])
         self.assertEqual(len(launcher.calls), 1)
-        project, repo, number, kind, agent, _title = launcher.calls[0]
+        project, repo, number, kind, agent, _title, _author = launcher.calls[0]
         self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "start"))
         self.assertEqual(agent, AGENT)
         found = store.claim_of("app", 7)
