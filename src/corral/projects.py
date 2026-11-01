@@ -52,6 +52,15 @@ def _fail(path: str, text: str) -> ProjectsError:
     return ProjectsError(f"{path}: {text}")
 
 
+def terminated(prefix: str) -> str:
+    """`prefix` with the trailing separator every load normalizes to.
+
+    The separator is part of the prefix: unit names read
+    `<prefix><repo>-<number>`, as with the default `corral-agent-`.
+    """
+    return prefix if prefix.endswith("-") else prefix + "-"
+
+
 def _plain(value: object) -> bool:
     return isinstance(value, str) and bool(_NAME.fullmatch(value))
 
@@ -73,10 +82,7 @@ def _project(stem: str, path: str, raw: object) -> Project:
     prefix = raw.get("unit_prefix")
     if not isinstance(prefix, str) or not prefix:
         raise _fail(path, "unit_prefix must be a non-empty string")
-    # The separator is part of the prefix: unit names read
-    # `<prefix><repo>-<number>`, as with the default `corral-agent-`.
-    if not prefix.endswith("-"):
-        prefix += "-"
+    prefix = terminated(prefix)
     root = raw.get("root")
     if not isinstance(root, str) or not os.path.isabs(root):
         raise _fail(path, f"root {root!r} must be an absolute path")
