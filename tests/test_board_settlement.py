@@ -135,10 +135,10 @@ class BoardSettlementTest(SettlementCase):
         self.apply(board_reading(updated_at=T0), now=T0)
         self.assertEqual(self.verdict(), (2, 0, 0, board.PENDING))
 
-    def test_empty_reading_preserves_stored_board_extra(self):
+    def test_concept_free_reading_preserves_stored_board_extra(self):
         self.seed(extra={"priority": "high", "pool": "dispatch"})
         self.store.enqueue(REPO, 1, "agent", "agent-1", now=T0 - 50)
-        self.apply(board_reading(updated_at=T0, extra={}), now=T0)
+        self.apply(reading(repo=REPO, number=1, updated_at=T0, extra={}), now=T0)
         row, _ = self.store.item(REPO, 1, now=T0)
         self.assertEqual(row.extra, {"priority": "high", "pool": "dispatch"})
 
@@ -195,8 +195,8 @@ class BoardSettlementTest(SettlementCase):
         self.assertEqual(row.agent, "")
 
 
-def run_scenario(make_reading):
-    """One queued agent write settled by one reading, as a verdict tuple.
+def run_scenario(make_reading, field="agent", queued="agent-1"):
+    """One queued write settled by one reading, as a verdict tuple.
 
     A fresh temporary store per call, so board and label rows compare
     directly with no shared state. Only the settlement verdict compares:
@@ -211,7 +211,7 @@ def run_scenario(make_reading):
                 operators=["alice"],
                 now=T0 - 100,
             )
-            store.enqueue(REPO, 1, "agent", "agent-1", now=T0 - 50)
+            store.enqueue(REPO, 1, field, queued, now=T0 - 50)
             store.upsert_item(sync._reading(make_reading()), operators=["alice"], now=T0)
             row, _ = store.item(REPO, 1, now=T0)
             return (
@@ -236,6 +236,34 @@ class LabelParityTest(unittest.TestCase):
     def test_overridden_verdict_matches_label_mode(self):
         board_verdict = run_scenario(lambda: board_reading(agent="agent-2", updated_at=T0))
         label_verdict = run_scenario(lambda: label_reading(agent="agent-2", updated_at=T0))
+        self.assertEqual(board_verdict, label_verdict)
+        self.assertEqual(board_verdict, (0, 0, 1, board.CONFIRMED))
+
+    def test_status_echo_verdict_matches_label_mode(self):
+        board_verdict = run_scenario(
+            lambda: board_reading(status="working", updated_at=T0),
+            field="status",
+            queued="working",
+        )
+        label_verdict = run_scenario(
+            lambda: label_reading(status="working", updated_at=T0),
+            field="status",
+            queued="working",
+        )
+        self.assertEqual(board_verdict, label_verdict)
+        self.assertEqual(board_verdict, (0, 1, 0, board.CONFIRMED))
+
+    def test_status_overridden_verdict_matches_label_mode(self):
+        board_verdict = run_scenario(
+            lambda: board_reading(status="review", updated_at=T0),
+            field="status",
+            queued="working",
+        )
+        label_verdict = run_scenario(
+            lambda: label_reading(status="review", updated_at=T0),
+            field="status",
+            queued="working",
+        )
         self.assertEqual(board_verdict, label_verdict)
         self.assertEqual(board_verdict, (0, 0, 1, board.CONFIRMED))
 
