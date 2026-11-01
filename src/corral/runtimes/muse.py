@@ -25,6 +25,10 @@ from corral.runtimes import DEFAULT_MAX_TIME, check_prompt
 NAME = "muse"
 #: Where muse installs for a user, when PATH does not have it.
 FALLBACK = "~/.local/bin/muse"
+#: Prefix of the versioned binaries the `muse` launcher installs beside
+#: itself (`muse-bin-<version>`). `coord` reuses this to recognize a
+#: coordinator running under one.
+BINARY_PREFIX = "muse-bin-"
 #: The per-launch config in the session dir; `argv` reads its model from here.
 CONFIG_NAME = "muse.json"
 #: The launch prompt the session setup writes; the worker run reads it back.

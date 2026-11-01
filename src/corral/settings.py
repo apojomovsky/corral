@@ -238,24 +238,9 @@ def _check_private(raw, where):
     return Private(terms=checked["terms"], patterns=checked["patterns"])
 
 
-#: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
-#: the ``[models]`` and ``[private]`` precedent: strict keys, so a typo
-#: fails here instead of silently running label mode.
-_BOARD_KEYS = frozenset(
-    {
-        "project_owner",
-        "project_number",
-        "project_id",
-        "agent_field",
-        "status_field",
-        "status_column",
-        "priority_column",
-        "area_column",
-        "pool_column",
-        "blocked_by_column",
-        "priority_map",
-    }
-)
+#: Concept keys naming the board address: the owner plus exactly one of
+#: the number or the node id.
+_BOARD_ADDRESS = ("project_owner", "project_number", "project_id")
 
 #: Concept keys holding a board field or column name; all default to
 #: unmapped when the table omits them.
@@ -269,13 +254,21 @@ _BOARD_COLUMNS = (
     "blocked_by_column",
 )
 
+#: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
+#: the ``[models]`` and ``[private]`` precedent: strict keys, so a typo
+#: fails here instead of silently running label mode. Derived from the
+#: address and column groups above (plus ``priority_map``), so a concept
+#: added to one group is never silently dropped by the other.
+_BOARD_KEYS = frozenset(_BOARD_ADDRESS + _BOARD_COLUMNS + ("priority_map",))
+
 
 def _split_board(raw, where):
     """A ``[[repo]]`` entry's ``board`` value as ``(scalars, concepts)``.
 
-    Registered ``board.*`` settings (``board.hold_label`` today) keep their
-    scalar path; concept keys (``project_owner`` and friends) go to
-    ``_check_board``. Anything else is an unknown setting, as before."""
+    Keys registered as ``board.*`` settings keep their scalar path;
+    concept keys (the board address, the field and column names, and
+    ``priority_map``) go to ``_check_board``. Anything else is an
+    unknown setting, as before."""
     if raw is None:
         return {}, {}
     if not isinstance(raw, dict):

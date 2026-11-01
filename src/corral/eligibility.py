@@ -13,9 +13,10 @@ modules the host operator trusts; a policy that needs the outside
 world is a configuration error in that project, never a new seam.
 
 The entry is either a dotted ``module:function`` name or a
-``path/to/policy.py:function`` file path. A relative file path resolves
-against the project's registered ops root, never the process working
-directory, so the same entry loads from a shell and under a unit.
+``path/to/policy.py:function`` file path. Corral's callers pass the
+project's registered ops root as `base`, so a relative file path
+resolves against that root rather than the process working directory,
+and the same entry loads from a shell and under a unit.
 A project without the entry registers no candidates; loading failures
 are configuration errors (exit 4) naming the project and the entry,
 blocking only that project.
@@ -163,15 +164,13 @@ def _load_file(path: str, *, entry: str, project: str, base: str | None = None) 
     if not os.path.isfile(path):
         raise EligibilityError(f"project {project}: eligibility {entry!r} has no file {path!r}")
     name = "corral_policy_" + os.path.abspath(path).encode().hex()
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise EligibilityError(f"project {project}: eligibility {entry!r} cannot load {path!r}")
     try:
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            raise EligibilityError(f"project {project}: eligibility {entry!r} cannot load {path!r}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-    except EligibilityError:
-        raise
     except Exception as err:
         raise EligibilityError(
             f"project {project}: eligibility {entry!r} does not import: {err}"
