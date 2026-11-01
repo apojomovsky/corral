@@ -96,55 +96,74 @@ corral is a uv project. On a host, `uv tool install` puts the CLI in its own env
 6. GitHub pacing.
 7. Snapshot. Exit: `corral snapshot --json` lists every project's agents.
 
-## 4. Milestone 2: several hosts, peer to peer
+## 4. Milestone 2: several hosts, a hub
 
-Decided: no hub and no central database. Every corral host is a peer. **Assumption:** every peer can reach every other one directly at a configured address (a LAN, or a tailnet such as Tailscale or Netbird), so hosts are always "local-ish". corral sees `host:port` and a bearer token from `~/.config/corral/token`, and never relies on the network layer for authentication.
+Superseded: the peer-to-peer plan was replaced by the hub design in
+[`08-hub-multihost.md`](08-hub-multihost.md), decided by the
+maintainer (see
+[`adr/0001-hub-not-peer-to-peer.md`](adr/0001-hub-not-peer-to-peer.md)).
+The peer log-pull, ack roundtrip, feed duty, and cap-share machinery
+of the old plan were abandoned, not implemented. The hub summary
+follows; the new doc is authoritative.
 
-**Principle: certainty over availability.** A host acts alone only where it is certain nothing can collide. Anything else waits until every peer is reachable again.
+Decided: a hub, hosted on one host the maintainer owns, reachable
+over a private network. A small service in front of SQLite, standard
+library only, authenticated per host with bearer tokens.
 
-### Replication
+**Assumption:** every host can reach the hub directly at a configured address (a LAN, or a tailnet such as Tailscale or Netbird), so hosts are always "local-ish". corral sees `host:port` and a per-host bearer token kept in the host config dir, and never relies on the network layer for authentication.
 
-- **Every host holds a full copy of the board.** This is the store described in the tracker section, with one addition: each write is also appended to that host's own log.
-- **Peers pull each other's logs** over the API, from a cursor.
-- **Every host folds the logs into the same board**, using three rules:
-  - **field ownership**: people win the fields they own on the tracker; corral wins the agent fields;
-  - **external items are never written**;
-  - **for two corral writes to one field, the later wins**, compared by hybrid logical clock and then host id.
-- Dashboards read their own host's copy, with no network call.
-- **The tracker stays the durable record.** A host can be rebuilt from its peers' logs, or from the tracker with a full resync.
+**Principle: certainty over availability.** A host acts alone only where it is certain nothing can collide. A hub outage blocks new claims everywhere; a single host outage blocks nothing.
 
-### Shared duties, without a hub
+### Claims are hub transactions
 
-| Duty | How |
-| --- | --- |
-| pushing writes to the tracker | each host pushes only the entries it wrote; pushes are idempotent |
-| reading the tracker's change feed | one peer per tracker, chosen deterministically among the peers that are up; what it sees becomes log entries |
-| the provider-API rate budget | split evenly among the peers that are up |
-| quota marks and readings | log entries; every peer sees an exhausted provider within one pull |
-| the cap across hosts | each host admits only within its share of the total |
+- **The hub claim comes first, then the local store adopts the
+  hub-minted fencing epoch, then the tracker mirrors it.** Racing
+  proposes resolve in one database transaction with `epoch+1`;
+  losers get a conflict naming the holder.
+- **Leases bound crash recovery.** A lapsed lease re-grants to a
+  new owner with a bumped epoch; a partitioned holder keeps
+  running its agents but claims nothing new, and reconciles
+  stale-first on reconnect (exit 3, host unreachable, while the
+  hub is down).
+- **If the hub is unreachable, no new claim is made.** Work on
+  claims already held continues (work, commit, push, open PRs,
+  resume). Removing a host is an operator action
+  (`corral hub remove-host --id <host>`): it bumps the membership epoch
+  and releases the removed host's claims. A removed host that comes
+  back sees the newer epoch, stops its agents, drops their claims,
+  and does nothing until it is added again. Worktrees stay under
+  the cleanup's proof rule.
+- **The tracker stays the durable record.** The hub rebuilds from
+  re-registering hosts and the tracker's in-flight labels.
 
-The feed duty, the budget split and the cap shares are recomputed only when every peer agrees on who is up. During a partition they stay as they were.
+### No shared duties, no cap split
 
-### Claims
+The peer plan split the feed duty, the rate budget, and the cap
+across peers. The hub needs none of that: each host pushes only the
+writes it made (idempotent, as today), reads the tracker's change
+feed as today, and admits only within its own host total
+(`08-hub-multihost.md`, section 11).
 
-- **A claim needs an ack from every current peer.** The proposing host sends it to all peers. Each peer acks unless it knows of a conflicting claim or proposal. Two racing proposals resolve by clock and then host id, the same way everywhere. The claim commits when every peer has acked.
-- **If any peer is unreachable, no new claim is made.** Work on claims already held continues (work, commit, push, open PRs, resume), because nobody else can hold those tickets.
-- **Removing a peer is an operator action** (`corral peers remove <host>`). It bumps the membership epoch and releases the removed host's claims. A removed host that comes back sees the newer epoch. It stops its agents and drops their claims, and it does nothing until it is added again. Its worktrees stay under the cleanup's proof rule.
+### Placement is hooks only
 
-### Placement
+- A start request carries constraints: docker, attached hardware,
+  free disk, a clone.
+- Each host advertises what it has at registration and on every
+  heartbeat.
+- **A resume always runs on the host that holds the session.**
+  Sessions do not move.
+- Remote launch and stop are a later phase, not designed here.
 
-- A start request carries constraints: docker, attached hardware, free disk, a clone.
-- Each peer advertises what it has.
-- **A resume always runs on the host that holds the session.** Sessions do not move.
+### One dashboard across hosts
+
+Hosts push snapshots on the heartbeat; the hub merges per project
+or all at once, with per-host staleness and clocks shown as data.
+The host-local API is unchanged.
 
 ### Steps
 
-1. Put the local API in front of everything on one host, and write the log from the start. One host is a fleet of one.
-2. Add peer pull, the fold rules and membership, using fake transports.
-3. Add claims with acks from every peer, and the partition behaviour. Tests cover a split and a rejoin.
-4. Add the shared duties and the shares.
-5. Add placement, plus remote launch, stop, tail and resume.
-6. Make the coordinator lease a claim like any other: one coordinator per project across all peers.
+Hub with claims and a registry first, operator verbs next, the
+aggregated dashboard last (`08-hub-multihost.md`, section 10).
 
 ## 5. Later
 

@@ -10,7 +10,8 @@
 | [`05-dashboard-api.md`](05-dashboard-api.md) | design for the read-only dashboard API: routes, loopback HTTP plus SSE, token rules, schema stability, test plan, tickets |
 | [`06-corral-new.md`](06-corral-new.md) | design for `corral new`: scaffold templates, the `init` writer, the forge side, label bootstrap, idempotence, test plan, tickets |
 | [`07-board-fields.md`](07-board-fields.md) | the board-field tracker variant: project board fields behind the tracker interface, and the tickets to build it |
+| [`08-hub-multihost.md`](08-hub-multihost.md) | the hub design: multi-host claims, leases, the aggregated dashboard, hub operations, and the rollout tickets |
 | [`09-host-resource-governance.md`](09-host-resource-governance.md) | host resource governance: the host budget, per-project shares, the ledger, and the tickets to build them |
-| [`adr/`](adr/) | decision records; none yet |
+| [`adr/`](adr/) | decision records |
 
 `00-design.md` and `02-accounts-quota.md` are designs: how the system works and what each slice builds. `01-onboarding.md` records decisions (the R1 to R7 requirements and what each one settled) alongside the flow they shape. New decision records go in `adr/`.
