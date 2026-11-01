@@ -1397,5 +1397,73 @@ class StuckJournalTest(unittest.TestCase):
         self.assertEqual(entries[-1]["gave_up"], 1)
 
 
+class StuckDayCapTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-daycap-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.day = os.path.join(self.tmp.name, "starts.json")
+
+    def day_starts(self):
+        with open(self.day, encoding="utf-8") as handle:
+            return json.load(handle)["starts"]
+
+    def test_a_stuck_restart_spends_one_from_the_day_cap(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        drive.write_day_count(self.day, drive._day_string(NOW), 0)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(self.day_starts(), 1)
+
+    def test_a_stuck_restart_at_the_cap_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        drive.write_day_count(self.day, drive._day_string(NOW), 1)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            agent_states={},
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+            day_path=self.day,
+            max_starts=1,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("day cap", out.getvalue())
+        self.assertEqual(self.day_starts(), 1)
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+
 if __name__ == "__main__":
     unittest.main()
