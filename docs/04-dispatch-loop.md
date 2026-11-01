@@ -390,15 +390,16 @@ the day counter, the pause file, and the journal. A pass never assumes
 another host sees its state except through the tracker labels the
 mirror writes.
 
-The future multi-host loop (per `00-design.md` section 4) needs,
-without this doc designing it: claims carrying host plus epoch (kept),
-peer-acked claims before launch, the cap split across peers, and one
-peer owning the tracker feed duty. The loop leaves those hooks by
-recording host and epoch on every claim, leaving the epoch for the
-next claim to mint after a release (which fences the stale holder),
-and never deciding from a row it has not freshness-checked. When
-multi-host lands, the per-pass order in section 3 stays; only the
-claim step gains the ack roundtrip.
+The future multi-host loop (per `08-hub-multihost.md`, which
+supersedes `00-design.md` section 4) needs, without this doc
+designing it: claims carrying host plus epoch (kept), a hub grant
+before launch, and no cap split and no feed duty (the hub design
+drops both). The loop leaves those hooks by recording host and
+epoch on every claim, leaving the epoch for the next claim to mint
+after a release (which fences the stale holder), and never deciding
+from a row it has not freshness-checked. When multi-host lands,
+the per-pass order in section 3 stays; only the claim step gains
+the hub roundtrip.
 
 ## 9. Test plan, fakes only at the single seams
 
