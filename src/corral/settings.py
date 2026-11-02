@@ -94,6 +94,7 @@ PROVIDERS = (
     "corral.registry",
     "corral.resources",
     "corral.runtimes",
+    "corral.serve",
     "corral.sync",
     "corral.takeoff",
     "corral.units",
