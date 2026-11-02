@@ -2230,6 +2230,25 @@ runtime = "muse"
         with open(os.path.join(session, "runtime"), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), "muse\n")
 
+    def test_launch_with_profile_registers_the_profile_name(self):
+        self.write_profiles()
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        unit = out.split()[1]
+        (found,) = [e for e in registry.load_all() if e["id"] == unit]
+        self.assertEqual(found["profile"], "fast")
+
     def test_launch_with_unknown_profile_is_exit_4(self):
         self.write_profiles()
         code, _, err = self.verb(

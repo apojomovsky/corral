@@ -35,9 +35,10 @@ touched by a read (section 6).
 ## 1. What the API serves, and what it does not
 
 The single source of truth is the `corral snapshot --json` document
-(schema version 1 today): `schema_version`, `fleet_header` (host, now,
+(schema version 2 today): `schema_version`, `fleet_header` (host, now,
 live/stale/finished counts), `agents` rows (id, project, repo, number,
-runtime, model, state, started_at, last_seen, note), `quota` (per
+runtime, role, profile, model, state, started_at, last_seen, note),
+`quota` (per
 provider state, windows, read_at, stale, mark, reader, error),
 `capacity` (total_cap, repo_cap, live, by_project, pending), `disk`
 (per path totals or per path error). `GET /v1/snapshot` returns that
@@ -81,7 +82,7 @@ the snapshot only summarizes:
 - `GET /v1/stream?topics=&cursor=`: Server-Sent Events (section 2)
   over the journal, the event queue, and a snapshot generation
   counter.
-- `GET /v1/version`: `{api: 1, schema_version: 1}` for change
+- `GET /v1/version`: `{api: 1, schema_version: 2}` for change
   detection (section 4).
 - `GET /v1/health`: `{ok, host, now, uptime_s, requests_total,
   requests_304, degraded}` where `ok` is false exactly when
