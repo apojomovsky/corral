@@ -232,7 +232,9 @@ class BoardSpec(NamedTuple):
     repo: str               # "owner/name" to link, or "" for no link
     fields: tuple[FieldSpec, ...]
     private: bool = True
-    priority_map: dict[str, str] = {}  # the config's existing id -> rank map, if any
+    number: int | None = None       # config address: per-owner number, if the table has one
+    project_id: str | None = None   # config address: node id, if the table has one
+    priority_map: dict[str, str] | None = None  # the config's existing id -> rank map, if any
 
 class BoardProvision(NamedTuple):
     owner: str
@@ -249,6 +251,20 @@ class BoardProvisioner(Protocol):
     def populate(self, project_id: str, repo: str) -> BoardPopulate: ...
 ```
 
+The spec's address is exactly one of `number` and `project_id`, or
+neither: one when the config already addresses a board (the same
+exactly-one rule `settings._check_board` enforces on the table), and
+neither in the bootstrap states where no table exists yet, when title
+search or creation (steps 2 and 3) is the only way to find the board.
+A spec carrying both, or a non-positive number, is refused by
+`effective_spec` before any lookup; the spec is plain data built in
+that one place, so no caller constructs an ambiguous address.
+`priority_map` has no mutable default: it is `None` when the config
+has no map, and `effective_spec` normalizes it to a fresh dict (a copy
+of the config's map, never the config's own object) before the spec
+reaches the planner, so one entry's spec can never share or mutate
+another entry's map in a multi-entry run.
+
 `populate` is section 4's operation; `BoardPopulate` is the analogous
 report (`added`, `kept`, `refused` as fix lines). Both methods raise
 `TrackerError` (exit 3) for an unreachable or unusable provider and
@@ -263,16 +279,24 @@ normally with them in `refused`, counted as a 1 for that entry.
 `STANDARD_BOARD` (the section 1 table as data) and a pure
 `effective_spec` helper live beside these types: the one place that
 turns "what the project mapped, else the standard name" into a spec.
-Its inputs are the resolved `BoardConfig` (or `None` in the bootstrap
-state), the entry's `tracker.repo`, and the operator's setup flags.
+Its inputs are the entry's variant, the resolved `BoardConfig` (or
+`None` in the bootstrap state), the entry's `tracker.repo`, and the
+operator's setup flags, carried into `setup_root` as one
+`trackers.SetupEntry` per entry (the wiring restructure below).
 Derivation, in one place so no caller re-derives it: the owner is the
 `--board-owner` flag when given, else the config's `project_owner`
-when a table exists, else the tracker repo's owner; the title is
+when a table exists, else the tracker repo's owner; the address is
+carried from the config unchanged when a table exists
+(`BoardConfig.project_number` to `number`, `project_id` to
+`project_id`, exactly one of them as `_check_board` already validated)
+and is neither when there is no table, with no flag that overrides it
+(a flag naming a different board than the config would be a second
+address for the same entry); the title is
 `<repo> board` from the tracker repo's name unless `--board-title`
 overrides; each field name is the config's name for the concept when
 mapped, else the standard name; the config's existing `priority_map`
-rides into the spec so the planner can resolve renamed options by id
-(step 6); `Area` and `Pool` enter the spec with at least one declared
+rides into the spec (copied, per above) so the planner can resolve
+renamed options by id (step 6); `Area` and `Pool` enter the spec with at least one declared
 option, or as keep-only when the config already maps them, and not at
 all otherwise (section 1). No second resolver for field names may
 appear; the reader keeps resolving names through `BoardConfig`, the
@@ -292,8 +316,8 @@ provisioning exists for. A small factory beside
 builds the provisioner the same way `build_tracker` wires board mode
 (the raw `gh` runner; GraphQL is paced through the shared bucket) and
 is the one production wiring. `githubcli.cmd_setup` passes it into
-`setup_root` as an injected `provisioner_factory` seam next to the
-existing `tracker_factory`; tests inject a fake. Mutations go through
+`setup_root` as an injected `provisioner_factory` seam, as part of the
+setup wiring restructure below; tests inject a fake. Mutations go through
 `gh.graphql`, so they are charged at mutation cost and rate-limit
 answers raise `TrackerRateLimited` through the shared classifier,
 exactly like board reads and writes. Nothing outside the adapter
@@ -305,6 +329,76 @@ build one at all. Asking setup to provision a board when the factory
 yields nothing is a usage error counted as exit 4 in the aggregation
 below ("this tracker does not provision boards"), never a silent
 skip and never a missing-attribute crash on a repo tracker.
+
+### Production wiring: the `cmd_setup` restructure
+
+The built wiring cannot reach the bootstrap state, and ticket 4
+restructures it; a fake-only `setup_root` test would pass while the
+real verb still failed, so the restructure is designed here, not left
+to the ticket. Today `cmd_setup` calls
+`trackers.production_trackers(root, names, git=...)` before
+`setup_root` runs, and that one call builds every entry's tracker up
+front through `build_tracker`, which raises `ValueError` for board
+mode without a `[repo.board]` table. One bootstrap entry therefore
+fails the whole run with exit 4 before any entry is attempted, and
+the `RepoTracker` it returns carries no `BoardConfig`, so
+`setup_root` could not learn an entry's board config (or, for a
+bootstrap entry, that it has none) even if construction succeeded.
+`production_trackers` and `build_tracker` stay exactly as they are
+for the fleet passes, where refusing board mode without a table is
+correct; setup gets its own per-entry wiring beside them:
+
+- `trackers.SetupEntry` (a `NamedTuple`: `name`, `tracker_repo`,
+  `operators`, `variant`, `board`, `max_pages`), where `board` is
+  the entry's resolved `BoardConfig` or `None` and `max_pages` is
+  its resolved `board.poll_pages`. It is `RepoTracker` minus the
+  built tracker, plus the board config: the plain-data half of an
+  entry, with no construction in it.
+- `trackers.setup_entry(root, name, *, git) -> SetupEntry` resolves
+  one entry the way `production_trackers` resolves each of its
+  entries (the shared `syncli.repo_operators` for the tracker repo
+  and operators, then `settings.load(root=root, repo=name)` for
+  `tracker.variant`, `board.poll_pages` and `resolved.board`) and
+  builds nothing. A resolution failure raises, and `setup_root`
+  counts it as that entry's 4 and continues; it never aborts the
+  entries after it.
+- `trackers.setup_tracker(entry, *, run=None, pacer=None)` builds
+  the one tracker the label half needs, lazily, per entry, inside
+  the loop, through `build_tracker` so the runner wiring stays in
+  that one factory: a labels entry and a board entry with a table
+  go through it exactly as today (variant, `entry.board`,
+  `entry.max_pages`); a board entry with no table goes through it
+  as a labels entry for the label half (labels are repository
+  state and need no board), while its board half goes to the
+  provisioner, which needs no `BoardConfig`. An unknown variant
+  raises `ValueError`, counted as that entry's 4.
+- `trackers.production_board_provisioner(*, run=None, pacer=None)`
+  as above, built lazily per entry only when that entry's board
+  ensure runs, from only the runner and the pacer.
+
+`cmd_setup` then resolves only the root and the entry names (the
+existing pre-loop 4s: no root, unparseable settings, unknown entry
+name) and passes three injected seams into `setup_root`:
+`entry_factory` (production: `setup_entry` bound to the root and
+the git seam), `tracker_factory` (production: `setup_tracker`, now
+taking a `SetupEntry` rather than a tracker-repo string), and
+`provisioner_factory` (production: `production_board_provisioner`).
+Inside the loop, per entry in order, `setup_root` resolves the
+`SetupEntry`, builds that entry's tracker, runs the label half,
+and, when the board half applies, builds the provisioner and calls
+`effective_spec` with the entry's variant, its `board` (or `None`)
+and its tracker repo. The variant and board config that
+`effective_spec` needs therefore travel as data on the `SetupEntry`;
+no caller re-loads settings to recover them, and no tracker is
+constructed for an entry the loop has not reached. Tests inject all
+three seams; ticket 4's acceptance includes a `cmd_setup`-level
+test for a `variant = "board"` entry with no table: the production
+`entry_factory`, `tracker_factory` and `provisioner_factory` run
+for real against a temporary root, with only the `run` seam they
+default to (the `gh` runners) and the git seam faked, proving the
+real verb provisions it instead of exiting 4 before the loop.
+`cmd_setup` gains no test-only parameter for this; the factories'
+existing `run=None` defaults are the seam, as in `build_tracker`.
 
 ### The ensure algorithm
 
@@ -325,14 +419,31 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    one board per tracker repo, but the operation takes the repo to
    link as data and does not forbid other repos linking the same
    board later.
-2. **Find the Project.** By node id when the config has one, else by
-   owner plus number, else, and only during provisioning, by exact
-   title under the owner (paged list, exact string match, nodes
-   validated like every other board answer). Zero title matches means
-   create. Two or more title matches raises `ValueError` (exit 4 at
-   the CLI) naming every matching number, before any mutation: corral
-   never picks one (the same ambiguity in `_fetch_single` already
-   fails closed the same way).
+2. **Find the Project.** By the spec's address first, when it has
+   one: by node id (`project_id`), else by owner plus `number`.
+   A board found by address is the board, whatever its current title
+   is: titles are never consulted on an addressed run, so a board a
+   person renamed after provisioning is found again by its address
+   and no duplicate is created. An addressed board that does not
+   resolve (deleted, or a number or id that names nothing under that
+   owner) never falls through to title search or creation: a typo'd
+   address must not silently mint a second board and then collide
+   with the existing table in section 3. It raises `ValueError`
+   before any mutation, counted as exit 4 for the entry in the
+   aggregation below (a configuration error: the config names a
+   board that is not there), with the fix line "the board in the
+   config no longer exists: remove the table and re-run". Removing
+   the table returns the entry to the bootstrap state, where title
+   search and creation are again allowed; correcting the address by
+   hand is the other fix, and the line says so by naming the table.
+   Only a spec with no address (the bootstrap states) searches by
+   exact title under the owner (paged list, exact string match,
+   nodes validated like every other board answer), and only during
+   provisioning. Zero title matches means create. Two or more title
+   matches raises `ValueError` (exit 4 at the CLI) naming every
+   matching number, before any mutation: corral never picks one (the
+   same ambiguity in `_fetch_single` already fails closed the same
+   way).
 3. **Create the Project when missing.** One create mutation with the
    owner id and title (UNVERIFIED: U3, the mutation name and inputs).
    Visibility: private by default, the `06-corral-new.md` section 3
@@ -368,8 +479,10 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    `01-onboarding.md`: someone else's repository), with a fix line,
    and the rest of the provision stands.
 5. **Ensure fields.** Read the live schema once (the `_SCHEMA_BY_NUMBER`
-   and `_SCHEMA_BY_ID` shapes, extended only if the spike shows a
-   missing datum), as a raw field list for the planner, not through
+   and `_SCHEMA_BY_ID` shapes, extended with each option's color and
+   description, which step 6's whole-list resend needs, and otherwise
+   only if the spike shows a missing datum), as a raw field list for
+   the planner, not through
    `BoardReader._project_index`: that index raises `TrackerError` on a
    duplicate field name, which is right for the passes but wrong here.
    Duplicate names on the live board are a planning refusal, never an
@@ -411,13 +524,20 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    are never topped up either. The provider's option update is
    believed to replace the whole option list, so the one append
    update corral may send (on `Priority` only) is the existing list,
-   in its existing order, with the missing ranks' names appended;
-   existing ids must survive it (UNVERIFIED: U7). If the spike shows
-   ids do not survive an append, this step does not ship as designed:
-   a kept field with an unrepresented rank becomes a refused line
-   instead, because rewriting ids would silently invalidate every
-   `priority_map` in the wild. Options are never removed and never
-   renamed by corral.
+   in its existing order, with the missing ranks' names appended.
+   Because the whole list is resent, the planner's live-schema data
+   carries each existing option's color and description beside its
+   id and name, and the append resends them unchanged for every
+   carried-over option; only the appended options get provider
+   defaults. Existing ids, colors and descriptions must all survive
+   it (UNVERIFIED: U7). If the spike cannot confirm that survival,
+   this step does not ship as designed: the planner refuses the
+   append instead and prints a fix line ("add the `<rank>` option
+   to the field on the board by hand, then re-run"), because
+   resetting people's option colors is an alteration step 5 forbids,
+   and rewriting ids would silently invalidate every `priority_map`
+   in the wild. Options are never removed and never renamed by
+   corral.
 7. **Read back and report.** One final schema fetch is the truth the
    report and section 3 are built from: project owner, number and node
    id, the live per-concept field names (`BoardProvision.fields`,
@@ -443,7 +563,7 @@ AGENTS.md:
 | Nothing to do (board and file already converge) | 1 |
 | A refusal a person must resolve (no permission, wrong kind, duplicate field or option name, public board where private was specced, still public after the correction, link refused) | 1, one fix line each |
 | Tracker or host unreachable, rate limit outlasts the pacer cap, the make-private update errors | 3 |
-| Bad spec or config (unresolvable owner, ambiguous title, a different board table already in the file, unknown concept in an extended spec, no provisioner for the adapter) | 4 |
+| Bad spec or config (unresolvable owner, ambiguous title, the config-addressed board no longer resolves, a different board table already in the file, unknown concept in an extended spec, no provisioner for the adapter) | 4 |
 | Admission slot | 75 is never used; setup starts no agents |
 
 Across entries, setup adopts the aggregation the built verb already
@@ -451,8 +571,11 @@ uses in `githubcli.setup_root`, extended with where board 4s rank.
 Every named entry is attempted, in entry order; a per-entry failure
 of any kind is recorded and the loop continues with the next entry,
 never aborting the rest (the built loop already continues past a
-`TrackerError`; ticket 4 gives board `ValueError`s, different-table
-refusals and provisioner-missing errors the same continue treatment).
+`TrackerError`; ticket 4 gives board `ValueError`s (the
+config-addressed board that no longer resolves included),
+per-entry lazy resolution and construction failures, different-table
+refusals and provisioner-missing errors the same continue treatment,
+each counted under the 4 precedence below).
 Validation that the built verb does before the loop (no root, unknown
 entry name, unparseable settings) still exits 4 before any entry
 runs, unchanged. The final exit is the first of these that happened:
@@ -477,11 +600,18 @@ Two `setup` runs racing can still create two same-title boards when
 both look before either creates (titles are not unique, U3): the
 create is not guarded by a title check, and no post-create re-list
 uncreates the second board. Duplicate titles are a documented risk
-of the operator command, flagged for a person to resolve: the next
-setup run refuses at step 2 naming both numbers, the doctor's fix
-line points at that setup run, and a person deletes one board by
-hand. Setup is an operator command, not a fleet pass; no lock is
-designed for it, and the failure is closed and visible.
+of the operator command, flagged for a person to resolve, and the
+flagging does not depend on a later setup run happening to
+title-search again (once either run writes a table, later runs
+resolve by address and never title-search): the doctor carries a
+duplicate-title warn row that lists the boards under the configured
+owner sharing the configured board's title and names every number
+(section 5, ticket 6), so the orphan is visible on the next doctor
+run even though every addressed check on the kept board passes.
+An unaddressed setup run also refuses at step 2 naming both
+numbers, and a person deletes one board by hand; corral designs no
+delete for it. Setup is an operator command, not a fleet pass; no
+lock is designed for it, and the failure is closed and visible.
 
 ### The token scope
 
@@ -524,17 +654,32 @@ writes the inert table; the flip stays the separate config edit of
 labels-only, byte-identical to the `06` design.
 
 `setup --plan` prints what it would do and does none of it, on either
-half of the verb. The label half becomes report-only: `ensure_labels`
-always mutates, so plan never calls it; instead the adapter's label
-list read (the read `GithubTracker.ensure_labels` already starts
-from) reports each bootstrap label as would-create or kept, and no
-label is created. Ticket 4 exposes that read as the plan seam; the
-`ensure_labels` contract itself does not change. The board half reads
-the live board (a read is the only way to know created from kept),
-lists the planned creations, and shows the mapping write as the
-`init.plan_diff` of the target file. No mutation of any kind and no
-file write happen under `--plan`. A plan against a board that does
-not exist lists the full creation set from the spec.
+half of the verb. The label half becomes report-only through the
+read that already exists for exactly this: `ensure_labels` always
+mutates, so plan never calls it; instead it calls
+`Tracker.missing_labels(repo)`, the built read-only listing
+`GithubTracker.ensure_labels` itself starts from and the doctor
+already uses, and reports each returned name as would-create (every
+bootstrap label not returned is kept). No new label seam is designed
+or built; one resolver already owns the absent-labels fact. The
+board half reads the live board (a read is the only way to know
+created from kept), lists the planned creations, and shows the
+mapping write as the `init.plan_diff` of the target file. No
+mutation of any kind and no file write happen under `--plan`. A plan
+in a bootstrap state (no config address) against a board that does
+not exist lists the full creation set from the spec; a plan whose
+spec carries an address that no longer resolves plans nothing for
+that entry and counts it as the exit-4 configuration error of step
+2, like a real run. Plan exit codes follow the built would-change precedent
+(`new` and `init` exit 0 when a plan would change something): a
+would-create counts as created for the 0/1 split, so the cross-entry
+aggregation above applies unchanged with "created" read as "created
+or would create", and the same 4-over-3-over-1-over-0 precedence
+(0 when something would change and nothing failed or refused, 1 when
+nothing would or something was refused, 3 unreachable, 4 usage or
+conflict, including an addressed board that no longer resolves).
+Exit codes are a public interface, so a plan that lists creations
+never exits 1 merely because it created nothing.
 
 ## 3. Writing the mapping into `corral.toml`
 
@@ -742,7 +887,7 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 | Finding | Row | Fix line (printed, never run) |
 | --- | --- | --- |
 | Board mode, no `[repo.board]` table | fail (exists) | `corral github setup` (creates the board and writes the table) |
-| Table names a board that does not resolve (deleted, wrong owner or number, no read access) | fail, naming owner and number | `corral github setup` if the board should exist under that owner, else correct the table |
+| Table names a board that does not resolve (deleted, wrong owner or number, no read access) | fail, naming owner and number | the board in the config no longer exists: remove the table and re-run `corral github setup`, or correct the address by hand (setup refuses the same state with exit 4 and this same line; it never recreates over a stale address) |
 | Token lacks the board scope | fail, naming the missing scope | `gh auth refresh -s project` (UNVERIFIED scope string, U8; printed for the person, who owns their login) |
 | Board rate-limited during the check | fail (exists, marked transient) | wait for the cooldown, re-run `corral doctor` |
 | Mapped field missing on the live board | fail, naming repo, concept and field name | `corral github setup` (creates the missing field, alters nothing) |
@@ -752,9 +897,10 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 | Variant flip with queued writes | fail (exists, `flip_refusal`) | drain the outbox, then flip |
 | Label and board priority disagree; unparseable `blocked_by` | fail (exists, `parity_lines`) | backfill on the board, then resync |
 | Board provisioned but variant still `labels` | warn, naming the table | the `07` section 6 flip steps, or remove the table |
+| Another board under the same owner shares the configured board's title | warn, naming the title and every matching number | delete the board the config does not address, by hand (the racing-setups duplicate of section 2; corral deletes no board) |
 | Open issues missing from the board | fail, naming the count and the first few numbers | `corral github setup --populate` (needs the section 8 ticket 6 seam; not in the first doctor ticket) |
 
-Five implementation notes, so the rows above are buildable rather
+Six implementation notes, so the rows above are buildable rather
 than aspirational:
 
 - **Naming the missing or wrong-kind field** needs findings, not an
@@ -781,8 +927,22 @@ than aspirational:
   `BoardRow.status` to `"ok" | "warn" | "fail"` and passes it through
   to the `Check` unchanged. Row precedence inside `_check_site` is
   fail over warn over ok: any fail finding makes the row fail, else
-  any warn finding (today: a live priority option the map does not
-  name) makes it warn, else ok.
+  any warn finding (a live priority option the map does not name,
+  the duplicate-title row below) makes it warn, else ok.
+- **The duplicate-title warn lists titles under the owner.** It
+  needs data the addressed schema fetch does not return: the
+  configured board's live title, and the titles and numbers of the
+  other boards under the same owner. Ticket 6 widens what the
+  `fetch` seam returns beside the resolved schema (the board's title
+  and the owner's board list, the same paged title list step 2 of
+  provisioning reads, through the adapter and never a second
+  resolver in `boarddoctor`), and the pure comparison warns when
+  another listed board shares that exact title. It is warn, not
+  fail: the addressed board is healthy, and which of the two a
+  person deletes is a people's call. A title list that fails to
+  fetch folds into the row's existing fetch-failure handling, never
+  into a silent ok. The labels-with-table warn above is exempt, as
+  stated there: that row fetches nothing.
 - **The provisioned-but-labels warn needs a site-inclusion rule.**
   `check_sites` keeps only `variant == "board"` sites and
   `sites_from_settings` skips labels repos entirely today, so that
@@ -923,8 +1083,9 @@ ticket.
    one text field, one single-select field, link one repository, add
    one issue, and record the answer to every GitHub UNVERIFIED item,
    U1 to U9 and U11 in section 9 (mutation names and inputs, built-in
-   fields, visibility defaults, option-append id survival, the token
-   scope and its error text, the already-present answers, title
+   fields, visibility defaults, option-append survival of existing
+   ids, colors and descriptions when the whole list is resent with
+   them, the token scope and its error text, the already-present answers, title
    uniqueness, the owner lookup). U10 is not the spike's to settle:
    GitLab facts stay UNVERIFIED until a GitLab adapter is itself
    designed. Acceptance:
@@ -935,20 +1096,30 @@ ticket.
    variant). No corral code changes.
 1. **Types, the standard spec, and the pure planner.** `tracker.py`
    gains `FieldSpec` (with `keep_only`), `BoardSpec` (with the
-   existing `priority_map`), `BoardProvision` (with live `fields`),
+   exactly-one-or-none `number`/`project_id` address and the
+   existing `priority_map` as `None`-or-dict, no mutable default),
+   `BoardProvision` (with live `fields`),
    the `BoardProvisioner` protocol and `STANDARD_BOARD`;
    `effective_spec` resolves config-names-else-standard in one place,
-   including config-mapped `Area` and `Pool` as keep-only; a pure
-   planner maps (spec, live schema as plain data) to the ordered
+   including carrying the address from `BoardConfig` unchanged,
+   normalizing a `None` priority map to a fresh dict, and
+   config-mapped `Area` and `Pool` as keep-only; a pure
+   planner maps (spec, live schema as plain data, each option
+   carrying id, name, color and description) to the ordered
    create/keep/refuse action list the adapter will execute.
-   Acceptance: planner tests cover empty board, exact board, wrong
+   Acceptance: `effective_spec` tests show a board table's number
+   (and, in a second case, its node id) carried into the spec, no
+   address when there is no table, both-address and non-positive
+   number refused, and two specs built in sequence sharing no
+   priority-map object; planner tests cover empty board, exact board, wrong
    kind, missing option, extra team fields and options (all kept,
    none planned for change), and the five-rank map built from live
    ids; a renamed priority option (`High` renamed, id unchanged, the
    spec's map naming that id) plans no append and keeps its rank,
    while a rank with neither a live mapped id nor its standard name
-   plans exactly one append; a kept `Status` field plans no option
-   append whatever its option names are; duplicate field names and
+   plans exactly one append whose resent option list carries every
+   existing option's color and description unchanged; a kept
+   `Status` field plans no option append whatever its option names are; duplicate field names and
    duplicate option names on the live board each plan a refusal with
    a fix line, never a pick; a keep-only `Area` present on the board
    is kept with no option requirement, and absent is refused naming
@@ -962,7 +1133,13 @@ ticket.
    `trackers.production_board_provisioner` beside
    `production_trackers` as the one production wiring. Acceptance
    against canned payloads: created/kept/refused reported separately;
-   a re-run over an exactly-standard board sends no mutation; an
+   a re-run over an exactly-standard board sends no mutation; a
+   renamed-board re-run (the spec carries the board's number, the
+   canned board's title no longer matches the spec title) resolves
+   by address, sends no create and no title search, and reports
+   all-kept; a spec whose address resolves to nothing raises
+   `ValueError` with the remove-the-table fix line before any
+   mutation and sends no title search and no create; an
    existing field is never the target of an update or delete
    mutation; two same-title projects and an unresolvable owner raise
    `ValueError` naming the conflict before any mutation; duplicate
@@ -986,35 +1163,55 @@ ticket.
    renders `area_column`, so re-rendering against the file a flagged
    run wrote is identical (the no-op behind the plain re-run's
    exit 1, exercised end to end in ticket 4).
-4. **Extend `corral github setup`.** The verb and its label half are
-   built (`githubcli.setup_root`, `ensure_labels` on the `Tracker`
-   protocol); this ticket adds no verb and rebuilds no label code. It
-   extends `setup_root` with an injected `provisioner_factory` seam
-   (production: `trackers.production_board_provisioner`), the flags
-   `--board`, `--populate`, `--plan`, `--area`, `--pool`,
+4. **Extend `corral github setup`, including its production
+   wiring.** The verb and its label half are built
+   (`githubcli.setup_root`, `ensure_labels` on the `Tracker`
+   protocol); this ticket adds no verb and rebuilds no label code.
+   It first performs the section 2 `cmd_setup` restructure:
+   `trackers.SetupEntry`, `setup_entry` and `setup_tracker` beside
+   the untouched `production_trackers`; `cmd_setup` stops building
+   every tracker up front and passes `entry_factory`,
+   `tracker_factory` (now taking a `SetupEntry`) and
+   `provisioner_factory` (production:
+   `trackers.production_board_provisioner`) into `setup_root`, which
+   resolves and builds per entry, lazily, inside the loop, a board
+   entry with no table getting a labels tracker for its label half
+   and the provisioner for its board half. On that wiring it adds
+   the flags `--board`, `--populate`, `--plan`, `--area`, `--pool`,
    `--board-owner` and `--board-title`, the per-entry board ensure
    (board-mode entries, or any entry with `--board`) after the label
    ensure, the section 3 mapping write, the cross-entry aggregation
    of section 2 (4 over 3 over 1 over 0, every entry attempted), and
    the next-step lines (flip steps for labels entries, doctor
-   otherwise). Acceptance through a fake tracker and fake
-   provisioner: a labels entry with `--board` provisions and writes
-   the inert table (the factory needed no `BoardConfig`); a
+   otherwise). Acceptance through fake entry, tracker and
+   provisioner seams: a labels entry with `--board` provisions and
+   writes the inert table (the factory needed no `BoardConfig`); a
    board-variant entry with no `[repo.board]` table provisions and
-   writes the table that makes it whole; a plain re-run after a run
+   writes the table that makes it whole, and the same case passes
+   at `cmd_setup` level with the production `entry_factory`,
+   `tracker_factory` and `provisioner_factory` in place and only
+   the `run` and git seams faked, proving the real verb no longer
+   exits 4 before the loop and that its `SetupEntry` carries
+   variant `board` with `board is None` into `setup_root`; an entry
+   whose lazy resolution or construction fails counts 4 and the
+   entries after it still run; a plain re-run after a run
    with `--area` and `--pool` is a no-op, exit 1, with no
    different-table refusal; mixed multi-entry runs aggregate as
    section 2 states (entry A creates and its mapping file stands,
    entry B raises `TrackerError`, entry C hits a different table: all
    three attempted, final exit 4; A and B without C exit 3; created
    plus refused exits 1; all-kept exits 1); every row of the section 2
-   per-board exit table; `--plan` creates no label (the fake sees the
-   report-only label read and no create), sends no board mutation and
-   writes no file byte; the `--area`, `--pool`, `--board-owner` and
-   `--board-title` flags reach `effective_spec` and nowhere else; a
-   labels entry without `--board` behaves byte-identically to the
-   built verb today; the README Commands row for `github setup` is
-   updated for the board half and the new flags in this ticket.
+   per-board exit table; `--plan` creates no label (the fake tracker
+   sees `missing_labels` and no `ensure_labels`, and no new label
+   seam exists), sends no board mutation and writes no file byte,
+   and its exits count would-create as created (a plan listing
+   creations exits 0, a plan over a converged root exits 1, and
+   mixed plans keep the 4-over-3 precedence); the `--area`,
+   `--pool`, `--board-owner` and `--board-title` flags reach
+   `effective_spec` and nowhere else; a labels entry without
+   `--board` behaves byte-identically to the built verb today; the
+   README Commands row for `github setup` is updated for the board
+   half and the new flags in this ticket.
 5. **Population.** The adapter's populate operation and its setup
    wiring (may land with ticket 4 if small): open issues only,
    presence pre-read, add-missing only, no field value ever written.
@@ -1024,8 +1221,12 @@ ticket.
    and a re-run adds only the remainder.
 6. **Doctor rows.** The `boarddoctor` raw-schema comparison (missing
    field, wrong kind, unmapped option warn), the scope row over the
-   exposed classifier, the provisioned-but-labels warn, fix lines
-   pointing at `corral github setup`; the warn plumbing
+   exposed classifier, the provisioned-but-labels warn, the
+   duplicate-title warn (the widened `fetch` seam returns the
+   configured board's title and the owner's board list beside the
+   schema; another board sharing that exact title warns, naming the
+   title and every matching number), fix lines pointing at
+   `corral github setup`; the warn plumbing
    (`BoardRow.status` gains `"warn"`, passed through to `doctor.Check`,
    fail over warn over ok per row) and the site-inclusion rule (a
    labels entry with a `[repo.board]` table becomes a site answered
@@ -1034,8 +1235,13 @@ ticket.
    the same ticket or a follow-up if it grows, the missing-from-board
    row over its second injected fetch. Acceptance: each row of the
    section 5 table names repo and field against fake seams; the
+   duplicate-title warn fires for a fake owner list holding two
+   boards of the configured title (and stays ok for a second board
+   of a different title, and for the configured board itself being
+   the only match), leaving the doctor exit at 0; the
    labels-with-table warn is produced with the fake `fetch` asserting
-   it was never called; doctor exit codes unchanged (fail rows exit 1,
+   it was never called (so it carries no duplicate-title check);
+   doctor exit codes unchanged (fail rows exit 1,
    warn-only exits 0); no row runs anything.
 7. **`new --create-remote` wiring.** `corral new` is built; this is a
    small extension of it, not a blocked ticket. In the
@@ -1075,7 +1281,10 @@ option and one marked recommended.
 - U6. `createProjectV2Field` takes `dataType` (`TEXT`,
   `SINGLE_SELECT`) and options at creation for single-select.
 - U7. Appending options replaces the option list but preserves the
-  ids of the options carried over unchanged.
+  ids, colors and descriptions of the options carried over, when
+  the resent list carries each option's color and description with
+  it (and, if colors or descriptions cannot ride the update at all,
+  that is the failure this item records, and step 6 refuses).
 - U8. The needed token scope is `project` (write) / `read:project`
   (read); its refusal text classifies as `scope`; the fix is
   `gh auth refresh -s project`.
@@ -1132,6 +1341,3 @@ O8. External authors' open issues during population:
 Options:
 1. Add them; board membership writes no issue (recommended)
 2. Operators' issues only; external stays off-board
-
-
-
