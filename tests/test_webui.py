@@ -317,7 +317,12 @@ class SourceDiscipline(unittest.TestCase):
 
     def test_volatile_keys_match_the_server(self):
         text = web_bytes("fmt.js").decode("utf-8")
-        names = set(re.findall(r'"(now|read_at)"', text))
+        # Parse the Set literal itself: collecting only the known
+        # names would pass with an extra member sitting beside them.
+        found = re.search(r"VOLATILE_KEYS = new Set\(\[([^\]]*)\]\)", text)
+        self.assertIsNotNone(found)
+        assert found is not None
+        names = set(re.findall(r'"([^"]+)"', found.group(1)))
         self.assertEqual(names, set(serve.VOLATILE_KEYS))
 
     def test_bundle_stays_small(self):
@@ -351,6 +356,64 @@ class SourceDiscipline(unittest.TestCase):
         self.assertIn("nextDelay(failures)", app)
         self.assertNotIn("POLL_MS", app)
         self.assertNotIn("BACKOFF_MS", app)
+
+    def test_schedule_runs_only_from_a_finally(self):
+        # The poll loop is structurally unable to die: the single
+        # reschedule sits in tick's finally, so any throw above it
+        # still rearms the loop.
+        app = web_bytes("app.js").decode("utf-8")
+        sites = list(re.finditer(r"schedule\(config, token\);", app))
+        self.assertEqual(len(sites), 1)
+        start = sites[0].start()
+        self.assertGreater(app.rfind("finally {", 0, start), app.rfind("catch", 0, start))
+
+    def test_draw_failure_is_visible_and_counts_a_failure(self):
+        # A render throw (a new server shape) must read as a failure
+        # with a visible notice, never as a live page over stale data.
+        app = web_bytes("app.js").decode("utf-8")
+        at = app.find("Could not draw this update")
+        self.assertGreater(at, -1)
+        window = app[max(0, at - 400) : at]
+        self.assertIn("failures += 1", window)
+        self.assertIn("renderConnection({ live: false, seenMs })", window)
+
+    def test_stopped_state_drops_the_compare_cache(self):
+        # Entering the stopped gate must clear the fingerprint, or the
+        # compare-and-skip path redraws nothing when the version
+        # matches again and an empty page claims to be live.
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertEqual(app.count("renderStopped("), 1)
+        at = app.find("renderStopped(")
+        start = app.rfind("function enterStopped", 0, at)
+        self.assertGreater(start, -1)
+        block = app[start:at]
+        self.assertIn("lastFingerprint = null", block)
+        self.assertIn("lastDoc = null", block)
+
+    def test_usage_triple_tolerates_a_null_share(self):
+        # A null by_project share on a new server shape must read as
+        # unknown, not throw inside the poll loop.
+        text = web_bytes("views.js").decode("utf-8")
+        start = text.find("function usageTriple(")
+        self.assertGreater(start, -1)
+        body = text[start : text.find("\n}\n", start)]
+        self.assertIn("typeof triple", body)
+
+    def test_pressure_degrades_to_verbatim(self):
+        # A non-numeric pressure reading must read as its raw value,
+        # the timestamp formatters' rule, not NaN.
+        text = web_bytes("views.js").decode("utf-8")
+        start = text.find("function pressureValue(")
+        self.assertGreater(start, -1)
+        body = text[start : text.find("\n}\n", start)]
+        self.assertIn("Number.isFinite", body)
+        self.assertIn("String(value)", body)
+        view = web_bytes("views.js").decode("utf-8")
+        at = view.find("function pressureText(")
+        self.assertGreater(at, -1)
+        section = view[at : view.find("\n}\n", at)]
+        self.assertIn("pressureValue(info.load_per_cpu, 2)", section)
+        self.assertIn("pressureValue(info.mem_available_pct, 1)", section)
 
     def test_fetch_maps_network_failure_to_the_failure_branch(self):
         text = web_bytes("api.js").decode("utf-8")

@@ -95,7 +95,7 @@ async function checkVersion(config, token, nowMs) {
     lastVersionCheckMs = nowMs;
     if (!isSupportedApi(reply.data, config.api)) {
       outdated = true;
-      renderStopped("This dashboard is out of date for this server, reload after upgrading.");
+      enterStopped("This dashboard is out of date for this server, reload after upgrading.");
       renderConnection({ live: true, seenMs: nowMs });
       return false;
     }
@@ -108,82 +108,105 @@ async function checkVersion(config, token, nowMs) {
   return true;
 }
 
+// Entering the stopped gate drops the compare cache, so the
+// compare-and-skip path cannot skip the redraw when the version
+// matches again and an empty page claims to be live.
+function enterStopped(message) {
+  lastDoc = null;
+  lastFingerprint = null;
+  renderStopped(message);
+}
+
 async function tick(config, token) {
   const nowMs = Date.now();
-  let versionOk = true;
   try {
-    versionOk = await checkVersion(config, token, nowMs);
-  } catch {
-    versionOk = true;
-  }
-  if (!versionOk) {
-    schedule(config, token);
-    return;
-  }
-  let reply = null;
-  try {
-    reply = await loadSnapshot(token);
-  } catch {
-    reply = null;
-  }
-  if (reply && reply.status === 200 && reply.data) {
-    seenMs = Date.now();
-    failures = 0;
-    hideToken();
-    renderShell({
-      mode: config.mode,
-      api: config.api,
-      version: lastVersion,
-      seenMs,
-      serverNowMs:
-        typeof reply.data.now === "number"
-          ? reply.data.now * 1000
-          : typeof reply.data.fleet_header === "object" &&
-              reply.data.fleet_header !== null &&
-              typeof reply.data.fleet_header.now === "number"
-            ? reply.data.fleet_header.now * 1000
-            : null,
-    });
-    if (!isSupportedDocument(reply.data, EXPECTED_SCHEMA_VERSION)) {
-      const value =
-        reply.data && typeof reply.data.schema_version === "number"
-          ? String(reply.data.schema_version)
-          : "missing";
-      renderStopped(
-        "Unsupported document schema " + value + ": reload after upgrading.",
-      );
-    } else {
-      const route = projectFromHash();
-      const fingerprint = canonicalJson(stripVolatile(reply.data));
-      if (
-        fingerprint !== lastFingerprint ||
-        route.project !== lastProject ||
-        route.notice !== lastNotice
-      ) {
-        lastDoc = reply.data;
-        lastFingerprint = fingerprint;
-        lastProject = route.project;
-        lastNotice = route.notice;
-        renderOverview(reply.data, { project: route.project, nowMs: seenMs, notice: route.notice });
-      }
+    let versionOk = true;
+    try {
+      versionOk = await checkVersion(config, token, nowMs);
+    } catch {
+      versionOk = true;
     }
-    renderConnection({ live: true, seenMs });
-  } else if (reply && reply.status === 401) {
-    showToken({
-      message: "This server needs a token.",
-      help: helpFor(config.mode),
-    });
-    if (seenMs !== null) {
+    if (!versionOk) {
+      return;
+    }
+    let reply = null;
+    try {
+      reply = await loadSnapshot(token);
+    } catch {
+      reply = null;
+    }
+    if (reply && reply.status === 200 && reply.data) {
+      seenMs = Date.now();
+      failures = 0;
+      hideToken();
+      renderShell({
+        mode: config.mode,
+        api: config.api,
+        version: lastVersion,
+        seenMs,
+        serverNowMs:
+          typeof reply.data.now === "number"
+            ? reply.data.now * 1000
+            : typeof reply.data.fleet_header === "object" &&
+                reply.data.fleet_header !== null &&
+                typeof reply.data.fleet_header.now === "number"
+              ? reply.data.fleet_header.now * 1000
+              : null,
+      });
+      if (!isSupportedDocument(reply.data, EXPECTED_SCHEMA_VERSION)) {
+        const value =
+          reply.data && typeof reply.data.schema_version === "number"
+            ? String(reply.data.schema_version)
+            : "missing";
+        enterStopped(
+          "Unsupported document schema " + value + ": reload after upgrading.",
+        );
+      } else {
+        const route = projectFromHash();
+        const fingerprint = canonicalJson(stripVolatile(reply.data));
+        if (
+          fingerprint !== lastFingerprint ||
+          route.project !== lastProject ||
+          route.notice !== lastNotice
+        ) {
+          // The cache updates only after a clean draw, so a throw
+          // below retries on the next poll instead of skipping.
+          renderOverview(reply.data, { project: route.project, nowMs: seenMs, notice: route.notice });
+          lastDoc = reply.data;
+          lastFingerprint = fingerprint;
+          lastProject = route.project;
+          lastNotice = route.notice;
+        }
+      }
+      renderConnection({ live: true, seenMs });
+    } else if (reply && reply.status === 401) {
+      showToken({
+        message: "This server needs a token.",
+        help: helpFor(config.mode),
+      });
+      if (seenMs !== null) {
+        renderConnection({ live: false, seenMs });
+      }
+    } else {
+      // Any other status, a status-0 network failure, or a throw:
+      // count the backoff, show stale-with-age when a last good poll
+      // exists (or the never-connected state when none does).
+      failures += 1;
       renderConnection({ live: false, seenMs });
     }
-  } else {
-    // Any other status, a status-0 network failure, or a throw: count
-    // the backoff, show stale-with-age when a last good poll exists
-    // (or the never-connected state when none does), reschedule below.
+  } catch {
+    // A render throw (a new server shape, an unexpected null) must
+    // never kill the loop: count it, keep the last good data under
+    // its age banner, and say the draw failed.
     failures += 1;
     renderConnection({ live: false, seenMs });
+    const note = document.getElementById("notice");
+    note.hidden = false;
+    note.textContent = "";
+    note.appendChild(document.createTextNode("Could not draw this update; the next poll retries."));
+  } finally {
+    schedule(config, token);
   }
-  schedule(config, token);
 }
 
 function schedule(config, token) {

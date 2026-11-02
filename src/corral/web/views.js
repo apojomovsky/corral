@@ -207,9 +207,12 @@ function quotaCard(quota, nowMs) {
 }
 
 function usageTriple(triple) {
-  const cpu = triple.cpu_m === null || triple.cpu_m === undefined ? "?" : String(triple.cpu_m);
-  const mem = triple.memory_mb === null || triple.memory_mb === undefined ? "?" : String(triple.memory_mb);
-  const pids = triple.pids === null || triple.pids === undefined ? "?" : String(triple.pids);
+  // A new server shape can send a null share: read it as unknown
+  // instead of throwing inside the poll loop.
+  const info = triple !== null && typeof triple === "object" ? triple : {};
+  const cpu = info.cpu_m === null || info.cpu_m === undefined ? "?" : String(info.cpu_m);
+  const mem = info.memory_mb === null || info.memory_mb === undefined ? "?" : String(info.memory_mb);
+  const pids = info.pids === null || info.pids === undefined ? "?" : String(info.pids);
   return "cpu " + cpu + "m, mem " + mem + " MB, pids " + pids;
 }
 
@@ -227,14 +230,21 @@ function measuredText(measured) {
   return bits.join(", ");
 }
 
+// A pressure reading outside the contract degrades to its raw value
+// as text, the timestamp formatters' rule, instead of NaN.
+function pressureValue(value, digits) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num.toFixed(digits) : String(value);
+}
+
 function pressureText(pressure) {
   const info = pressure && typeof pressure === "object" ? pressure : {};
   const bits = [];
   if (info.load_per_cpu !== null && info.load_per_cpu !== undefined) {
-    bits.push("load " + Number(info.load_per_cpu).toFixed(2) + "/cpu");
+    bits.push("load " + pressureValue(info.load_per_cpu, 2) + "/cpu");
   }
   if (info.mem_available_pct !== null && info.mem_available_pct !== undefined) {
-    bits.push("mem " + Number(info.mem_available_pct).toFixed(1) + "% avail");
+    bits.push("mem " + pressureValue(info.mem_available_pct, 1) + "% avail");
   }
   if (bits.length === 0) {
     return "pressure unknown";
