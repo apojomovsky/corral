@@ -28,8 +28,10 @@ from corral import (
     boarddoctor,
     deps,
     drive,
+    host_ledger,
     hub,
     paths,
+    pressure,
     projects,
     prompts,
     registry,
@@ -78,6 +80,24 @@ class HubAuth(NamedTuple):
 
     status: str
     detail: str
+
+
+class ResourceState(NamedTuple):
+    """The host-budget inputs the `resources` row reports on, as plain data.
+
+    `budget_set` tells whether a host budget configures enforcement;
+    `expired` names the foreign claims older than `gone_s` (ignored by
+    admission, warned here); `claims_error` names an unreadable claims
+    channel; `pressure` is one of "ok", "saturated" or "unknown" with
+    the numbers in `pressure_detail`. Tests inject values; only
+    production gathers them.
+    """
+
+    budget_set: bool
+    expired: Sequence[str]
+    claims_error: str | None
+    pressure: str
+    pressure_detail: str
 
 
 class Env(NamedTuple):
@@ -131,6 +151,9 @@ class Env(NamedTuple):
     #: The hub version probe. None means the caller has no reading, and
     #: then the report carries no `hub` row.
     hub_probe: HubProbe | None = None
+    #: The host-budget inputs for the `resources` row. None means the
+    #: caller has no reading, and then the report carries no row.
+    resources: ResourceState | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -399,6 +422,54 @@ def _check_disk(pressure: str | None) -> list[Check]:
     ]
 
 
+def _check_resources(state: ResourceState | None) -> list[Check]:
+    """The `resources` row: budget, foreign claims and host pressure.
+
+    No state, no row. An unreadable claims channel fails; a saturated
+    host fails (launches wait); expired claims, an unset budget and an
+    unknown pressure warn; anything else reads ok. The detail joins
+    every part, so one row carries the whole budget story.
+    """
+    if state is None:
+        return []
+    if state.claims_error is not None:
+        return [
+            Check(
+                "resources",
+                "fail",
+                f"foreign claims unreadable: {state.claims_error}",
+                "fix the ledger and the drop-in claims dir beside it,"
+                " then run `corral doctor` again",
+            )
+        ]
+    notes: list[str] = []
+    status = "ok"
+    if not state.budget_set:
+        status = "warn"
+        notes.append("no host budget configured: the budget gate passes everything")
+    if state.expired:
+        status = "warn"
+        names = ", ".join(state.expired)
+        notes.append(f"foreign claim(s) expired and ignored: {names}")
+    if state.pressure == "saturated":
+        status = "fail"
+        notes.append(f"host saturated ({state.pressure_detail}): launches wait")
+    elif state.pressure == "unknown":
+        status = "warn" if status == "ok" else status
+        notes.append("host pressure unknown: a pressure file could not be read")
+    if status == "ok":
+        return [Check("resources", "ok", "host budget and pressure ok", "")]
+    fix = "wait for the load to drop, then retry the launch"
+    if status == "warn":
+        if not state.budget_set:
+            fix = "set [resources.host] in the host config to enforce shares"
+        elif state.expired:
+            fix = "drop the stale claim or declare it again, then run `corral doctor` again"
+        else:
+            fix = "check the pressure files read, then run `corral doctor` again"
+    return [Check("resources", status, "; ".join(notes), fix)]
+
+
 def _check_boards(env: Env) -> list[Check]:
     """One row per repo in board mode, mapped from the board slice."""
     if env.board_error is not None:
@@ -505,9 +576,94 @@ def run_checks(env: Env) -> list[Check]:
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_disk(env.disk),
+        *_check_resources(env.resources),
         *_check_hub_auth(env.hub_url, env.hub_auth),
         *_check_hub(env.hub_url, env.hub_probe),
     ]
+
+
+def resource_state(
+    *,
+    budget_set: bool,
+    claims: Sequence[Mapping],
+    claims_error: str | None,
+    gone_s: float,
+    now: float,
+    reading: tuple[float | None, float | None],
+    max_load_per_cpu: float,
+    min_mem_available_pct: float,
+) -> ResourceState:
+    """The `resources` row inputs from gathered data: pure, never raising.
+
+    `claims` are the merged foreign-claim dicts with `name` and
+    `claimed_at`; entries older than `gone_s` at `now` read as expired.
+    `reading` is `(load_per_cpu, mem_available_pct)`, Nones unknown.
+    """
+    expired = tuple(
+        str(entry["name"])
+        for entry in claims
+        if isinstance(entry.get("claimed_at"), (int, float)) and now - entry["claimed_at"] > gone_s
+    )
+    measured = pressure.Reading(load_per_cpu=reading[0], mem_available_pct=reading[1])
+    hot, detail = pressure.saturated(
+        measured,
+        max_load_per_cpu=max_load_per_cpu,
+        min_mem_available_pct=min_mem_available_pct,
+    )
+    if hot:
+        status = "saturated"
+    elif reading[0] is None and reading[1] is None:
+        status = "unknown"
+    else:
+        status = "ok"
+    return ResourceState(
+        budget_set=budget_set,
+        expired=expired,
+        claims_error=claims_error,
+        pressure=status,
+        pressure_detail=detail,
+    )
+
+
+def load_resource_state(resolved) -> ResourceState | None:
+    """Gather the `resources` row inputs. None when there is no host config.
+
+    Fallible gathering degrades to data: an unreadable ledger or claims
+    dir is a `claims_error`, never a traceback. Only the CLI calls this;
+    tests call `resource_state` with plain data.
+    """
+    if resolved is None:
+        return None
+    tables = resolved.resources
+    budget_set = tables is not None and tables.host is not None
+    try:
+        gone_s = float(resolved["resources.gone_s"])
+    except (KeyError, TypeError, ValueError):
+        gone_s = 600.0
+    now = time.time()
+    try:
+        claims: Sequence[Mapping] = host_ledger.load()["foreign"]
+        claims_error = None
+    except (host_ledger.LedgerError, OSError) as err:
+        claims = ()
+        claims_error = str(err)
+    measured = pressure.production_read()
+    if tables is not None and tables.pressure is not None:
+        max_load = tables.pressure.max_load_per_cpu
+        min_mem = tables.pressure.min_mem_available_pct
+    else:
+        max_load = pressure.DEFAULT_MAX_LOAD_PER_CPU
+        min_mem = pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT
+    return resource_state(
+        budget_set=budget_set,
+        claims=claims,
+        claims_error=claims_error,
+        gone_s=gone_s,
+        now=now,
+        reading=(measured.load_per_cpu, measured.mem_available_pct),
+        max_load_per_cpu=max_load,
+        min_mem_available_pct=min_mem,
+    )
 
 
 def exit_code(checks: Sequence[Check]) -> int:
@@ -920,6 +1076,7 @@ def production_env() -> Env:
     dep_results, deps_error = load_dep_results()
     prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
     disk_pressure = load_disk_pressure(resolved)
+    resource_inputs = load_resource_state(resolved)
     board_sites, board_error = load_board_sites(settings_error)
     project_problems = load_project_problems()
     timer_state = load_timer_state()
@@ -944,6 +1101,7 @@ def production_env() -> Env:
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
         disk=disk_pressure,
+        resources=resource_inputs,
         board_sites=board_sites,
         board_fetch=production_board_fetch,
         board_open_store=store.open_store,

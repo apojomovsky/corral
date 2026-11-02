@@ -24,7 +24,7 @@ from unittest import mock
 from contextlib import redirect_stdout
 
 from corral import accounts, cli, hold, host_ledger, launch, launchcli, models, paths
-from corral import registry, resources, runtimes
+from corral import pressure, registry, resources, runtimes
 from corral import settings, units
 from corral.runtimes import muse, omp, opencode
 from tests.test_reviewrecord import git_in
@@ -705,6 +705,57 @@ class BudgetWiringTest(OpsCase):
             self.system.seams(),
         )
         self.assertEqual(code, 4)
+
+
+class PressureWiringTest(OpsCase):
+    """Saturation backoff in `launch.admit`: hot hosts wait with exit 75."""
+
+    def host_config(self, text=HOST_BUDGET):
+        config = os.environ["CORRAL_CONFIG"]
+        os.makedirs(config, exist_ok=True)
+        with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def admit(self, number=5, **kwargs):
+        kwargs.setdefault("list_fn", self.system.list_fn)
+        kwargs.setdefault("usage", roomy)
+        kwargs.setdefault("host_ledger_fn", self.system.host_ledger_fn)
+        return launch.admit(self.target(), number, **kwargs)
+
+    def test_a_saturated_host_refuses_with_75_while_shares_are_free(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        hot = lambda: pressure.Reading(load_per_cpu=8.0, mem_available_pct=50.0)
+        with self.assertRaises(launch.CapFull) as caught:
+            self.admit(now_fn=lambda: NOW, pressure_fn=hot)
+        self.assertEqual(caught.exception.exit_code, 75)
+        self.assertIn("saturated", str(caught.exception))
+        self.assertEqual(self.system.started, [])
+
+    def test_an_unknown_reading_admits(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        unknown = lambda: pressure.Reading(load_per_cpu=None, mem_available_pct=None)
+        self.admit(now_fn=lambda: NOW, pressure_fn=unknown)
+
+    def test_no_seam_reads_as_unknown(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        self.admit(now_fn=lambda: NOW)
+
+    def test_no_host_budget_skips_the_pressure_read(self):
+        def explode():
+            raise AssertionError("no budget configured: nothing may read pressure")
+
+        self.admit(pressure_fn=explode)
+
+    def test_a_saturated_host_maps_to_exit_75_on_the_cli(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        seams = self.system.seams()._replace(
+            pressure_fn=lambda: pressure.Reading(load_per_cpu=8.0, mem_available_pct=50.0)
+        )
+        code = launchcli.run_verb(
+            ["launch", "lib", "5", "--prompt-file", self.prompt_file(), "--root", self.root],
+            seams,
+        )
+        self.assertEqual(code, 75)
 
 
 class LaunchTest(OpsCase):
