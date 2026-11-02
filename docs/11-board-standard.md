@@ -28,25 +28,35 @@ Checked against the code, not against the older docs:
   `github/board.py`, the one factory in `trackers.build_tracker`, the
   board sync step in `sync.sync_board_repo`, and one doctor row per
   board-mode repo in `boarddoctor.check_sites`.
-- Nothing creates a board. The `Tracker` protocol in `tracker.py`
-  (`item`, `changes`, `items`, `write`, `comment`, `add_label`) has no
-  ensure or provisioning operation, for labels or for boards.
-- `corral github setup` does not exist as a verb yet. `init` prints it
-  as its next step (`init.cmd_init` prints `next: corral github setup`)
-  and `06-corral-new.md` section 4 designs it as the one code path for
-  the label bootstrap, with the build in that doc's ticket 4. That
-  ticket has not landed, so today setup creates nothing: the verb it
-  would live in does not exist yet. Section 8 sequences the board
-  work around that fact instead of assuming the verb exists.
-- `corral new` is not built either (the README status line says so).
-  Its `--create-remote` path is designed in `06-corral-new.md`
-  sections 1 and 3. This doc designs only the board operation those
-  callers invoke; it does not re-design `new`.
+- The label bootstrap is built, and it is the precedent this design
+  extends. The `Tracker` protocol in `tracker.py` carries
+  `ensure_labels(repo)` returning a `LabelReport` (created, kept,
+  refused), implemented by `GithubTracker.ensure_labels` and delegated
+  by `BoardBackedTracker`. Provisioning on that protocol is therefore
+  an established shape in corral, not a new idea.
+- `corral github setup` is a built verb (`githubcli.cmd_setup` and
+  `githubcli.setup_root`). It runs `ensure_labels` on every named
+  `[[repo]]` entry, continuing past a `TrackerError`, and aggregates
+  the exit code across entries: any failed repo is 3, else any refused
+  label is 1, else 0 only when something was created, else 1. Today
+  it creates labels only; no board half exists. `init` prints it as
+  its next step and never runs it.
+- `corral new` is built, including `--create-remote` (`new.py`): after
+  creating the remote it bootstraps labels through the same
+  `ensure_labels` (`new._bootstrap_labels`); without the flag it
+  prints `next: corral github setup` and runs nothing outward. This
+  doc designs only the board operation those built callers invoke; it
+  does not re-design `new` or the label half of `setup`.
+- Nothing creates a board. No `ensure_board` exists anywhere, and
+  board mode assumes a person made the Project and mapped its fields
+  by hand. That gap, and only that gap, is what this doc designs.
 
-Two consequences. First, board provisioning joins the label bootstrap
-in the same operation and the same verb, so there is still exactly one
-code path that creates outward board state (`06-corral-new.md`
-section 4: "one code path owns this"). Second, board mode today
+Two consequences. First, board provisioning extends the existing
+`github setup` verb and joins the label bootstrap in that one
+operation, so there is still exactly one code path that creates
+outward tracker state (`06-corral-new.md` section 4: "one code path
+owns this"). No new verb is added, and the label half is not rebuilt.
+Second, board mode today
 assumes a person made the Project, created the fields, read the option
 ids out of the provider, and typed them into `corral.toml`. Every step
 of that is a place to copy the wrong id. Provisioning writes the
@@ -94,15 +104,18 @@ REST issue payload, the edges from the sub-issues endpoints
 
 ### Options
 
-- `Status`: the standard requires at least `Todo`, `In Progress` and
-  `Done`. corral carries the display name verbatim into
-  `extra["board_status"]` and gives it no meaning; what a status
+- `Status`: a field corral creates gets at least `Todo`,
+  `In Progress` and `Done`. Those names are creation defaults only:
+  corral assigns them no meaning and never tops up a kept field's
+  options by name (section 2, step 6). corral carries the display
+  name verbatim into `extra["board_status"]` and gives it no meaning; what a status
   allows is project eligibility policy, as today. A new GitHub Project
   is believed to ship a built-in `Status` single-select field with
   exactly these options (UNVERIFIED: section 9, item U1). When it does,
   provisioning keeps the built-in and creates nothing for this concept.
-- `Priority`: five options, one per rank in the closed set the label
-  adapter already parses (`PRIORITIES` in `github/tracker.py`:
+- `Priority`: five options, one per rank in the closed set every
+  adapter already parses (`PRIORITIES` in `tracker.py`, the provider
+  neutral interface module; `github/tracker.py` only imports it:
   `urgent`, `high`, `normal`, `low`, `backlog`, highest first). The
   rank mapping the provisioning writes is identity by rank:
 
@@ -132,9 +145,19 @@ REST issue payload, the edges from the sub-issues endpoints
   `corral github setup` (decision O6): there is deliberately no
   `corral.toml` key for the lists, because once the field exists its
   options are people's board state, and a config copy would be a
-  second resolver for the same fact. Undeclared, the concept stays
-  unmapped, which the reader already treats as absent; a later setup
-  run with the flags creates the field then.
+  second resolver for the same fact. Undeclared and unmapped, the
+  concept stays out of the spec, which the reader already treats as
+  absent; a later setup run with the flags creates the field then.
+  Once a project's `corral.toml` maps the concept (`area_column` or
+  `pool_column` is set, whether by an earlier flagged setup run or by
+  hand), it enters every later spec as **keep-only**: the field must
+  exist with the right kind and is then kept exactly as found, and no
+  option is required, checked or appended. Options are required only
+  at creation. A keep-only field that is absent from the board cannot
+  be created without declared options, so it is a refused line naming
+  the `--area` or `--pool` flag as the fix. This is what makes a
+  plain re-run after a flagged run a no-op: the spec still names the
+  concept, the field is kept, and section 3 renders the same table.
 
 ### What corral requires, what a team may add
 
@@ -181,12 +204,19 @@ the label bootstrap in `06-corral-new.md` section 4.
 
 ### The interface shape
 
-The operation does not go on the `Tracker` protocol. That protocol is
-per-repo item work; every fake tracker in the suite implements it, and
-a new required method would break them all for an operation label-mode
-repos never call. Instead `tracker.py` gains the provider-neutral
+The operation does not go on the `Tracker` protocol, even though
+`ensure_labels` sets a precedent for provisioning there. The
+difference is the unit of work. Every `Tracker` method, `ensure_labels`
+included, takes a repository and works on that repository; board
+ensure needs a Project, not a repository: it resolves an owner, finds
+or creates an owner-level board, and only then links a repository to
+it. It must also run in the two bootstrap states where no board
+tracker can exist yet (a labels entry, and board mode with no
+`[repo.board]` table; see the factory below), which a method reached
+through a built repo tracker cannot do. So the board half is a
+separate provisioner object: `tracker.py` gains the provider-neutral
 types and a separate narrow protocol, in the same style as the rest of
-that module:
+that module. `ensure_labels` stays where it is; nothing moves.
 
 ```python
 class FieldSpec(NamedTuple):
@@ -194,6 +224,7 @@ class FieldSpec(NamedTuple):
     name: str               # the effective board spelling of the concept
     kind: str               # "text" | "single_select"
     options: tuple[str, ...]  # standard option names, single-select only
+    keep_only: bool = False  # mapped Area/Pool: must exist, never created or topped up
 
 class BoardSpec(NamedTuple):
     owner: str              # board owner login (user or organization)
@@ -201,11 +232,13 @@ class BoardSpec(NamedTuple):
     repo: str               # "owner/name" to link, or "" for no link
     fields: tuple[FieldSpec, ...]
     private: bool = True
+    priority_map: dict[str, str] = {}  # the config's existing id -> rank map, if any
 
 class BoardProvision(NamedTuple):
     owner: str
     number: int | None      # the provider's per-owner number, when it has one
     project_id: str         # the provider's opaque node id
+    fields: tuple[FieldSpec, ...]  # concept -> live name, after the final read-back
     created: tuple[str, ...]  # "project", "field:Agent", "option:Priority/High", "link:example/repo"
     kept: tuple[str, ...]
     refused: tuple[str, ...]  # one fix line per refusal
@@ -223,9 +256,9 @@ report (`added`, `kept`, `refused` as fix lines). Both methods raise
 adapter call. A spec that cannot be executed as given (unresolvable
 owner, ambiguous title in step 2 below) raises `ValueError` naming
 the conflict, the established shape for a refused write in
-`tracker.py`; the setup CLI maps it to exit 4. A provision that ran
-but met refusals returns normally with them in `refused`; the CLI
-exits 1.
+`tracker.py`; setup counts it as a 4 for that entry in the cross-entry
+aggregation below. A provision that ran but met refusals returns
+normally with them in `refused`, counted as a 1 for that entry.
 
 `STANDARD_BOARD` (the section 1 table as data) and a pure
 `effective_spec` helper live beside these types: the one place that
@@ -237,26 +270,41 @@ Derivation, in one place so no caller re-derives it: the owner is the
 when a table exists, else the tracker repo's owner; the title is
 `<repo> board` from the tracker repo's name unless `--board-title`
 overrides; each field name is the config's name for the concept when
-mapped, else the standard name; `Area` and `Pool` enter the spec only
-with at least one declared option (section 1). No second resolver for
-field names may appear; the reader keeps resolving names through
-`BoardConfig`, the provisioner through this helper, and after a
-successful provision the two agree because section 3 writes the
-spec's names into the config.
+mapped, else the standard name; the config's existing `priority_map`
+rides into the spec so the planner can resolve renamed options by id
+(step 6); `Area` and `Pool` enter the spec with at least one declared
+option, or as keep-only when the config already maps them, and not at
+all otherwise (section 1). No second resolver for field names may
+appear; the reader keeps resolving names through `BoardConfig`, the
+provisioner through this helper, and after a successful provision the
+two agree because section 3 writes the provision's live names into
+the config.
 
-The GitHub implementation lives in `github/board.py` next to
-`BoardReader` and `BoardTracker`, constructed with the same
-`run(args)` seam and pacer, calling `gh.api graphql` through
-`gh.graphql` so mutations are charged to the shared bucket at mutation
-cost and rate-limit answers raise `TrackerRateLimited` through the
-shared classifier, exactly like board reads and writes. Nothing
-outside the adapter knows a mutation name or a field-creation shape.
+The GitHub implementation, `GithubBoardProvisioner`, lives in
+`github/board.py` next to `BoardReader` and `BoardTracker`. Unlike
+them it is constructed with only the `run(args)` seam and the pacer,
+never a `BoardConfig`: `BoardReader` requires a resolved board table
+(owner plus number or id), and `trackers.build_tracker` returns a
+plain `GithubTracker` for a labels entry and refuses board mode
+without a table, so neither can exist in the bootstrap states
+provisioning exists for. A small factory beside
+`trackers.production_trackers`, `production_board_provisioner(*, run=None, pacer=None)`,
+builds the provisioner the same way `build_tracker` wires board mode
+(the raw `gh` runner; GraphQL is paced through the shared bucket) and
+is the one production wiring. `githubcli.cmd_setup` passes it into
+`setup_root` as an injected `provisioner_factory` seam next to the
+existing `tracker_factory`; tests inject a fake. Mutations go through
+`gh.graphql`, so they are charged at mutation cost and rate-limit
+answers raise `TrackerRateLimited` through the shared classifier,
+exactly like board reads and writes. Nothing outside the adapter
+knows a mutation name or a field-creation shape.
 
-Whether a tracker supports provisioning is a capability the caller
-checks by shape (a callable `ensure_board`), the same duck-typing
-`trackers.is_board_tracker` already uses for the board step. An
-adapter without it is exit 4 at the setup CLI ("this tracker does not
-provision boards"), never a silent skip.
+Whether an adapter supports provisioning is what the factory says:
+it returns an object with a callable `ensure_board`, or it does not
+build one at all. Asking setup to provision a board when the factory
+yields nothing is a usage error counted as exit 4 in the aggregation
+below ("this tracker does not provision boards"), never a silent
+skip and never a missing-attribute crash on a repo tracker.
 
 ### The ensure algorithm
 
@@ -264,14 +312,19 @@ Each step checks its own precondition against the live board, so a
 partial run converges on re-run and the board itself is the state; no
 ledger is kept on disk (the `06-corral-new.md` section 5 rule):
 
-1. **Resolve the owner.** The owner login comes from the spec. Whether
-   it is a user or an organization is answered the way
-   `_fetch_project` already answers it: ask for both, accept exactly
-   one. An owner that resolves to neither raises `ValueError` (exit 4
-   at the CLI) before any mutation. The owner's node id is read here
-   for the create step. The standard is one board per tracker repo,
-   but the operation takes the repo to link as data and does not
-   forbid other repos linking the same board later.
+1. **Resolve the owner.** The owner login comes from the spec. This
+   needs a new owner query, not an existing one: `BoardReader._fetch_project`
+   resolves a *project* by number across user and organization (it
+   asks both for `projectV2(number)` and accepts exactly one); it
+   resolves neither an owner's type nor its node id. Provisioning
+   asks for the login as both a user and an organization, accepts
+   exactly one, and reads that owner's node id for the create step
+   (UNVERIFIED: U11, the query shape and its answer for an unknown
+   login). An owner that resolves to neither raises `ValueError`
+   (exit 4 in the aggregation) before any mutation. The standard is
+   one board per tracker repo, but the operation takes the repo to
+   link as data and does not forbid other repos linking the same
+   board later.
 2. **Find the Project.** By node id when the config has one, else by
    owner plus number, else, and only during provisioning, by exact
    title under the owner (paged list, exact string match, nodes
@@ -289,6 +342,14 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    private, sends one update to make it private before anything else
    is put on it. Making a just-created board private is part of
    creating it as specced; it is the only update an ensure ever sends.
+   The correction gates everything after it: when the update errors,
+   provisioning stops before the link and field steps and the error
+   propagates as `TrackerError` (counted as exit 3 for the entry);
+   when the update reports success but the board still reads public
+   on the re-read, provisioning likewise stops before link and
+   fields, with a refused line naming the manual fix (counted as
+   exit 1). Corral never puts fields, links or items on a board it
+   knows is not private as specced; a re-run after the fix converges.
    An existing Project's visibility is never flipped. When an existing
    board the config addresses directly (by number or id) is public
    while the spec asks for private, the report carries a refused line
@@ -308,12 +369,23 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    and the rest of the provision stands.
 5. **Ensure fields.** Read the live schema once (the `_SCHEMA_BY_NUMBER`
    and `_SCHEMA_BY_ID` shapes, extended only if the spike shows a
-   missing datum). For each spec field, in spec order:
+   missing datum), as a raw field list for the planner, not through
+   `BoardReader._project_index`: that index raises `TrackerError` on a
+   duplicate field name, which is right for the passes but wrong here.
+   Duplicate names on the live board are a planning refusal, never an
+   unreachable error and never a silent pick: two fields with one
+   name, or two options with one name on a field the spec names, each
+   produce a refused line ("rename or delete the duplicate on the
+   board, then re-run") and no step plans against the ambiguous name.
+   For each unambiguously named spec field, in spec order:
    - name present with the right kind: kept, byte-for-byte as a person
-     left it (description, option colors, ordering are never touched);
+     left it (description, option colors, ordering are never touched).
+     A keep-only field stops here: present is the whole contract;
    - name present with the wrong kind: refused, with a fix line
      ("rename or delete the field on the board, then re-run"), and no
      lookalike field is created beside it;
+   - name absent and keep-only: refused, with the fix line naming the
+     `--area` or `--pool` options that would create it (section 1);
    - name absent: create it, with its standard options for a
      single-select (UNVERIFIED: U6, the create-field mutation, the
      `dataType` spellings, and whether options ride along at creation).
@@ -321,44 +393,95 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    like) are ignored, like any other team field. A spec field whose
    name matches a built-in of the right kind (the expected `Status`
    case, U1) is kept like any existing field.
-6. **Ensure options.** For a kept single-select field, standard option
-   names missing from the live list are appended. The provider's
-   option update is believed to replace the whole option list, so the
-   update corral sends is the existing list, in its existing order,
-   with the missing names appended; existing ids must survive it
-   (UNVERIFIED: U7). If the spike shows ids do not survive an append,
-   this step does not ship as designed: a kept field with missing
-   standard options becomes a refused line instead, because rewriting
-   ids would silently invalidate every `priority_map` in the wild.
-   Options are never removed and never renamed by corral.
+6. **Ensure options, rename-is-free.** Appending by missing *name*
+   would undo a person's rename: rename `High` to `P1` (the id is
+   stable, the map still valid) and a name-based top-up would append a
+   second, duplicate-meaning `High` to a people's field. So on a kept
+   `Priority` field the planner resolves ranks through the spec's
+   existing `priority_map` ids first: a rank whose mapped id is live
+   on the field is present, whatever that option is now called; then
+   a rank whose standard name is live is present. Only a rank with
+   neither a mapped live id nor the standard name is appended, under
+   its standard name. The equivalent rule for `Status`: corral keeps
+   no id map for it and gives its names no meaning, so there is no
+   evidence by which a missing standard name is missing rather than
+   renamed; corral therefore never appends options to a kept `Status`
+   field at all. Its standard names are creation defaults (section 1),
+   and a kept field's options are wholly people's. Keep-only fields
+   are never topped up either. The provider's option update is
+   believed to replace the whole option list, so the one append
+   update corral may send (on `Priority` only) is the existing list,
+   in its existing order, with the missing ranks' names appended;
+   existing ids must survive it (UNVERIFIED: U7). If the spike shows
+   ids do not survive an append, this step does not ship as designed:
+   a kept field with an unrepresented rank becomes a refused line
+   instead, because rewriting ids would silently invalidate every
+   `priority_map` in the wild. Options are never removed and never
+   renamed by corral.
 7. **Read back and report.** One final schema fetch is the truth the
    report and section 3 are built from: project owner, number and node
-   id, per-field and per-option created/kept, every refusal with its
-   fix line, and `priority_map` built by matching the five standard
-   option names to live option ids on the priority field. A standard
-   priority name with no live option after step 6 is a refused line,
-   and the map omits it, so the file never names an id the board does
-   not hold.
+   id, the live per-concept field names (`BoardProvision.fields`,
+   live concepts only, so a refused field renders nothing),
+   per-field and per-option created/kept, every refusal with its fix
+   line, and `priority_map` built rename-is-free: first the spec's
+   existing id-to-rank entries whose ids are still live, then, for
+   ranks still unrepresented, the live option carrying the standard
+   name. Duplicate option names were refused in step 5, so a name
+   never silently picks one of two ids here. A rank with neither a
+   live mapped id nor a standard-named option after step 6 is a
+   refused line, and the map omits it, so the file never names an id
+   the board does not hold.
 
 A run that creates nothing reports all-kept and the caller exits 1
 (nothing to do) when the config file is also already written, or 0
-when it still writes the mapping. Exit codes, public per AGENTS.md:
+when it still writes the mapping. Per-board exit codes, public per
+AGENTS.md:
 
 | Situation | Exit |
 | --- | --- |
 | Board ensured and mapping written, or items populated | 0 |
 | Nothing to do (board and file already converge) | 1 |
-| A refusal a person must resolve (no permission, wrong kind, public board where private was specced, link refused) | 1, one fix line each |
-| The board appeared under the title between lookup and create, and the re-read finds it | 0 or 1 by the re-read, never a second board knowingly |
-| Tracker or host unreachable, rate limit outlasts the pacer cap | 3 |
-| Bad spec or config (unresolvable owner, ambiguous title, unknown concept in an extended spec) | 4 |
+| A refusal a person must resolve (no permission, wrong kind, duplicate field or option name, public board where private was specced, still public after the correction, link refused) | 1, one fix line each |
+| Tracker or host unreachable, rate limit outlasts the pacer cap, the make-private update errors | 3 |
+| Bad spec or config (unresolvable owner, ambiguous title, a different board table already in the file, unknown concept in an extended spec, no provisioner for the adapter) | 4 |
 | Admission slot | 75 is never used; setup starts no agents |
 
+Across entries, setup adopts the aggregation the built verb already
+uses in `githubcli.setup_root`, extended with where board 4s rank.
+Every named entry is attempted, in entry order; a per-entry failure
+of any kind is recorded and the loop continues with the next entry,
+never aborting the rest (the built loop already continues past a
+`TrackerError`; ticket 4 gives board `ValueError`s, different-table
+refusals and provisioner-missing errors the same continue treatment).
+Validation that the built verb does before the loop (no root, unknown
+entry name, unparseable settings) still exits 4 before any entry
+runs, unchanged. The final exit is the first of these that happened:
+
+1. any usage or conflict error on any entry: 4;
+2. else any entry unreachable (`TrackerError` from labels, board or
+   populate): 3, even when another entry created something;
+3. else any refused line, or a pass that created nothing at all
+   (every label, field and file already kept): 1;
+4. else 0: something was created (a label, a project, a field, an
+   option, a link, a mapping write, a populated item) and nothing
+   failed, was refused or conflicted.
+
+An entry's work stands when a later entry fails: labels and board
+state it created stay created, and the mapping file section 3 wrote
+for it stays written. There is no cross-entry rollback; there cannot
+be one for outward state. `new --create-remote` runs a single entry,
+so the same outcomes map onto its existing codes through its
+`_bootstrap_labels` precedent (section 8, ticket 7).
+
 Two `setup` runs racing can still create two same-title boards when
-both look before either creates (titles are not unique, U3). The next
-run then refuses at step 2 naming both numbers, and a person deletes
-one by hand. Setup is an operator command, not a fleet pass; no lock
-is designed for it, and the failure is closed and visible.
+both look before either creates (titles are not unique, U3): the
+create is not guarded by a title check, and no post-create re-list
+uncreates the second board. Duplicate titles are a documented risk
+of the operator command, flagged for a person to resolve: the next
+setup run refuses at step 2 naming both numbers, the doctor's fix
+line points at that setup run, and a person deletes one board by
+hand. Setup is an operator command, not a fleet pass; no lock is
+designed for it, and the failure is closed and visible.
 
 ### The token scope
 
@@ -385,8 +508,8 @@ spike's outcome.
 
 | Caller | Behavior |
 | --- | --- |
-| `corral github setup` | Runs it (labels first, then the board, then the mapping write). The verb is the operator's approval, per `06-corral-new.md` section 3. Still to be built (section 0). |
-| `corral new --create-remote` | Runs it after creating the repository and the labels, through the same operation, never a second implementation. Still to be built. |
+| `corral github setup` | Runs it (labels first, then the board, then the mapping write). The verb exists (`githubcli`); the board half extends it (ticket 4). The verb is the operator's approval, per `06-corral-new.md` section 3. |
+| `corral new --create-remote` | Runs it after creating the repository and the labels, through the same operation and provisioner factory, never a second implementation. `new` exists; ticket 7 adds the board call after its built `_bootstrap_labels`. |
 | `corral new` without the flag | Prints `corral github setup`, runs nothing outward. |
 | `corral init` | Prints `corral github setup`, exactly as today; never runs it. |
 | `corral doctor` | Prints it as the fix line, never runs it (outward fixes are printed, `01-onboarding.md` section 6). |
@@ -400,12 +523,18 @@ writes the inert table; the flip stays the separate config edit of
 `07-board-fields.md` section 6). A labels entry without `--board` is
 labels-only, byte-identical to the `06` design.
 
-`setup --plan` prints what it would do and does none of it: the live
-board is read (a read is the only way to know created from kept), the
-planned creations are listed, the mapping write is shown as the
-`init.plan_diff` of the target file, and no mutation and no file
-write happen. A plan against a board that does not exist lists the
-full creation set from the spec.
+`setup --plan` prints what it would do and does none of it, on either
+half of the verb. The label half becomes report-only: `ensure_labels`
+always mutates, so plan never calls it; instead the adapter's label
+list read (the read `GithubTracker.ensure_labels` already starts
+from) reports each bootstrap label as would-create or kept, and no
+label is created. Ticket 4 exposes that read as the plan seam; the
+`ensure_labels` contract itself does not change. The board half reads
+the live board (a read is the only way to know created from kept),
+lists the planned creations, and shows the mapping write as the
+`init.plan_diff` of the target file. No mutation of any kind and no
+file write happen under `--plan`. A plan against a board that does
+not exist lists the full creation set from the spec.
 
 ## 3. Writing the mapping into `corral.toml`
 
@@ -421,18 +550,26 @@ not a rival).
 The file is the ops root's `corral.toml` for the entry: in the inline
 layout the project's own file, in the split layout the ops root's
 file and never the project clone, where corral writes nothing tracked
-(R1 in `01-onboarding.md`). The root is resolved by the existing
-resolver (`settings.find_root` and the host registration, the same
-resolution `doctor.load_board_sites` and the passes use); setup adds
-no new way to find it. When the entry cannot be found in exactly one
-resolved root, setup refuses with exit 4 and prints `corral init` as
-the fix: provisioning never onboards as a side effect.
+(R1 in `01-onboarding.md`). The root is the one root the built verb
+already resolves: `settings.find_root` returns the nearest single
+directory at or above the working directory holding a `corral.toml`
+(it finds one root, never one of several candidates), and
+`githubcli.cmd_setup` runs against that root today. Setup adds no new
+way to find it. No root above the working directory, or an entry name
+that root does not hold, is the built verb's pre-loop exit 4, with
+`corral init` as the fix when there is no root: provisioning never
+onboards as a side effect.
 
 ### The write
 
 A new helper beside `_split_toml_change`, on its precedent:
-`board_table_change(toml_target, entry_name, provision)` returns
-`(new_text, is_noop)`. `--force` changes none of the rules below. The
+`board_table_change(toml_target, entry_name, spec, provision)` returns
+`(new_text, is_noop)`. The renderer needs both arguments: the spec
+says which concepts were asked for, and `provision.fields` (with
+`provision.priority_map`) says which of them are live under which
+names after the read-back, so the seven names in the rendered table
+come from the provision, never re-derived from defaults, and a
+concept the provision refused renders nothing. `--force` changes none of the rules below. The
 stdlib parses TOML but does not write it, so like every other corral
 edit of this file the change is textual, block-shaped, and every byte
 it does not own is preserved:
@@ -487,9 +624,14 @@ Rules: the number is written, not the node id, because people read
 and share numbers and `_check_board` accepts exactly one of the two;
 the node id the provision also returned is dropped, since the reader
 re-resolves it live from owner plus number on every schema fetch. A
-concept the provision left unmapped (an `Area` with no declared
-options) is omitted from the table, never written as an empty string,
-which `_check_board` rightly rejects. Option display names ride as
+concept with no live field in `provision.fields` (an undeclared
+`Area`, or a refused field) is omitted from the table, never written
+as an empty string, which `_check_board` rightly rejects. A keep-only
+`Area` or `Pool` is live by definition when the run kept it, so it
+renders its name like any other concept; that is why a plain re-run
+after a flagged run renders a table identical to the one on disk and
+is a no-op (all-kept, exit 1), rather than tripping the
+different-table refusal above. Option display names ride as
 comments only, the `07` rule. The rendered text must round-trip
 through `settings._check_board`: a golden test renders a provision,
 loads it through `settings.load`, and gets the same `BoardConfig`
@@ -503,8 +645,10 @@ board that was never created, which turns every board-mode pass into
 an error until a person intervenes.
 
 `tracker.variant` is never flipped by this write. A board table on a
-labels entry is inert (`trackers.build_tracker` ignores it in label
-mode; the doctor lists no site for it), so pre-provisioning is safe.
+labels entry is inert for the passes (`trackers.build_tracker`
+ignores it in label mode), so pre-provisioning is safe. The doctor
+does list it, as the warn-only row of section 5, computed from config
+alone with no board fetch; it changes no pass behavior.
 When the table lands on a labels entry, setup prints the flip as its
 next step, in the `07-board-fields.md` section 6 order: drain the
 outbox, backfill on the board, set `tracker.variant = "board"`,
@@ -610,7 +754,7 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 | Board provisioned but variant still `labels` | warn, naming the table | the `07` section 6 flip steps, or remove the table |
 | Open issues missing from the board | fail, naming the count and the first few numbers | `corral github setup --populate` (needs the section 8 ticket 6 seam; not in the first doctor ticket) |
 
-Three implementation notes, so the rows above are buildable rather
+Five implementation notes, so the rows above are buildable rather
 than aspirational:
 
 - **Naming the missing or wrong-kind field** needs findings, not an
@@ -631,6 +775,24 @@ than aspirational:
   the spike (U8) confirms the real error text and scope string, the
   row ships behind no hard-coded assumption stronger than the
   classifier itself.
+- **The warn rows need warn plumbing.** `boarddoctor.BoardRow.status`
+  is only `"ok"` or `"fail"` today; `doctor.Check` already carries
+  `"warn"` and warn-only rows do not fail the doctor. Ticket 6 widens
+  `BoardRow.status` to `"ok" | "warn" | "fail"` and passes it through
+  to the `Check` unchanged. Row precedence inside `_check_site` is
+  fail over warn over ok: any fail finding makes the row fail, else
+  any warn finding (today: a live priority option the map does not
+  name) makes it warn, else ok.
+- **The provisioned-but-labels warn needs a site-inclusion rule.**
+  `check_sites` keeps only `variant == "board"` sites and
+  `sites_from_settings` skips labels repos entirely today, so that
+  row currently has no site to hang on. Ticket 6 includes a labels
+  entry whose resolved `[repo.board]` table is not `None` as a site
+  too, and `check_sites` answers it with the single warn row from
+  config alone: for that row it calls neither `fetch` nor the store,
+  so the warn costs no board fetch and cannot fail on an unreachable
+  board. A labels entry with no table still gets no row, exactly as
+  today.
 - **Missing-from-board** cannot be computed from the store alone: no
   column records board membership. The honest check lists board item
   numbers through a second injected fetch and diffs them against the
@@ -722,7 +884,9 @@ When approved, the steps are the ordinary adoption path with no
 special cases:
 
 1. `corral github setup --board --populate` against corral's own
-   tracker repo, from the root that drives corral. The mapping lands
+   tracker repo, from the root that drives corral. This works on
+   corral's labels entry precisely because the provisioner factory
+   needs no `BoardConfig` (section 2). The mapping lands
    in whichever `corral.toml` that is: this repository carries no
    `corral.toml` of its own today, so the file written is the driving
    ops root's, per section 3, and it is committed there like any
@@ -758,60 +922,99 @@ ticket.
    explicit go-ahead creating boards requires: create one Project,
    one text field, one single-select field, link one repository, add
    one issue, and record the answer to every GitHub UNVERIFIED item,
-   U1 to U9 in section 9 (mutation names and inputs, built-in fields,
-   visibility defaults, option-append id survival, the token scope
-   and its error text, the already-present answers, title
-   uniqueness). U10 is not the spike's to settle: GitLab facts stay
-   UNVERIFIED until a GitLab adapter is itself designed. Acceptance:
-   each of U1 to U9 is marked verified or false with the command that
+   U1 to U9 and U11 in section 9 (mutation names and inputs, built-in
+   fields, visibility defaults, option-append id survival, the token
+   scope and its error text, the already-present answers, title
+   uniqueness, the owner lookup). U10 is not the spike's to settle:
+   GitLab facts stay UNVERIFIED until a GitLab adapter is itself
+   designed. Acceptance:
+   each of U1 to U9 and U11 is marked verified or false with the command that
    showed it, in an amendment to this doc; where a fact is false, the
    affected section above is amended before ticket 2 starts (in
    particular, if U7 fails, section 2 step 6 ships as its refused-line
    variant). No corral code changes.
 1. **Types, the standard spec, and the pure planner.** `tracker.py`
-   gains `FieldSpec`, `BoardSpec`, `BoardProvision`, the
-   `BoardProvisioner` protocol and `STANDARD_BOARD`; `effective_spec`
-   resolves config-names-else-standard in one place; a pure planner
-   maps (spec, live schema as plain data) to the ordered create/keep/
-   refuse action list the adapter will execute. Acceptance: planner
-   tests cover empty board, exact board, wrong kind, missing option,
-   extra team fields and options (all kept, none planned for change),
-   and the five-rank map built from live ids; label-mode fake
-   trackers compile untouched.
-2. **The GitHub provisioner.** `ensure_board` in `github/board.py`
-   executing the planner's actions through the injected `run` and
-   pacer: owner resolution, find-or-create, visibility read-back,
-   link, field and option ensures, final read-back report. Acceptance
+   gains `FieldSpec` (with `keep_only`), `BoardSpec` (with the
+   existing `priority_map`), `BoardProvision` (with live `fields`),
+   the `BoardProvisioner` protocol and `STANDARD_BOARD`;
+   `effective_spec` resolves config-names-else-standard in one place,
+   including config-mapped `Area` and `Pool` as keep-only; a pure
+   planner maps (spec, live schema as plain data) to the ordered
+   create/keep/refuse action list the adapter will execute.
+   Acceptance: planner tests cover empty board, exact board, wrong
+   kind, missing option, extra team fields and options (all kept,
+   none planned for change), and the five-rank map built from live
+   ids; a renamed priority option (`High` renamed, id unchanged, the
+   spec's map naming that id) plans no append and keeps its rank,
+   while a rank with neither a live mapped id nor its standard name
+   plans exactly one append; a kept `Status` field plans no option
+   append whatever its option names are; duplicate field names and
+   duplicate option names on the live board each plan a refusal with
+   a fix line, never a pick; a keep-only `Area` present on the board
+   is kept with no option requirement, and absent is refused naming
+   `--area`; label-mode fake trackers compile untouched (no new
+   `Tracker` method).
+2. **The GitHub provisioner and its factory.** `GithubBoardProvisioner`
+   in `github/board.py`, constructed with only `run` and the pacer
+   (no `BoardConfig`), executing the planner's actions: the new owner
+   query, find-or-create, visibility read-back and correction, link,
+   field and option ensures, final read-back report; plus
+   `trackers.production_board_provisioner` beside
+   `production_trackers` as the one production wiring. Acceptance
    against canned payloads: created/kept/refused reported separately;
    a re-run over an exactly-standard board sends no mutation; an
    existing field is never the target of an update or delete
    mutation; two same-title projects and an unresolvable owner raise
-   `ValueError` naming the conflict before any mutation;
-   rate-limit text raises `TrackerRateLimited`; malformed answers are
-   `TrackerError`, never partial provisions.
-3. **The mapping writer.** `init.board_table_change` plus the table
-   renderer, wired so the write lands after a successful provision.
-   Acceptance: golden files for inline and split layouts (the clone
-   untouched in split), insertion attaches to the named entry when a
-   later `[[repo]]` entry exists, identical table is a no-op,
-   a different table refuses with the diff even under `--force`, an
-   unscannable entry block prints the rendered table and exits 4, and
-   the rendered table round-trips through `settings.load` to the same
-   `BoardConfig`.
-4. **`corral github setup`.** The verb: label bootstrap per
-   `06-corral-new.md` section 4 (if that doc's ticket 4 has not
-   landed, this ticket builds the verb with the label half exactly as
-   designed there; it does not fork or trim that design), then the
-   board ensure for board-mode entries or with `--board`, then the
-   mapping write; `--populate` and `--plan` as designed in sections 2
-   and 4; the next-step lines (flip steps for labels entries, doctor
-   otherwise). Acceptance: every row of the section 2 exit table
-   through a fake tracker and fake provisioner; `--plan` sends no
-   mutation and writes no byte; the `--area`, `--pool`,
-   `--board-owner` and `--board-title` flags reach `effective_spec`
-   and nowhere else; a labels entry without `--board` is
-   byte-identical to the `06` behavior; README Commands gains its row
-   in this ticket.
+   `ValueError` naming the conflict before any mutation; duplicate
+   field or option names in a canned schema return refusals, not
+   `TrackerError`; a make-private update that errors stops before any
+   link or field mutation and raises `TrackerError`, and a board that
+   still reads public after the update stops at the same place with a
+   refused line; rate-limit text raises `TrackerRateLimited`;
+   malformed answers are `TrackerError`, never partial provisions.
+3. **The mapping writer.** `init.board_table_change(toml_target,
+   entry_name, spec, provision)` plus the table renderer, wired so
+   the write lands after a successful provision. Acceptance: golden
+   files for inline and split layouts (the clone untouched in split),
+   insertion attaches to the named entry when a later `[[repo]]`
+   entry exists, identical table is a no-op, a different table
+   refuses with the diff even under `--force`, an unscannable entry
+   block prints the rendered table and exits 4, and the rendered
+   table round-trips through `settings.load` to the same
+   `BoardConfig`; the names in the golden tables come from
+   `provision.fields`, and a provision that kept a keep-only `Area`
+   renders `area_column`, so re-rendering against the file a flagged
+   run wrote is identical (the no-op behind the plain re-run's
+   exit 1, exercised end to end in ticket 4).
+4. **Extend `corral github setup`.** The verb and its label half are
+   built (`githubcli.setup_root`, `ensure_labels` on the `Tracker`
+   protocol); this ticket adds no verb and rebuilds no label code. It
+   extends `setup_root` with an injected `provisioner_factory` seam
+   (production: `trackers.production_board_provisioner`), the flags
+   `--board`, `--populate`, `--plan`, `--area`, `--pool`,
+   `--board-owner` and `--board-title`, the per-entry board ensure
+   (board-mode entries, or any entry with `--board`) after the label
+   ensure, the section 3 mapping write, the cross-entry aggregation
+   of section 2 (4 over 3 over 1 over 0, every entry attempted), and
+   the next-step lines (flip steps for labels entries, doctor
+   otherwise). Acceptance through a fake tracker and fake
+   provisioner: a labels entry with `--board` provisions and writes
+   the inert table (the factory needed no `BoardConfig`); a
+   board-variant entry with no `[repo.board]` table provisions and
+   writes the table that makes it whole; a plain re-run after a run
+   with `--area` and `--pool` is a no-op, exit 1, with no
+   different-table refusal; mixed multi-entry runs aggregate as
+   section 2 states (entry A creates and its mapping file stands,
+   entry B raises `TrackerError`, entry C hits a different table: all
+   three attempted, final exit 4; A and B without C exit 3; created
+   plus refused exits 1; all-kept exits 1); every row of the section 2
+   per-board exit table; `--plan` creates no label (the fake sees the
+   report-only label read and no create), sends no board mutation and
+   writes no file byte; the `--area`, `--pool`, `--board-owner` and
+   `--board-title` flags reach `effective_spec` and nowhere else; a
+   labels entry without `--board` behaves byte-identically to the
+   built verb today; the README Commands row for `github setup` is
+   updated for the board half and the new flags in this ticket.
 5. **Population.** The adapter's populate operation and its setup
    wiring (may land with ticket 4 if small): open issues only,
    presence pre-read, add-missing only, no field value ever written.
@@ -822,18 +1025,33 @@ ticket.
 6. **Doctor rows.** The `boarddoctor` raw-schema comparison (missing
    field, wrong kind, unmapped option warn), the scope row over the
    exposed classifier, the provisioned-but-labels warn, fix lines
-   pointing at `corral github setup`; then, in the same ticket or a
-   follow-up if it grows, the missing-from-board row over its second
-   injected fetch. Acceptance: each row of the section 5 table names
-   repo and field against fake seams; doctor exit codes unchanged
-   (fail rows exit 1, warn-only exits 0); no row runs anything.
-7. **`new --create-remote` wiring.** Blocked on `corral new` itself
-   (`06-corral-new.md` tickets 1 to 4): after repo creation and
-   labels, invoke the same setup operation for the board; without
-   `--create-remote`, print `corral github setup` as today.
-   Acceptance: fake-forge and fake-tracker tests show one operation
-   invoked, no second provisioning path, and the printed-not-run
-   default unchanged.
+   pointing at `corral github setup`; the warn plumbing
+   (`BoardRow.status` gains `"warn"`, passed through to `doctor.Check`,
+   fail over warn over ok per row) and the site-inclusion rule (a
+   labels entry with a `[repo.board]` table becomes a site answered
+   warn-only from config, with no `fetch` and no store call for that
+   row; a labels entry without a table still gets no row); then, in
+   the same ticket or a follow-up if it grows, the missing-from-board
+   row over its second injected fetch. Acceptance: each row of the
+   section 5 table names repo and field against fake seams; the
+   labels-with-table warn is produced with the fake `fetch` asserting
+   it was never called; doctor exit codes unchanged (fail rows exit 1,
+   warn-only exits 0); no row runs anything.
+7. **`new --create-remote` wiring.** `corral new` is built; this is a
+   small extension of it, not a blocked ticket. In the
+   `--create-remote` path, after the built `_bootstrap_labels`, invoke
+   the same board ensure (the `production_board_provisioner` factory
+   and `effective_spec`, never a second implementation) for the new
+   entry and write its mapping through ticket 3's writer. Outcomes
+   map onto `new`'s existing codes by the `_bootstrap_labels`
+   precedent: created counts as changed; refused prints
+   `next: corral github setup` and the run ends 1; `TrackerError`
+   prints the same next step and the run ends 3; a spec `ValueError`
+   is a usage error, 4. Without `--create-remote`, print
+   `corral github setup` exactly as today. Acceptance: fake-forge,
+   fake-tracker and fake-provisioner tests show the one operation
+   invoked once, no second provisioning path, the four outcome
+   mappings above, and the printed-not-run default unchanged.
 8. **Corral's own adoption.** Not an agent ticket. Held for the
    maintainer's go-ahead in their own session, run per section 7.
 
@@ -864,6 +1082,9 @@ option and one marked recommended.
 - U9. `addProjectV2ItemById` adds an issue by node id and answers
   identifiably when the item is already present.
 - U10. Every GitLab statement in section 6.
+- U11. An owner login can be resolved to exactly one of user or
+  organization, with its node id, by asking for both; and an unknown
+  login answers identifiably as neither (not as a generic failure).
 
 O1. Priority option names on the standard board:
 Options:
