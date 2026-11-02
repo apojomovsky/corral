@@ -276,6 +276,29 @@ class OperatorCommandTest(unittest.TestCase):
         code, _ = self.run_hub("rotate-token", "--id", "host-9")
         self.assertEqual(code, 4)
 
+    def test_open_store_failures_are_usage_errors_with_stderr(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import paths
+
+        for argv in (
+            ("remove-host", "--id", "host-1"),
+            ("release", "app", "7"),
+            ("rotate-token", "--id", "host-1"),
+        ):
+            with self.subTest(argv=argv):
+                args = self.parse(*argv)
+                err = io.StringIO()
+                with mock.patch.object(
+                    paths, "hub_db_path", side_effect=paths.PathError("no state")
+                ):
+                    with redirect_stderr(err):
+                        code = args.func(args)
+                self.assertEqual(code, 4)
+                self.assertTrue(err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

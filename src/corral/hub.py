@@ -624,7 +624,11 @@ def import_hub(conn: sqlite3.Connection, document: object) -> tuple[int, list[st
                     for claim in claims
                 ],
             )
-            conn.execute("UPDATE meta SET value=? WHERE key='membership_epoch'", (epoch,))
+            conn.execute(
+                "INSERT INTO meta(key, value) VALUES('membership_epoch', ?)"
+                " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (epoch,),
+            )
     except sqlite3.Error as err:
         raise HubError(f"cannot import into the hub store: {err}") from None
     return len(claims), host_ids
@@ -1038,11 +1042,14 @@ def renewal_entry(repo: str, number: int, agent: str, epoch: int) -> dict[str, A
 def bind_warning(bind: str) -> str | None:
     """Why a hub bind address is unsafe to serve on, or None when quiet.
 
-    Loopback and private addresses stay quiet. A wildcard, a
-    non-loopback multicast address, or a public address warns, and so
-    does a name that is not a literal IP: without resolving it (no DNS
-    from this check) privacy cannot be proved. Warning never refuses:
-    the operator knows best, and serving continues.
+    Only loopback, private addresses, and ``localhost`` stay quiet: a
+    wildcard, a non-loopback multicast address, shared address space
+    such as 100.64.0.0/10 (neither private nor global), or a public
+    address warns, and so does a name that is not a literal IP:
+    without resolving it (no DNS from this check) privacy cannot be
+    proved. The wildcard is checked first because the standard
+    library reports it as private. Warning never refuses: the
+    operator knows best, and serving continues.
     """
     host = str(bind or "")
     if host == "localhost":
@@ -1054,19 +1061,22 @@ def bind_warning(bind: str) -> str | None:
             f"hub bind {host!r} is not a literal IP address: cannot prove it is"
             " private, serving plain HTTP anyway"
         )
-    if address.is_loopback:
-        return None
     if address.is_unspecified:
         return (
             f"hub bind {host} listens on every interface: the hub speaks plain HTTP,"
             " serve it only over a private network"
         )
+    if address.is_loopback or address.is_private:
+        return None
     if address.is_multicast or address.is_global:
         return (
             f"hub bind {host} looks public: the hub speaks plain HTTP,"
             " serve it only over a private network"
         )
-    return None
+    return (
+        f"hub bind {host} is not a loopback or private address: the hub speaks plain HTTP,"
+        " serve it only over a private network"
+    )
 
 
 class HubServer(http.server.ThreadingHTTPServer):
@@ -1153,8 +1163,16 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         try:
             length = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            # The length is unknowable, so nothing can be drained: drop
+            # the connection instead of parsing leftovers as the next
+            # request.
+            self.close_connection = True
             return None
         if length <= 0 or length > _MAX_BODY:
+            # An oversize body is never consumed, so on keep-alive the
+            # leftover would parse as the next request: drop the
+            # connection instead (fail closed, no drain of a huge body).
+            self.close_connection = True
             return None
         try:
             raw = self.rfile.read(length)
@@ -1211,7 +1229,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         if self._refuse_old_major():
             return
         split = urllib.parse.urlsplit(self.path)
-        if split.path == "/v1/version" and not split.query:
+        if split.path == "/v1/version":
             self._send(200, {"api": HUB_API, "schema_version": SCHEMA_VERSION})
             return
         if split.path == "/v1/claims" and not split.query:
@@ -1375,7 +1393,15 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         except HubError as err:
             self._send(400, {"error": str(err)})
             return
-        self._send(200, {"host_id": body["host_id"], "membership_epoch": epoch})
+        self._send(
+            200,
+            {
+                "api": HUB_API,
+                "schema_version": SCHEMA_VERSION,
+                "host_id": body["host_id"],
+                "membership_epoch": epoch,
+            },
+        )
 
     def _held_by_other(self, conn: sqlite3.Connection, repo: str, number: int, caller: str) -> bool:
         """Whether the claim row names a live holder other than the caller.
@@ -1502,7 +1528,15 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             except HubError as err:
                 self._send(400, {"error": str(err)})
                 return
-        self._send(200, {"membership_epoch": epoch, "renewals": answers})
+        self._send(
+            200,
+            {
+                "api": HUB_API,
+                "schema_version": SCHEMA_VERSION,
+                "membership_epoch": epoch,
+                "renewals": answers,
+            },
+        )
 
     def do_POST(self) -> None:
         if self._refuse_old_major():
@@ -1544,18 +1578,28 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             conn.close()
 
     def do_PUT(self) -> None:
+        if self._refuse_old_major():
+            return
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_DELETE(self) -> None:
+        if self._refuse_old_major():
+            return
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_PATCH(self) -> None:
+        if self._refuse_old_major():
+            return
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_HEAD(self) -> None:
+        if self._refuse_old_major():
+            return
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_OPTIONS(self) -> None:
+        if self._refuse_old_major():
+            return
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
 
@@ -1769,12 +1813,14 @@ def _post_json(
     Only the register and heartbeat clients (``push_register``,
     ``push_heartbeat``) use this helper: claim proposals handle
     their own 409 answers, so the mapping here is not for them. A
-    ``200`` with a JSON object body is returned decoded. A refused
-    connection, any I/O failure, or a malformed or dropped reply is
-    ``HubUnreachable`` (exit 3): the caller keeps running held work
-    and claims nothing new. A decided reply (401, 400, 404, 405,
-    500) is ``HubError`` naming the server's reason without echoing
-    the token.
+    ``200`` with a JSON object body is returned decoded, after its
+    version exchange passes ``check_version``: an older hub major,
+    or a reply with no versions at all, is ``HubVersionError``
+    (exit 4, fail closed). A refused connection, any I/O failure,
+    or a malformed or dropped reply is ``HubUnreachable`` (exit 3):
+    the caller keeps running held work and claims nothing new. A
+    decided reply (401, 400, 404, 405, 500) is ``HubError`` naming
+    the server's reason without echoing the token.
     """
     host, port = _split_url(url)
     raw = json.dumps(payload).encode("utf-8")
@@ -1802,6 +1848,7 @@ def _post_json(
     except (ValueError, UnicodeDecodeError):
         decoded = None
     if response.status == 200 and isinstance(decoded, dict):
+        check_version(decoded.get("api"), decoded.get("schema_version"))
         return decoded
     reason = decoded.get("error") if isinstance(decoded, dict) else None
     raise HubError(f"hub at {url} refused {path}: {response.status} {reason or ''}".rstrip())
