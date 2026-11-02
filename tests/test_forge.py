@@ -9,7 +9,7 @@ import json
 import unittest
 from unittest import mock
 
-from corral import forge
+from corral import forge, paths
 from corral.github import forge as ghforge
 
 BASE_SHA = "a" * 40
@@ -112,6 +112,19 @@ class FakeForge:
 
     def describe_create(self, name, owner=None, *, private=True):
         self.calls.append(("describe_create", name, owner, private))
+        if owner is None:
+            if not paths.plain_repo_name(name):
+                raise forge.ForgeError(f"unusable forge name {name!r}")
+        else:
+            if (
+                not isinstance(owner, str)
+                or not owner
+                or "/" in owner
+                or any(ch.isspace() for ch in owner)
+            ):
+                raise forge.ForgeError(f"unusable forge owner {owner!r}")
+            if not paths.plain_repo_name(name):
+                raise forge.ForgeError(f"unusable forge name {name!r}")
         visibility = "--private" if private else "--public"
         target = f"{owner}/{name}" if owner else name
         return f"gh repo create {target} {visibility}"
@@ -368,10 +381,29 @@ class RepoExistsTest(unittest.TestCase):
         self.assertTrue(ghforge.GithubForge(run).repo_exists("acme/lib"))
 
     def test_missing_repo_is_false(self):
-        for message in ("gh: Not Found (HTTP 404)", "gh: not found"):
+        run = CmdRun({("api", "repos/acme/missing"): RuntimeError("gh: Not Found (HTTP 404)")})
+        self.assertFalse(ghforge.GithubForge(run).repo_exists("acme/missing"))
+
+    def test_port_number_is_not_a_missing_repo(self):
+        run = CmdRun(
+            {
+                ("api", "repos/acme/lib"): RuntimeError(
+                    "failed to connect to 127.0.0.1 port 4040: Connection refused"
+                )
+            }
+        )
+        with self.assertRaises(forge.ForgeError):
+            ghforge.GithubForge(run).repo_exists("acme/lib")
+
+    def test_unauthorized_is_unreachable(self):
+        for message in (
+            "gh: Bad credentials (HTTP 401)",
+            "gh: Resource not accessible by personal access token (HTTP 403)",
+        ):
             with self.subTest(message=message):
-                run = CmdRun({("api", "repos/acme/missing"): RuntimeError(message)})
-                self.assertFalse(ghforge.GithubForge(run).repo_exists("acme/missing"))
+                run = CmdRun({("api", "repos/acme/lib"): RuntimeError(message)})
+                with self.assertRaises(forge.ForgeError):
+                    ghforge.GithubForge(run).repo_exists("acme/lib")
 
     def test_unreachable_is_forge_error(self):
         run = CmdRun({("api", "repos/acme/lib"): RuntimeError("connection refused")})
@@ -439,7 +471,18 @@ class CreateRepoTest(unittest.TestCase):
     def test_bad_shapes_never_call_the_runner(self):
         run = CmdRun({})
         adapter = ghforge.GithubForge(run)
-        for owner, name in (("", "lib"), ("ac me", "lib"), ("acme", "li/b"), ("acme", "lib.git")):
+        for owner, name in (
+            ("", "lib"),
+            ("ac me", "lib"),
+            ("acme", "li/b"),
+            ("acme", "lib.git"),
+            ("acme", "-lib"),
+            ("acme", ".lib"),
+            ("acme", "li:b"),
+            ("acme", "lïb"),
+            ("acme", ""),
+            ("acme", "-"),
+        ):
             with self.subTest(owner=owner, name=name):
                 with self.assertRaises(forge.ForgeError):
                     adapter.create_repo(owner, name)
