@@ -380,6 +380,112 @@ class ValidateLimits(unittest.TestCase):
         self.assertEqual(R.LimitsError.exit_code, 4)
 
 
+class Join(unittest.TestCase):
+    def base(self, host=(8000, 16000, 4096)):
+        return R.Limits(
+            host=R.Usage(*host) if host is not None else None,
+            roles={"worker": R.Usage(**WORKER)},
+            gone_s=600.0,
+        )
+
+    def test_shares_and_claims_join_into_one_limits(self):
+        joined = R.join(
+            self.base(),
+            {"web": {"weight": 1, "cpu_floor_m": 500}},
+            [{"name": "desk", "cpu_m": 100, "claimed_at": NOW}],
+            where="config.toml",
+        )
+        self.assertEqual(joined.host, R.Usage(8000, 16000, 4096))
+        self.assertEqual(joined.projects["web"].cpu_floor_m, 500)
+        self.assertEqual(len(joined.foreign), 1)
+        R.validate_limits(joined)
+
+    def test_a_missing_share_reads_as_floor_zero(self):
+        joined = R.join(self.base(), {"web": None}, [], where="config.toml")
+        self.assertEqual(joined.projects["web"], R.Share())
+
+    def test_floors_at_the_host_pass(self):
+        R.join(self.base(), {"a": {"cpu_floor_m": 8000}}, [], where="config.toml")
+
+    def test_floors_above_the_host_name_the_file_and_key(self):
+        with self.assertRaisesRegex(R.settings.SettingsError, r"config\.toml.*cpu_m") as caught:
+            R.join(
+                self.base(),
+                {"a": {"cpu_floor_m": 5000}, "b": {"cpu_floor_m": 4000}},
+                [],
+                where="config.toml",
+            )
+        message = str(caught.exception)
+        self.assertIn("9000", message)
+        self.assertIn("8000", message)
+
+    def test_no_host_budget_skips_the_floor_sum(self):
+        joined = R.join(self.base(host=None), {"a": {"cpu_floor_m": 5000}}, [], where="c")
+        self.assertIsNone(joined.host)
+
+    def test_a_floor_above_its_ceiling_is_still_a_limits_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.join(
+                self.base(),
+                {"a": {"cpu_floor_m": 2000, "cpu_ceiling_m": 1000}},
+                [],
+                where="config.toml",
+            )
+
+    def test_an_admit_on_joined_limits_enforces_the_share(self):
+        joined = R.join(
+            self.base(host=(2000, 16000, 4096)),
+            {"web": {"weight": 1}},
+            [],
+            where="config.toml",
+        )
+        load = charged(total=(1500, 0, 0), by_project={"web": (1500, 0, 0)})
+        verdict = R.admit(req("web", "worker"), load, joined, NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "project-share"))
+
+
+class ShareCap(unittest.TestCase):
+    def test_no_host_budget_reads_as_no_share(self):
+        self.assertIsNone(R.share_cap(limits(host=None), "web", NOW))
+
+    def test_an_empty_host_splits_nothing_yet(self):
+        cap = R.share_cap(limits(), "web", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (8000, 16000, 4096))
+
+    def test_the_remainder_splits_by_weight(self):
+        host = limits(projects={"a": {"weight": 3}, "b": {"weight": 1}})
+        cap = R.share_cap(host, "a", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 6000)
+
+    def test_a_floor_is_kept_and_a_ceiling_caps(self):
+        host = limits(projects={"a": {"weight": 1, "cpu_floor_m": 500, "cpu_ceiling_m": 1000}})
+        cap = R.share_cap(host, "a", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 1000)
+
+    def test_a_live_foreign_claim_shrinks_the_share(self):
+        host = limits(
+            projects={"a": {"weight": 1}},
+            foreign=[claim(cpu_m=6000, memory_mb=11000)],
+        )
+        cap = R.share_cap(host, "a", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 2000)
+
+    def test_an_unknown_project_gets_the_default_weight(self):
+        host = limits(host=(1000, 16000, 4096), projects={"a": {"weight": 1}})
+        cap = R.share_cap(host, "newcomer", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 500)
+
+    def test_a_negative_gone_s_is_a_configuration_error(self):
+        bad = limits()
+        with self.assertRaises(R.LimitsError):
+            R.share_cap(R.Limits(host=bad.host, gone_s=-1.0), "web", NOW)
+
+
 class Codes(unittest.TestCase):
     def test_codes_are_stable_strings(self):
         self.assertEqual(

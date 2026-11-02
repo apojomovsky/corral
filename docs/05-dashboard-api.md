@@ -182,7 +182,12 @@ registry that does not exist yet.
 - CORS: no `Access-Control-Allow-Origin: *` ever. Default serves
   same-origin only; `--allow-origin ORIGIN` (repeatable, exact match,
   no wildcards) adds named dashboard origins. Preflight answers only
-  the origins configured.
+  the origins configured. A preflight (`OPTIONS` carrying `Origin`
+  and `Access-Control-Request-Method`) is exempt from the Bearer [REDACTED]:
+  it answers `204` with no body, echoing only an exact-match allowed
+  origin, so a browser can probe before sending credentials. Any other
+  `OPTIONS` request answers under the auth and method rules like every
+  other request.
 - No writes: v1 registers GET only. Any other method answers `405`,
   unknown paths answer `404`, and neither path executes anything.
   There is no `POST /v1/ack`, no launch, no stop, no settings edit:
