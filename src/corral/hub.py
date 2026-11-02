@@ -1,10 +1,11 @@
 """The hub: one SQLite database behind a small loopback HTTP service.
 
-Tickets H1 and H2 of docs/08-hub-multihost.md section 10: the hub
-skeleton, the host registry, the claims table, and the lease cycle
-(renew and release with fencing epochs). Later tickets add drive
-composition (H3), operator verbs (H4), the merged dashboard (H5) and
-hub operations (H6); this module grows no further than H2 needs.
+Tickets H1, H2 and H6 of docs/08-hub-multihost.md section 10: the
+hub skeleton, the host registry and the claims table (H1), the lease
+cycle with renew and release (H2), and hub operations (H6): backup,
+export and import with fencing epochs preserved, and the version
+exchange hosts check on every call. Later tickets add drive
+composition (H3), operator verbs (H4) and the merged dashboard (H5).
 
 Every grant is decided by one SQLite transaction: the row is
 unclaimed, or its lease has lapsed, and the new owner takes a strictly
@@ -27,7 +28,7 @@ import secrets
 import socket
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -297,6 +298,247 @@ def grant(
         return Receipt(repo, number, agent, host_id, epoch, expires)
 
 
+#: Export document version written by `export_hub`. Import refuses a
+#: newer document instead of guessing: fencing continuity is too
+#: important to reinterpret.
+EXPORT_VERSION = 1
+
+
+class HubVersionError(Exception):
+    """This host and the hub speak different API majors (exit 4)."""
+
+    exit_code = 4
+
+
+def check_version(hub_api: int, hub_schema: int) -> None:
+    """Fail closed when the hub's API major differs from this host's.
+
+    Both versions are named in the error: the operator upgrades the hub
+    and the hosts in lockstep. The schema version floats within a
+    major: additive-only changes never break the exchange.
+    """
+    _ = hub_schema
+    if hub_api != HUB_API:
+        raise HubVersionError(
+            f"hub speaks api {hub_api}, this host speaks api {HUB_API}:"
+            " upgrade the hub and the hosts in lockstep"
+        )
+
+
+def export_hub(conn: sqlite3.Connection) -> dict[str, Any]:
+    """The hub's movable state as JSON-ready data.
+
+    Hosts carry ids and reported facts only, never token material, so
+    no secret crosses the export. Claims carry their fencing epochs, so
+    fencing continuity survives the move. Snapshots are excluded by
+    design: hosts re-push on their next heartbeat. The projects list is
+    empty until the dashboard ticket grows a projects table; the key
+    stays so the shape never changes under readers.
+    """
+    try:
+        hosts = [
+            {
+                "host_id": host_id,
+                "address": address,
+                "capacity": capacity,
+                "constraints": constraints,
+            }
+            for host_id, address, capacity, constraints in conn.execute(
+                "SELECT host_id, address, capacity, constraints FROM hosts ORDER BY host_id"
+            ).fetchall()
+        ]
+        claims = [
+            {
+                "repo": repo,
+                "number": number,
+                "host_id": host_id,
+                "agent": agent,
+                "epoch": epoch,
+                "lease_expires": lease_expires,
+                "updated_at": updated_at,
+            }
+            for repo, number, host_id, agent, epoch, lease_expires, updated_at in conn.execute(
+                "SELECT repo, number, host_id, agent, epoch,"
+                " lease_expires, updated_at FROM claims ORDER BY repo, number"
+            ).fetchall()
+        ]
+        epoch_row = conn.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
+    except sqlite3.Error as err:
+        raise HubError(f"cannot export the hub store: {err}") from None
+    return {
+        "export_version": EXPORT_VERSION,
+        "hosts": hosts,
+        "projects": [],
+        "claims": claims,
+        "membership_epoch": epoch_row[0] if epoch_row is not None else 0,
+    }
+
+
+def _checked_claim(entry: Any) -> dict[str, Any]:
+    """One validated claim entry, or HubError naming what is wrong."""
+    if not isinstance(entry, dict):
+        raise HubError(f"hub claim {entry!r} must be an object")
+    for key in ("repo", "agent", "host_id"):
+        if not isinstance(entry.get(key), str) or not entry[key]:
+            raise HubError(f"hub claim {key} {entry.get(key)!r} must be a non-empty string")
+    for key in ("number", "epoch"):
+        value = entry.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise HubError(f"hub claim {key} {value!r} must be a positive integer")
+    for key in ("lease_expires", "updated_at"):
+        value = entry.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise HubError(f"hub claim {key} {value!r} must be a number")
+    return {
+        "repo": entry["repo"],
+        "number": entry["number"],
+        "host_id": entry["host_id"],
+        "agent": entry["agent"],
+        "epoch": entry["epoch"],
+        "lease_expires": float(entry["lease_expires"]),
+        "updated_at": float(entry["updated_at"]),
+    }
+
+
+def import_hub(conn: sqlite3.Connection, document: object) -> tuple[int, list[str]]:
+    """Load an `export_hub` document into a fresh hub, keeping every epoch.
+
+    Returns the claims loaded and the host ids to re-add: hosts are
+    validated but never stored, because token hashes never cross the
+    export and `add_host` stays the only minter, so the operator
+    re-runs `add_host --id` for each listed id and installs the minted
+    tokens. A hub that already holds hosts or claims, a newer export
+    version, a non-empty projects list (this hub stores no projects
+    yet), and any bad shape are HubError, checked before anything is
+    written, so a refused import leaves the target untouched.
+    """
+    if not isinstance(document, Mapping):
+        raise HubError("hub import needs the JSON object `corral hub export` wrote")
+    version = document.get("export_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != EXPORT_VERSION:
+        raise HubError(
+            f"hub export version {version!r} is not supported here"
+            f" (this hub reads {EXPORT_VERSION}): failing closed"
+        )
+    hosts = document.get("hosts")
+    if not isinstance(hosts, list):
+        raise HubError("hub import needs a hosts list")
+    host_ids: list[str] = []
+    for entry in hosts:
+        if not isinstance(entry, dict):
+            raise HubError(f"hub host {entry!r} must be an object")
+        host_id = entry.get("host_id")
+        if not isinstance(host_id, str) or not HOST_ID_RE.fullmatch(host_id):
+            raise HubError(f"hub host id {host_id!r} must match {HOST_ID_RE.pattern}")
+        host_ids.append(host_id)
+    projects = document.get("projects")
+    if not isinstance(projects, list):
+        raise HubError("hub import needs a projects list")
+    if projects:
+        raise HubError(
+            "hub import holds projects this hub version cannot store:"
+            " upgrade the hub first, then import again"
+        )
+    claims_raw = document.get("claims")
+    if not isinstance(claims_raw, list):
+        raise HubError("hub import needs a claims list")
+    claims = [_checked_claim(entry) for entry in claims_raw]
+    seen = set()
+    for claim in claims:
+        key = (claim["repo"], claim["number"])
+        if key in seen:
+            raise HubError(f"hub import lists {claim['repo']}#{claim['number']} twice")
+        seen.add(key)
+    epoch = document.get("membership_epoch")
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise HubError(f"hub membership epoch {epoch!r} must be an integer of 0 or more")
+    try:
+        held = conn.execute("SELECT COUNT(*) FROM hosts").fetchone()[0]
+        held += conn.execute("SELECT COUNT(*) FROM claims").fetchone()[0]
+        stored = conn.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
+    except sqlite3.Error as err:
+        raise HubError(f"cannot read the hub store: {err}") from None
+    if held or (stored is not None and stored[0] != 0):
+        raise HubError("hub import needs a fresh hub: this one already holds state")
+    try:
+        with _txn(conn):
+            conn.executemany(
+                "INSERT INTO claims(repo, number, host_id, agent, epoch,"
+                " lease_expires, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        claim["repo"],
+                        claim["number"],
+                        claim["host_id"],
+                        claim["agent"],
+                        claim["epoch"],
+                        claim["lease_expires"],
+                        claim["updated_at"],
+                    )
+                    for claim in claims
+                ],
+            )
+            conn.execute("UPDATE meta SET value=? WHERE key='membership_epoch'", (epoch,))
+    except sqlite3.Error as err:
+        raise HubError(f"cannot import into the hub store: {err}") from None
+    return len(claims), host_ids
+
+
+def backup_hub(source: str, dest: str) -> str:
+    """Copy the hub database to `dest` and return it.
+
+    The stdlib online backup API copies a running hub safely; the copy
+    is owner-only like the live store. `dest` is created exclusively
+    before anything connects, so an existing file is refused instead of
+    clobbered and a failed copy leaves nothing behind. Restore is a
+    file replacement while the hub is stopped.
+    """
+    parent = os.path.dirname(dest)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as err:
+            raise HubError(f"cannot create backup dir {parent}: {err}") from None
+    try:
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise HubError(f"backup destination {dest} exists: remove it first") from None
+    except OSError as err:
+        raise HubError(f"cannot write backup {dest}: {err}") from None
+    os.close(fd)
+    try:
+        try:
+            src = sqlite3.connect(
+                f"file:{source}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_MS / 1000
+            )
+        except sqlite3.Error as err:
+            raise HubError(f"cannot read hub store {source}: {err}") from None
+        try:
+            try:
+                dst = sqlite3.connect(dest, timeout=_BUSY_TIMEOUT_MS / 1000)
+            except sqlite3.Error as err:
+                raise HubError(f"cannot write backup {dest}: {err}") from None
+            try:
+                os.chmod(dest, 0o600)
+            except OSError as err:
+                raise HubError(f"cannot secure backup {dest}: {err}") from None
+            try:
+                src.backup(dst)
+            except sqlite3.Error as err:
+                raise HubError(f"cannot copy hub store {source} to {dest}: {err}") from None
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except (HubError, OSError, sqlite3.Error):
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
+    return dest
+
+
 def renew(
     conn: sqlite3.Connection,
     repo: str,
@@ -464,16 +706,27 @@ def _server(handler: http.server.BaseHTTPRequestHandler) -> HubServer:
     return server
 
 
+#: A versioned hub path: `/v<major>` plus the rest, or None.
+_VERSIONED_PATH_RE = re.compile(r"^/v(\d+)(?:/|$)")
+
 #: Authed claim routes: propose, renew a live lease, release a hold.
 CLAIM_PATHS = ("/v1/claims", "/v1/claims/renew", "/v1/claims/release")
+
+
+def _path_major(path: str) -> int | None:
+    """The API major a request path asks for, or None when unversioned."""
+    match = _VERSIONED_PATH_RE.match(path)
+    return int(match.group(1)) if match else None
 
 
 class HubHandler(http.server.BaseHTTPRequestHandler):
     """Routes: `GET /v1/version` (open), the claim routes (authed).
 
     Anything else is 404 (unknown path) or 405 (wrong method), with no
-    side effects. Error bodies are minimal JSON: no paths, no tokens,
-    no tracebacks.
+    side effects. A path naming another API major gets a typed 404
+    refusal carrying the served versions, so an older host learns to
+    upgrade instead of guessing. Error bodies are minimal JSON: no
+    paths, no tokens, no tracebacks.
     """
 
     server_version = "corral-hub/1"
@@ -514,7 +767,24 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         log.warning("hub: rejected request from %s: %s", self.client_address[0], text)
         self._send(401, {"error": text})
 
+    def _refuse_old_major(self) -> bool:
+        """A typed refusal for a path naming another API major, or False."""
+        major = _path_major(self.path)
+        if major is None or major == HUB_API:
+            return False
+        self._send(
+            404,
+            {
+                "api": HUB_API,
+                "schema_version": SCHEMA_VERSION,
+                "error": f"unsupported hub api {major}: this hub serves api {HUB_API}",
+            },
+        )
+        return True
+
     def do_GET(self) -> None:
+        if self._refuse_old_major():
+            return
         if self.path == "/v1/version":
             self._send(200, {"api": HUB_API, "schema_version": SCHEMA_VERSION})
             return
@@ -610,6 +880,8 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, {"repo": body["repo"], "number": body["number"], "epoch": kept})
 
     def do_POST(self) -> None:
+        if self._refuse_old_major():
+            return
         if self.path == "/v1/version":
             self._send(405, {"error": "hub v1 takes GET and POST only"})
             return

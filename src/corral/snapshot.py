@@ -353,27 +353,28 @@ def _below(path, parent):
         return False
 
 
-def cmd_snapshot(args: argparse.Namespace) -> int:
-    """Run the `snapshot` verb."""
-    from corral import accounts, admission, drive, paths, quota_ledger, quotacli, registry, settings
+def collect_kwargs() -> dict:
+    """Keyword arguments for `build` from the host's local readers.
 
-    try:
-        resolved = settings.load(root=_settings_root(os.getcwd()))
-        cfg = registry.config(resolved)
-        plain = {
-            "admission.total_cap": resolved["admission.total_cap"],
-            "admission.repo_cap": resolved["admission.repo_cap"],
-            "registry.count_toward_cap": cfg["count_toward_cap"],
-        }
-        admission.validate_limits(
-            admission.Limits(
-                total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"]
-            )
-        )
-        low_pct = resolved["quota.low_pct"]
-    except (settings.SettingsError, paths.PathError, admission.LimitsError) as err:
-        _err(str(err))
-        return USAGE
+    One shared helper so the `snapshot` verb and `serve.collect`
+    cannot diverge: settings load, registry config, validated limits,
+    and the registry, quota and drive readers in that order.
+    Settings and limit errors propagate; section readers fail into
+    the returned values, never raise.
+    """
+    from corral import accounts, admission, drive, quota_ledger, quotacli, registry, settings
+
+    resolved = settings.load(root=_settings_root(os.getcwd()))
+    cfg = registry.config(resolved)
+    plain = {
+        "admission.total_cap": resolved["admission.total_cap"],
+        "admission.repo_cap": resolved["admission.repo_cap"],
+        "registry.count_toward_cap": cfg["count_toward_cap"],
+    }
+    admission.validate_limits(
+        admission.Limits(total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"])
+    )
+    low_pct = resolved["quota.low_pct"]
     now = time.time()
     host = socket.gethostname()
     try:
@@ -397,7 +398,27 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         )
     except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
         drive_view = exc
-    doc = build(now, host, registry_view, quota_view, plain, shutil.disk_usage, drive_view)
+    return {
+        "now": now,
+        "host": host,
+        "registry_view": registry_view,
+        "quota_view": quota_view,
+        "settings": plain,
+        "usage_fn": shutil.disk_usage,
+        "drive_view": drive_view,
+    }
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Run the `snapshot` verb."""
+    from corral import admission, paths, settings
+
+    try:
+        kwargs = collect_kwargs()
+    except (settings.SettingsError, paths.PathError, admission.LimitsError) as err:
+        _err(str(err))
+        return USAGE
+    doc = build(**kwargs)
     if _all_failed(doc):
         _err("nothing to report: every section failed")
         return UNREACHABLE
