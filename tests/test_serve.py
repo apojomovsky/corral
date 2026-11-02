@@ -2452,6 +2452,29 @@ class SnapshotCache(ServeCase):
         self.assertEqual(json.loads(body), healthy_doc())
         self.assertEqual(len(calls), 2)
 
+    def test_non_dict_build_never_populates_the_cache(self):
+        # Mirrors the flaky-builder test above for the non-dict path: a
+        # builder that returns a list once and then a valid document must
+        # read as a 500 followed by a 200, proving the bad result was not
+        # cached (a cached list would answer the second request from one
+        # build, and with the wrong body).
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                return ["agents"]
+            return healthy_doc()
+
+        server, _ = self.start_cached(flaky)
+        status, _, body = self.get(server, "/v1/snapshot")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "snapshot unavailable"})
+        status, _, body = self.get(server, "/v1/snapshot")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), healthy_doc())
+        self.assertEqual(len(calls), 2)
+
     def test_snapshot_carries_etag_and_last_modified(self):
         server, _ = self.start_cached(FakeBuilder(healthy_doc()))
         status, headers, _ = self.get(server, "/v1/snapshot")

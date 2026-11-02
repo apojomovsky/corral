@@ -488,9 +488,15 @@ class RunVerb(unittest.TestCase):
         self.assertEqual(code, 4)
         self.assertIn("--repo", err)
 
-    def test_show_with_an_unknown_profile_is_exit_4(self):
+    def test_show_with_a_dangling_global_selection_is_exit_4(self):
+        # The old test passed --profile to show, which has no such flag,
+        # so argparse's unrecognized-arguments rejection (exit 4) fired
+        # before the dangling selection was ever resolved. Store the
+        # dangling name first, then show: the refusal must come from
+        # resolve naming the value.
         with tempfile.TemporaryDirectory() as tmp:
-            code, _, err = self.run_cli(["profile", "show", "--profile", "nope"], tmp)
+            self.assertEqual(self.run_cli(["profile", "set", "--global", "nope"], tmp)[0], 0)
+            code, _, err = self.run_cli(["profile", "show"], tmp)
         self.assertEqual(code, 4)
         self.assertIn("nope", err)
 
