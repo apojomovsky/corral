@@ -23,17 +23,35 @@ def proc(returncode=0, stdout=""):
 class FakeGit:
     """An injectable git seam over a fixed directory."""
 
-    def __init__(self, root, *, origin_url=None, head=None, current="main", hooks=""):
+    def __init__(
+        self,
+        root,
+        *,
+        origin_url=None,
+        head=None,
+        current="main",
+        hooks="",
+        fail=(),
+        status="",
+    ):
         self.root = root
         self.origin_url = origin_url
         self.head = head
         self.current = current
         self.hooks = hooks
+        self.fail = set(fail)
+        self.status = status
         self.calls = []
+        self.commits = []
+        self.inited = set()
 
     def __call__(self, args, cwd):
         self.calls.append((list(args), cwd))
         if args == ["rev-parse", "--show-toplevel"]:
+            if os.path.normpath(cwd) == os.path.normpath(self.root):
+                return proc(0, self.root + "\n")
+            if os.path.normpath(cwd) in self.inited:
+                return proc(0, cwd + "\n")
             return proc(0, self.root + "\n")
         if args == ["remote", "get-url", "origin"]:
             if self.origin_url is None:
@@ -45,11 +63,32 @@ class FakeGit:
             return proc(0, f"refs/remotes/origin/{self.head}\n")
         if args == ["branch", "--show-current"]:
             return proc(0, self.current + "\n")
-        if args == ["config", "core.hooksPath"]:
+        if args[:2] == ["config", "core.hooksPath"]:
+            if len(args) == 3:
+                if "config" in self.fail:
+                    return proc(1, "")
+                self.hooks = args[2]
+                return proc(0, "")
             if not self.hooks:
                 return proc(1, "")
             return proc(0, self.hooks + "\n")
         if args[:1] == ["init"]:
+            if "init" in self.fail:
+                return proc(1, "")
+            self.inited.add(os.path.normpath(cwd))
+            return proc(0, "")
+        if args == ["status", "--porcelain"]:
+            if "status" in self.fail:
+                return proc(1, "")
+            return proc(0, self.status)
+        if args[:1] == ["add"]:
+            if "add" in self.fail:
+                return proc(1, "")
+            return proc(0, "")
+        if args[:1] == ["commit"]:
+            if "commit" in self.fail:
+                return proc(1, "")
+            self.commits.append((list(args), cwd))
             return proc(0, "")
         raise AssertionError(f"unexpected git call {args}")
 
@@ -792,6 +831,55 @@ class SlugCase(unittest.TestCase):
         got, inputs = init.collect(root, git=git, test_cmd="make check")
         self.assertEqual((got, inputs.name), (root, "name"))
         self.assertTrue(inputs.test_command)
+
+
+class ResolveBranchCase(unittest.TestCase):
+    def test_flag_wins_over_detected_and_default(self):
+        self.assertEqual(init.resolve_branch("detected", flag="flag"), "flag")
+
+    def test_set_entry_wins_over_detected_and_default(self):
+        self.assertEqual(
+            init.resolve_branch("detected", sets=("clone.default_branch=set-branch",)),
+            "set-branch",
+        )
+
+    def test_equal_flag_and_set_agree(self):
+        self.assertEqual(
+            init.resolve_branch("detected", flag="same", sets=("clone.default_branch=same",)),
+            "same",
+        )
+
+    def test_conflicting_flag_and_set_is_exit_4(self):
+        with self.assertRaises(init.InitError) as ctx:
+            init.resolve_branch("detected", flag="flag", sets=("clone.default_branch=other",))
+        self.assertIn("--default-branch", str(ctx.exception))
+        self.assertIn("clone.default_branch", str(ctx.exception))
+
+    def test_detected_used_when_nothing_explicit(self):
+        self.assertEqual(init.resolve_branch("detected"), "detected")
+
+    def test_registry_default_used_when_nothing_detected(self):
+        self.assertEqual(
+            init.resolve_branch(None), settings.REGISTRY["clone.default_branch"].default
+        )
+
+    def test_missing_registry_key_is_an_internal_error(self):
+        with mock.patch.dict(settings.REGISTRY):
+            del settings.REGISTRY["clone.default_branch"]
+            with self.assertRaises(init.InitError) as ctx:
+                init.resolve_branch(None)
+        self.assertIn("internal", str(ctx.exception))
+
+    def test_unusable_registry_default_is_an_internal_error(self):
+        for bad in ("", 0):
+            with self.subTest(bad=bad):
+                with mock.patch.dict(settings.REGISTRY):
+                    settings.REGISTRY["clone.default_branch"] = settings.Setting(
+                        "clone.default_branch", str, bad, "help"
+                    )
+                    with self.assertRaises(init.InitError) as ctx:
+                        init.resolve_branch(None)
+                self.assertIn("internal", str(ctx.exception))
 
 
 class DirectoryNameCase(Fixture):

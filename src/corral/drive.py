@@ -57,7 +57,6 @@ from corral import (
 from corral import syncli
 from corral import tracker as iface
 from corral.eligibility import StartRequest, TicketRow
-from corral.github.tracker import NEEDS_DECISION, PRIORITIES
 
 OK, NO, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
@@ -133,8 +132,8 @@ def priority_rank(priority) -> int:
     Follows the tracker's highest-first priority order; anything outside
     it (including no priority) ranks zero and sorts last.
     """
-    if priority in PRIORITIES:
-        return len(PRIORITIES) - PRIORITIES.index(priority)
+    if priority in iface.PRIORITIES:
+        return len(iface.PRIORITIES) - iface.PRIORITIES.index(priority)
     return 0
 
 
@@ -261,6 +260,7 @@ def gate(
     ledger,
     now,
     finished=None,
+    agent_roles=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -272,9 +272,12 @@ def gate(
     proceeds only for PR-ready rows: unclaimed with a finished worker
     behind them, whose id the reviewer passes as its author. Rows
     reviewed since the last work are merge-ready and ignored, and a fix
-    round requested after the fix already landed is skipped. Every input
-    is plain data or an injected seam (`read_labels`); nothing is
-    launched, claimed or written.
+    round requested after the fix already landed is skipped. A fix or
+    resume behind a reviewer holder (from `agent_roles`) skips with the
+    claim kept, matching the claiming pass, so `--plan` prints the
+    verdict the real pass would print. Every input is plain data or an
+    injected seam (`read_labels`); nothing is launched, claimed or
+    written.
     """
     if candidate.request is None:
         row = candidate.row
@@ -352,12 +355,12 @@ def gate(
     )
     if held is not None:
         return _skip(candidate, kind, "hold", held)
-    if NEEDS_DECISION in (row.labels or ()):
+    if iface.NEEDS_DECISION in (row.labels or ()):
         return _skip(
             candidate,
             kind,
             "hold",
-            f"{ref}: carries {NEEDS_DECISION}, waiting on a human, never started",
+            f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, never started",
         )
 
     decided = admission.admit(
@@ -381,6 +384,14 @@ def gate(
         blocked = shut["blocked"]
         roles = ", ".join(f"role {name!r} ({blocked[name]['state']})" for name in sorted(blocked))
         return _skip(candidate, kind, "quota", f"{ref}: quota refuses {roles}: skipped")
+
+    if kind in ("resume", "fix") and (agent_roles or {}).get(holder) == "reviewer":
+        return _skip(
+            candidate,
+            kind,
+            "claim",
+            f"{ref}: reviewer `{holder}` still holds the claim, fix waits for release",
+        )
 
     if kind == "start" and request.kind in ("resume", "fix"):
         reason = f"{ref}: {request.kind} on an unclaimed ticket, fresh start instead"
@@ -796,10 +807,13 @@ def timer_state(run=units.default_run) -> str:
     """Whether the user timer is enabled: one of "enabled", "disabled",
     "masked" or "missing". Pure over the `run` seam.
 
-    A manager that cannot be asked raises `units.Unreachable` (exit 3):
-    a missing `systemctl`, a dead bus, or an answered state outside the
-    known words. Anything else the manager answers that is not an
-    enabled, disabled or masked state reads as "missing".
+    The enabled words read as "enabled" and the masked words as
+    "masked"; "disabled", "static", "indirect", "generated" and
+    "transient" read as "disabled"; the known not-installed answers
+    read as "missing". A manager that cannot be asked raises
+    `units.Unreachable` (exit 3): a missing `systemctl`, a dead bus,
+    or an answered state outside those known words, success or not.
+    An unknown answer is never guessed at.
     """
     import subprocess
 
@@ -819,7 +833,7 @@ def timer_state(run=units.default_run) -> str:
         raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {err_text or out}")
     if out in ("masked", "masked-runtime"):
         return "masked"
-    if proc.returncode == 0 or out in (
+    if out in (
         "disabled",
         "static",
         "indirect",
@@ -1066,6 +1080,7 @@ def _gate_all(
     hold_label,
     released=None,
     finished=None,
+    agent_roles=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -1076,7 +1091,9 @@ def _gate_all(
     released this pass) simulates the post-release rows, so a plan over
     still-claimed rows gates what the real pass would gate after the
     release; `finished` carries the newest finished entry per ticket for
-    the reviewer and fix-round readiness. Nothing is written.
+    the reviewer and fix-round readiness; `agent_roles` ({agent id:
+    role}) feeds the gate's reviewer-holder skip, so a plan matches
+    the claiming pass. Nothing is written.
     """
     rows = eligibility.rows_from_items(items)
     by_key = {(row.repo, row.number): row for row in rows}
@@ -1127,8 +1144,7 @@ def _gate_all(
         counted[entry_project] = counted.get(entry_project, 0) + 1
 
     def floor_of(name):
-        entry = limits.projects.get(name) or {}
-        return entry.get("floor", 0)
+        return admission.bounds(limits.projects.get(name))[0]
 
     stop_starts = False
     gated_rows = []
@@ -1163,6 +1179,7 @@ def _gate_all(
             ledger=ledger_data,
             now=now,
             finished=finished,
+            agent_roles=agent_roles,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1187,15 +1204,16 @@ def _pass(
     pool,
     agent_states=None,
     finished_for=None,
+    agent_roles=None,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
     Nothing is synced, claimed, enqueued, started, mirrored or journaled.
     A project whose policy or quota settings fail is skipped with one
     error line; the pass still gates every other project and exits 4.
-    `agent_states` and `finished_for` feed the reviewer and fix-round
-    readiness exactly like the claiming pass, so the plan shows the
-    verdicts the real pass would print; both are reads only.
+    `agent_states`, `finished_for` and `agent_roles` feed the reviewer
+    and fix-round readiness exactly like the claiming pass, so the plan
+    shows the verdicts the real pass would print; all are reads only.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1242,6 +1260,7 @@ def _pass(
         hold_label=hold_label,
         released=released,
         finished=finished,
+        agent_roles=agent_roles,
     )
     table = [
         Candidate(
@@ -2044,7 +2063,7 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         )
         return
     try:
-        tracker.add_label(claim.repo, claim.number, NEEDS_DECISION)
+        tracker.add_label(claim.repo, claim.number, iface.NEEDS_DECISION)
         tracker.comment(
             claim.repo,
             claim.number,
@@ -2323,7 +2342,8 @@ def _claim_and_launch(
     row's reason. `released` ({(repo, number): worker id} released
     this pass) and `finished` (the newest finished entry per ticket)
     feed the reviewer author. With no `launcher` the pass stops after
-    claiming and records that, so no row counts as launched. The day
+    claiming and records that, releasing a reviewer claim again like a
+    failed launch, so no row counts as launched. The day
     cap counts `start`, `review` and fresh `fix` launches: each one
     starts a new agent. A `resume` reuses the holder's claim and stays
     exempt. When `start_budget` is not None, at most that many launch;
@@ -2387,15 +2407,16 @@ def _claim_and_launch(
                 rows.append(skipped)
                 continue
             if launcher is None:
+                suffix = _release_reviewer_claim(store, gated.repo, gated.number, agent, now=now)
                 rows.append(
                     Gated(
                         project=gated.project,
                         repo=gated.repo,
                         number=gated.number,
                         kind=gated.kind,
-                        verdict=gated.verdict,
-                        reason=f"{gated.reason}; launch skipped (no launcher)",
-                        code=gated.code,
+                        verdict="skip",
+                        reason=f"{gated.reason}; launch skipped (no launcher){suffix}",
+                        code="launch",
                     )
                 )
                 continue
@@ -2921,10 +2942,13 @@ def _reviewer_prompt(root, tgt, number, title, author):
 
     The worker id rides in the prompt text: the reviewer passes it as
     `review record --author`, and the record refuses a self-review. A
-    blank author raises LaunchError before anything is claimed, since a
-    reviewer that cannot record is a wasted run. Validated before the
-    launch makes anything, so a bad override never leaves a stray branch
-    behind. The heartbeat lines go on in `launch.launch`, not here.
+    blank author raises LaunchError before anything is launched, since
+    a reviewer that cannot record is a wasted run. The no-claim
+    guarantee is the author skip in the claim path, not this guard:
+    this renderer runs at launch time, after the claim. Validated
+    before the launch makes anything, so a bad override never leaves a
+    stray branch behind. The heartbeat lines go on in `launch.launch`,
+    not here.
     """
     worker = str(author or "").strip()
     if not worker:
@@ -3484,7 +3508,8 @@ def run_pass(
     ticket) feeds the reviewer and fix-round readiness alongside the
     same-pass releases. `agent_roles` ({agent id: role} for visible
     entries) serializes a fix behind a reviewer holder; unknown
-    holders proceed as before. When `pause_path` names an
+    holders proceed as before. The plan pass reads it too, so `--plan`
+    prints the same reviewer-holder skips. When `pause_path` names an
     existing pause file, either pass reports it and exits 1, starting
     nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
@@ -3523,6 +3548,7 @@ def run_pass(
             label="plan",
             agent_states=agent_states,
             finished_for=finished_for,
+            agent_roles=agent_roles,
             **args,
         )
     try:
@@ -3612,6 +3638,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             try:
                 planned_states, _ = production_stuck_inputs(registered, now=moment)
                 planned_finished = production_finished_for(now=moment)
+                planned_roles = production_agent_roles(now=moment)
             except settings.SettingsError as problem:
                 print(f"corral drive: {problem}", file=sys.stderr)
                 return USAGE
@@ -3625,6 +3652,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 pause_path=pause_path(),
                 agent_states=planned_states,
                 finished_for=planned_finished,
+                agent_roles=planned_roles,
             )
         try:
             registered = projects.load_all()
@@ -3694,8 +3722,16 @@ def add_parser(sub) -> None:
         help="print the candidate table and change nothing",
     )
     verbs = p.add_subparsers(dest="drive_verb", required=False)
-    verbs.add_parser(
+    install = verbs.add_parser(
         "install-timer",
         help="install and enable the user timer that repeats the pass",
+    )
+    # SUPPRESS keeps a verb-last `--plan` intact: a plain default here
+    # would overwrite it when the subparser runs.
+    install.add_argument(
+        "--plan",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="refused: installing changes the host, so there is no dry run",
     )
     p.set_defaults(func=cmd_drive)
