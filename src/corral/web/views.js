@@ -3,6 +3,8 @@
 
 import { cleanText, formatAge } from "./fmt.js";
 
+// el() sets attributes unchecked: never pass a tracker href through it
+// without a scheme check (W6 must allow http/https only).
 export function el(tag, text, attrs) {
   const node = document.createElement(tag);
   if (text !== null && text !== undefined) {
@@ -42,6 +44,16 @@ export function renderConnection({ live, seenMs }) {
     banner.hidden = true;
     banner.textContent = "";
     view.classList.remove("stale");
+    return;
+  }
+  if (seenMs === null || seenMs === undefined) {
+    // No good poll yet (the server was down at first load): there is
+    // no stale data to age, only the retry the poll loop scheduled.
+    conn.textContent = "still connecting";
+    updated.textContent = "";
+    banner.hidden = false;
+    banner.textContent = "";
+    banner.appendChild(document.createTextNode("Cannot reach the API yet. Retrying."));
     return;
   }
   conn.textContent = "cannot reach the api";

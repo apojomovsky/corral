@@ -2,6 +2,20 @@
 
 export const TOKEN_KEY = "corral.token";
 
+// Poll cadence and failure backoff, in milliseconds. One pure table:
+// the delay after N consecutive failures is BACKOFF_MS[N-1], capped
+// at the last entry. Kept here (not in app.js) so the suite can pin
+// the numbers without a JS runner.
+export const POLL_MS = 5000;
+export const BACKOFF_MS = [5000, 15000, 30000, 60000];
+
+export function nextDelay(failures) {
+  if (failures <= 0) {
+    return POLL_MS;
+  }
+  return BACKOFF_MS[Math.min(failures - 1, BACKOFF_MS.length - 1)];
+}
+
 export function loadToken() {
   try {
     return window.localStorage.getItem(TOKEN_KEY);
@@ -10,12 +24,24 @@ export function loadToken() {
   }
 }
 
+// False when this browser refuses the write (private mode): the
+// caller keeps the token for the current page and says so on screen.
 export function saveToken(value) {
-  window.localStorage.setItem(TOKEN_KEY, value);
+  try {
+    window.localStorage.setItem(TOKEN_KEY, value);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function forgetToken() {
-  window.localStorage.removeItem(TOKEN_KEY);
+  try {
+    window.localStorage.removeItem(TOKEN_KEY);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function readJson(resp) {
@@ -44,6 +70,11 @@ export async function fetchJson(path, token, { timeoutMs = 10000 } = {}) {
       signal: ctrl.signal,
     });
     return { status: resp.status, data: await readJson(resp) };
+  } catch {
+    // Unreachable server, refused connection, timeout: a status the
+    // HTTP layer can never send, so every caller takes the failure
+    // branch (backoff, stale banner, reschedule) without its own throw.
+    return { status: 0, data: null };
   } finally {
     window.clearTimeout(timer);
   }

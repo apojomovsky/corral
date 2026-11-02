@@ -652,7 +652,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": UNAVAILABLE})
             return
         path = urlsplit(self.path).path
-        if path == "/ui/config.json":
+        if path == webui.CONFIG_PATH:
             self._send_bytes(200, webui.config_body(API_VERSION), webui.config_headers())
             return
         asset = state.web_assets.get(path)
@@ -1219,6 +1219,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self._count()
+        if webui.is_ui_path(urlsplit(self.path).path):
+            self._send_json(405, {"error": f"method {self.command} not allowed"})
+            return
         origin = self.headers.get("Origin")
         wanted = self.headers.get("Access-Control-Request-Method")
         if origin is not None and wanted is not None and self._echo_origin() is not None:
@@ -1230,9 +1233,6 @@ class _Handler(BaseHTTPRequestHandler):
                     ("Access-Control-Allow-Headers", "Authorization"),
                 ),
             )
-            return
-        if webui.is_ui_path(urlsplit(self.path).path):
-            self._send_json(405, {"error": f"method {self.command} not allowed"})
             return
         if not self._authorized():
             return

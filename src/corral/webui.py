@@ -18,6 +18,11 @@ from importlib import resources
 #: ever serve. `index.html` answers `/`; the rest answer `/ui/<name>`.
 WEB_FILES = ("index.html", "app.css", "app.js", "api.js", "fmt.js", "views.js")
 
+#: The generated backend-identity route. One constant, read by the
+#: asset table check and the host handler alike, so the path cannot
+#: drift between the two.
+CONFIG_PATH = "/ui/config.json"
+
 #: Exact content type per shipped file. JS rides as `text/javascript`,
 #: the one type every browser module script accepts.
 CONTENT_TYPES = {
@@ -135,4 +140,4 @@ def config_headers() -> tuple:
 
 def is_ui_path(path: str) -> bool:
     """Whether `path` (already split from any query) is a UI route."""
-    return path == "/" or path == "/ui/config.json" or path.startswith("/ui/")
+    return path == "/" or path == CONFIG_PATH or path.startswith("/ui/")

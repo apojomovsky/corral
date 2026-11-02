@@ -104,6 +104,20 @@ class AssetTable(unittest.TestCase):
         body = json.loads(webui.config_body(serve.API_VERSION))
         self.assertEqual(body, {"mode": "host", "api": serve.API_VERSION})
 
+    def test_config_path_is_one_constant(self):
+        import pathlib
+        from importlib.util import find_spec
+
+        from corral import webui
+
+        self.assertEqual(webui.CONFIG_PATH, "/ui/config.json")
+        self.assertTrue(webui.is_ui_path(webui.CONFIG_PATH))
+        spec = find_spec("corral.serve")
+        assert spec is not None and spec.origin is not None
+        text = pathlib.Path(spec.origin).read_text()
+        self.assertIn("webui.CONFIG_PATH", text)
+        self.assertNotIn('"/ui/config.json"', text)
+
 
 class DocumentServing(WebCase):
     def test_root_returns_index_bytes_with_security_headers(self):
@@ -181,13 +195,23 @@ class MethodPrecedence(WebCase):
                 token_reader=lambda: "tok-1",
             )
             headers = {} if token is None else {"Authorization": f"Bearer {token}"}
-            for method in ("POST", "PUT", "DELETE", "PATCH", "HEAD"):
+            for method in ("POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"):
                 status, _, body = self.fetch(server, method, "/", headers=headers)
                 self.assertEqual(status, 405, (method, token))
                 if method != "HEAD":  # HEAD answers carry no body by HTTP rule
                     self.assertIn("error", json.loads(body))
             status, _, _ = self.fetch(server, "POST", "/ui/app.js", headers=headers)
             self.assertEqual(status, 405)
+
+    def test_options_on_ui_paths_is_405_even_as_a_preflight(self):
+        origin = "https://dash.example.com"
+        server = self.start_server(trivial_doc, allowed_origins=(origin,))
+        headers = {"Origin": origin, "Access-Control-Request-Method": "GET"}
+        for target in ("/", "/ui/app.js", "/ui/config.json"):
+            status, resp_headers, body = self.fetch(server, "OPTIONS", target, headers=headers)
+            self.assertEqual(status, 405, target)
+            self.assertNotIn("Access-Control-Allow-Methods", resp_headers)
+            self.assertIn("error", json.loads(body))
 
 
 class ShellExemption(WebCase):
@@ -283,6 +307,54 @@ class SourceDiscipline(unittest.TestCase):
             self.assertLessEqual(size, 60 * 1024, name)
             total += size
         self.assertLessEqual(total, 120 * 1024)
+
+    def test_poll_backoff_table_is_pinned(self):
+        text = web_bytes("api.js").decode("utf-8")
+        self.assertIn("export const POLL_MS = 5000;", text)
+        self.assertIn("export const BACKOFF_MS = [5000, 15000, 30000, 60000];", text)
+        self.assertIn("export function nextDelay(failures) {", text)
+        self.assertIn("Math.min(failures - 1, BACKOFF_MS.length - 1)", text)
+
+    def test_every_poll_await_sits_inside_a_try(self):
+        text = web_bytes("app.js").decode("utf-8")
+        for name in ("fetchJson", "loadConfig", "loadVersion"):
+            sites = list(re.finditer(r"await\s+" + name + r"\s*\(", text))
+            self.assertTrue(sites, name)
+            for site in sites:
+                start = site.start()
+                self.assertGreater(
+                    text.rfind("try {", 0, start), text.rfind("catch", 0, start), name
+                )
+
+    def test_schedule_uses_the_shared_next_delay(self):
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertIn("nextDelay(failures)", app)
+        self.assertNotIn("POLL_MS", app)
+        self.assertNotIn("BACKOFF_MS", app)
+
+    def test_fetch_maps_network_failure_to_the_failure_branch(self):
+        text = web_bytes("api.js").decode("utf-8")
+        self.assertIn("return { status: 0, data: null };", text)
+
+    def test_token_writes_are_guarded(self):
+        text = web_bytes("api.js").decode("utf-8")
+        for call in (
+            "localStorage.getItem",
+            "localStorage.setItem",
+            "localStorage.removeItem",
+        ):
+            at = text.find(call)
+            self.assertGreater(at, -1, call)
+            self.assertGreater(text.rfind("try {", 0, at), text.rfind("catch", 0, at), call)
+
+    def test_unstorable_token_is_said_on_screen(self):
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertIn("cannot keep this token", app)
+
+    def test_el_warns_about_unchecked_hrefs(self):
+        text = web_bytes("views.js").decode("utf-8")
+        self.assertIn("W6", text)
+        self.assertIn("scheme", text)
 
 
 if __name__ == "__main__":

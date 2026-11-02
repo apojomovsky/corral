@@ -1,10 +1,15 @@
 // Entry module: routing, view mounting, the poll loop.
 
-import { fetchJson, forgetToken, loadConfig, loadToken, loadVersion, saveToken } from "./api.js";
+import {
+  fetchJson,
+  forgetToken,
+  loadConfig,
+  loadToken,
+  loadVersion,
+  nextDelay,
+  saveToken,
+} from "./api.js";
 import { hideToken, renderConnection, renderShell, showToken } from "./views.js";
-
-const POLL_MS = 5000;
-const BACKOFF_MS = [5000, 15000, 30000, 60000];
 
 let seenMs = null;
 let failures = 0;
@@ -26,8 +31,13 @@ function currentRoute() {
 }
 
 async function tick(config, token) {
-  const reply = await fetchJson("/v1/version", token);
-  if (reply.status === 200 && reply.data) {
+  let reply = null;
+  try {
+    reply = await fetchJson("/v1/version", token);
+  } catch {
+    reply = null;
+  }
+  if (reply && reply.status === 200 && reply.data) {
     seenMs = Date.now();
     failures = 0;
     hideToken();
@@ -39,7 +49,7 @@ async function tick(config, token) {
       serverNowMs: typeof reply.data.now === "number" ? reply.data.now * 1000 : null,
     });
     renderConnection({ live: true, seenMs });
-  } else if (reply.status === 401) {
+  } else if (reply && reply.status === 401) {
     showToken({
       message: "This server needs a token.",
       help: helpFor(config.mode),
@@ -48,10 +58,11 @@ async function tick(config, token) {
       renderConnection({ live: false, seenMs });
     }
   } else {
+    // Any other status, a status-0 network failure, or a throw: count
+    // the backoff, show stale-with-age when a last good poll exists
+    // (or the never-connected state when none does), reschedule below.
     failures += 1;
-    if (seenMs !== null) {
-      renderConnection({ live: false, seenMs });
-    }
+    renderConnection({ live: false, seenMs });
   }
   schedule(config, token);
 }
@@ -63,10 +74,9 @@ function schedule(config, token) {
   if (document.hidden) {
     return;
   }
-  const wait = failures === 0 ? POLL_MS : BACKOFF_MS[Math.min(failures - 1, BACKOFF_MS.length - 1)];
   timer = window.setTimeout(() => {
     void tick(config, token);
-  }, wait);
+  }, nextDelay(failures));
 }
 
 function bindToken(config, setToken) {
@@ -79,15 +89,26 @@ function bindToken(config, setToken) {
       showToken({ message: "Paste a token first." });
       return;
     }
-    const reply = await loadVersion(value);
-    if (reply.status === 200) {
-      saveToken(value);
+    let reply = null;
+    try {
+      reply = await loadVersion(value);
+    } catch {
+      reply = null;
+    }
+    if (reply && reply.status === 200) {
+      const kept = saveToken(value);
       setToken(value);
       input.value = "";
       hideToken();
       failures = 0;
       await tick(config, value);
-    } else if (reply.status === 401) {
+      if (!kept) {
+        showToken({
+          message:
+            "This device cannot keep this token, so it works for this page only. Paste it again after a reload.",
+        });
+      }
+    } else if (reply && reply.status === 401) {
       showToken({ message: "Wrong token: this server answered 401." });
     } else {
       showToken({ message: "Cannot reach the API. Showing nothing yet." });
@@ -106,9 +127,20 @@ function bindToken(config, setToken) {
 }
 
 async function boot() {
-  const configReply = await loadConfig();
-  if (configReply.status !== 200 || !configReply.data) {
-    renderConnection({ live: false, seenMs: Date.now() });
+  let configReply = null;
+  try {
+    configReply = await loadConfig();
+  } catch {
+    configReply = null;
+  }
+  if (!configReply || configReply.status !== 200 || !configReply.data) {
+    // The server is down at first load: say so and retry on the same
+    // backoff as polls, instead of stranding the page on "connecting".
+    failures += 1;
+    renderConnection({ live: false, seenMs });
+    timer = window.setTimeout(() => {
+      void boot();
+    }, nextDelay(failures));
     return;
   }
   const config = configReply.data;
