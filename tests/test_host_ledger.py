@@ -55,13 +55,35 @@ class LedgerFile(LedgerCase):
             "projects": {"web": {"weight": 1, "cpu_floor_m": 500, "memory_floor_mb": 1024}},
             "foreign": [],
         }
-        out = hl.update(lambda _old: ledger, self.path, self.state)
+        out = hl.update(lambda _old: ledger, path=self.path, state_dir=self.state)
         self.assertEqual(out, ledger)
         self.assertEqual(hl.load(self.path), ledger)
 
+    def test_a_mutating_change_returning_none_leaves_the_file_unchanged(self):
+        hl.ensure(state_dir=self.state, path=self.path)
+        before = hl.load(self.path)
+
+        def change(ledger):
+            ledger["foreign"].append({"name": "desk", "claimed_at": 0.0})
+            return None
+
+        out = hl.update(change, path=self.path, state_dir=self.state)
+        self.assertEqual(hl.load(self.path), before)
+        self.assertEqual(len(out["foreign"]), 1)
+
+    def test_path_state_dir_and_timeout_are_keyword_only(self):
+        with self.assertRaises(TypeError):
+            hl.ensure(self.state, self.path)  # ty: ignore[too-many-positional-arguments]
+        with self.assertRaises(TypeError):
+            hl.update(
+                lambda ledger: ledger,
+                self.path,  # ty: ignore[too-many-positional-arguments]
+                self.state,
+            )
+
     def test_ensure_creates_missing_parent_dirs(self):
         nested = os.path.join(self.dir, "sub", "dir", "host-resources.json")
-        hl.ensure(self.state, nested)
+        hl.ensure(state_dir=self.state, path=nested)
         self.assertEqual(hl.load(nested), hl.empty())
 
     def test_load_of_a_missing_file_is_an_empty_ledger(self):
@@ -96,7 +118,9 @@ class LedgerFile(LedgerCase):
                 hl.load(self.path)
 
     def test_helpers_keep_unknown_top_level_keys(self):
-        out = hl.update(lambda ledger: {**ledger, "future": {"v": 1}}, self.path, self.state)
+        out = hl.update(
+            lambda ledger: {**ledger, "future": {"v": 1}}, path=self.path, state_dir=self.state
+        )
         self.assertEqual(out["future"], {"v": 1})
         self.assertEqual(hl.load(self.path)["future"], {"v": 1})
 
@@ -104,22 +128,22 @@ class LedgerFile(LedgerCase):
         self.write("{not json")
         change = mock.Mock(side_effect=lambda ledger: ledger)
         with self.assertRaises(hl.LedgerError):
-            hl.update(change, self.path, self.state)
+            hl.update(change, path=self.path, state_dir=self.state)
         change.assert_not_called()
         self.assertEqual(self.read(), "{not json")
 
     def test_update_applies_a_change_under_the_lock(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         out = hl.update(
             lambda ledger: {**ledger, "foreign": [{"name": "desk", "claimed_at": 0.0}]},
-            self.path,
-            self.state,
+            path=self.path,
+            state_dir=self.state,
         )
         self.assertEqual(hl.load(self.path)["foreign"], out["foreign"])
         self.assertEqual(len(out["foreign"]), 1)
 
     def test_a_change_returning_none_still_creates_the_missing_file(self):
-        out = hl.update(lambda ledger: None, self.path, self.state)
+        out = hl.update(lambda ledger: None, path=self.path, state_dir=self.state)
         self.assertEqual(out, hl.empty())
         self.assertEqual(hl.load(self.path), hl.empty())
 
@@ -127,11 +151,11 @@ class LedgerFile(LedgerCase):
         self.assertFalse(hasattr(hl, "save"))
 
     def test_write_to_a_foreign_state_dir_refuses_with_4(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         before = self.read()
         change = mock.Mock(side_effect=lambda ledger: ledger)
         with self.assertRaises(hl.StateDirError) as caught:
-            hl.update(change, self.path, OTHER)
+            hl.update(change, path=self.path, state_dir=OTHER)
         self.assertEqual(hl.StateDirError.exit_code, 4)
         change.assert_not_called()
         self.assertEqual(self.read(), before)
@@ -163,21 +187,21 @@ class LedgerFile(LedgerCase):
         self.assertIn(self.dir, str(caught.exception))
         self.assertEqual(hl.LedgerError.exit_code, 4)
         with self.assertRaises(hl.LedgerError):
-            hl.ensure(self.state, self.dir)
+            hl.ensure(state_dir=self.state, path=self.dir)
 
     def test_ensure_on_a_corrupt_file_refuses_and_leaves_bytes_identical(self):
         self.write("{not json")
         with self.assertRaises(hl.LedgerError):
-            hl.ensure(self.state, self.path)
+            hl.ensure(state_dir=self.state, path=self.path)
         self.assertEqual(self.read(), "{not json")
 
     def test_update_writes_the_marker_beside_a_new_ledger(self):
-        hl.update(lambda ledger: None, self.path, self.state)
+        hl.update(lambda ledger: None, path=self.path, state_dir=self.state)
         with open(self.marker, encoding="utf-8") as handle:
             self.assertEqual(handle.read().strip(), self.state)
 
     def test_concurrent_updates_all_land(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         errors = []
 
         def work(index):
@@ -190,8 +214,8 @@ class LedgerFile(LedgerCase):
                             {"name": f"desk-{index}", "claimed_at": 0.0},
                         ],
                     },
-                    self.path,
-                    self.state,
+                    path=self.path,
+                    state_dir=self.state,
                 )
             except Exception as exc:  # pragma: no cover - fails the test below
                 errors.append(exc)
@@ -267,7 +291,7 @@ class TimedLock(LedgerCase):
         self.patch_lock_seams(_ContendedFlock(None), clock)
         change = mock.Mock(side_effect=lambda ledger: ledger)
         with self.assertRaises(hl.LedgerLocked) as caught:
-            hl.update(change, self.path, self.state, timeout=hl.LOCK_TIMEOUT_S)
+            hl.update(change, path=self.path, state_dir=self.state, timeout=hl.LOCK_TIMEOUT_S)
         self.assertIn("try later", str(caught.exception))
         self.assertEqual(hl.LedgerLocked.exit_code, 75)
         change.assert_not_called()
@@ -289,13 +313,13 @@ class TimedLock(LedgerCase):
 
         self.patch_lock_seams(bad_flock, clock)
         with self.assertRaises(hl.LedgerError) as caught:
-            hl.update(lambda ledger: ledger, self.path, self.state)
+            hl.update(lambda ledger: ledger, path=self.path, state_dir=self.state)
         self.assertEqual(hl.LedgerError.exit_code, 4)
         self.assertIn(self.path, str(caught.exception))
         self.assertEqual(clock.sleeps, [])
 
     def test_a_lock_held_by_a_thread_blocks_then_lands(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         entered = threading.Event()
         release = threading.Event()
 
@@ -304,13 +328,17 @@ class TimedLock(LedgerCase):
             self.assertTrue(release.wait(timeout=10))
             return ledger
 
-        first = threading.Thread(target=hl.update, args=(slow, self.path, self.state), daemon=True)
+        first = threading.Thread(
+            target=hl.update,
+            kwargs={"change": slow, "path": self.path, "state_dir": self.state},
+            daemon=True,
+        )
         first.start()
         self.assertTrue(entered.wait(timeout=10))
         timer = threading.Timer(0.5, release.set)
         timer.start()
         try:
-            hl.update(lambda ledger: ledger, self.path, self.state)
+            hl.update(lambda ledger: ledger, path=self.path, state_dir=self.state)
         finally:
             timer.cancel()
         first.join(timeout=10)
@@ -320,26 +348,32 @@ class TimedLock(LedgerCase):
 
 class Guard(LedgerCase):
     def test_ensure_creates_the_ledger_and_marks_the_state_dir(self):
-        ledger = hl.ensure(self.state, self.path)
+        ledger = hl.ensure(state_dir=self.state, path=self.path)
         self.assertEqual(ledger, hl.empty())
         self.assertEqual(hl.load(self.path), hl.empty())
         with open(self.marker, encoding="utf-8") as handle:
             self.assertEqual(handle.read().strip(), self.state)
 
     def test_ensure_with_a_matching_marker_reads_the_ledger(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         out = hl.update(
             lambda ledger: {**ledger, "host_budget": {"cpu_m": 1}},
-            self.path,
-            self.state,
+            path=self.path,
+            state_dir=self.state,
         )
-        self.assertEqual(hl.ensure(self.state, self.path), out)
+        self.assertEqual(hl.ensure(state_dir=self.state, path=self.path), out)
+
+    def test_a_trailing_slash_state_dir_matches_itself(self):
+        hl.ensure(state_dir=self.state + "/", path=self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
+        with open(self.marker, encoding="utf-8") as handle:
+            self.assertEqual(handle.read().strip(), self.state)
 
     def test_ensure_with_a_foreign_state_dir_refuses_with_4(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         before = self.read()
         with self.assertRaises(hl.StateDirError) as caught:
-            hl.ensure(OTHER, self.path)
+            hl.ensure(state_dir=OTHER, path=self.path)
         message = str(caught.exception)
         self.assertIn(self.state, message)
         self.assertIn(OTHER, message)
@@ -350,15 +384,15 @@ class Guard(LedgerCase):
             self.assertEqual(handle.read().strip(), self.state)
 
     def test_update_with_a_foreign_state_dir_calls_no_change(self):
-        hl.ensure(self.state, self.path)
+        hl.ensure(state_dir=self.state, path=self.path)
         change = mock.Mock(side_effect=lambda ledger: ledger)
         with self.assertRaises(hl.StateDirError):
-            hl.update(change, self.path, OTHER)
+            hl.update(change, path=self.path, state_dir=OTHER)
         change.assert_not_called()
 
     def test_a_ledger_without_a_marker_adopts_the_callers_state_dir(self):
         self.write(json.dumps(hl.empty()))
-        self.assertEqual(hl.ensure(self.state, self.path), hl.empty())
+        self.assertEqual(hl.ensure(state_dir=self.state, path=self.path), hl.empty())
         with open(self.marker, encoding="utf-8") as handle:
             self.assertEqual(handle.read().strip(), self.state)
 
@@ -366,7 +400,7 @@ class Guard(LedgerCase):
         with open(self.marker, "w", encoding="utf-8") as handle:
             handle.write(OTHER)
         with self.assertRaises(hl.StateDirError):
-            hl.ensure(self.state, self.path)
+            hl.ensure(state_dir=self.state, path=self.path)
         self.assertFalse(os.path.exists(self.path))
 
 

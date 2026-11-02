@@ -207,13 +207,97 @@ def spawn_lock():
 # ------------------------------------------------------------ starting
 
 
-def unit_argv(unit, workdir, session_dir, command, env, runtime_max_s):
+#: The host-wide slice holding every project's share (MemoryMax, CPUQuota).
+HOST_SLICE = "corral.slice"
+
+#: The controllers a budget needs. Every launch with a host budget refuses
+#: when one is not delegated; see `delegated_controllers`.
+REQUIRED_CONTROLLERS = ("cpu", "memory", "pids")
+
+#: Controllers corral sets no property for. An absent one is silently
+#: skipped by `unit_argv`; it never refuses a launch.
+OPTIONAL_CONTROLLERS = ("cpuset", "io")
+
+
+def _limit(value, name):
+    """The numeric limit, or None when unset; a bad limit is a usage error.
+
+    None and zero read as unset: an unpriced role costs nothing and sets
+    no property. Anything else must be a positive number.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise UnitsError(f"{name} {value!r} must be a positive number")
+    if value == 0:
+        return None
+    if value < 0:
+        raise UnitsError(f"{name} {value!r} must be a positive number")
+    return value
+
+
+def _memory_prop(value):
+    return f"--property=MemoryMax={value:g}M"
+
+
+def _cpu_prop(value):
+    return f"--property=CPUQuota={value / 10:g}%"
+
+
+def _tasks_prop(value):
+    return f"--property=TasksMax={value:g}"
+
+
+def _limit_props(memory_max, cpu_quota, tasks_max):
+    """The `(controller, property)` lines for the set limits, in argv order."""
+    props = []
+    for value, controller, render, label in (
+        (memory_max, "memory", _memory_prop, "memory_max"),
+        (cpu_quota, "cpu", _cpu_prop, "cpu_quota"),
+        (tasks_max, "pids", _tasks_prop, "tasks_max"),
+    ):
+        limit = _limit(value, label)
+        if limit is not None:
+            props.append((controller, render(limit)))
+    return props
+
+
+def _classify(tail):
+    """The start-like failure bucket for a stderr tail: exists, unreachable or failed."""
+    low = tail.lower()
+    if "already exists" in low or "already loaded" in low:
+        return "exists"
+    if "failed to connect to bus" in low or "no medium found" in low:
+        return "unreachable"
+    return "failed"
+
+
+def unit_argv(
+    unit,
+    workdir,
+    session_dir,
+    command,
+    env,
+    runtime_max_s,
+    *,
+    slice=None,
+    memory_max=None,
+    cpu_quota=None,
+    tasks_max=None,
+    controllers=None,
+):
     """The `systemd-run --user` argv that starts `command` as a transient unit.
 
     stdout and stderr append to the session's out.log and err.log. `env` is
     `K=V` strings, or a mapping; each item becomes one `--setenv`. PATH and
     HOME are passed through explicitly. The command is a program and its
     arguments; a first element that is an option is refused.
+
+    `slice` places the unit in a slice, and the limits cap it through the
+    kernel: memory megabytes, CPU millicores (as a quota percent), and
+    pids. An unset or zero limit sets no property. `controllers`, when
+    given, is the delegated controller set: a limit whose controller is
+    not in it is skipped, and unknown names are ignored.
     """
     _check_int(runtime_max_s, "runtime_max_s", 1)
     command = list(command)
@@ -223,6 +307,16 @@ def unit_argv(unit, workdir, session_dir, command, env, runtime_max_s):
         items = [f"{key}={value}" for key, value in env.items()]
     else:
         items = list(env)
+    extra = []
+    if slice is not None:
+        if not isinstance(slice, str) or not slice:
+            raise UnitsError(f"slice {slice!r} must be a non-empty slice name")
+        extra.append(f"--property=Slice={slice}")
+    available = None if controllers is None else set(controllers)
+    for controller, prop in _limit_props(memory_max, cpu_quota, tasks_max):
+        if available is not None and controller not in available:
+            continue
+        extra.append(prop)
     return [
         "systemd-run",
         "--user",
@@ -232,12 +326,108 @@ def unit_argv(unit, workdir, session_dir, command, env, runtime_max_s):
         f"--property=RuntimeMaxSec={runtime_max_s}",
         f"--property=StandardOutput=append:{os.path.join(session_dir, 'out.log')}",
         f"--property=StandardError=append:{os.path.join(session_dir, 'err.log')}",
+        *extra,
         f"--working-directory={workdir}",
         f"--setenv=PATH={os.environ.get('PATH', '/usr/bin:/bin')}",
         f"--setenv=HOME={os.path.expanduser('~')}",
         *[f"--setenv={item}" for item in items],
         *command,
     ]
+
+
+def project_slice(project):
+    """`corral-<project>.slice`: the slice holding one project's agents.
+
+    The host slice parents it; the project's agent units run inside it.
+    """
+    if not isinstance(project, str) or not _PREFIX.fullmatch(project):
+        raise UnitsError(f"project {project!r} cannot name a slice")
+    return f"corral-{project}.slice"
+
+
+def controllers_path(uid=None):
+    """The user slice's `cgroup.controllers` file: what the manager may enforce with."""
+    if uid is None:
+        uid = os.getuid()
+    return f"/sys/fs/cgroup/user.slice/user-{uid}.slice/cgroup.controllers"
+
+
+def read_controllers(path=None, *, read=None):
+    """The controllers delegated to the user slice, as a frozenset of names.
+
+    `read(path)` is the injected file seam; the default reads the real
+    file. An unreadable file raises UnitsError: without proof of
+    delegation the launch refuses rather than running unlimited.
+    """
+    target = path or controllers_path()
+    try:
+        text = read(target) if read is not None else open(target, encoding="utf-8").read()
+    except OSError as err:
+        raise UnitsError(f"cannot read the delegated controllers at {target}: {err}") from None
+    return frozenset(text.split())
+
+
+def check_controllers(available):
+    """Raise UnitsError naming every required controller missing from `available`."""
+    missing = [name for name in REQUIRED_CONTROLLERS if name not in set(available or ())]
+    if missing:
+        raise UnitsError(
+            f"the user slice does not delegate {', '.join(missing)} "
+            f"(see {controllers_path()}); the budget cannot be enforced"
+        )
+
+
+def delegated_controllers(path=None, *, read=None):
+    """The delegated controllers, requiring every required one.
+
+    Reads through `read_controllers` and refuses when a required
+    controller is missing. Optional controllers simply read as absent;
+    `unit_argv` skips the properties they would need.
+    """
+    available = read_controllers(path, read=read)
+    check_controllers(available)
+    return available
+
+
+def slice_argv(name, parent=None, *, memory_max=None, cpu_quota=None, tasks_max=None):
+    """The `systemd-run --user` argv creating one slice with its limits.
+
+    `/bin/true` exits at once and `--remain-after-exit` keeps the slice,
+    with its limits, around. Parents come first: the host slice, then
+    each project slice under it, then the agent unit. A name that is not
+    a `.slice` unit is refused, as is a bad limit.
+    """
+    if not isinstance(name, str) or not name.endswith(".slice") or name == ".slice":
+        raise UnitsError(f"slice name {name!r} is not a well-formed slice unit name")
+    argv = ["systemd-run", "--user", "--quiet", f"--unit={name}"]
+    if parent is not None:
+        argv.append(f"--slice={parent}")
+    argv.extend(prop for _controller, prop in _limit_props(memory_max, cpu_quota, tasks_max))
+    return [*argv, "--remain-after-exit", "/bin/true"]
+
+
+def ensure_slice(name, *, parent=None, memory_max=None, cpu_quota=None, tasks_max=None, run):
+    """Create one slice with its limits; an existing slice reads as created.
+
+    Parent slices are shared by every launch, so a slice that is already
+    loaded is success, not a race. Other failures map like `start`: an
+    unreachable bus is Unreachable (exit 3), and anything else, manager
+    text naming a refused property included, is UnitsError (exit 4).
+    `run` is required: slice creation is a write seam.
+    """
+    argv = slice_argv(name, parent, memory_max=memory_max, cpu_quota=cpu_quota, tasks_max=tasks_max)
+    try:
+        proc = run(argv, timeout=START_TIMEOUT_S)
+    except OSError as err:
+        raise UnitsError(f"cannot create slice {name}: {err}") from err
+    if proc.returncode != 0:
+        tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
+        bucket = _classify(tail)
+        if bucket == "exists":
+            return
+        if bucket == "unreachable":
+            raise Unreachable(f"cannot create slice {name}: {tail}")
+        raise UnitsError(f"cannot create slice {name}: {tail}")
 
 
 def start(argv, session_dir, unit, run=default_run):
@@ -258,10 +448,10 @@ def start(argv, session_dir, unit, run=default_run):
         raise UnitsError(f"cannot start {unit}: {err}") from err
     if proc.returncode != 0:
         tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
-        low = tail.lower()
-        if "already exists" in low or "already loaded" in low:
+        bucket = _classify(tail)
+        if bucket == "exists":
             raise UnitExists(f"{unit}: {tail}")
-        if "failed to connect to bus" in low or "no medium found" in low:
+        if bucket == "unreachable":
             raise Unreachable(f"cannot start {unit}: {tail}")
         raise UnitsError(f"cannot start {unit}: {tail}")
     try:

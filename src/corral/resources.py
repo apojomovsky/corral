@@ -339,6 +339,111 @@ def validate_limits(limits):
                 )
 
 
+def _caps(table, host, foreign_used, project):
+    """The fair-share caps and the total weight for `project`.
+
+    Each cap is the project's floor plus its weight of the remainder of
+    the host budget after every floor and the live foreign claims, with a
+    ceiling capping it. An unknown project splits the remainder at the
+    default weight. ``admit`` and ``share_cap`` both decide from here, so
+    the slice limits a launch sets match the numbers the verdict used.
+    """
+    weights = sum(entry.weight for entry in table.values())
+    if project not in table:
+        weights += 1.0
+    share = table.get(project, Share())
+    floors = {dim: sum(_floor(entry, dim) for entry in table.values()) for dim in DIMS}
+    caps = {}
+    for dim in DIMS:
+        remainder = _at(host, dim) - floors[dim] - _at(foreign_used, dim)
+        cap = _floor(share, dim) + max(0, remainder) * (share.weight / weights if weights else 0)
+        ceiling = _ceiling_of(share, dim)
+        caps[dim] = min(cap, ceiling) if ceiling is not None else cap
+    return caps, weights
+
+
+def join(base, shares, foreign=(), *, where):
+    """The limits with project shares and foreign claims filled in, validated.
+
+    `base` is the host part from ``config`` (host, roles, ``gone_s``);
+    `shares` maps project names to ``Share`` values, plain mappings, or
+    None (floor zero, default weight); `foreign` is the ledger's claim
+    list. A floor sum above the host budget raises ``SettingsError``
+    naming `where` (the host config file) and the ``[resources.host]``
+    key; any other malformed number raises ``LimitsError``. Both read as
+    exit 4 at the launch seam.
+    """
+    if not isinstance(base, Limits):
+        raise LimitsError(f"limits must be a Limits table, not {base!r}")
+    table = {}
+    for name, entry in dict(shares or {}).items():
+        table[name] = Share() if entry is None else _share(entry, f"project {name}")
+    host = None
+    if base.host is not None:
+        host = _usage(base.host, "host budget")
+        for dim in DIMS:
+            floors = sum(_floor(share, dim) for share in table.values())
+            if floors > _at(host, dim):
+                detail = ", ".join(
+                    f"{name}: {_floor(share, dim)}"
+                    for name, share in sorted(table.items())
+                    if _floor(share, dim)
+                )
+                raise settings.SettingsError(
+                    f"{where}: [resources.host] {dim} budget {_at(host, dim)} "
+                    f"is below project floors summing to {floors} ({detail})"
+                )
+    joined = Limits(
+        host=host,
+        projects=table,
+        roles=dict(base.roles),
+        foreign=list(foreign or []),
+        gone_s=base.gone_s,
+    )
+    validate_limits(joined)
+    return joined
+
+
+def share_cap(limits, project, now):
+    """`project`'s fair share now: its floor plus its weight of the remainder.
+
+    Ceilings cap it and live foreign claims shrink it, the same formula
+    ``admit`` enforces, so the project-slice limits a launch sets match
+    the numbers the verdict was decided from. None when no host budget
+    is configured, where the gate passes everything.
+    """
+    if not isinstance(limits, Limits):
+        if isinstance(limits, Mapping):
+            limits = Limits(
+                host=limits.get("host"),
+                projects=dict(limits.get("projects") or {}),
+                roles=dict(limits.get("roles") or {}),
+                foreign=list(limits.get("foreign") or []),
+                gone_s=limits.get("gone_s", DEFAULT_GONE_S),
+            )
+        else:
+            raise LimitsError(f"limits must be a Limits table, not {limits!r}")
+    now = _moment(now, "now")
+    gone_s = _moment(limits.gone_s, "gone_s")
+    if gone_s < 0:
+        raise LimitsError(f"gone_s {limits.gone_s!r} must be zero or more")
+    if limits.host is None:
+        return None
+    host = _usage(limits.host, "host budget")
+    table = {name: _share(entry, f"project {name}") for name, entry in limits.projects.items()}
+    foreign = [
+        _claim(entry, f"foreign claim {index}") for index, entry in enumerate(limits.foreign)
+    ]
+    live = _live_foreign(foreign, now, gone_s)
+    foreign_used = Usage(
+        cpu_m=sum(entry.cpu_m for entry in live),
+        memory_mb=sum(entry.memory_mb for entry in live),
+        pids=sum(entry.pids for entry in live),
+    )
+    caps, _weights = _caps(table, host, foreign_used, project)
+    return Usage(**caps)
+
+
 def _live_foreign(foreign, now, gone_s):
     """The claims no older than ``gone_s`` at ``now``."""
     return [entry for entry in foreign if now - entry.claimed_at <= gone_s]
@@ -425,6 +530,7 @@ def admit(request, charged, limits, now):
             )
     table = {name: _share(entry, f"project {name}") for name, entry in limits.projects.items()}
     share = table.get(request.project, Share())
+    caps, weights = _caps(table, host, foreign_used, request.project)
     ceiling_hit = next(
         (
             dim
@@ -445,16 +551,6 @@ def admit(request, charged, limits, now):
             used,
             cost,
         )
-    weights = sum(entry.weight for entry in table.values())
-    if request.project not in table:
-        weights += 1.0
-    floors = {dim: sum(_floor(entry, dim) for entry in table.values()) for dim in DIMS}
-    caps = {}
-    for dim in DIMS:
-        remainder = _at(host, dim) - floors[dim] - _at(foreign_used, dim)
-        cap = _floor(share, dim) + max(0, remainder) * (share.weight / weights if weights else 0)
-        ceiling = _ceiling_of(share, dim)
-        caps[dim] = min(cap, ceiling) if ceiling is not None else cap
     over_share = next((dim for dim in DIMS if _at(used, dim) + _at(cost, dim) > caps[dim]), None)
     if over_share is not None:
         return Verdict(
