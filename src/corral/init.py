@@ -162,6 +162,41 @@ def registration_name(root):
     return os.path.basename(root)
 
 
+def resolve_branch(detected, *, flag=None, sets=()):
+    """The effective `clone.default_branch`: the one fact `init` and `new` share.
+
+    An explicit `--default-branch` flag or `--set clone.default_branch=`
+    entry wins over detection; detection wins over the settings registry
+    default, so the two verbs agree when the default changes. A flag
+    conflicting with a differing `--set` entry is exit 4: two answers
+    for one fact.
+    """
+    from_sets = None
+    for raw in sets:
+        key, sep, value = raw.partition("=")
+        if sep and key == "clone.default_branch":
+            from_sets = _coerce(key, value)
+    if flag is not None and from_sets is not None and flag != from_sets:
+        raise InitError(
+            f"--default-branch {flag!r} conflicts with"
+            f" --set clone.default_branch={from_sets!r}: give one branch"
+        )
+    explicit = flag if flag is not None else from_sets
+    if explicit is not None:
+        if not isinstance(explicit, str):
+            raise InitError("internal: clone.default_branch is not a str setting")
+        return explicit
+    if detected is not None:
+        return detected
+    try:
+        default = settings.REGISTRY["clone.default_branch"].default
+    except KeyError:
+        raise InitError("internal: clone.default_branch is not registered") from None
+    if not isinstance(default, str) or not default:
+        raise InitError("internal: clone.default_branch has no usable default")
+    return default
+
+
 def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_path="."):
     """`(root, PlanInputs)` for the repository holding `path`.
 
@@ -182,12 +217,7 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
             raise InitError(f"--set {raw!r}: want key=value")
         overrides[key] = _coerce(key, value)
     name = project_name(root, git)
-    branch = detect.default_branch(root, git)
-    if branch is None:
-        fallback = settings.REGISTRY["clone.default_branch"].default
-        if not isinstance(fallback, str):
-            raise InitError("clone.default_branch has no usable default")
-        branch = fallback
+    branch = resolve_branch(detect.default_branch(root, git), sets=sets)
     command = test_cmd if test_cmd is not None else detect.test_command(root)
     if command is None:
         hint = detect.suggested_test_command(root)
@@ -202,6 +232,9 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
         "checks.test": command,
     }
     for key in TRIO:
+        if key == "clone.default_branch":
+            overrides.pop(key, None)
+            continue
         if key in overrides:
             value = overrides.pop(key)
             if not isinstance(value, str):
@@ -687,7 +720,7 @@ def run(opts, git=gc.git):
             sets=opts.sets,
             clone_path="." if not split else os.path.realpath(clone_root),
         )
-        return _apply(ops_root, clone_root, inputs, opts, git, split, ops_created, ops_fresh)
+        return apply(ops_root, clone_root, inputs, opts, git, split, ops_created, ops_fresh)
     except InitError as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
@@ -747,8 +780,13 @@ def _split_toml_change(toml_target, inputs):
     return current + sep + block, False
 
 
-def _apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops_fresh=False):
+def apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops_fresh=False):
     """Write everything `init` owns. Raises `InitError` on refusal.
+
+    Public so `new` can onboard through the same path in-process:
+    the same inputs, the same renderer, the same convergence.
+    `corral init` calls it after resolving the roots; `new` calls it
+    after scaffolding the tree.
 
     `ops_root` holds `corral.toml`, the overlay and the hooks; the clone
     holds only local git state in the split layout. Inline is the case
