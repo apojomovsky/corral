@@ -18,8 +18,9 @@ import time
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
 
-#: The document schema version, printed as `schema_version`.
-SCHEMA_VERSION = 1
+#: The document schema version, printed as `schema_version`. Version 2 adds
+#: the agent `profile` row field: the profile name recorded at launch.
+SCHEMA_VERSION = 2
 
 #: Sections whose `{"error"}` body marks the server degraded.
 #: The one owner of the section names; `serve` reads through this.
@@ -64,6 +65,7 @@ def _agent_row(entry, state):
         "number": held[1] if held else None,
         "runtime": entry.get("runtime"),
         "role": entry.get("role"),
+        "profile": entry.get("profile"),
         "model": entry.get("model"),
         "state": state,
         "started_at": entry.get("started_at"),
