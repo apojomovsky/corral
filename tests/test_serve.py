@@ -1691,17 +1691,22 @@ class ProjectsRoute(ServeCase):
             conn.close()
 
     def test_projects_lists_names_sorted(self):
-        found = [
-            projects.Project(
-                name="beta",
-                unit_prefix="beta-",
-                root="/tmp/beta",
-                eligibility="policy:register",
-            ),
-            projects.Project(name="alpha", unit_prefix="alpha-", root="/tmp/alpha"),
-        ]
-        server, _ = self.start_server(FakeBuilder(healthy_doc()), projects_fn=lambda: found)
-        self.assertEqual(self.get_json(server, "/v1/projects"), {"projects": ["alpha", "beta"]})
+        with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
+            directory = os.path.join(tmp, projects.PROJECTS_DIR)
+            os.makedirs(directory)
+            for name, extra in (
+                ("beta", 'eligibility = "policy:register"\n'),
+                ("alpha", ""),
+            ):
+                with open(os.path.join(directory, f"{name}.toml"), "w", encoding="utf-8") as handle:
+                    handle.write(
+                        f'name = "{name}"\nunit_prefix = "{name}-"\nroot = "/tmp/{name}"\n{extra}'
+                    )
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": tmp}):
+                server, _ = self.start_server(FakeBuilder(healthy_doc()))
+                self.assertEqual(
+                    self.get_json(server, "/v1/projects"), {"projects": ["alpha", "beta"]}
+                )
 
     def test_projects_missing_registry_is_an_empty_list(self):
         with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
