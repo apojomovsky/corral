@@ -448,38 +448,42 @@ def register_host(
     host_id: str,
     *,
     now: float,
-    address: str = "",
+    address: str | None = None,
     capacity: dict[str, Any] | None = None,
     constraints: dict[str, Any] | None = None,
 ) -> int:
     """Record a host's check-in: address, capacity, constraints, last sighting.
 
-    The host row is minted by ``add_host``; checking in under an
-    unknown id is ``HubError`` (exit 4), never an implicit mint.
-    Returns the current membership epoch so the host learns it on
-    every contact. One transaction.
+    The update is partial: only keys the caller passes are stored,
+    and absent columns stay untouched, so a renewals-only heartbeat
+    never wipes the address, capacity or constraints a previous
+    check-in reported. The host row is minted by ``add_host``;
+    checking in under an unknown id is ``HubError`` (exit 4), never
+    an implicit mint. Returns the current membership epoch so the
+    host learns it on every contact. One transaction.
     """
     name = _check_address(host_id) if isinstance(host_id, str) else host_id
     if not isinstance(name, str) or not name:
         raise HubError(f"hub host_id {host_id!r} must be a non-empty string")
-    address = _check_address(address)
-    stored_capacity = _check_mapping("capacity", capacity if capacity is not None else {})
-    stored_constraints = _check_mapping(
-        "constraints", constraints if constraints is not None else {}
-    )
+    updates = ["last_seen=?"]
+    values: list[Any] = [now]
+    if address is not None:
+        updates.append("address=?")
+        values.append(_check_address(address))
+    if capacity is not None:
+        updates.append("capacity=?")
+        values.append(json.dumps(_check_mapping("capacity", capacity), sort_keys=True))
+    if constraints is not None:
+        updates.append("constraints=?")
+        values.append(json.dumps(_check_mapping("constraints", constraints), sort_keys=True))
+    values.append(name)
     with _txn(conn):
         row = conn.execute("SELECT host_id FROM hosts WHERE host_id=?", (name,)).fetchone()
         if row is None:
             raise HubError(f"hub host {name!r} is not registered: add it first")
         conn.execute(
-            "UPDATE hosts SET address=?, capacity=?, constraints=?, last_seen=? WHERE host_id=?",
-            (
-                address,
-                json.dumps(stored_capacity, sort_keys=True),
-                json.dumps(stored_constraints, sort_keys=True),
-                now,
-                name,
-            ),
+            f"UPDATE hosts SET {', '.join(updates)} WHERE host_id=?",
+            tuple(values),
         )
         return membership_epoch(conn)
 
@@ -901,22 +905,33 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, receipt.as_dict())
 
     def _post_renew(
-        self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any]
+        self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any], caller: str
     ) -> None:
         if not self._valid_claim_body(body, want_epoch=True):
             self._send(400, {"error": "renew needs repo, number, agent, epoch and host_id"})
             return
+        repo, number = str(body["repo"]), int(body["number"])
+        if self._held_by_other(conn, repo, number, caller):
+            refused = self._refuse_foreign({"repo": repo, "number": number}, repo, number, caller)
+            self._send(409, {"error": refused["error"]})
+            return
         try:
             receipt = renew(
                 conn,
-                str(body["repo"]),
-                int(body["number"]),
+                repo,
+                number,
                 str(body["agent"]),
                 int(body["epoch"]),
                 now=server.clock(),
                 lease_ttl_s=server.lease_ttl_s,
             )
         except Conflict as err:
+            if self._held_by_other(conn, repo, number, caller):
+                refused = self._refuse_foreign(
+                    {"repo": repo, "number": number}, repo, number, caller
+                )
+                self._send(409, {"error": refused["error"]})
+                return
             self._send(409, {"error": str(err), "holder": err.holder})
         except HubError as err:
             self._send(400, {"error": str(err)})
@@ -954,9 +969,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
                 conn,
                 body["host_id"],
                 now=server.clock(),
-                address=body.get("address", ""),
-                capacity=body.get("capacity"),
-                constraints=body.get("constraints"),
+                **{key: body[key] for key in ("address", "capacity", "constraints") if key in body},
             )
         except HubError as err:
             self._send(400, {"error": str(err)})
@@ -1119,7 +1132,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             elif path == HEARTBEAT_PATH:
                 self._post_heartbeat(server, conn, body, host)
             elif path == "/v1/claims/renew":
-                self._post_renew(server, conn, body)
+                self._post_renew(server, conn, body, host)
             elif path == "/v1/claims/release":
                 self._post_release(conn, body)
             else:
@@ -1167,10 +1180,10 @@ def _split_url(url: str) -> tuple[str, int]:
     """The `(host, port)` for a hub URL. The hub speaks plain HTTP only."""
     try:
         split = urllib.parse.urlsplit(url)
+        if split.scheme != "http" or not split.hostname or not split.port:
+            raise HubError(f"hub url {url!r} must be http://host:port")
     except ValueError as err:
         raise HubError(f"hub url {url!r} is not usable: {err}") from None
-    if split.scheme != "http" or not split.hostname or not split.port:
-        raise HubError(f"hub url {url!r} must be http://host:port")
     return split.hostname, split.port
 
 
@@ -1179,10 +1192,15 @@ def _post_json(
 ) -> dict[str, Any]:
     """POST one JSON body to the hub and return the decoded reply.
 
-    A refused connection (or any I/O failure) is ``HubUnreachable``
-    (exit 3): the caller keeps running held work and claims nothing
-    new. A decided reply (401, 400, 404) is ``HubError`` naming the
-    server's reason without echoing the token.
+    Only the register and heartbeat clients (``push_register``,
+    ``push_heartbeat``) use this helper: claim proposals handle
+    their own 409 answers, so the mapping here is not for them. A
+    ``200`` with a JSON object body is returned decoded. A refused
+    connection, any I/O failure, or a malformed or dropped reply is
+    ``HubUnreachable`` (exit 3): the caller keeps running held work
+    and claims nothing new. A decided reply (401, 400, 404, 405,
+    500) is ``HubError`` naming the server's reason without echoing
+    the token.
     """
     host, port = _split_url(url)
     raw = json.dumps(payload).encode("utf-8")
@@ -1201,7 +1219,7 @@ def _post_json(
             )
             response = conn.getresponse()
             body = response.read()
-        except OSError as err:
+        except (OSError, http.client.HTTPException) as err:
             raise HubUnreachable(f"hub at {url} is unreachable: {err}") from None
     finally:
         conn.close()
@@ -1252,20 +1270,26 @@ def push_heartbeat(
     *,
     renewals: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
     snapshot: dict[str, Any] | None = None,
+    address: str | None = None,
     capacity: dict[str, Any] | None = None,
     constraints: dict[str, Any] | None = None,
     timeout: float = 10,
 ) -> dict[str, Any]:
     """One call per heartbeat interval: renewals beside the snapshot.
 
-    Returns the hub reply: the membership epoch plus one
-    granted-or-refused answer per renewal entry. A refused renewal
-    (``ok`` false) never raises here: the caller stops the ticket's
-    units and drops its local claim, exactly like the reconnect rule.
+    Only keys the caller passes travel: omitted address, capacity
+    and constraints leave the hub's stored columns untouched, so a
+    renewals-only heartbeat never wipes them. Returns the hub reply:
+    the membership epoch plus one granted-or-refused answer per
+    renewal entry. A refused renewal (``ok`` false) never raises
+    here: the caller stops the ticket's units and drops its local
+    claim, exactly like the reconnect rule.
     """
     payload: dict[str, Any] = {"host_id": host_id, "renewals": list(renewals)}
     if snapshot is not None:
         payload["snapshot"] = snapshot
+    if address is not None:
+        payload["address"] = address
     if capacity is not None:
         payload["capacity"] = capacity
     if constraints is not None:

@@ -868,7 +868,7 @@ class RenewReleaseRouteTest(ServerCase):
         status, granted = self.propose(agent="drive-bbb", host="host-2", token=self.token_b)
         self.assertEqual(status, 200)
         self.assertEqual(granted["epoch"], 2)
-        status, payload = self.renew()
+        status, payload = self.renew(agent="drive-bbb", host="host-2", epoch=1, token=self.token_b)
         self.assertEqual(status, 409)
         self.assertEqual(payload["holder"]["agent"], "drive-bbb")
 
@@ -902,6 +902,26 @@ class RenewReleaseRouteTest(ServerCase):
         self.assertEqual(status, 401)
         status, _ = self.release(host="host-2", token=self.token_a)
         self.assertEqual(status, 401)
+
+    def test_renew_of_another_hosts_claim_is_409_without_a_holder(self):
+        _, granted = self.propose(agent="drive-bbb", host="host-2", token=self.token_b)
+        before = granted["lease_expires"]
+        status, payload = self.renew(
+            agent="drive-bbb", host="host-1", epoch=granted["epoch"], token=self.token_a
+        )
+        self.assertEqual(status, 409)
+        self.assertNotIn("holder", payload)
+        self.assertNotIn("host-2", payload.get("error", ""))
+        self.assertNotIn("drive-bbb", payload.get("error", ""))
+        store = hub.open_db(self.db)
+        try:
+            row = store.execute(
+                "SELECT agent, lease_expires FROM claims WHERE repo=? AND number=?",
+                ("app", 7),
+            ).fetchone()
+        finally:
+            store.close()
+        self.assertEqual(tuple(row), ("drive-bbb", before))
 
     def test_bad_bodies_are_400(self):
         self.propose()

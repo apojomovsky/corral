@@ -18,6 +18,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 from corral import hub, settings
 from tests.test_hub import temp_db
@@ -374,6 +375,29 @@ class HeartbeatRouteTest(DashboardCase):
         self.assertEqual(by_id["host-1"]["capacity"], {"cpus": 2})
         self.assertEqual(by_id["host-1"]["constraints"], {"docker": False})
 
+    def test_renewals_only_heartbeat_keeps_the_stored_host_fields(self):
+        status, _ = self.call(
+            "POST",
+            "/v1/register",
+            {
+                "host_id": "host-1",
+                "address": "10.0.0.5:8000",
+                "capacity": {"cpus": 8},
+                "constraints": {"docker": True},
+            },
+            token=self.token_a,
+        )
+        self.assertEqual(status, 200)
+        self.clock[0] = 1030.0
+        status, payload = self.heartbeat()
+        self.assertEqual(status, 200)
+        status, payload = self.call("GET", "/v1/hosts", token=self.token_a)
+        by_id = {row["host_id"]: row for row in payload["hosts"]}
+        self.assertEqual(by_id["host-1"]["address"], "10.0.0.5:8000")
+        self.assertEqual(by_id["host-1"]["capacity"], {"cpus": 8})
+        self.assertEqual(by_id["host-1"]["constraints"], {"docker": True})
+        self.assertEqual(by_id["host-1"]["last_seen"], 1030.0)
+
     def test_heartbeat_needs_its_own_token(self):
         status, _ = self.heartbeat(host="host-2", token=self.token_a)
         self.assertEqual(status, 401)
@@ -560,6 +584,42 @@ class PushClientTest(DashboardCase):
         with self.assertRaises(hub.HubError):
             hub.push_heartbeat(self.url(), "wrong", "host-1")
 
+    def test_heartbeat_client_forwards_address_and_omits_absent_fields(self):
+        hub.push_register(
+            self.url(),
+            self.token_a,
+            "host-1",
+            address="10.0.0.5:8000",
+            capacity={"cpus": 8},
+            constraints={"docker": True},
+        )
+        hub.push_heartbeat(self.url(), self.token_a, "host-1", renewals=[])
+        status, payload = self.call("GET", "/v1/hosts", token=self.token_a)
+        by_id = {row["host_id"]: row for row in payload["hosts"]}
+        self.assertEqual(by_id["host-1"]["address"], "10.0.0.5:8000")
+        self.assertEqual(by_id["host-1"]["capacity"], {"cpus": 8})
+        self.assertEqual(by_id["host-1"]["constraints"], {"docker": True})
+        hub.push_heartbeat(self.url(), self.token_a, "host-1", renewals=[], address="10.0.0.9:8000")
+        status, payload = self.call("GET", "/v1/hosts", token=self.token_a)
+        by_id = {row["host_id"]: row for row in payload["hosts"]}
+        self.assertEqual(by_id["host-1"]["address"], "10.0.0.9:8000")
+
+    def test_malformed_reply_is_unreachable(self):
+        class Broken:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def request(self, *args, **kwargs):
+                raise http.client.BadStatusLine("bad line")
+
+            def close(self):
+                pass
+
+        with mock.patch("http.client.HTTPConnection", Broken):
+            with self.assertRaises(hub.HubUnreachable) as caught:
+                hub.push_heartbeat(self.url(), self.token_a, "host-1")
+        self.assertEqual(caught.exception.exit_code, 3)
+
 
 class SplitUrlTest(unittest.TestCase):
     def test_non_http_scheme_is_refused(self):
@@ -570,6 +630,11 @@ class SplitUrlTest(unittest.TestCase):
     def test_missing_port_is_refused(self):
         with self.assertRaises(hub.HubError) as caught:
             hub._split_url("http://host-1")
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_non_numeric_port_is_refused(self):
+        with self.assertRaises(hub.HubError) as caught:
+            hub._split_url("http://host-1:abc")
         self.assertEqual(caught.exception.exit_code, 4)
 
     def test_plain_http_url_splits(self):
