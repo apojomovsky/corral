@@ -92,8 +92,95 @@ main {
   max-width: 60rem;
 }
 
-main.stale #status-card {
+main.stale #status-card,
+main.stale #cards,
+main.stale #agents {
   background: var(--stale-bg);
+}
+
+#chips {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding: 0.5rem 1rem;
+  border-bottom: 1px solid var(--line);
+}
+
+#chips a {
+  flex: none;
+  padding: 0.5rem 1rem;
+  min-height: 44px;
+  line-height: 2;
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  text-decoration: none;
+}
+
+#chips a[aria-current="true"] {
+  border-color: var(--accent);
+  border-width: 2px;
+}
+
+#chips a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+#notice {
+  padding: 0.75rem 1rem;
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+#notice[hidden] {
+  display: none;
+}
+
+.card {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.card h2 {
+  margin: 0 0 0.5rem;
+  font-size: 1.1rem;
+}
+
+.card h3 {
+  margin: 0.75rem 0 0.25rem;
+  font-size: 1rem;
+}
+
+.card p {
+  margin: 0.25rem 0;
+}
+
+.card.error {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+.card ul,
+#agents ul {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+}
+
+.card li,
+#agents li {
+  margin: 0.25rem 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.bar svg {
+  display: inline-block;
+  vertical-align: middle;
+  margin-right: 0.5rem;
 }
 
 #token input {

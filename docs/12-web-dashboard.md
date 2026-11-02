@@ -996,7 +996,10 @@ token paste; wrong token; forget token; loopback no-token
 load; each view in light and dark OS themes; kill the server
 mid-view and watch the disconnected banner age honestly while
 polls back off 5, 15, 30, 60s; restart the server and watch the
-page recover without a reload; load the page with the server
+page recover without a reload; serve a snapshot that throws
+during rendering (a null resources share) and watch the loop
+survive with a could-not-draw notice over aging data; load the
+page with the server
 down and watch the never-connected banner retry instead of
 stranding on "connecting"; a host gone silent in hub mode showing
 stale, never dropping; upgrade the server under an open tab
