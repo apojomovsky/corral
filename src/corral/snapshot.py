@@ -1,7 +1,8 @@
 """`corral snapshot`: one read-only view of the host.
 
 Composes what already exists and adds no new state: the agent registry,
-the quota pool and ledger, the admission caps and the host disks. Every
+the quota pool and ledger, the admission caps, the resource charges, the
+host disks and the drive status. Every
 section is read independently, so one unreadable section errors while the
 rest still print. Exits 0 when the document printed (even with section
 errors), 3 when nothing at all could be read, 4 on a usage or settings
@@ -704,7 +705,7 @@ def add_parser(sub) -> None:
     """Register `snapshot` on the top-level subparsers."""
     p = sub.add_parser(
         "snapshot",
-        help="one read-only view of the host: agents, quota, capacity, disks and drive",
+        help="one read-only view of the host: agents, quota, capacity, resources, disks and drive",
     )
     p.add_argument("--json", action="store_true", help="print the stable machine-readable document")
     p.set_defaults(func=cmd_snapshot)
