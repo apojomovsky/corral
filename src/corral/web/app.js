@@ -1,19 +1,43 @@
 // Entry module: routing, view mounting, the poll loop.
 
 import {
-  fetchJson,
+  VERSION_CHECK_MS,
   forgetToken,
+  isSupportedApi,
+  isSupportedDocument,
   loadConfig,
+  loadSnapshot,
   loadToken,
   loadVersion,
   nextDelay,
   saveToken,
 } from "./api.js";
-import { hideToken, renderConnection, renderShell, showToken } from "./views.js";
+import { canonicalJson, stripVolatile } from "./fmt.js";
+import {
+  hideToken,
+  renderConnection,
+  renderOverview,
+  renderShell,
+  renderStopped,
+  showToken,
+} from "./views.js";
+
+// The document schema this shell renders. Newer documents proceed
+// (additive); older or missing ones render as unsupported. Pinned
+// by the suite against the server's own schema number.
+const EXPECTED_SCHEMA_VERSION = 2;
 
 let seenMs = null;
 let failures = 0;
 let timer = null;
+let lastDoc = null;
+let lastFingerprint = null;
+let lastProject = null;
+let lastNotice = null;
+let lastVersion = null;
+let lastVersionCheckMs = 0;
+let versionCheckForced = false;
+let outdated = false;
 
 function helpFor(mode) {
   if (mode === "hub") {
@@ -22,18 +46,83 @@ function helpFor(mode) {
   return "Paste the API token for this server. It lives in the host token file; mint one with corral serve --new-token.";
 }
 
-function currentRoute() {
+function projectFromHash() {
   const hash = window.location.hash || "#/";
-  if (hash === "#/" || hash.startsWith("#/?")) {
-    return { name: "overview" };
+  if (hash === "#/") {
+    return { name: "overview", project: null, notice: null };
   }
-  return { name: "unknown", hash };
+  if (hash.startsWith("#/?")) {
+    let project = null;
+    try {
+      const picked = new URLSearchParams(hash.slice(3)).get("project");
+      project = picked === null || picked === "" ? null : picked;
+    } catch {
+      project = null;
+    }
+    return { name: "overview", project, notice: null };
+  }
+  return {
+    name: "unknown",
+    project: null,
+    notice: "Unknown view " + hash + ", showing the overview.",
+  };
+}
+
+function renderCurrent() {
+  if (outdated || lastDoc === null) {
+    return false;
+  }
+  const route = projectFromHash();
+  lastProject = route.project;
+  lastNotice = route.notice;
+  renderOverview(lastDoc, { project: route.project, nowMs: Date.now(), notice: route.notice });
+  return true;
+}
+
+async function checkVersion(config, token, nowMs) {
+  if (!versionCheckForced && lastVersion !== null && nowMs - lastVersionCheckMs < VERSION_CHECK_MS) {
+    return true;
+  }
+  versionCheckForced = false;
+  let reply = null;
+  try {
+    reply = await loadVersion(token);
+  } catch {
+    reply = null;
+  }
+  if (reply && reply.status === 200 && reply.data) {
+    lastVersion = reply.data;
+    lastVersionCheckMs = nowMs;
+    if (!isSupportedApi(reply.data, config.api)) {
+      outdated = true;
+      renderStopped("This dashboard is out of date for this server, reload after upgrading.");
+      renderConnection({ live: true, seenMs: nowMs });
+      return false;
+    }
+    // A recheck after an upgrade resumes rendering on the next poll.
+    outdated = false;
+    return true;
+  }
+  // Any other outcome leaves the last version (or none) in place;
+  // the snapshot poll below decides the failure branch.
+  return true;
 }
 
 async function tick(config, token) {
+  const nowMs = Date.now();
+  let versionOk = true;
+  try {
+    versionOk = await checkVersion(config, token, nowMs);
+  } catch {
+    versionOk = true;
+  }
+  if (!versionOk) {
+    schedule(config, token);
+    return;
+  }
   let reply = null;
   try {
-    reply = await fetchJson("/v1/version", token);
+    reply = await loadSnapshot(token);
   } catch {
     reply = null;
   }
@@ -44,10 +133,40 @@ async function tick(config, token) {
     renderShell({
       mode: config.mode,
       api: config.api,
-      version: reply.data,
+      version: lastVersion,
       seenMs,
-      serverNowMs: typeof reply.data.now === "number" ? reply.data.now * 1000 : null,
+      serverNowMs:
+        typeof reply.data.now === "number"
+          ? reply.data.now * 1000
+          : typeof reply.data.fleet_header === "object" &&
+              reply.data.fleet_header !== null &&
+              typeof reply.data.fleet_header.now === "number"
+            ? reply.data.fleet_header.now * 1000
+            : null,
     });
+    if (!isSupportedDocument(reply.data, EXPECTED_SCHEMA_VERSION)) {
+      const value =
+        reply.data && typeof reply.data.schema_version === "number"
+          ? String(reply.data.schema_version)
+          : "missing";
+      renderStopped(
+        "Unsupported document schema " + value + ": reload after upgrading.",
+      );
+    } else {
+      const route = projectFromHash();
+      const fingerprint = canonicalJson(stripVolatile(reply.data));
+      if (
+        fingerprint !== lastFingerprint ||
+        route.project !== lastProject ||
+        route.notice !== lastNotice
+      ) {
+        lastDoc = reply.data;
+        lastFingerprint = fingerprint;
+        lastProject = route.project;
+        lastNotice = route.notice;
+        renderOverview(reply.data, { project: route.project, nowMs: seenMs, notice: route.notice });
+      }
+    }
     renderConnection({ live: true, seenMs });
   } else if (reply && reply.status === 401) {
     showToken({
@@ -115,10 +234,19 @@ function bindToken(config, setToken) {
     }
   });
   forget.addEventListener("click", () => {
-    forgetToken();
-    setToken(null);
-    input.value = "";
-    window.location.reload();
+    // A private-mode browser can refuse the remove: reloading then
+    // would resurrect the token through loadToken, so a failed
+    // forget says so on screen instead of reloading.
+    if (forgetToken()) {
+      setToken(null);
+      input.value = "";
+      window.location.reload();
+    } else {
+      showToken({
+        message:
+          "This device cannot forget this token, so it stays saved here. Clear this site's storage by hand to remove it.",
+      });
+    }
   });
   document.getElementById("token-btn").addEventListener("click", () => {
     const panel = document.getElementById("token");
@@ -145,7 +273,7 @@ async function boot() {
   }
   const config = configReply.data;
   let token = loadToken();
-  const route = currentRoute();
+  const route = projectFromHash();
   if (route.name === "unknown") {
     renderShell({ mode: config.mode, api: config.api, version: null, seenMs: Date.now() });
   }
@@ -154,11 +282,14 @@ async function boot() {
   });
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
+      versionCheckForced = true;
       void tick(config, token);
     }
   });
   window.addEventListener("hashchange", () => {
-    void tick(config, token);
+    if (!renderCurrent()) {
+      void tick(config, token);
+    }
   });
   await tick(config, token);
 }

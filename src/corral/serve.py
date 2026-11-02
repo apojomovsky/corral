@@ -125,6 +125,11 @@ STREAM_RETRY_AFTER_S = 1
 #: The generic 500 body: the detail goes to stderr, never the wire.
 UNAVAILABLE = "snapshot unavailable"
 
+#: The generic 500 body for the dashboard routes: kept distinct from
+#: `UNAVAILABLE` so an assets failure never sends the operator to
+#: snapshot debugging. The detail goes to stderr, never the wire.
+UI_UNAVAILABLE = "dashboard unavailable"
+
 #: The generic 401 body: the presented value is never logged.
 UNAUTHORIZED = "unauthorized"
 
@@ -647,12 +652,13 @@ class _Handler(BaseHTTPRequestHandler):
         """The dashboard shell: the asset table, exempt from auth.
 
         Exact table-key lookup only, so traversal shapes 404. An empty
-        table (the assets failed to load) degrades to the generic 500
-        while the API routes keep serving.
+        table (the assets failed to load) degrades to the dashboard
+        500 while the API routes keep serving.
         """
         state = self.server_state
         if not state.web_assets:
-            self._send_json(500, {"error": UNAVAILABLE})
+            print("corral serve: dashboard assets unavailable", file=sys.stderr)
+            self._send_json(500, {"error": UI_UNAVAILABLE})
             return
         path = urlsplit(self.path).path
         if path == webui.CONFIG_PATH:
