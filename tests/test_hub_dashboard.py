@@ -257,13 +257,29 @@ class RegisterRouteTest(DashboardCase):
             token=self.token_a,
         )
         self.assertEqual(status, 200)
-        self.assertEqual(payload, {"host_id": "host-1", "membership_epoch": 0})
+        self.assertEqual(
+            payload,
+            {
+                "api": hub.HUB_API,
+                "schema_version": hub.SCHEMA_VERSION,
+                "host_id": "host-1",
+                "membership_epoch": 0,
+            },
+        )
         status, payload = self.call("GET", "/v1/hosts", token=self.token_a)
         by_id = {row["host_id"]: row for row in payload["hosts"]}
         self.assertEqual(by_id["host-1"]["address"], "10.0.0.5:8000")
         self.assertEqual(by_id["host-1"]["capacity"], {"cpus": 8})
         self.assertEqual(by_id["host-1"]["constraints"], {"docker": True})
         self.assertTrue(by_id["host-1"]["reachable"])
+
+    def test_register_reply_carries_the_version_exchange(self):
+        status, payload = self.call(
+            "POST", "/v1/register", {"host_id": "host-1"}, token=self.token_a
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["api"], hub.HUB_API)
+        self.assertEqual(payload["schema_version"], hub.SCHEMA_VERSION)
 
     def test_register_needs_its_own_token(self):
         status, _ = self.call("POST", "/v1/register", {"host_id": "host-1"}, token=self.token_b)
@@ -309,6 +325,12 @@ class HeartbeatRouteTest(DashboardCase):
         finally:
             store.close()
         self.assertEqual(tuple(row), (1000.0, 1030.0))
+
+    def test_heartbeat_reply_carries_the_version_exchange(self):
+        status, payload = self.heartbeat()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["api"], hub.HUB_API)
+        self.assertEqual(payload["schema_version"], hub.SCHEMA_VERSION)
 
     def test_heartbeat_reports_a_lost_race_per_entry(self):
         _, granted = self.grant()
@@ -561,7 +583,12 @@ class PushClientTest(DashboardCase):
     def test_push_registers_and_heartbeats_through_the_client(self):
         self.assertEqual(
             hub.push_register(self.url(), self.token_a, "host-1", capacity={"cpus": 4}),
-            {"host_id": "host-1", "membership_epoch": 0},
+            {
+                "api": hub.HUB_API,
+                "schema_version": hub.SCHEMA_VERSION,
+                "host_id": "host-1",
+                "membership_epoch": 0,
+            },
         )
         doc = canned_doc("host-1", 1000.0, ["alpha"])
         reply = hub.push_heartbeat(self.url(), self.token_a, "host-1", renewals=[], snapshot=doc)
@@ -603,6 +630,36 @@ class PushClientTest(DashboardCase):
         status, payload = self.call("GET", "/v1/hosts", token=self.token_a)
         by_id = {row["host_id"]: row for row in payload["hosts"]}
         self.assertEqual(by_id["host-1"]["address"], "10.0.0.9:8000")
+
+    def test_posted_replies_are_version_checked(self):
+        class FakeResponse:
+            def __init__(self, status, payload):
+                self.status = status
+                self._payload = payload
+
+            def read(self):
+                return self._payload
+
+        def fake_connection(status, payload):
+            conn = mock.Mock()
+            conn.getresponse.return_value = FakeResponse(status, payload)
+            return conn
+
+        older = json.dumps({"api": hub.HUB_API - 1, "schema_version": hub.SCHEMA_VERSION}).encode()
+        with mock.patch("http.client.HTTPConnection", return_value=fake_connection(200, older)):
+            with self.assertRaises(hub.HubVersionError) as caught:
+                hub.push_heartbeat("http://127.0.0.1:9", "token", "host-1")
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertIn(str(hub.HUB_API - 1), str(caught.exception))
+        self.assertIn(str(hub.HUB_API), str(caught.exception))
+
+    def test_a_reply_without_versions_fails_closed(self):
+        conn = mock.Mock()
+        conn.getresponse.return_value.status = 200
+        conn.getresponse.return_value.read.return_value = b"{}"
+        with mock.patch("http.client.HTTPConnection", return_value=conn):
+            with self.assertRaises(hub.HubVersionError):
+                hub.push_register("http://127.0.0.1:9", "token", "host-1")
 
     def test_malformed_reply_is_unreachable(self):
         class Broken:

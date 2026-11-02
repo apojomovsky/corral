@@ -331,10 +331,12 @@ replaces per-host reads.
   only the fact, never the presented value.
   Constant-time comparison, read at call time, never stored in
   logs or settings.
-- Remote bind rules: the hub binds loopback by default. A
-  non-loopback bind is refused (exit 4) unless `--allow-remote` is
-  passed and every registered host has a token. Same refusal order
-  as `corral serve`.
+- Remote bind rules: the hub binds loopback by default. A bind
+  that is not loopback or private warns on stderr and keeps
+  serving (decision D2): only loopback, private addresses, and
+  `localhost` stay quiet; anything else warns and serving
+  continues. There is no `--allow-remote` flag and no bind
+  refusal: the operator knows best.
 - Leaked token: the operator runs
   `corral hub rotate-token --id <host>`; the old hash is replaced
   immediately, so the leaked token dies on the next request. The
@@ -428,7 +430,7 @@ on ephemeral ports and speak to them in-process.
 | Staleness: silent host keeps last rows with growing age and `stale` | fake clock, `received_at` assertions |
 | Clock skew shown, never compared: merge keeps per-host `now` | two canned documents with skewed clocks, byte comparison |
 | Token: missing or wrong bearer is `401` with nothing leaked; rotation kills old token only | capturing log handler, temp token store |
-| Bind refusal: non-loopback without `--allow-remote` is exit 4 | parser and validator, no listen |
+| Bind warning: a non-loopback, non-private bind warns on stderr and keeps serving | bind helper over loopback fixtures of known private, shared, and public addresses, no DNS |
 | Export and import preserve epochs; snapshots excluded | temp hub DB roundtrip |
 | Version mismatch is exit 4 naming both versions | canned version replies |
 | Import closure: hub client unreachable from host read paths | walk of read-path imports, as in `05-dashboard-api.md` section 7 |
