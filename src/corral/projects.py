@@ -77,6 +77,14 @@ def _count(value: object, what: str, path: str) -> int:
     return value
 
 
+#: The top-level keys a registration file may hold: exactly the ones
+#: ``_project`` reads below. Strict: any other key is an error naming the
+#: file and the key, never a silent default (a misspelled share header
+#: would otherwise load with no share).
+_PROJECT_KEYS = frozenset(
+    ("name", "unit_prefix", "root", "floor", "ceiling", "eligibility", "resources")
+)
+
 #: The keys a ``[resources]`` share table may hold: the remainder weight,
 #: per-dimension floors, and optional per-dimension ceilings. Strict: any
 #: other key is an error, never silently dropped.
@@ -150,6 +158,12 @@ def _share_table(raw: object, path: str) -> dict | None:
 def _project(stem: str, path: str, raw: object) -> Project:
     if not isinstance(raw, dict):
         raise _fail(path, "the file must hold a TOML table")
+    for key in raw:
+        if key not in _PROJECT_KEYS:
+            raise _fail(
+                path,
+                f"unknown key {key!r}: expected one of {', '.join(sorted(_PROJECT_KEYS))}",
+            )
     name = raw.get("name")
     if name != stem or not _plain(name):
         raise _fail(path, f"name {name!r} must equal the file stem {stem!r}")

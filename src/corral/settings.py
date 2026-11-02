@@ -509,8 +509,21 @@ def resolve(
     resource_tables = host.pop("resources", None)
     if not isinstance(limits, dict):
         raise SettingsError(f"{host_name}: [limits] must be a table")
-    for key, value in _flatten(host, host_name).items():
+    nested_gone = None
+    has_nested_gone = isinstance(resource_tables, dict) and "gone_s" in resource_tables
+    if has_nested_gone:
+        assert isinstance(resource_tables, dict)
+        resource_tables = dict(resource_tables)
+        nested_gone = resource_tables.pop("gone_s")
+        if not resource_tables:
+            resource_tables = None
+    flat_host = _flatten(host, host_name)
+    if has_nested_gone and "resources.gone_s" in flat_host:
+        raise SettingsError(f"{host_name}: resources.gone_s is set twice")
+    for key, value in flat_host.items():
         result[key] = Value(_check(key, value, host_name), HOST)
+    if has_nested_gone:
+        result["resources.gone_s"] = Value(_check("resources.gone_s", nested_gone, host_name), HOST)
 
     repos = project.pop("repo", [])
     chains = _check_models(project.pop("models", {}), project_name)

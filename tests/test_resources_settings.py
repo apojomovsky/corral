@@ -163,6 +163,45 @@ class GoneS(unittest.TestCase):
         with self.assertRaisesRegex(S.SettingsError, "resources.gone_s"):
             R.config(resolve(host={"resources.gone_s": -1}))
 
+    def test_gone_s_loads_from_the_nested_resources_table(self):
+        # tomllib nests `[resources] gone_s` under the resources table, so
+        # the nested dict (not the dotted flat form) is what real files give.
+        tables = resolve(host={"resources": {"gone_s": 60}})
+        self.assertEqual(tables["resources.gone_s"], 60)
+        self.assertIsNone(tables.resources)
+
+    def test_gone_s_loads_beside_the_host_and_role_tables(self):
+        import tomllib
+
+        parsed = tomllib.loads(
+            "[resources]\ngone_s = 60\n"
+            "[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        resolved = resolve(host=parsed, host_name="config.toml")
+        self.assertEqual(resolved["resources.gone_s"], 60)
+        assert resolved.resources is not None
+        self.assertEqual(resolved.resources.host, R.Usage(cpu_m=8000, memory_mb=16000, pids=4096))
+        self.assertEqual(resolved.resources.roles["worker"], R.Usage(cpu_m=1000, memory_mb=2048))
+
+    def test_a_nested_gone_s_beside_no_tables_reads_as_unset(self):
+        import tomllib
+
+        parsed = tomllib.loads("[resources]\ngone_s = 45\n")
+        resolved = resolve(host=parsed, host_name="config.toml")
+        self.assertEqual(resolved["resources.gone_s"], 45)
+        self.assertIsNone(resolved.resources)
+
+    def test_a_bad_nested_gone_s_names_the_key(self):
+        with self.assertRaisesRegex(S.SettingsError, r"config\.toml.*resources\.gone_s"):
+            resolve(host={"resources": {"gone_s": "60"}})
+        with self.assertRaisesRegex(S.SettingsError, "resources.gone_s"):
+            R.config(resolve(host={"resources": {"gone_s": -1}}))
+
+    def test_gone_s_set_twice_is_an_error(self):
+        with self.assertRaisesRegex(S.SettingsError, r"config\.toml.*set twice"):
+            resolve(host={"resources": {"gone_s": 60}, "resources.gone_s": 30})
+
 
 class DefaultsLeaveBehaviorUnchanged(unittest.TestCase):
     def test_an_unset_host_budget_passes_the_gate(self):
