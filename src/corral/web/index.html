@@ -25,6 +25,16 @@
 </section>
 <section id="cards" aria-label="fleet status"></section>
 <section id="agents" aria-label="agents"></section>
+<section id="detail" aria-label="agent detail" hidden>
+<p><a id="detail-back" href="#/">back to the overview</a></p>
+<div id="detail-fields" aria-label="agent fields"></div>
+<div id="tail-controls">
+<button id="tail-pause" type="button">tail: pause</button>
+<button id="tail-follow" type="button">follow: on</button>
+</div>
+<pre id="tail" aria-label="agent tail"></pre>
+<p id="tail-state" role="status"></p>
+</section>
 <section id="token" aria-label="api token" hidden>
 <h2>api token</h2>
 <p id="token-help">Paste the API token for this server, then save.</p>

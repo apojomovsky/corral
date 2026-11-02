@@ -1,24 +1,36 @@
 // Entry module: routing, view mounting, the poll loop.
 
 import {
+  TAIL_POLL_MS,
   VERSION_CHECK_MS,
   forgetToken,
+  hasTicket,
   isSupportedApi,
   isSupportedDocument,
   loadConfig,
   loadSnapshot,
+  loadTail,
   loadToken,
   loadVersion,
   nextDelay,
+  resolveAgent,
   saveToken,
 } from "./api.js";
 import { canonicalJson, stripVolatile } from "./fmt.js";
 import {
   hideToken,
   renderConnection,
+  renderDetail,
+  renderDetailMissing,
   renderOverview,
   renderShell,
   renderStopped,
+  renderTail,
+  renderTailButtons,
+  renderTailFailed,
+  renderTailLoading,
+  renderTailMissing,
+  renderTailPaused,
   showToken,
 } from "./views.js";
 
@@ -34,10 +46,19 @@ let lastDoc = null;
 let lastFingerprint = null;
 let lastProject = null;
 let lastNotice = null;
+let lastAgentKey = null;
 let lastVersion = null;
 let lastVersionCheckMs = 0;
 let versionCheckForced = false;
 let outdated = false;
+// The tail poll is its own loop beside the snapshot poll: one timer,
+// its own failure count, and operator state that survives polls.
+let tailTimer = null;
+let tailFailures = 0;
+let tailPaused = false;
+let tailFollow = true;
+let lastTailKey = null;
+let tailTarget = null;
 
 function helpFor(mode) {
   if (mode === "hub") {
@@ -46,10 +67,10 @@ function helpFor(mode) {
   return "Paste the API token for this server. It lives in the host token file; mint one with corral serve --new-token.";
 }
 
-function projectFromHash() {
+function routeFromHash() {
   const hash = window.location.hash || "#/";
   if (hash === "#/") {
-    return { name: "overview", project: null, notice: null };
+    return { name: "overview", project: null, notice: null, key: null };
   }
   if (hash.startsWith("#/?")) {
     let project = null;
@@ -59,23 +80,89 @@ function projectFromHash() {
     } catch {
       project = null;
     }
-    return { name: "overview", project, notice: null };
+    return { name: "overview", project, notice: null, key: null };
+  }
+  if (hash === "#/agent" || hash.startsWith("#/agent?")) {
+    let key = null;
+    try {
+      const query = hash.startsWith("#/agent?") ? hash.slice("#/agent?".length) : "";
+      const params = new URLSearchParams(query);
+      const id = params.get("id");
+      if (id !== null && id !== "") {
+        key = { kind: "id", id };
+      } else {
+        const repo = params.get("repo");
+        const number = params.get("number");
+        if (repo !== null && repo !== "" && number !== null && number !== "") {
+          const rawRole = params.get("role");
+          key = {
+            kind: "ticket",
+            repo,
+            number,
+            role: rawRole === null || rawRole === "" ? null : rawRole,
+          };
+        }
+      }
+    } catch {
+      key = null;
+    }
+    if (key !== null) {
+      return { name: "agent", project: null, notice: null, key };
+    }
   }
   return {
     name: "unknown",
     project: null,
     notice: "Unknown view " + hash + ", showing the overview.",
+    key: null,
   };
 }
 
-function renderCurrent() {
+// The row a detail key names, drawn, with the row for the tail poll.
+// A null row draws the miss notice; a throw leaves every cache and
+// the live page untouched for the caller to fall through.
+function drawAgentDetail(doc, key, nowMs) {
+  const row = resolveAgent(doc, key);
+  if (row === null) {
+    renderDetailMissing();
+    return null;
+  }
+  renderDetail(row, { nowMs });
+  return row;
+}
+
+function renderCurrent(config, token) {
   if (outdated || lastDoc === null) {
+    stopTail();
     return false;
   }
-  const route = projectFromHash();
+  const route = routeFromHash();
+  if (route.name === "agent") {
+    let row = null;
+    try {
+      row = drawAgentDetail(lastDoc, route.key, Date.now());
+    } catch {
+      return false;
+    }
+    // The cache updates only after a clean draw, so a throw above
+    // retries on the next poll instead of skipping.
+    lastAgentKey = canonicalJson(route.key);
+    lastProject = null;
+    lastNotice = null;
+    syncTailPoll(config, token, row);
+    return true;
+  }
+  try {
+    renderOverview(lastDoc, { project: route.project, nowMs: Date.now(), notice: route.notice });
+  } catch {
+    return false;
+  }
+  // The cache updates only after a clean draw, so a throw above
+  // retries on the next poll instead of skipping.
   lastProject = route.project;
   lastNotice = route.notice;
-  renderOverview(lastDoc, { project: route.project, nowMs: Date.now(), notice: route.notice });
+  lastAgentKey = null;
+  stopTail();
   return true;
 }
 
@@ -114,7 +201,134 @@ async function checkVersion(config, token, nowMs) {
 function enterStopped(message) {
   lastDoc = null;
   lastFingerprint = null;
+  lastAgentKey = null;
+  stopTail();
   renderStopped(message);
+}
+
+function stopTail() {
+  if (tailTimer !== null) {
+    window.clearTimeout(tailTimer);
+    tailTimer = null;
+  }
+  lastTailKey = null;
+  tailTarget = null;
+}
+
+function scheduleTail(config, token, delayMs) {
+  if (tailTimer !== null) {
+    window.clearTimeout(tailTimer);
+    tailTimer = null;
+  }
+  if (document.hidden || tailPaused || outdated) {
+    return;
+  }
+  tailTimer = window.setTimeout(() => {
+    void tickTail(config, token);
+  }, delayMs);
+}
+
+function tailAtBottom() {
+  const pane = document.getElementById("tail");
+  return pane.scrollHeight - pane.scrollTop - pane.clientHeight <= 8;
+}
+
+// Keeps the tail poll on its ticket: a new ticket clears the pane
+// and reloads at once, the same ticket re-arms a dead timer (after
+// a visibility return or a resume), anything else stops the loop.
+function syncTailPoll(config, token, row) {
+  if (row !== null && hasTicket(row)) {
+    const target = { repo: String(row.repo), number: String(row.number) };
+    const key = target.repo + "\n" + target.number;
+    tailTarget = target;
+    if (key !== lastTailKey) {
+      lastTailKey = key;
+      tailFailures = 0;
+      renderTailLoading();
+    }
+    if (tailTimer === null && !tailPaused && !document.hidden && !outdated) {
+      void tickTail(config, token);
+    }
+    return;
+  }
+  stopTail();
+}
+
+async function tickTail(config, token) {
+  tailTimer = null;
+  if (tailTarget === null || outdated || lastDoc === null) {
+    return;
+  }
+  const target = tailTarget;
+  try {
+    let reply = null;
+    try {
+      reply = await loadTail(token, target.repo, target.number);
+    } catch {
+      reply = null;
+    }
+    if (target !== tailTarget) {
+      return;
+    }
+    if (reply && reply.status === 200) {
+      tailFailures = 0;
+      const pinned = tailFollow && tailAtBottom();
+      renderTail(reply.text === null ? "" : reply.text);
+      if (pinned) {
+        const pane = document.getElementById("tail");
+        pane.scrollTop = pane.scrollHeight;
+      }
+    } else if (reply && reply.status === 404) {
+      // No session file yet (or any more): an answer, not a failure.
+      tailFailures = 0;
+      renderTailMissing();
+    } else {
+      tailFailures += 1;
+      renderTailFailed();
+    }
+  } catch {
+    tailFailures += 1;
+    renderTailFailed();
+  } finally {
+    if (target === tailTarget && tailTarget !== null) {
+      scheduleTail(config, token, tailFailures === 0 ? TAIL_POLL_MS : nextDelay(tailFailures));
+    }
+  }
+}
+
+function bindTailButtons(config, getToken) {
+  const pause = document.getElementById("tail-pause");
+  const follow = document.getElementById("tail-follow");
+  const pane = document.getElementById("tail");
+  renderTailButtons(tailPaused, tailFollow);
+  pause.addEventListener("click", () => {
+    tailPaused = !tailPaused;
+    renderTailButtons(tailPaused, tailFollow);
+    if (tailPaused) {
+      if (tailTimer !== null) {
+        window.clearTimeout(tailTimer);
+        tailTimer = null;
+      }
+      renderTailPaused(true);
+    } else {
+      renderTailPaused(false);
+      void tick(config, getToken());
+    }
+  });
+  follow.addEventListener("click", () => {
+    tailFollow = !tailFollow;
+    renderTailButtons(tailPaused, tailFollow);
+    if (tailFollow) {
+      pane.scrollTop = pane.scrollHeight;
+    }
+  });
+  pane.addEventListener("scroll", () => {
+    // Scrolling up disengages follow; only the button re-engages it.
+    if (tailFollow && !tailAtBottom()) {
+      tailFollow = false;
+      renderTailButtons(tailPaused, tailFollow);
+    }
+  });
 }
 
 async function tick(config, token) {
@@ -162,24 +376,41 @@ async function tick(config, token) {
           "Unsupported document schema " + value + ": reload after upgrading.",
         );
       } else {
-        const route = projectFromHash();
+        const route = routeFromHash();
         const fingerprint = canonicalJson(stripVolatile(reply.data));
+        const agentKeyText = route.name === "agent" ? canonicalJson(route.key) : null;
         if (
           fingerprint !== lastFingerprint ||
           route.project !== lastProject ||
-          route.notice !== lastNotice
+          route.notice !== lastNotice ||
+          agentKeyText !== lastAgentKey
         ) {
           // The cache updates only after a clean draw, so a throw
           // below retries on the next poll instead of skipping.
-          renderOverview(reply.data, { project: route.project, nowMs: seenMs, notice: route.notice });
+          if (route.name === "agent") {
+            drawAgentDetail(reply.data, route.key, seenMs);
+          } else {
+            renderOverview(reply.data, {
+              project: route.project,
+              nowMs: seenMs,
+              notice: route.notice,
+            });
+          }
           lastDoc = reply.data;
           lastFingerprint = fingerprint;
           lastProject = route.project;
           lastNotice = route.notice;
+          lastAgentKey = agentKeyText;
         }
+        syncTailPoll(
+          config,
+          token,
+          route.name === "agent" ? resolveAgent(reply.data, route.key) : null,
+        );
       }
       renderConnection({ live: true, seenMs });
     } else if (reply && reply.status === 401) {
+      stopTail();
       showToken({
         message: "This server needs a token.",
         help: helpFor(config.mode),
@@ -196,8 +427,9 @@ async function tick(config, token) {
     }
   } catch {
     // A render throw (a new server shape, an unexpected null) must
-    // never kill the loop: count it, keep the last good data under
-    // its age banner, and say the draw failed.
+    // never kill the loop: renders swap fully built trees, so the
+    // last good data stays in place under its age banner; count the
+    // failure and say the draw failed.
     failures += 1;
     renderConnection({ live: false, seenMs });
     const note = document.getElementById("notice");
@@ -243,6 +475,9 @@ function bindToken(config, setToken) {
       input.value = "";
       hideToken();
       failures = 0;
+      // The tail timer chain holds its own token closure: drop it so
+      // the tick below re-arms the tail on the pasted token.
+      stopTail();
       await tick(config, value);
       if (!kept) {
         showToken({
@@ -296,13 +531,14 @@ async function boot() {
   }
   const config = configReply.data;
   let token = loadToken();
-  const route = projectFromHash();
+  const route = routeFromHash();
   if (route.name === "unknown") {
     renderShell({ mode: config.mode, api: config.api, version: null, seenMs: Date.now() });
   }
   bindToken(config, (value) => {
     token = value;
   });
+  bindTailButtons(config, () => token);
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       versionCheckForced = true;
@@ -310,7 +546,7 @@ async function boot() {
     }
   });
   window.addEventListener("hashchange", () => {
-    if (!renderCurrent()) {
+    if (!renderCurrent(config, token)) {
       void tick(config, token);
     }
   });
