@@ -22,7 +22,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, paths, serve, settings, snapshot
+from corral import board, cli, hub, launch, paths, serve, settings, snapshot
 from tests.test_snapshot import (
     HOST,
     T0,
@@ -328,10 +328,27 @@ class ServerBinding(ServeCase):
 
 class ServerFamilyDedup(unittest.TestCase):
     def test_serve_and_hub_share_one_family_helper(self):
-        from corral import hub, netbind
+        from corral import netbind
 
         self.assertIs(serve.server_family, netbind.server_family)
         self.assertIs(hub.server_family, netbind.server_family)
+
+
+class ServerFamilyBehavior(unittest.TestCase):
+    def test_serve_binds_an_ipv6_literal_as_v6(self):
+        server = serve.make_server(build=FakeBuilder(healthy_doc()), bind="::1")
+        self.addCleanup(server.server_close)
+        import socket as _socket
+
+        self.assertEqual(server.address_family, _socket.AF_INET6)
+
+    def test_hub_binds_an_ipv6_literal_as_v6(self):
+        import socket as _socket
+
+        with tempfile.TemporaryDirectory(prefix="corral-serve-hub-") as tmp:
+            server = hub.make_server("::1", 0, os.path.join(tmp, "hub.sqlite"))
+            self.addCleanup(server.server_close)
+            self.assertEqual(server.address_family, _socket.AF_INET6)
 
 
 class MethodFallback(unittest.TestCase):
@@ -937,6 +954,375 @@ class CollectWiring(unittest.TestCase):
         self.assertEqual(
             kwargs["resources_view"]["charged"], {"cpu_m": 0, "memory_mb": 0, "pids": 0}
         )
+
+
+class SharedSections(unittest.TestCase):
+    def test_serve_uses_snapshots_section_names(self):
+        self.assertIs(serve.ERROR_SECTIONS, snapshot.ERROR_SECTIONS)
+
+
+class UnreadableTokenFailsClosed(unittest.TestCase):
+    def test_loopback_unreadable_token_is_a_usage_error(self):
+        case = ServeCommandTest()
+        with mock.patch.object(
+            serve, "read_token", side_effect=serve.ServeError("cannot read token file: denied")
+        ):
+            with mock.patch.object(
+                serve, "make_server", side_effect=AssertionError("must not bind")
+            ):
+                self.assertEqual(case.run_func([]), 4)
+
+
+class MintCleanup(unittest.TestCase):
+    def test_failed_mint_leaves_no_token_file(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-token-") as tmp:
+            target = os.path.join(tmp, "token")
+            with mock.patch.object(os, "chmod", side_effect=OSError("denied")):
+                with self.assertRaises(serve.ServeError):
+                    serve.mint_token(target)
+            self.assertFalse(os.path.exists(target))
+
+
+def stored_board(path, *itemspec, claims=()):
+    """A board store at `path` holding the given items; `claims` maps number to agent."""
+    store = board.open_store(path)
+    try:
+        for spec in itemspec:
+            item = board.Item(
+                repo=spec.get("repo", "app"),
+                number=spec["number"],
+                title=spec.get("title", f"Title {spec['number']}"),
+                state=spec.get("state", "open"),
+                author="alice",
+                labels=list(spec.get("labels", [])),
+                fetched_at=spec.get("fetched_at", T0),
+            )
+            store.upsert_item(item, operators=["alice"], now=spec.get("fetched_at", T0))
+        for number, agent in claims:
+            store.claim("app", number, agent, "host-1", now=T0)
+    finally:
+        store.close()
+
+
+class BoardView(ServeCase):
+    def open_store(self, tmp, *itemspec, claims=()):
+        stored_board(os.path.join(tmp, "board.sqlite"), *itemspec, claims=claims)
+        return lambda: board.open_store(os.path.join(tmp, "board.sqlite"))
+
+    def get_json(self, server, target):
+        status, headers, body = self.fetch(server, "GET", target)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "application/json")
+        return json.loads(body)
+
+    def test_board_lists_rows_oldest_first(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_store(
+                tmp,
+                {"number": 7, "fetched_at": T0 + 20},
+                {"number": 3, "fetched_at": T0 + 10},
+            )
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            payload = self.get_json(server, "/v1/board")
+            self.assertEqual(payload["now"], T0)
+            self.assertEqual([row["number"] for row in payload["board"]], [3, 7])
+            row = payload["board"][0]
+            self.assertEqual(row["repo"], "app")
+            self.assertEqual(row["confidence"], board.CONFIRMED)
+            self.assertEqual(row["fetched_at"], T0 + 10)
+            self.assertTrue(row["fresh"])
+            self.assertIsNone(row["claim"])
+
+    def test_board_filters_reach_the_store(self):
+        seen = []
+
+        class FakeStore:
+            def items(self, repo=None, state=None, label=None):
+                seen.append((repo, state, label))
+                return []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=lambda: FakeStore())
+        payload = self.get_json(server, "/v1/board?repo=app&state=open&label=ready")
+        self.assertEqual(payload["board"], [])
+        self.assertEqual(seen, [("app", "open", "ready")])
+
+    def test_board_reports_confidence_freshness_and_claims(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_store(
+                tmp,
+                {"number": 7, "fetched_at": T0},
+                {"number": 9, "fetched_at": T0 - 100},
+                claims=[(7, "agent-1")],
+            )
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            payload = self.get_json(server, "/v1/board?max_age=10")
+            by_number = {row["number"]: row for row in payload["board"]}
+            self.assertTrue(by_number[7]["fresh"])
+            self.assertFalse(by_number[9]["fresh"])
+            claim = by_number[7]["claim"]
+            self.assertEqual(
+                claim,
+                {"agent": "agent-1", "host": "host-1", "epoch": 1, "claimed_at": T0},
+            )
+            self.assertIsNone(by_number[9]["claim"])
+            self.assertEqual(by_number[7]["agent"], "agent-1")
+
+    def test_board_captures_one_now_per_request(self):
+        ticks = [T0]
+
+        def clock():
+            ticks[0] += 1
+            return float(ticks[0])
+
+        nows = []
+
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            stored_board(
+                os.path.join(tmp, "board.sqlite"),
+                {"number": 7, "fetched_at": T0},
+                {"number": 9, "fetched_at": T0},
+            )
+            path = os.path.join(tmp, "board.sqlite")
+
+            class RecordingStore:
+                def items(self, repo=None, state=None, label=None):
+                    return self.real.items(repo=repo, state=state, label=label)
+
+                def item(self, repo, number, *, now, max_age=None):
+                    nows.append(now)
+                    return self.real.item(repo, number, now=now, max_age=max_age)
+
+                def claim_of(self, repo, number):
+                    return self.real.claim_of(repo, number)
+
+                def __enter__(self):
+                    self.real = board.open_store(path)
+                    return self
+
+                def __exit__(self, *exc):
+                    self.real.close()
+                    return False
+
+            server, _ = self.start_server(
+                FakeBuilder(healthy_doc()),
+                board_open=RecordingStore,
+                clock=clock,
+            )
+            payload = self.get_json(server, "/v1/board?max_age=30")
+            self.assertEqual(len(nows), 2)
+            self.assertEqual(nows[0], nows[1])
+            self.assertEqual(payload["now"], nows[0])
+
+    def test_board_without_a_store_is_a_json_error(self):
+        def boom():
+            raise board.StoreError("gone")
+
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=boom)
+        status, _, body = self.fetch(server, "GET", "/v1/board")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "board unavailable"})
+
+    def open_many(self, tmp, count):
+        specs = [{"number": n, "fetched_at": T0 + n} for n in range(1, count + 1)]
+        return self.open_store(tmp, *specs)
+
+    def test_board_defaults_to_the_first_100_with_total(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 250)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            payload = self.get_json(server, "/v1/board")
+            self.assertEqual(payload["total"], 250)
+            self.assertEqual(payload["limit"], 100)
+            self.assertEqual(payload["offset"], 0)
+            self.assertEqual([row["number"] for row in payload["board"]], list(range(1, 101)))
+
+    def test_board_limit_clamps_at_the_maximum(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 250)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            payload = self.get_json(server, "/v1/board?limit=5000")
+            self.assertEqual(payload["limit"], 1000)
+            self.assertEqual(payload["total"], 250)
+            self.assertEqual(payload["offset"], 0)
+            self.assertEqual(len(payload["board"]), 250)
+
+    def test_board_pages_cover_every_row_exactly_once(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 250)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            seen = []
+            offset = 0
+            while True:
+                payload = self.get_json(server, f"/v1/board?limit=100&offset={offset}")
+                self.assertEqual(payload["total"], 250)
+                self.assertEqual(payload["limit"], 100)
+                self.assertEqual(payload["offset"], offset)
+                seen.extend(row["number"] for row in payload["board"])
+                if len(payload["board"]) < 100:
+                    break
+                offset += 100
+            self.assertEqual(sorted(seen), list(range(1, 251)))
+            self.assertEqual(len(seen), 250)
+
+    def test_board_bad_paging_is_a_400(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 3)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            for target in (
+                "/v1/board?limit=many",
+                "/v1/board?limit=-1",
+                "/v1/board?offset=many",
+                "/v1/board?offset=-3",
+            ):
+                with self.subTest(target=target):
+                    status, _, body = self.fetch(server, "GET", target)
+                    self.assertEqual(status, 400, target)
+                    self.assertIn("error", json.loads(body))
+
+
+class FilteredViews(ServeCase):
+    def test_agents_view_matches_the_snapshot_sections(self):
+        doc = healthy_doc()
+        server, _ = self.start_server(FakeBuilder(doc))
+        status, _, body = self.fetch(server, "GET", "/v1/agents")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            json.loads(body), {"fleet_header": doc["fleet_header"], "agents": doc["agents"]}
+        )
+
+    def test_quota_capacity_and_disks_carry_now(self):
+        doc = healthy_doc()
+        server, _ = self.start_server(FakeBuilder(doc))
+        for target, section in (
+            ("/v1/quota", "quota"),
+            ("/v1/capacity", "capacity"),
+            ("/v1/disks", "disk"),
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body), {"now": T0, section: doc[section]})
+
+    def test_filtered_views_do_not_rebuild_per_section(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_server(builder)
+        self.fetch(server, "GET", "/v1/agents")
+        self.fetch(server, "GET", "/v1/quota")
+        self.assertEqual(builder.calls, 2)
+
+
+class FakeTail:
+    """An injected tail reader: canned text, recorded calls."""
+
+    def __init__(self, text="line one\nline two\n", error=None):
+        self.text = text
+        self.error = error
+        self.calls = []
+
+    def __call__(self, repo, number, last):
+        self.calls.append((repo, number, last))
+        if self.error is not None:
+            raise self.error
+        return self.text
+
+
+class TailView(ServeCase):
+    def start(self, tail, **kwargs):
+        kwargs.setdefault("tail_fn", tail)
+        kwargs.setdefault("tail_max", 5)
+        return self.start_server(FakeBuilder(healthy_doc()), **kwargs)
+
+    def get_text(self, server, target):
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request("GET", target)
+            resp = conn.getresponse()
+            return resp.status, dict(resp.getheaders()), resp.read()
+        finally:
+            conn.close()
+
+    def test_tail_returns_plain_text(self):
+        tail = FakeTail("line one\nline two\n")
+        server, _ = self.start(tail)
+        status, headers, body = self.get_text(server, "/v1/tail?repo=app&number=7")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "text/plain; charset=utf-8")
+        self.assertEqual(body, b"line one\nline two\n")
+        self.assertEqual(tail.calls, [("app", 7, 5)])
+
+    def test_tail_last_is_clamped_not_refused(self):
+        tail = FakeTail()
+        server, _ = self.start(tail)
+        status, _, _ = self.get_text(server, "/v1/tail?repo=app&number=7&last=999")
+        self.assertEqual(status, 200)
+        self.assertEqual(tail.calls, [("app", 7, 5)])
+        tail.calls.clear()
+        status, _, _ = self.get_text(server, "/v1/tail?repo=app&number=7&last=2")
+        self.assertEqual(status, 200)
+        self.assertEqual(tail.calls, [("app", 7, 2)])
+
+    def test_tail_missing_ticket_is_404(self):
+        tail = FakeTail(error=launch.LaunchError("no session"))
+        server, _ = self.start(tail)
+        status, _, body = self.get_text(server, "/v1/tail?repo=app&number=7")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not found"})
+
+    def test_tail_unknown_repo_is_404(self):
+        tail = FakeTail(error=settings.SettingsError("unknown repo 'nosuch'"))
+        server, _ = self.start(tail)
+        status, _, body = self.get_text(server, "/v1/tail?repo=nosuch&number=1")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not found"})
+
+    def test_tail_needs_repo_number_and_a_valid_last(self):
+        tail = FakeTail()
+        server, _ = self.start(tail)
+        for target in (
+            "/v1/tail?repo=app",
+            "/v1/tail?number=7",
+            "/v1/tail?repo=app&number=seven",
+            "/v1/tail?repo=app&number=7&last=many",
+            "/v1/tail?repo=app&number=7&last=0",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.get_text(server, target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+        self.assertEqual(tail.calls, [])
+
+    def test_tail_failure_is_a_generic_500(self):
+        tail = FakeTail(error=OSError("gone"))
+        server, _ = self.start(tail)
+        status, _, body = self.get_text(server, "/v1/tail?repo=app&number=7")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "tail unavailable"})
+
+
+class ProductionTailWiring(unittest.TestCase):
+    def test_production_tail_reads_through_launch_without_the_ledger(self):
+        with (
+            mock.patch.object(launch, "target") as target,
+            mock.patch.object(launch, "tail") as tail,
+        ):
+            target.return_value = mock.sentinel.tgt
+
+            def fake(tgt, number, **kwargs):
+                self.assertIs(tgt, mock.sentinel.tgt)
+                kwargs["out"].write("line one\n")
+                self.assertEqual(kwargs["last"], 3)
+                self.assertEqual(kwargs["pool_fn"](), [])
+
+            tail.side_effect = fake
+            self.assertEqual(serve.read_tail("app", 7, 3), "line one\n")
+        target.assert_called_once()
 
 
 if __name__ == "__main__":

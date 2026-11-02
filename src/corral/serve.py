@@ -3,14 +3,17 @@
 S1 covers the request router, `GET /v1/snapshot` from `snapshot.build`,
 `/v1/version`, `/v1/health`, the JSON error shape and the 405/404 rules.
 S2 adds the `serve.*` settings, the token file, the bind rules, CORS and
-the `serve` verb. Every endpoint reads local files through one injected
-builder, so the API can never disagree with the CLI. No `gh`, no network,
-no service control in this module.
+the `serve` verb. S3 adds the filtered views: `/v1/agents`,
+`/v1/quota`, `/v1/capacity`, `/v1/disks`, `/v1/board` and `/v1/tail`.
+Every endpoint reads local files through injected readers, so the API
+can never disagree with the CLI. No `gh`, no network, no service
+control in this module.
 """
 
 import argparse
 import errno
 import hmac
+import io
 import ipaddress
 import json
 import os
@@ -20,10 +23,11 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
-from corral import settings, snapshot
+from corral import board, launch, settings, snapshot
 from corral.netbind import server_family
 
 OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
@@ -59,7 +63,14 @@ class ServeError(Exception):
 API_VERSION = 1
 
 #: Snapshot sections whose `{"error"}` body marks the server degraded.
-ERROR_SECTIONS = ("agents", "quota", "capacity", "resources", "disk", "drive")
+#: Read through `snapshot`, the one owner of the section names.
+ERROR_SECTIONS = snapshot.ERROR_SECTIONS
+
+#: Board rows one listing returns unless `?limit=` says otherwise.
+BOARD_LIMIT_DEFAULT = 100
+
+#: Board rows one listing never returns more than; a larger `?limit=` clamps.
+BOARD_LIMIT_MAX = 1000
 
 #: The generic 500 body: the detail goes to stderr, never the wire.
 UNAVAILABLE = "snapshot unavailable"
@@ -153,6 +164,10 @@ def mint_token(path: str) -> None:
             handle.write(secrets.token_hex(32) + "\n")
         os.chmod(path, 0o600)
     except OSError as err:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         raise ServeError(f"cannot mint token file {path}: {err}") from None
 
 
@@ -167,8 +182,57 @@ def token_file_warning(path: str) -> str | None:
     return None
 
 
+def read_tail(repo: str, number: int, last: int) -> str:
+    """The ticket's rendered activity lines, through `launch.tail`.
+
+    The production tail reader: resolves the repo target and returns the
+    same text `corral tail` prints. The quota pool is empty on purpose, so
+    a read never touches the quota ledger and the read-only promise holds.
+    Raises `launch.LaunchError` when the ticket has nothing to show.
+    """
+    root = settings.find_root(os.getcwd())
+    tgt = launch.target(root, repo)
+    out = io.StringIO()
+    launch.tail(tgt, number, last=last, out=out, pool_fn=lambda: [])
+    return out.getvalue()
+
+
+def _page_int(raw: str | None, name: str, default: int) -> tuple[int, str | None]:
+    """A validated paging parameter, or the 400 body when it is unusable.
+
+    Missing reads as `default`; above any maximum clamps at the call
+    site, never here. A non-integer or a negative is an error, never a
+    silent default: the poller must know its page is not what it asked.
+    """
+    if raw is None:
+        return default, None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default, f"{name} {raw!r} is not an integer"
+    if value < 0:
+        return default, f"{name} {raw!r} must be 0 or more"
+    return value, None
+
+
+def _board_row(item: board.Item, fresh: bool, claim: board.Claim | None) -> dict:
+    """One board row: the stored item, its freshness, and its holder."""
+    row = asdict(item)
+    row["fresh"] = fresh
+    if claim is None:
+        row["claim"] = None
+    else:
+        row["claim"] = {
+            "agent": claim.agent,
+            "host": claim.host,
+            "epoch": claim.epoch,
+            "claimed_at": claim.claimed_at,
+        }
+    return row
+
+
 class _State:
-    """One server's injected builder, clock, auth, CORS, and counters."""
+    """One server's injected builder, board, tail, clock, auth, CORS, and counters."""
 
     def __init__(
         self,
@@ -178,6 +242,9 @@ class _State:
         allowed_origins: tuple[str, ...] = (),
         token_required: bool = False,
         token_reader: Callable[[], str | None] | None = None,
+        board_open: Callable[[], board.Store] | None = None,
+        tail_fn: Callable[[str, int, int], str] | None = None,
+        tail_max: int = 200,
     ) -> None:
         self.build = build
         self.clock = clock
@@ -189,6 +256,9 @@ class _State:
         self.allowed_origins = tuple(allowed_origins)
         self.token_required = token_required
         self.token_reader = token_reader
+        self.board_open = board_open
+        self.tail_fn = tail_fn
+        self.tail_max = tail_max
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -231,6 +301,20 @@ class _Handler(BaseHTTPRequestHandler):
         for name, value in headers:
             self.send_header(name, value)
         self.end_headers()
+
+    def _send_text(self, code: int, text: str) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        echo = self._echo_origin()
+        if echo is not None:
+            self.send_header("Access-Control-Allow-Origin", echo)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _query(self) -> dict:
+        return dict(parse_qsl(urlsplit(self.path).query, keep_blank_values=True))
 
     def _authorized(self) -> bool:
         state = self.server_state
@@ -305,6 +389,108 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
 
+    def _serve_agents(self) -> None:
+        doc, error = self._read_doc()
+        if error is not None:
+            self._send_json(500, {"error": error})
+        else:
+            assert doc is not None  # _read_doc pairs a missing doc with an error
+            self._send_json(
+                200, {"fleet_header": doc.get("fleet_header"), "agents": doc.get("agents")}
+            )
+
+    def _serve_section(self, section: str) -> None:
+        now = self.server_state.clock()
+        doc, error = self._read_doc()
+        if error is not None:
+            self._send_json(500, {"error": error})
+        else:
+            assert doc is not None  # _read_doc pairs a missing doc with an error
+            self._send_json(200, {"now": now, section: doc.get(section)})
+
+    def _serve_board(self) -> None:
+        query = self._query()
+        repo = query.get("repo") or None
+        state = query.get("state") or None
+        label = query.get("label") or None
+        raw_age = query.get("max_age") or None
+        max_age = None
+        if raw_age is not None:
+            try:
+                max_age = float(raw_age)
+            except ValueError:
+                self._send_json(400, {"error": f"max_age {raw_age!r} is not seconds"})
+                return
+        limit, problem = _page_int(query.get("limit") or None, "limit", BOARD_LIMIT_DEFAULT)
+        if problem is None:
+            offset, problem = _page_int(query.get("offset") or None, "offset", 0)
+        else:
+            offset = 0
+        if problem is not None:
+            self._send_json(400, {"error": problem})
+            return
+        limit = min(limit, BOARD_LIMIT_MAX)
+        now = self.server_state.clock()
+        opener = self.server_state.board_open or board.open_store
+        try:
+            with opener() as store:
+                listed = store.items(repo=repo, state=state, label=label)
+                rows = []
+                for got in listed:
+                    item, fresh = store.item(got.repo, got.number, now=now, max_age=max_age)
+                    if item is None:
+                        continue
+                    rows.append(_board_row(item, fresh, store.claim_of(item.repo, item.number)))
+        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "board unavailable"})
+            return
+        self._send_json(
+            200,
+            {
+                "now": now,
+                "board": rows[offset : offset + limit],
+                "total": len(rows),
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+    def _serve_tail(self) -> None:
+        query = self._query()
+        repo = query.get("repo") or None
+        raw_number = query.get("number") or None
+        if repo is None or raw_number is None:
+            self._send_json(400, {"error": "tail needs ?repo= and ?number="})
+            return
+        try:
+            number = int(raw_number)
+        except ValueError:
+            self._send_json(400, {"error": f"number {raw_number!r} is not an integer"})
+            return
+        limit = self.server_state.tail_max
+        raw_last = query.get("last") or None
+        if raw_last is not None:
+            try:
+                limit = int(raw_last)
+            except ValueError:
+                self._send_json(400, {"error": f"last {raw_last!r} is not an integer"})
+                return
+            if limit < 1:
+                self._send_json(400, {"error": f"last {raw_last!r} must be 1 or more"})
+                return
+        limit = min(limit, self.server_state.tail_max)
+        reader = self.server_state.tail_fn or read_tail
+        try:
+            text = reader(repo, number, limit)
+        except (launch.LaunchError, settings.SettingsError):
+            self._send_json(404, {"error": "not found"})
+        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "tail unavailable"})
+        else:
+            self._send_text(200, text)
+
     def do_GET(self) -> None:
         self._count()
         if not self._authorized():
@@ -312,6 +498,18 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/v1/snapshot":
             self._serve_snapshot()
+        elif path == "/v1/agents":
+            self._serve_agents()
+        elif path == "/v1/quota":
+            self._serve_section("quota")
+        elif path == "/v1/capacity":
+            self._serve_section("capacity")
+        elif path == "/v1/disks":
+            self._serve_section("disk")
+        elif path == "/v1/board":
+            self._serve_board()
+        elif path == "/v1/tail":
+            self._serve_tail()
         elif path == "/v1/version":
             self._send_json(200, {"api": API_VERSION, "schema_version": snapshot.SCHEMA_VERSION})
         elif path == "/v1/health":
@@ -366,6 +564,9 @@ def make_server(
     allowed_origins: tuple[str, ...] = (),
     token_required: bool = False,
     token_reader: Callable[[], str | None] | None = None,
+    board_open: Callable[[], board.Store] | None = None,
+    tail_fn: Callable[[str, int, int], str] | None = None,
+    tail_max: int = 200,
 ) -> ThreadingHTTPServer:
     """An HTTP server answering the v1 routes.
 
@@ -373,6 +574,9 @@ def make_server(
     same readers the `snapshot` verb uses). Health reports the host the
     built document names. `bind` defaults to loopback and `port` to an
     ephemeral one; the bound address reads as `server.server_address`.
+    `board_open` opens the board store per board request (`board.open_store`
+    by default); `tail_fn` renders tail output (`read_tail` by default),
+    capped at `tail_max` lines.
     The caller enforces the bind rules; `token_required` with a
     `token_reader` enforces the bearer token per request.
     """
@@ -383,6 +587,9 @@ def make_server(
         allowed_origins=allowed_origins,
         token_required=token_required,
         token_reader=token_reader,
+        board_open=board_open,
+        tail_fn=tail_fn,
+        tail_max=tail_max,
     )
 
     class _BoundHandler(_Handler):
@@ -433,10 +640,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     try:
         have_token = read_token(token_path) is not None
     except ServeError as err:
-        if remote:
-            _err(str(err))
-            return USAGE
-        have_token = False
+        _err(str(err))
+        return USAGE
     problem = check_origins(origins)
     if problem is None:
         problem = check_bind(bind, port, allow_remote=args.allow_remote, has_token=have_token)
@@ -465,6 +670,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             allowed_origins=tuple(origins),
             token_required=remote,
             token_reader=lambda: read_token(token_path),
+            tail_max=resolved["serve.tail_max"],
         )
     except OSError as err:
         if err.errno == errno.EADDRINUSE:
