@@ -1287,22 +1287,42 @@ def sync_all(store, tracker_factory, *, operators, now):
 
     ``tracker_factory`` maps a tracker repo to its tracker (labels or
     board, built by the one factory); board repos run the feed step then
-    the board step. Returns (seen, errors): the rows applied and one line
-    per failed repo. A failed repo keeps its rows and its cursor (that is
-    `sync_repo`'s contract) and the pass moves on to the next repo; a
-    repo the factory does not know is an error line, never a silent skip.
-    With no factory there is nothing to sync from: no rows move and no
-    errors are reported.
+    the board step. Returns (seen, errors, store_errors): the rows
+    applied, one line per tracker/outage failure, and one line per
+    corrupt stored row. A failed repo keeps its rows and its cursor
+    (that is `sync_repo`'s contract) and the pass moves on to the next
+    repo; a repo the factory does not know is an error line, never a
+    silent skip. With no factory there is nothing to sync from: no rows
+    move and no errors are reported.
+
+    The repo list itself parses no row JSON (`Store.repos`), so one
+    corrupt row cannot hide the healthy repos; each repo's rows are then
+    enumerated inside the pass, and a repo whose rows cannot be parsed
+    is reported as one store line and skipped while the other repos
+    still sync. The other stored enumerations in the drive pass need no
+    guard here: orphan release, finished reconciliation and stuck
+    handling are already caught at their call sites, and the shared
+    read setup aborts earlier with exit 4 on a corrupt row anyway.
     """
     if tracker_factory is None:
-        return 0, []
+        return 0, [], []
     seen = 0
     errors = []
-    for repo in sorted({item.repo for item in store.items()}):
+    store_errors = []
+    try:
+        repos = store.repos()
+    except (board.StoreError, sqlite3.Error) as err:
+        return 0, [], [f"store repo listing unreadable: {err}"]
+    for repo in sorted(repos):
         try:
             tracker = tracker_factory(repo)
         except KeyError:
             errors.append(f"{repo}: no tracker for this repo, skipped")
+            continue
+        try:
+            store.items(repo=repo)
+        except board.StoreError as err:
+            store_errors.append(str(err))
             continue
         ops = list(mirror._ops_for(operators, repo))
         result = sync.sync_repo(
@@ -1315,6 +1335,7 @@ def sync_all(store, tracker_factory, *, operators, now):
         )
         seen += result.items_seen
         errors.extend(result.errors)
+        store_errors.extend(result.store_errors)
         if not trackers.is_board_tracker(tracker):
             continue
         try:
@@ -1333,7 +1354,8 @@ def sync_all(store, tracker_factory, *, operators, now):
         )
         seen += board_result.items_seen
         errors.extend(board_result.errors)
-    return seen, errors
+        store_errors.extend(board_result.store_errors)
+    return seen, errors, store_errors
 
 
 def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_after):
@@ -3012,8 +3034,9 @@ def _launching_pass(
     held. The mirror drains whatever the
     outbox holds, old backlog and new claims alike; what it cannot push
     stays queued for the next healthy pass. A pass that synced nothing
-    at all exits 3; a pass that launched nothing because the service
-    manager was unreachable does too. When `journal_path` is set, the
+    at all exits 3 on tracker failures, and 4 when only corrupt stored
+    rows failed; a pass that launched nothing because the service
+    manager was unreachable exits 3 too. When `journal_path` is set, the
     pass appends its start, every start, skip, release, restart and
     give-up, and its end with verdict counts; a journal write failure
     warns and the pass continues. When `day_path` and `max_starts` are
@@ -3055,14 +3078,16 @@ def _launching_pass(
     if journal_path is not None:
         journal_write({"event": "pass_start", "at": now, "host": host or ""})
     try:
-        seen, sync_errors = sync_all(store, tracker_factory, operators=operators, now=now)
+        seen, sync_errors, sync_store_errors = sync_all(
+            store, tracker_factory, operators=operators, now=now
+        )
     except board.StoreError as problem:
         print(f"corral drive: {problem}", file=err)
         return finish(USAGE)
     except sqlite3.Error as problem:
         print(f"corral drive: cannot read the store: {problem}", file=err)
         return finish(USAGE)
-    for line in sync_errors:
+    for line in sync_errors + sync_store_errors:
         print(f"corral drive: {line}", file=err)
     ctx, fatal = _read_inputs(
         store,
@@ -3316,6 +3341,8 @@ def _launching_pass(
     for problem in problems:
         print(problem, file=err)
     if problems:
+        return finish(USAGE, started=started, skipped=skipped)
+    if sync_store_errors and seen == 0:
         return finish(USAGE, started=started, skipped=skipped)
     if sync_errors and seen == 0:
         return finish(UNREACHABLE, started=started, skipped=skipped)
