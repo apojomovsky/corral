@@ -96,6 +96,22 @@ def sessions_dir(env=None):
     return _override("CORRAL_SESSIONS", env) or os.path.join(state_dir(env), "sessions")
 
 
+def host_ledger_path(env=None):
+    """The host-wide resource ledger file, shared by every project on this host.
+
+    The one deliberate exception to the override rule: a shared ledger
+    must not move under a running fleet, so `CORRAL_STATE` is ignored
+    here and the XDG state base decides alone. Callers never read the
+    environment straight; they go through this helper.
+    """
+    env = os.environ if env is None else env
+    return os.path.normpath(
+        os.path.join(
+            _xdg_base("XDG_STATE_HOME", "~/.local/state", env), "corral", "host-resources.json"
+        )
+    )
+
+
 def hub_state_dir(env=None):
     """The hub's own state dir: `CORRAL_HUB_STATE`, else `<state>/hub`.
 
