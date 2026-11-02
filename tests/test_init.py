@@ -259,6 +259,11 @@ TAIL = """# Defaults: uncomment to override.
 # git.commits.conventional = true  # enforce Conventional Commits
 # git.worktrees = ".worktrees/"  # worktree root, relative to the clone
 #
+# [hub]
+# hub.heartbeat_s = 30  # seconds between hub heartbeats
+# hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
+# hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
+#
 # [prompts]
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
 # prompts.triage = ""  # override file for the triage prompt (relative to the ops root)
@@ -361,6 +366,11 @@ commits.conventional = false
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
 # git.worktrees = ".worktrees/"  # worktree root, relative to the clone
+#
+# [hub]
+# hub.heartbeat_s = 30  # seconds between hub heartbeats
+# hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
+# hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [prompts]
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
