@@ -58,9 +58,12 @@ the snapshot only summarizes:
   goes through `Store.items` (which takes no `max_age` and reports no
   freshness); freshness is computed in exactly one place in the serve
   layer by calling `Store.item(repo, number, now=..., max_age=...)`
-  per listed row, so `item()` stays the single freshness resolver. A
-  decision-grade consumer asks for freshness with `max_age` and sees
-  staleness in the reply instead of guessing it.
+  per listed row, so `item()` stays the single freshness resolver. The
+  serve layer captures one `now` per request and passes the same value
+  to every per-row call, so rows near the `max_age` boundary cannot
+  disagree inside one listing. A decision-grade consumer asks for
+  freshness with `max_age` and sees staleness in the reply instead of
+  guessing it.
 - `GET /v1/events?project=`: one project's unresolved coordinator
   events oldest first (`coordevents.unresolved`), each with id, kind,
   ref, evidence, state, first_seen. A `resolved_since` parameter
@@ -309,8 +312,10 @@ takes injected views):
   is `404`; output equals `launch.tail` rendering for the same
   session file.
 - Board freshness: `max_age` honored, `fetched_at` and confidence
-  visible; journal pagination returns a continuous log across the
-  live file boundary using canned archives.
+  visible; one test pins rows near the `max_age` boundary and asserts
+  every per-row `item()` call in one listing received the same `now`
+  (a fake store or clock records the values); journal pagination returns
+  a continuous log across the live file boundary using canned archives.
 - Security: non-loopback bind without `--allow-remote` and a token
   refuses before listening (exit 4, asserted on the parser/validator,
   not by binding); with token required, a missing or wrong Bearer is
@@ -321,8 +326,12 @@ takes injected views):
   and resumes from `Last-Event-ID` with no gaps against a canned
   journal; heartbeats arrive within the idle timeout; past
   `serve.max_streams` concurrent streams the next connection gets
-  `503` plus `Retry-After` and no thread is held for it (asserted by
-  opening the bound plus one against a small test bound).
+  `503` plus `Retry-After` and holds no thread once refused (asserted
+  by opening the bound plus one against a small test bound, then
+  asserting the live-stream count returns to baseline within a
+  timeout: under `ThreadingHTTPServer` a thread is spawned before the
+  handler runs, so the test must never assert the count at the instant
+  of refusal).
 - Import closure: a test walks `serve.py` imports and fails on `gh`,
   tracker, forge, or any subprocess seam, so a later slice cannot
   smuggle a live call into a read.
@@ -360,13 +369,19 @@ matters: each ticket builds on the previous one's tests.
   `/v1/disks`, `/v1/board`, `/v1/tail` with limits and clamps.
   Acceptance: each view equals its builder's output for the same
   inputs; tail clamps and `404`s; board shows confidence and
-  `fetched_at`; `make check` green.
+  `fetched_at`, and captures one `now` per request shared by every
+  per-row freshness call (tested with rows near the `max_age`
+  boundary); `make check` green.
 - S4: events, journal, and the stream. Add `/v1/events`,
   `/v1/journal` (live plus archives, opaque cursors), and `/v1/stream`
   with ids, resume, and heartbeats. Acceptance: the pagination,
   continuity, SSE, and stream-shedding (`503` plus `Retry-After` past
-  `serve.max_streams`) tests pass; polling alone still covers every
-  fact; `make check` green.
+  `serve.max_streams`) tests pass, with the shedding test asserting
+  the stream count returns to baseline within a timeout rather than
+  at the instant of refusal (no custom accept path: the bound is
+  enforced in the handler, and the test allows for the thread that
+  `ThreadingHTTPServer` spawns before the handler runs); polling alone
+  still covers every fact; `make check` green.
 - S5: caching and health. Add the snapshot TTL cache, the generation
   counter with `ETag`/`304`, and the in-memory request counters in
   `/v1/health`. Acceptance: repeated polls within the TTL share one
