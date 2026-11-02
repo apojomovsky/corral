@@ -365,6 +365,31 @@ class RoleTest(RegistryCase):
         self.assertEqual(self.entry()["role"], "worker")
 
 
+class ProfileFieldTest(RegistryCase):
+    def test_the_profile_is_recorded_and_reads_back(self):
+        self.register(profile="fast")
+        self.assertEqual(self.entry()["profile"], "fast")
+
+    def test_no_profile_reads_as_none(self):
+        self.register()
+        self.assertIsNone(self.entry()["profile"])
+
+    def test_a_bad_profile_is_refused(self):
+        for bad in ("", 123, True):
+            with self.subTest(bad=bad), self.assertRaises(reg.RegistryError):
+                self.register(profile=bad)
+
+    def test_reregister_without_a_profile_keeps_it(self):
+        self.register(profile="fast")
+        self.register(now=T0 + 10)
+        self.assertEqual(self.entry()["profile"], "fast")
+
+    def test_reregister_with_a_profile_replaces_it(self):
+        self.register(profile="fast")
+        self.register(profile="slim", now=T0 + 10)
+        self.assertEqual(self.entry()["profile"], "slim")
+
+
 class CliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
