@@ -10,6 +10,7 @@ speaks to it in-process; no test touches the network, a real state
 dir, or another project.
 """
 
+import ast
 import http.client
 import json
 import os
@@ -133,7 +134,7 @@ class RegisterStoreTest(StoreCase):
 
 
 class SnapshotStoreTest(StoreCase):
-    def test_store_keeps_the_document_byte_identical(self):
+    def test_store_keeps_the_document_semantically_identical(self):
         doc = canned_doc("h1", 1000.0, ["alpha"])
         hub.register_host(self.store, "host-1", now=1000.0)
         hub.store_snapshot(self.store, "host-1", doc, now=1005.0)
@@ -142,7 +143,7 @@ class SnapshotStoreTest(StoreCase):
             ("host-1",),
         ).fetchone()
         self.assertEqual(json.loads(row[0]), doc)
-        self.assertEqual(json.loads(row[0]), json.loads(json.dumps(doc)))
+        self.assertEqual(row[0], json.dumps(doc, sort_keys=True))
         self.assertEqual(row[1], 1000.0)
         self.assertEqual(row[2], 1005.0)
 
@@ -321,6 +322,42 @@ class HeartbeatRouteTest(DashboardCase):
         self.assertEqual(loser["status"], 409)
         self.assertEqual(loser["holder"]["agent"], "drive-aaa")
 
+    def test_heartbeat_renewal_is_bound_to_the_calling_host(self):
+        _, foreign = self.call(
+            "POST",
+            "/v1/claims",
+            {"repo": "app", "number": 7, "agent": "drive-bbb", "host_id": "host-2"},
+            token=self.token_b,
+        )
+        _, own = self.call(
+            "POST",
+            "/v1/claims",
+            {"repo": "app", "number": 8, "agent": "drive-aaa", "host_id": "host-1"},
+            token=self.token_a,
+        )
+        before = foreign["lease_expires"]
+        self.clock[0] = before - 10.0
+        foreign_entry = hub.renewal_entry("app", 7, "drive-bbb", foreign["epoch"])
+        own_entry = hub.renewal_entry("app", 8, "drive-aaa", own["epoch"])
+        status, payload = self.heartbeat(renewals=[foreign_entry, own_entry])
+        self.assertEqual(status, 200)
+        refused, accepted = payload["renewals"]
+        self.assertFalse(refused["ok"])
+        self.assertEqual(refused["status"], 409)
+        self.assertNotIn("holder", refused)
+        self.assertNotIn("host-2", refused.get("error", ""))
+        self.assertNotIn("drive-bbb", refused.get("error", ""))
+        self.assertTrue(accepted["ok"])
+        store = hub.open_db(self.db)
+        try:
+            row = store.execute(
+                "SELECT agent, lease_expires FROM claims WHERE repo=? AND number=?",
+                ("app", 7),
+            ).fetchone()
+        finally:
+            store.close()
+        self.assertEqual(tuple(row), ("drive-bbb", before))
+
     def test_heartbeat_without_a_snapshot_still_checks_in(self):
         status, payload = self.heartbeat()
         self.assertEqual(status, 200)
@@ -345,6 +382,33 @@ class HeartbeatRouteTest(DashboardCase):
         status, payload = self.heartbeat(snapshot=["nope"])
         self.assertEqual(status, 400)
         self.assertTrue(payload["error"])
+
+    def test_post_routes_ignore_the_query_string(self):
+        status, payload = self.call(
+            "POST", "/v1/heartbeat?x=1", {"host_id": "host-1", "renewals": []}, token=self.token_a
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["renewals"], [])
+
+    def test_empty_body_error_names_no_operation(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/heartbeat",
+            body="",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.token_a}",
+            },
+        )
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        payload = json.loads(raw.decode("utf-8"))
+        self.assertEqual(response.status, 400)
+        self.assertIn("JSON", payload["error"])
+        for word in ("claim", "renew", "heartbeat", "register", "release", "repo"):
+            self.assertNotIn(word, payload["error"])
 
 
 class HostsRouteTest(DashboardCase):
@@ -417,6 +481,15 @@ class MergeRouteTest(DashboardCase):
         self.assertEqual(by_id["host-1"]["snapshot"]["fleet_header"], full["fleet_header"])
         self.assertEqual(by_id["host-1"]["snapshot"]["quota"], full["quota"])
 
+    def test_idle_host_keeps_an_empty_agents_list_in_a_slice(self):
+        self.push("host-1", self.token_a, 1000.0, ["alpha"])
+        self.push("host-2", self.token_b, 1000.0, ["beta"])
+        status, payload = self.call("GET", "/v1/snapshot?project=beta", token=self.token_a)
+        self.assertEqual(status, 200)
+        by_id = {row["host_id"]: row for row in payload["hosts"]}
+        self.assertEqual(set(by_id), {"host-1", "host-2"})
+        self.assertEqual(by_id["host-1"]["snapshot"]["agents"], [])
+
     def test_unknown_project_is_404_not_an_empty_merge(self):
         self.push("host-1", self.token_a, 1000.0, ["alpha"])
         status, payload = self.call("GET", "/v1/snapshot?project=typo", token=self.token_a)
@@ -486,6 +559,53 @@ class PushClientTest(DashboardCase):
     def test_push_with_a_wrong_token_is_refused(self):
         with self.assertRaises(hub.HubError):
             hub.push_heartbeat(self.url(), "wrong", "host-1")
+
+
+class SplitUrlTest(unittest.TestCase):
+    def test_non_http_scheme_is_refused(self):
+        with self.assertRaises(hub.HubError) as caught:
+            hub._split_url("https://host-1:8000")
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_missing_port_is_refused(self):
+        with self.assertRaises(hub.HubError) as caught:
+            hub._split_url("http://host-1")
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_plain_http_url_splits(self):
+        self.assertEqual(hub._split_url("http://host-1:8000"), ("host-1", 8000))
+
+
+class SliceProjectTest(unittest.TestCase):
+    def test_agents_that_are_not_a_list_pass_through(self):
+        doc = {"agents": "nope", "quota": {}}
+        self.assertEqual(hub._slice_project(doc, "alpha"), doc)
+        self.assertEqual(hub._slice_project({"quota": {}}, "alpha"), {"quota": {}})
+
+
+class HostReadPathClosure(unittest.TestCase):
+    def test_serve_snapshot_and_drive_import_no_hub(self):
+        from corral import drive, serve, snapshot
+
+        bad = []
+        for module in (serve, snapshot, drive):
+            with open(module.__file__, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names = [alias.name for alias in node.names]
+                    if any(
+                        name == "corral.hub" or name.startswith("corral.hub.") for name in names
+                    ):
+                        bad.append(f"{module.__name__}: import {names}")
+                elif isinstance(node, ast.ImportFrom):
+                    if node.module == "corral.hub" or (node.module or "").startswith("corral.hub."):
+                        bad.append(f"{module.__name__}: from {node.module} import ...")
+                    elif node.module == "corral" and any(
+                        alias.name == "hub" for alias in node.names
+                    ):
+                        bad.append(f"{module.__name__}: from corral import hub")
+        self.assertEqual(bad, [])
 
 
 class HubStaleSettingTest(unittest.TestCase):

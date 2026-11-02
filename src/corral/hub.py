@@ -519,13 +519,13 @@ def store_snapshot(
 ) -> None:
     """Keep a host's last pushed document for the merged dashboard.
 
-    The document is stored as pushed, byte for byte: the hub never
-    reorders merged rows by time and never compares timestamps across
-    hosts. ``host_now`` is the serving host's clock from the
-    document's fleet header when it is a number, else None;
-    ``received_at`` is the hub clock. The host's project rows are
-    refreshed from the document, so the filter table is always the
-    union of the last push per host. One transaction.
+    The document is stored semantically identical, keys re-sorted:
+    the hub never reorders merged rows by time and never compares
+    timestamps across hosts. ``host_now`` is the serving host's
+    clock from the document's fleet header when it is a number, else
+    None; ``received_at`` is the hub clock. The host's project rows
+    are refreshed from the document, so the filter table is always
+    the union of the last push per host. One transaction.
     """
     if not isinstance(document, dict):
         raise HubError(f"hub snapshot must be an object, got {type(document).__name__}")
@@ -600,7 +600,9 @@ def _slice_project(document: dict[str, Any], project: str) -> dict[str, Any]:
     Quota, capacity, disk and drive stay host-wide: they describe the
     host, and slicing them by project would invent per-project
     numbers the host never reported. The agents list is the only
-    per-project section the document carries.
+    per-project section the document carries. A host with no agents
+    for the named project still appears with an empty agents list: a
+    host is visible to the dashboard even when idle.
     """
     agents = document.get("agents")
     if not isinstance(agents, list):
@@ -961,17 +963,49 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             return
         self._send(200, {"host_id": body["host_id"], "membership_epoch": epoch})
 
+    def _held_by_other(self, conn: sqlite3.Connection, repo: str, number: int, caller: str) -> bool:
+        """Whether the claim row names a live holder other than the caller.
+
+        A missing or cleared row is nobody's: only a live row held by
+        another host refuses, so a re-grant after a crash still renews.
+        """
+        row = conn.execute(
+            "SELECT agent, host_id FROM claims WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        return row is not None and bool(row[0]) and row[1] != caller
+
+    def _refuse_foreign(
+        self, identity: dict[str, Any], repo: str, number: int, caller: str
+    ) -> dict[str, Any]:
+        """The per-entry refusal for a renewal held by another host.
+
+        Same shape as every other rejected entry, but with no holder:
+        the caller learns its renewal failed, never who holds the
+        ticket.
+        """
+        return {
+            **identity,
+            "ok": False,
+            "status": 409,
+            "error": f"ticket {repo}#{number} cannot be renewed by {caller}",
+        }
+
     def _renewal_answer(
         self,
         server: HubServer,
         conn: sqlite3.Connection,
         entry: object,
+        caller: str,
     ) -> dict[str, Any]:
         """One granted-or-409 answer for a heartbeat renewal entry.
 
         A malformed entry is answered per entry (never a whole-body
         refusal), so one bad row cannot sink the heartbeat's other
-        renewals or its snapshot.
+        renewals or its snapshot. A renewal is bound to the
+        authenticated caller: an entry for a claim another host holds
+        is refused per entry without naming the holder, so no host
+        can extend another host's lease.
         """
         if not isinstance(entry, dict):
             return {"ok": False, "status": 400, "error": "renewal must be an object"}
@@ -998,6 +1032,8 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
                 "status": 400,
                 "error": "renewal needs repo, number, agent and epoch",
             }
+        if self._held_by_other(conn, repo, number, caller):
+            return self._refuse_foreign(identity, repo, number, caller)
         try:
             receipt = renew(
                 conn,
@@ -1009,6 +1045,8 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
                 lease_ttl_s=server.lease_ttl_s,
             )
         except Conflict as err:
+            if self._held_by_other(conn, repo, number, caller):
+                return self._refuse_foreign(identity, repo, number, caller)
             return {
                 **identity,
                 "ok": False,
@@ -1021,7 +1059,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         return {**identity, "ok": True, "receipt": receipt.as_dict()}
 
     def _post_heartbeat(
-        self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any]
+        self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any], caller: str
     ) -> None:
         if not isinstance(body.get("host_id"), str) or not body["host_id"]:
             self._send(400, {"error": "heartbeat needs host_id"})
@@ -1043,7 +1081,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         except HubError as err:
             self._send(400, {"error": str(err)})
             return
-        answers = [self._renewal_answer(server, conn, entry) for entry in renewals]
+        answers = [self._renewal_answer(server, conn, entry, caller) for entry in renewals]
         if "snapshot" in body and isinstance(body["snapshot"], dict):
             try:
                 store_snapshot(conn, body["host_id"], body["snapshot"], now=server.clock())
@@ -1053,16 +1091,17 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         self._send(200, {"membership_epoch": epoch, "renewals": answers})
 
     def do_POST(self) -> None:
-        if self.path == "/v1/version":
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/v1/version":
             self._send(405, {"error": "hub v1 takes GET and POST only"})
             return
-        if self.path not in POST_PATHS:
-            self._send(404, {"error": f"unknown hub route {self.path}"})
+        if path not in POST_PATHS:
+            self._send(404, {"error": f"unknown hub route {path}"})
             return
         server = _server(self)
         body = self._read_json()
         if body is None:
-            self._send(400, {"error": "claim needs a JSON object with repo and number"})
+            self._send(400, {"error": "hub needs a JSON object body"})
             return
         try:
             conn = open_db(server.db_path)
@@ -1075,13 +1114,13 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             if host is None or host != body.get("host_id"):
                 self._reject("unknown hub host")
                 return
-            if self.path == REGISTER_PATH:
+            if path == REGISTER_PATH:
                 self._post_register(server, conn, body)
-            elif self.path == HEARTBEAT_PATH:
-                self._post_heartbeat(server, conn, body)
-            elif self.path == "/v1/claims/renew":
+            elif path == HEARTBEAT_PATH:
+                self._post_heartbeat(server, conn, body, host)
+            elif path == "/v1/claims/renew":
                 self._post_renew(server, conn, body)
-            elif self.path == "/v1/claims/release":
+            elif path == "/v1/claims/release":
                 self._post_release(conn, body)
             else:
                 self._post_claim(server, conn, body)
