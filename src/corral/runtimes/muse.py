@@ -184,6 +184,11 @@ def with_models(config, chains):
     return {**(config or {}), "model": models.primary(chains)}
 
 
+def options_schema():
+    """The profile options muse accepts: none yet; a later ticket owns the schema."""
+    return {}
+
+
 def sessions_root():
     """Where muse keeps its own session logs. Corral reads here, never writes."""
     return os.path.expanduser(os.path.join("~", ".local", "share", "muse", "sessions"))
@@ -290,6 +295,7 @@ class Muse:
     with_models = staticmethod(with_models)
     resume_handle = staticmethod(resume_handle)
     activity_file = staticmethod(activity_file)
+    options_schema = staticmethod(options_schema)
 
 
 RUNTIME = Muse()

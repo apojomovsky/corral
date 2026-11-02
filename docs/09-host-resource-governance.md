@@ -250,9 +250,9 @@ cpu_m = 8000            # millicores for every project together
 memory_mb = 16000
 pids = 4096
 
-[resources.project]     # in projects.d/<name>.toml, beside floor/ceiling
+[resources]     # in projects.d/<name>.toml, beside floor/ceiling
 cpu_floor_m = 500
-cpu_weight = 1
+weight = 1
 memory_floor_mb = 1024
 
 [resources.role.worker] # per-agent charge
