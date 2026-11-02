@@ -343,7 +343,7 @@ def _require_role_price(tgt, role, where):
         )
 
 
-def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None):
+def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None, pressure_fn=None):
     """Refuse a ticket that is already live, a pressured host, or a host with no free slot.
 
     Gates run in this order and the first refusal wins: disk pressure,
@@ -358,9 +358,12 @@ def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None
     not bypass the disk gate). Config errors in any layer raise exit 4
     and are evaluated before any gate. `usage(path)` is the required
     disk seam and `host_ledger_fn()` the required host ledger seam (the
-    ensured ledger dict): neither has a default. `role` is the prompt
-    role being launched, None reading as worker: the budget prices its
-    charge. Returns the decided `Budget`.
+    ensured ledger dict): neither has a default. `pressure_fn()` reads
+    the host pressure, None reading as unknown (never blocking): only
+    the CLI passes the production reader. With no host budget the gate
+    passes everything and the pressure seam is never called. `role` is
+    the prompt role being launched, None reading as worker: the budget
+    prices its charge. Returns the decided `Budget`.
     """
     registered = projects.load_all()
     cfg = registry.config(tgt.resolved)
@@ -423,6 +426,7 @@ def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None
         charged,
         limits,
         now,
+        pressure=(pressure_fn() if pressure_fn is not None else None),
     )
     if not budget.allowed:
         raise CapFull(budget.reason)
@@ -731,6 +735,7 @@ def launch(
     store=None,
     tracker=None,
     controllers_read=None,
+    pressure_fn=None,
 ):
     """Start a new agent for ticket `number`. Returns `(unit, workdir)`.
 
@@ -807,6 +812,7 @@ def launch(
             host_ledger_fn=host_ledger_fn,
             role=role,
             now_fn=now_fn,
+            pressure_fn=pressure_fn,
         )
         if selection is None:
             chains = _model_chains(
@@ -839,6 +845,7 @@ def launch(
             host_ledger_fn=host_ledger_fn,
             role=role,
             now_fn=now_fn,
+            pressure_fn=pressure_fn,
         )
         prompt = prompts.with_heartbeat(prompt)
         leaves = _leaves(tgt, number)
@@ -1005,6 +1012,7 @@ def resume(
     pool_fn=None,
     ledger_fn=None,
     now_fn=None,
+    pressure_fn=None,
     selections=None,
     store=None,
     tracker=None,
@@ -1086,6 +1094,7 @@ def resume(
             host_ledger_fn=host_ledger_fn,
             role=role,
             now_fn=now_fn,
+            pressure_fn=pressure_fn,
         )
         workdir, _branch = worktrees.ensure_worktree(
             tgt.clone,
@@ -1105,6 +1114,7 @@ def resume(
             host_ledger_fn=host_ledger_fn,
             role=role,
             now_fn=now_fn,
+            pressure_fn=pressure_fn,
         )
         # A concurrent launch of this ticket may have added a newer
         # generation between the pre-lock read and this lock: resolve
