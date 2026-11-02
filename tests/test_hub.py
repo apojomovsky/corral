@@ -977,7 +977,7 @@ class ImportClosureTest(unittest.TestCase):
                 reached.update(f"corral.{name.strip()}" for name in names.split(","))
             else:
                 reached.add(module)
-        self.assertEqual(reached, {"corral.paths", "corral.settings"})
+        self.assertEqual(reached, {"corral.paths", "corral.settings", "corral.netbind"})
 
 
 class ReadPathClosureTest(unittest.TestCase):
