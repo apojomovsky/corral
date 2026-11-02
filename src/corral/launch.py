@@ -26,13 +26,14 @@ is live at all.
 
 import os
 import socket
+import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from corral import accounts, admission, disk, host_ledger, models, paths, projects
-from corral import prompts, quota, quota_ledger, registry, resources, runtimes, settings
-from corral import units, worktrees
+from corral import accounts, admission, board, disk, host_ledger, models, paths, profiles
+from corral import projects, prompts, quota, quota_ledger, registry, resources, runtimes
+from corral import settings, units, worktrees
 from corral.runtimes import muse
 from corral.runtimes import tail as runtime_tail
 
@@ -496,15 +497,17 @@ def _env(adapter, session, unit):
     return env
 
 
-def _model_chains(tgt, pool, ledger, now):
+def _model_chains(tgt, pool, ledger, now, chains=None):
     """The target's validated, re-routed chains, or {} when none are declared.
 
     Every entry must name a provider from the pool (exit 4 naming role and
     entry); each chain keeps only its live providers, and a required role
     with none left refuses the launch (exit 75 naming role and reset). A
     stale reading never blocks, so the strictest freshness bound wins.
+    `chains` overrides the resolved `[models]` tables: the profile path
+    passes the resolved profile's chains instead.
     """
-    chains = dict(tgt.resolved.models)
+    chains = dict(tgt.resolved.models) if chains is None else dict(chains)
     if not chains:
         return {}
     models.validate(chains, pool)
@@ -515,6 +518,133 @@ def _model_chains(tgt, pool, ledger, now):
         stale_after=quota.stale_after_for(chains, pool),
         low_pct=tgt.resolved["quota.low_pct"],
         unknown_blocks=tgt.resolved["quota.unknown_blocks"],
+    )
+
+
+@dataclass(frozen=True)
+class SelectedProfile:
+    """The profile one launch or resume runs on, after flag refinement.
+
+    `runtime` is the profile's runtime, or the `--runtime` refinement;
+    `model` is the `--model` refinement, or None for the runtime default;
+    `chains` are the profile's re-routed model chains; `provenance` names
+    the deciding layer and source, with any `--model`/`--runtime`
+    refinement noted in its source. `launch` writes this to the session
+    dir next to the runtime record, and a resume without flags runs the
+    recorded profile instead of resolving again.
+    """
+
+    profile: profiles.Profile
+    runtime: str
+    model: str | None
+    chains: dict
+    provenance: profiles.Provenance
+
+
+def _store_assignment(store, tracker, tgt, number, now):
+    """The ticket's shared assignment as `(name, source)`, None when withdrawn.
+
+    Reads the store row with a live re-read past the freshness bound,
+    exactly like the claim paths. A withdrawn ticket (no row) reads as no
+    assignment: the launch proceeds on the lower layers. A truncated
+    database or corrupt content maps to LaunchError (exit 4), mirroring
+    `drive.refresh_row`; an unreachable tracker raises TrackerError
+    (exit 3) unchanged.
+    """
+    stale_after = tgt.resolved["board.item_max_age_s"]
+    try:
+        if store is None:
+            with board.open_store() as real:
+                name, source, _skip = profiles.load_tracker_assignment(
+                    real,
+                    tracker,
+                    repo=tgt.repo,
+                    number=number,
+                    now=now,
+                    stale_after=stale_after,
+                )
+        else:
+            name, source, _skip = profiles.load_tracker_assignment(
+                store,
+                tracker,
+                repo=tgt.repo,
+                number=number,
+                now=now,
+                stale_after=stale_after,
+            )
+    except (board.StoreError, sqlite3.Error) as err:
+        raise LaunchError(
+            f"cannot read the ticket's profile assignment for {tgt.repo}#{number}: {err}"
+        ) from None
+    return name, source
+
+
+def select_profile(
+    tgt,
+    number,
+    *,
+    role,
+    flag=None,
+    model=None,
+    runtime=None,
+    selections=None,
+    store=None,
+    tracker=None,
+    pool=None,
+    ledger=None,
+    now=None,
+) -> SelectedProfile | None:
+    """The profile for one launch or resume, or None when profiles are off.
+
+    None means no `[profiles.*]` table is declared and no `--profile` flag
+    names one: the caller runs the pre-profiles path unchanged. Otherwise
+    the declarations validate (exit 4), the six layers resolve, and the
+    `--model`/`--runtime` refinements apply to the winner for this run
+    only, noted in the provenance source. The resolver runs before the
+    caller makes anything, so a bad profile fails before any worktree or
+    unit exists. `store` is the board store (or a fake with `.item`);
+    `tracker` re-reads stale rows live, and None trusts the cached row.
+    """
+    if not tgt.resolved.profiles and flag is None:
+        return None
+    pool = accounts.providers() if pool is None else pool
+    parsed = profiles.validate(tgt.resolved.profiles, pool)
+    moment = time.time() if now is None else now
+    ledger = quota_ledger.load() if ledger is None else ledger
+    if selections is None:
+        selections = profiles.load_selections()
+    if isinstance(flag, str) and flag in parsed:
+        name, source = None, ""
+        tracker = None
+    else:
+        name, source = _store_assignment(store, tracker, tgt, number, moment)
+    profile, provenance = profiles.resolve(
+        parsed,
+        selections,
+        repo=tgt.repo,
+        role=role,
+        number=number,
+        now=moment,
+        flag=flag,
+        tracker=name,
+        tracker_source=source,
+        committed=tgt.resolved.profile_committed,
+        selections_source=profiles.selections_path(),
+    )
+    refined = runtime if runtime is not None else profile.runtime
+    _adapter(refined)
+    bits = []
+    if runtime is not None:
+        bits.append(f"--runtime {runtime}")
+    if model is not None:
+        bits.append(f"--model {model}")
+    if bits:
+        provenance = replace(
+            provenance, source=f"{provenance.source} (refined by {' '.join(bits)})"
+        )
+    chains = _model_chains(tgt, pool, ledger, moment, chains=profile.models)
+    return SelectedProfile(
+        profile=profile, runtime=refined, model=model, chains=chains, provenance=provenance
     )
 
 
@@ -550,12 +680,14 @@ def _close_previous(tgt, number, list_fn):
     return closed
 
 
-def _register_started(tgt, unit, number, model, role=None):
+def _register_started(tgt, unit, number, model, role=None, runtime=None):
     """Register the unit before it starts, so agent list and snapshot show it.
 
     The ticket names the registered project of the ops root, so the
     agent counts for the same project its unit prefix counts for. The
-    role is recorded too, so snapshot shows reviewer vs worker.
+    role is recorded too, so snapshot shows reviewer vs worker. `runtime`
+    overrides the target's runtime: the profile path registers the
+    resolved (possibly refined) runtime instead.
     Raises LaunchError naming the unit when the registry cannot record
     it; the unit is not running yet.
     """
@@ -564,7 +696,7 @@ def _register_started(tgt, unit, number, model, role=None):
     try:
         registry.register(
             unit,
-            tgt.runtime,
+            runtime if runtime is not None else tgt.runtime,
             ticket=ticket,
             model=model,
             role=role,
@@ -604,6 +736,8 @@ def launch(
     model=None,
     runtime_config=None,
     role=None,
+    profile=None,
+    runtime=None,
     list_fn,
     run,
     usage,
@@ -612,6 +746,9 @@ def launch(
     pool_fn=None,
     ledger_fn=None,
     now_fn=None,
+    selections=None,
+    store=None,
+    tracker=None,
     controllers_read=None,
 ):
     """Start a new agent for ticket `number`. Returns `(unit, workdir)`.
@@ -637,6 +774,12 @@ def launch(
     and snapshot shows reviewer vs worker. A launch without a role runs
     as the worker role and writes its own worker generation, so it never
     touches the reviewer's record either.
+
+    `profile` is the `--profile` flag: the layer-1 profile name. `model`
+    and `runtime` are one-shot refinements of the resolved profile for
+    this launch only. The profile resolves before anything is made (no
+    worktree, no unit on a bad profile); without any `[profiles.*]`
+    declaration and no flag, the pre-profiles path runs unchanged.
     """
     factory = prompt if callable(prompt) else None
     if factory is None:
@@ -649,10 +792,29 @@ def launch(
         raise LaunchError("title must be a string")
     if runtime_config is not None and not isinstance(runtime_config, dict):
         raise LaunchError("runtime config must be a JSON object")
-    adapter = _adapter(tgt.runtime)
-    pool = (pool_fn or accounts.providers)() if tgt.resolved.models else None
-    if pool is not None:
-        models.validate(dict(tgt.resolved.models), pool)
+    pool = (pool_fn or accounts.providers)()
+    ledger = (ledger_fn or quota_ledger.load)()
+    moment = (now_fn or time.time)()
+    selection = select_profile(
+        tgt,
+        number,
+        role=session_role,
+        flag=profile,
+        model=model,
+        runtime=runtime,
+        selections=selections,
+        store=store,
+        tracker=tracker,
+        pool=pool,
+        ledger=ledger,
+        now=moment,
+    )
+    if selection is None:
+        adapter = _adapter(tgt.runtime)
+        session_runtime = tgt.runtime
+    else:
+        adapter = _adapter(selection.runtime)
+        session_runtime = selection.runtime
     _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
@@ -665,12 +827,15 @@ def launch(
             role=role,
             now_fn=now_fn,
         )
-        chains = _model_chains(
-            tgt,
-            pool,
-            (ledger_fn or quota_ledger.load)(),
-            (now_fn or time.time)(),
-        )
+        if selection is None:
+            chains = _model_chains(
+                tgt,
+                pool,
+                (ledger_fn or quota_ledger.load)(),
+                (now_fn or time.time)(),
+            )
+        else:
+            chains = selection.chains
         workdir, branch = worktrees.ensure_worktree(
             tgt.clone,
             number,
@@ -703,8 +868,15 @@ def launch(
         except paths.PathError as err:
             raise LaunchError(str(err)) from None
         session_id = _write_session(
-            session, adapter, tgt.runtime, prompt, runtime_config, chains, role
+            session, adapter, session_runtime, prompt, runtime_config, chains, role
         )
+        if selection is not None:
+            try:
+                profiles.record_profile(
+                    session, selection.profile, selection.provenance, model=selection.model
+                )
+            except (profiles.ProfileError, OSError) as err:
+                raise LaunchError(f"cannot write the agent's profile record: {err}") from None
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, _next_unit_gen(leaves))
             try:
@@ -745,7 +917,7 @@ def launch(
             if session_id is not None:
                 _drop_session_id(session)
             raise
-        _register_started(tgt, unit, number, model, role)
+        _register_started(tgt, unit, number, model, role, runtime=session_runtime)
         try:
             _ensure_slices(decided, run)
             units.start(argv, session, unit, run=run)
@@ -834,24 +1006,39 @@ def resume(
     hold_reason_fn,
     role=None,
     model=None,
+    profile=None,
+    runtime=None,
     list_fn,
     run,
     usage,
     host_ledger_fn,
     git=worktrees.git,
-    controllers_read=None,
+    pool_fn=None,
+    ledger_fn=None,
     now_fn=None,
+    selections=None,
+    store=None,
+    tracker=None,
+    controllers_read=None,
 ):
     """Resume ticket `number`'s newest session of `role` in a new unit.
 
     Returns `(unit, workdir)`. `role` None resumes the worker session.
-    The runtime is the one the session recorded at launch, and the
-    reviewer mode is the one the launch ran with: a resumed reviewer
-    stays read-only. Raises LaunchError when there is no session to
-    resume, and HeldError when the ticket is held for a human.
-    `hold_reason_fn(tgt, number)` returns the hold text, or None when the
-    ticket is free to resume; it is required, and it runs before the
-    spawn lock is taken or any worktree is touched.
+    Without flags the run reuses the profile the session recorded at
+    launch (runtime and model head), so a session started under an
+    override keeps its setup after the override expires; a session from
+    before profiles were recorded falls back to its recorded runtime.
+    With `--profile` (or `--model`/`--runtime`) the flag layer decides
+    for the resumed run instead, the same way it does at launch, and the
+    new profile is recorded over the old one. A lone `--runtime` without
+    any declared profile still switches the run to that runtime.
+    The reviewer mode is the one the launch ran with: a resumed reviewer
+    stays read-only.
+    Raises LaunchError when there is no session to resume, and HeldError
+    when the ticket is held for a human. `hold_reason_fn(tgt, number)`
+    returns the hold text, or None when the ticket is free to resume; it
+    is required, and it runs before the spawn lock is taken or any
+    worktree is touched.
     """
     reason = hold_reason_fn(tgt, number)
     if reason is not None:
@@ -862,7 +1049,35 @@ def resume(
     session = _newest(tgt, number, role)
     if session is None:
         raise _no_session(tgt, number, role, "session to resume")
-    adapter = _adapter(runtimes.recorded(session))
+    selection = None
+    if profile is not None or model is not None or runtime is not None:
+        selection = select_profile(
+            tgt,
+            number,
+            role=role,
+            flag=profile,
+            model=model,
+            runtime=runtime,
+            selections=selections,
+            store=store,
+            tracker=tracker,
+            pool=(pool_fn or accounts.providers)(),
+            ledger=(ledger_fn or quota_ledger.load)(),
+            now=(now_fn or time.time)(),
+        )
+    if selection is None:
+        recorded = profiles.recorded_profile(session)
+        if recorded is not None:
+            adapter = _adapter(recorded.runtime)
+            if model is None:
+                model = recorded.model
+        else:
+            adapter = _adapter(runtimes.recorded(session))
+        if runtime is not None:
+            adapter = _adapter(runtime)
+    else:
+        adapter = _adapter(selection.runtime)
+        model = selection.model
     recorded = _recorded_role(session)
     handle = adapter.resume_handle(session)
     if handle is None:
@@ -907,7 +1122,24 @@ def resume(
         session = _newest(tgt, number, role)
         if session is None:
             raise _no_session(tgt, number, role, "session to resume")
-        adapter = _adapter(runtimes.recorded(session))
+        if selection is not None:
+            adapter = _adapter(selection.runtime)
+            try:
+                profiles.record_profile(
+                    session, selection.profile, selection.provenance, model=selection.model
+                )
+            except (profiles.ProfileError, OSError) as err:
+                raise LaunchError(f"cannot write the agent's profile record: {err}") from None
+        else:
+            reread = profiles.recorded_profile(session)
+            if reread is not None:
+                adapter = _adapter(reread.runtime)
+                if model is None:
+                    model = reread.model
+            else:
+                adapter = _adapter(runtimes.recorded(session))
+            if runtime is not None:
+                adapter = _adapter(runtime)
         recorded = _recorded_role(session)
         handle = adapter.resume_handle(session)
         if handle is None:
@@ -947,7 +1179,14 @@ def resume(
                 controllers_read,
             ),
         )
-        _register_started(tgt, unit, number, model, recorded)
+        _register_started(
+            tgt,
+            unit,
+            number,
+            model,
+            recorded,
+            runtime=selection.runtime if selection is not None else runtime,
+        )
         try:
             _ensure_slices(decided, run)
             units.start(argv, session, unit, run=run)
