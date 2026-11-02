@@ -27,6 +27,7 @@ import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import cast
 
 from corral import pressure, prompts, settings
 from corral.pressure import saturated as _saturated_reading
@@ -149,19 +150,32 @@ class Limits:
     pressure: PressureCaps | Mapping[str, object] | None = None
 
     def __post_init__(self):
-        """Refuse non-mapping project and role tables at construction.
+        """Refuse misshapen budget tables at construction.
 
         Every path builds through here (direct construction and the
-        plain-mapping coercions in `validate_limits`, `share_cap` and
-        `admit`), so a list-shaped table raises LimitsError (exit 4)
-        once, at the boundary, never the bare TypeError `dict` or the
-        attribute access further in would raise.
+        plain-mapping coercions in `validate_limits`, `share_cap`,
+        `admit` and `join`), so a list-shaped project or role table
+        raises LimitsError (exit 4) once, at the boundary, never the
+        bare TypeError `dict` or the attribute access further in would
+        raise. A missing foreign table reads as empty; anything else
+        that is not a list or tuple of foreign-claim entries (a
+        `ForeignClaim` or a plain mapping, the two shapes `_claim`
+        accepts) raises LimitsError the same way.
         """
         for what in ("projects", "roles"):
             value = getattr(self, what)
             if not isinstance(value, Mapping):
                 raise LimitsError(f"limits {what} must be a mapping, not {value!r}")
             object.__setattr__(self, what, dict(value))
+        foreign = self.foreign
+        if foreign is None:
+            object.__setattr__(self, "foreign", [])
+        elif isinstance(foreign, (list, tuple)) and all(
+            isinstance(entry, (ForeignClaim, Mapping)) for entry in foreign
+        ):
+            object.__setattr__(self, "foreign", list(foreign))
+        else:
+            raise LimitsError(f"limits foreign must be a list of foreign claims, not {foreign!r}")
 
 
 @dataclass(frozen=True)
@@ -424,7 +438,7 @@ def validate_limits(limits):
                 host=limits.get("host"),
                 projects=limits.get("projects", {}),
                 roles=limits.get("roles", {}),
-                foreign=list(limits.get("foreign") or []),
+                foreign=limits.get("foreign"),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
             )
@@ -521,7 +535,8 @@ def join(base, shares, foreign=(), *, where):
         host=host,
         projects=table,
         roles=dict(base.roles),
-        foreign=list(foreign or []),
+        # The constructor validates the shape and normalizes to a list.
+        foreign=cast(list, foreign),
         gone_s=base.gone_s,
         pressure=_pressure_caps(base.pressure),
     )
@@ -543,7 +558,7 @@ def share_cap(limits, project, now):
                 host=limits.get("host"),
                 projects=limits.get("projects", {}),
                 roles=limits.get("roles", {}),
-                foreign=list(limits.get("foreign") or []),
+                foreign=limits.get("foreign"),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
             )
@@ -602,7 +617,7 @@ def admit(request, charged, limits, now, pressure=None):
                 host=limits.get("host"),
                 projects=limits.get("projects", {}),
                 roles=limits.get("roles", {}),
-                foreign=list(limits.get("foreign") or []),
+                foreign=limits.get("foreign"),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
             )

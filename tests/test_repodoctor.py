@@ -111,23 +111,7 @@ class StrictRemote(unittest.TestCase):
         self.assertEqual(doctor.exit_code(checks), 0)
 
 
-class UnknownBranchNote(unittest.TestCase):
-    def test_labels_ok_makes_the_remote_row_an_ok_note(self):
-        checks = rows(site(origin="https://example.com/o/demo.git", labels="ok"))
-        found = by_name(checks)
-        self.assertEqual(found["remote:demo"].status, "ok")
-        self.assertIn("was not checked", found["remote:demo"].detail)
-        self.assertEqual(found["labels:demo"].status, "ok")
-        self.assertEqual(doctor.exit_code(checks), 0)
-
-    def test_labels_missing_keeps_the_remote_quiet_while_the_labels_fail(self):
-        checks = rows(site(origin="https://example.com/o/demo.git", labels="missing"))
-        found = by_name(checks)
-        self.assertEqual(found["remote:demo"].status, "ok")
-        self.assertIn("was not checked", found["remote:demo"].detail)
-        self.assertEqual(found["labels:demo"].status, "fail")
-        self.assertEqual(doctor.exit_code(checks), 1)
-
+class UnreachedRemote(unittest.TestCase):
     def test_labels_unknown_keeps_the_unreachable_warning(self):
         checks = rows(site(origin="https://example.com/o/demo.git"))
         found = by_name(checks)

@@ -431,16 +431,18 @@ class ValidateLimits(unittest.TestCase):
 class NonMappingTables(unittest.TestCase):
     MISSING = object()
 
-    def table(self, projects=MISSING, roles=MISSING):
+    def table(self, projects=MISSING, roles=MISSING, foreign=MISSING):
         if projects is self.MISSING:
             projects = {"web": {"weight": 1}}
         if roles is self.MISSING:
             roles = {"worker": dict(WORKER)}
+        if foreign is self.MISSING:
+            foreign = []
         return {
             "host": triple(8000, 16000, 4096),
             "projects": projects,
             "roles": roles,
-            "foreign": [],
+            "foreign": foreign,
             "gone_s": 600.0,
         }
 
@@ -481,6 +483,59 @@ class NonMappingTables(unittest.TestCase):
                 with self.assertRaises(R.LimitsError):
                     R.Limits(host=host, projects=dict(good_projects), roles=bad)
         self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_non_mapping_foreign_is_a_limits_error(self):
+        bad_values: tuple[Any, ...] = (5, "x", [1], {"name": "desk"})
+        for bad in bad_values:
+            with self.subTest(foreign=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.validate_limits(self.table(foreign=bad))
+                with self.assertRaises(R.LimitsError):
+                    R.admit(req(), charged(), self.table(foreign=bad), NOW)
+                with self.assertRaises(R.LimitsError):
+                    R.share_cap(self.table(foreign=bad), "web", NOW)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_direct_limits_with_bad_foreign_refuses_at_construction(self):
+        host = triple(8000, 16000, 4096)
+        bad_values: tuple[Any, ...] = (5, "x", [1], {"name": "desk"})
+        for bad in bad_values:
+            with self.subTest(foreign=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.Limits(
+                        host=host,
+                        projects={"web": {"weight": 1}},
+                        roles={"worker": dict(WORKER)},
+                        foreign=bad,
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_none_foreign_reads_as_empty(self):
+        none: Any = None
+        made = R.Limits(
+            host=triple(8000, 16000, 4096),
+            projects={"web": {"weight": 1}},
+            roles={"worker": dict(WORKER)},
+            foreign=none,
+        )
+        self.assertEqual(made.foreign, [])
+        R.validate_limits(made)
+        R.validate_limits(self.table(foreign=None))
+
+    def test_tuple_and_claim_entries_are_accepted(self):
+        entry = {"name": "desk", "cpu_m": 100, "claimed_at": NOW}
+        tupled: Any = (dict(entry),)
+        made = R.Limits(
+            host=triple(8000, 16000, 4096),
+            projects={"web": {"weight": 1}},
+            roles={"worker": dict(WORKER)},
+            foreign=tupled,
+        )
+        self.assertEqual(made.foreign, [entry])
+        R.validate_limits(made)
+        R.validate_limits(
+            self.table(foreign=[R.ForeignClaim(name="desk", cpu_m=100, claimed_at=NOW)])
+        )
 
 
 class Join(unittest.TestCase):
@@ -534,6 +589,14 @@ class Join(unittest.TestCase):
                 [],
                 where="config.toml",
             )
+
+    def test_non_list_foreign_is_a_limits_error(self):
+        bad_values: tuple[Any, ...] = (5, "x", [1])
+        for bad in bad_values:
+            with self.subTest(foreign=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.join(self.base(), {"web": {"weight": 1}}, bad, where="config.toml")
+        self.assertEqual(R.LimitsError.exit_code, 4)
 
     def test_an_admit_on_joined_limits_enforces_the_share(self):
         joined = R.join(
