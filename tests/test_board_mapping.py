@@ -10,8 +10,10 @@ import inspect
 import io
 import os
 import tempfile
+import tomllib
 import unittest
 from contextlib import redirect_stdout
+from unittest import mock
 
 from corral import init, settings, tracker as iface
 
@@ -287,6 +289,39 @@ class ChangeTests(unittest.TestCase):
         self.assertEqual(board.priority_column, "Priority")
         self.assertEqual(board.area_column, "")
         self.assertEqual(board.priority_map, provision.priority_map)
+
+    def test_comparable_keys_follow_board_concept_attrs(self):
+        spec = spec_for()
+        provision = standard_provision(spec)
+        extra = iface.BOARD_CONCEPT_ATTRS + (("squad", "squad_column"),)
+        extra_spec = spec._replace(
+            fields=spec.fields
+            + (iface.FieldSpec(concept="squad", name="Squad", kind="text", options=()),)
+        )
+        extra_provision = provision._replace(
+            fields=provision.fields
+            + (iface.FieldSpec(concept="squad", name="Squad", kind="text", options=()),)
+        )
+        with mock.patch.object(iface, "BOARD_CONCEPT_ATTRS", extra):
+            table = init.render_board_table(extra_spec, extra_provision)
+            parsed = tomllib.loads(BASE_INLINE + "\n" + table)["repo"][0]["board"]
+            self.assertEqual(
+                init._canonical_board_table(parsed),
+                init._expected_board_table(extra_spec, extra_provision),
+            )
+
+    def test_two_same_name_entries_refuse_even_when_the_first_is_identical(self):
+        doubled = BASE_INLINE + "\n" + GOLDEN_TABLE + "\n" + BASE_INLINE
+        tmp, target = write_tmp(doubled)
+        self.addCleanup(tmp.cleanup)
+        spec = spec_for()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            with self.assertRaises(init.InitError):
+                init.board_table_change(target, "demo", spec, standard_provision(spec))
+        self.assertIn("[repo.board]", out.getvalue())
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), doubled)
 
     def test_a_kept_keep_only_area_renders_so_a_plain_rerun_is_a_noop(self):
         config = board_config(area_column="Area")

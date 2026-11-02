@@ -891,22 +891,18 @@ def _canonical_board_table(raw):
 
     Missing and empty are the same fact: an omitted concept reads as
     `""` through `settings`, and an empty map table holds no ranks.
+    The compared keys are the board address plus one key per board
+    concept, derived from `tracker.BOARD_CONCEPT_ATTRS` like the
+    renderer, so a concept added there is never silently dropped from
+    the comparison.
     """
     if not isinstance(raw, dict):
         return {}
+    keys = ("project_owner", "project_number", "project_id") + tuple(
+        attr for _, attr in tracker.BOARD_CONCEPT_ATTRS
+    )
     out = {}
-    for key in (
-        "project_owner",
-        "project_number",
-        "project_id",
-        "agent_field",
-        "status_field",
-        "status_column",
-        "priority_column",
-        "area_column",
-        "pool_column",
-        "blocked_by_column",
-    ):
+    for key in keys:
         value = raw.get(key)
         if value == "" or value is None:
             continue
@@ -979,7 +975,7 @@ def board_table_change(toml_target, entry_name, spec, provision):
         )
     lines = current.splitlines(keepends=True)
     at = _repo_block_index(lines, entry_name)
-    if "board" in matches[0]:
+    if len(matches) == 1 and "board" in matches[0]:
         if _canonical_board_table(matches[0].get("board")) == _expected_board_table(
             spec, provision
         ):
@@ -990,7 +986,7 @@ def board_table_change(toml_target, entry_name, spec, provision):
             f"{toml_target} already holds a [repo.board] table for {entry_name!r}"
             " with different values: edit it by hand"
         )
-    if at is None:
+    if at is None or len(matches) != 1:
         sys.stdout.write(table)
         raise InitError(
             f"{toml_target}: cannot locate the [[repo]] entry for {entry_name!r}"
