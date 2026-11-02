@@ -33,6 +33,7 @@ class FakeGit:
         hooks="",
         fail=(),
         status="",
+        remote_head="main",
     ):
         self.root = root
         self.origin_url = origin_url
@@ -41,6 +42,7 @@ class FakeGit:
         self.hooks = hooks
         self.fail = set(fail)
         self.status = status
+        self.remote_head = remote_head
         self.calls = []
         self.commits = []
         self.inited = set()
@@ -66,6 +68,12 @@ class FakeGit:
             if self.head is None:
                 return proc(1, "")
             return proc(0, f"refs/remotes/origin/{self.head}\n")
+        if len(args) == 4 and args[:2] == ["ls-remote", "--symref"]:
+            if "ls-remote" in self.fail:
+                return proc(1, "", "fatal: unable to connect to the remote\n")
+            if self.remote_head is None:
+                return proc(0, "0" * 40 + "\tHEAD\n")
+            return proc(0, f"ref: refs/heads/{self.remote_head}\tHEAD\n" + "0" * 40 + "\tHEAD\n")
         if args == ["branch", "--show-current"]:
             return proc(0, self.current + "\n")
         if args[:2] == ["config", "core.hooksPath"]:

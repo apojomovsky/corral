@@ -9,11 +9,12 @@ function, so it reads no real state either.
 
 import argparse
 import dataclasses
+import inspect
 import re
 import unittest
 from pathlib import Path
 
-from corral import cli, host_ledger, prompts, resources, runtimes, snapshot
+from corral import cli, host_ledger, pressure, prompts, resources, runtimes, snapshot
 
 SPAN_RE = re.compile(r"`([^`]*)`")
 COMMAND_RE = re.compile(r"\bcorral ([a-z][a-z0-9-]*)")
@@ -192,6 +193,22 @@ class ResourceSettings(unittest.TestCase):
         tokens.update(host_ledger.CLAIM_KEYS)
         tokens.update(("resources.gone_s", host_ledger.FOREIGN_CLAIMS_DIR, "<name>.json"))
         self.assertEqual(self.missing(tokens), [])
+
+    def test_repeated_default_numbers_match_the_code(self):
+        text = readme_text()
+        self.assertIn(f"(default {int(resources.DEFAULT_GONE_S)})", text)
+        self.assertIn(f"(default {pressure.DEFAULT_MAX_LOAD_PER_CPU})", text)
+        self.assertIn(f"(default {pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT})", text)
+
+    def test_pressure_parse_defaults_match_the_code(self):
+        self.assertFalse(hasattr(resources, "DEFAULT_MAX_LOAD_PER_CPU"))
+        self.assertFalse(hasattr(resources, "DEFAULT_MIN_MEM_AVAILABLE_PCT"))
+        params = inspect.signature(resources.parse_pressure).parameters
+        self.assertEqual(params["max_load_per_cpu"].default, pressure.DEFAULT_MAX_LOAD_PER_CPU)
+        self.assertEqual(
+            params["min_mem_available_pct"].default,
+            pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
+        )
 
 
 if __name__ == "__main__":

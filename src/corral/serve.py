@@ -410,11 +410,13 @@ def _page_int(raw: str | None, name: str, default: int) -> tuple[int, str | None
 def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
     """A validated seconds parameter, or the 400 body when it is unusable.
 
-    Missing reads as None. A non-number, a negative, or NaN is an
-    error, never a silent default: the caller must know its filter is
-    not what it asked. A present-but-blank value is not a number, so
-    it errors instead of folding to absent. `max_age` and
-    `resolved_since` both read through this one validator.
+    Missing reads as None. A non-number, a negative, NaN, or an
+    infinity is an error, never a silent default: the caller must know
+    its filter is not what it asked, and an infinity would echo into
+    the 200 body as bare `Infinity`, which strict JSON parsers reject.
+    A present-but-blank value is not a number, so it errors instead of
+    folding to absent. `max_age` and `resolved_since` both read through
+    this one validator.
     """
     if raw is None:
         return None, None
@@ -422,7 +424,7 @@ def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
         value = float(raw)
     except (TypeError, ValueError):
         return None, f"{name} {raw!r} is not seconds"
-    if value < 0 or math.isnan(value):
+    if value < 0 or not math.isfinite(value):
         return None, f"{name} {raw!r} must be 0 or more"
     return value, None
 
