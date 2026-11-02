@@ -1,4 +1,4 @@
-# 11: the web dashboard (browser UI over `corral serve` and the hub)
+# 12: the web dashboard (browser UI over `corral serve` and the hub)
 
 Status: design, awaiting maintainer approval. No code ships with this
 doc. It designs a read-only browser UI served by the two processes
@@ -62,15 +62,17 @@ Three findings from the code shape everything below:
    therefore needs a read-only "reader" token class first
    (sections 4 and 10).
 3. **The two backends do not serve the same surface.** Host mode
-   has agents, quota, capacity, disks, board, tail, events,
-   journal and the stream. Hub mode has two data read routes,
-   `GET /v1/hosts` and `GET /v1/snapshot?project=` (plus the
-   open `GET /v1/version`), whose merged document nests one host
-   snapshot per host (`{project, now, hosts: [{host_id,
-   received_at, stale, snapshot}]}` from `read_snapshot`, with
-   `membership_epoch` added by the handler). There
-   is no hub board, tail, journal, stream, ETag, CORS or claims
-   read route today. "Same UI, different backend" therefore means
+   has agents, quota, capacity, resources, disks, board, tail,
+   events, journal and the stream. Hub mode has three data read
+   routes, `GET /v1/hosts`, `GET /v1/snapshot?project=` and
+   `GET /v1/claims` (plus the open `GET /v1/version`). The merged
+   document nests one host snapshot per host (`{project, now,
+   hosts: [{host_id, received_at, stale, snapshot}]}` from
+   `read_snapshot`, with `membership_epoch` added by the
+   handler), and `GET /v1/claims` lists every claim row for the
+   hosts' reconnect fetch. There is no hub board, tail, journal,
+   stream, ETag or CORS today. "Same UI, different backend"
+   therefore means
    one UI with a small data adapter and some views that exist in
    host mode only, saying so on screen instead of failing
    (section 2).
@@ -168,14 +170,20 @@ reading" text with the provider's `error`, never as a zero bar;
 the provider `state`, `read_at` age and the `stale` flag are
 shown as text, never color alone), capacity (`live` of
 `total_cap`, `repo_cap`,
-`by_project`), disks (free of total per path in `disk.paths`),
+`by_project`), resources (the host budget with charged versus
+measured totals and per-project charged shares from the
+`resources` section's `host_budget`, `charged`, `by_project`
+and `measured_by_project`, plus `pressure` as text; the
+per-agent `agents` rows stay out of version one, section 11),
+disks (free of total per path in `disk.paths`),
 and the drive strip (`paused` with `pause_reason`, `last_pass_at`
 age, `last_exit`, `starts_today` of `max_starts_per_day`). Below,
 agents grouped by project: ticket (`repo#number`), state, runtime,
 model, role, age from `started_at`, `last_seen` age, and `note`
 when present. A section whose value is the `{"error": ...}` body
 (`snapshot.is_error_section`) renders as an error card with that
-text: degraded state is shown, never hidden behind a spinner,
+text, a failed `resources` section included: degraded state is
+shown, never hidden behind a spinner,
 mirroring the `/v1/health` rule in `05-dashboard-api.md`. In hub
 mode the same cards repeat per host from that host's nested
 `snapshot`, each headed by `host_id`, its `stale` flag and
@@ -242,11 +250,11 @@ snapshot by `host_id`: a registered host that has never pushed
 appears here but has no entry in the snapshot's `hosts` list
 (`read_snapshot` only returns hosts with a stored document), and
 the overview must show such a host as "registered, nothing
-pushed yet" instead of dropping it silently. Hub claims have no
-read route today, so there is no claims view in version one;
-claims are visible per host as agent rows and, in host mode, as
-board claim holders. Adding `GET /v1/claims` is decision D4
-(section 13).
+pushed yet" instead of dropping it silently. `GET /v1/claims`
+already lists every claim row, but there is no claims view in
+version one; claims are visible per host as agent rows and, in
+host mode, as board claim holders. Whether the UI ever shows
+the raw claims list is decision D4 (section 13).
 
 **Project filter.** A horizontally scrollable chip row ("All"
 plus one chip per project) sits above the overview and the log
@@ -308,6 +316,7 @@ Overview, narrow (wide screens put the cards in two columns):
 |   window-a [========----------] 42% resets 14:00  |
 |   window-b [===---------------] 17%               |
 | Capacity 6/10 (per repo 3)  a:4 b:2               |
+| Resources: 7/10 charged, 5 measured, pressure ok  |
 | Drive: running, last pass 3m ago, starts 5/20     |
 | Disk: 82G free of 200G (state), 80G free (cache)  |
 +---------------------------------------------------+
@@ -915,9 +924,12 @@ the existing serve and hub suites):
 - The shell exemption, per process: with a token required,
   assets and config answer 200 without one while every data
   route answers 401 without one and 200 with one. On the hub:
-  a reader token reads `/v1/hosts` and `/v1/snapshot` and is
-  refused (401) on every POST route, a host token still does
-  both, rotating a reader kills only that reader, and a
+  a reader token reads `/v1/hosts`, `/v1/snapshot` and
+  `GET /v1/claims` and is refused (401) on every POST route (the
+  claims list is read-only data of the same sensitivity as the
+  board holders the UI already shows, so readers may have it;
+  the claim write routes stay host-only), a host token still
+  does both, rotating a reader kills only that reader, and a
   retired host token gains nothing from the reader table.
 - Contract with the API: for each endpoint the UI consumes,
   one test builds the payload at the production seam with
@@ -1040,11 +1052,14 @@ flags and verbs it names.
   one sentence on the `serve` row saying the same address in a
   browser is the dashboard; `make check` green.
 - **W2: overview and polling core (host mode).** `api.js` and
-  `fmt.js`; the overview with quota, capacity, disk and drive
-  cards, grouped agents, error-section cards, project chips,
-  client-side filtering, the poll loop with backoff, textual
-  staleness, the disconnected banner, and the version check.
-  Acceptance: contract tests for the snapshot fields pass;
+  `fmt.js`; the overview with quota, capacity, resources, disk
+  and drive cards, grouped agents, error-section cards,
+  project chips, client-side filtering, the poll loop with
+  backoff, textual staleness, the disconnected banner, and the
+  version check. Acceptance: contract tests for the snapshot
+  fields pass, including the `resources` section shape
+  (`host_budget`, charged versus measured, `by_project`,
+  `pressure`) and a failed-resources error card;
   change detection strips the volatile keys of section 6
   (the VOLATILE_KEYS agreement test passes, and the single
   compare-and-skip path is confirmed by code inspection,
@@ -1087,12 +1102,16 @@ flags and verbs it names.
   remove beside the host token machinery in `hub.py` and
   `hubcli.py` under the verb spellings fixed in section 4, one
   id namespace across hosts and readers, readers accepted by
-  `_reader` only, and export and import extended to carry
+  `_reader` on the read routes only (`/v1/hosts`,
+  `/v1/snapshot` and the existing `GET /v1/claims`, whose
+  handler today checks `_authed_host` and must move to
+  `_reader`), and export and import extended to carry
   reader ids without hash material. Acceptance: a version 2
   database migrates with hosts, claims and snapshots intact
   and an unknown version still refuses; the reader test matrix
-  of section 8 (reads pass, every POST refused, rotation is
-  per-reader, a duplicate id across either table is exit 4);
+  of section 8 (all three reads pass, every POST refused,
+  rotation is per-reader, a duplicate id across either table
+  is exit 4);
   export then import preserves reader ids, carries no hash
   material, and old exports without readers still import;
   `README.md` hub rows updated for the new verbs; exit codes
@@ -1117,7 +1136,8 @@ flags and verbs it names.
   review gate instead of fixed silently; `make check` green.
 
 The smallest useful thing is W1 plus W2: a token-gated page
-that shows the fleet, quota and capacity for one host. If the
+that shows the fleet, quota, capacity and resources for one
+host. If the
 maintainer wants eyes on it before anything else is built,
 that is the stopping point to judge.
 
@@ -1156,19 +1176,22 @@ overrule any of them with a word.
   project chip selected *are* the project view; a fourth
   screen would duplicate all three assemblies. Saves one
   view, its route and its tests.
-- **A "resources" view (ticket scope wording): not built,
-  because there is nothing to show.** The snapshot has no
-  resources section; `ERROR_SECTIONS` is agents, quota,
-  capacity, disk and drive, and per-project resource shares
-  (`docs/09`) are admission inputs the API does not expose.
-  Capacity, disk and drive cards cover what exists. If a
-  resources section ever joins the snapshot, it lands as one
-  more card under the additive rule, no redesign.
-- **A hub claims view (ticket scope): deferred.** The hub
-  exposes no claims read route; what operators need day to
-  day (who holds what) is already visible as agent rows and
-  board claim holders. `GET /v1/claims` is a small honest
-  addition if wanted. (Decision D4.)
+- **Per-agent resources (ticket scope wording): not shown.**
+  The snapshot does carry a `resources` section (host budget,
+  charged versus measured totals, per-project shares and a
+  per-agent table, and `ERROR_SECTIONS` lists it sixth), and
+  the overview shows it as one card (section 2), because that
+  card is the number that explains why a launch was refused.
+  The per-agent rows stay out of version one: on a tablet they
+  duplicate the agent list with numbers only an operator
+  debugging a refusal needs, and the CLI already reports them.
+  Saves a table, its tests and its bytes on every poll.
+- **A hub claims view (ticket scope): deferred to version two.**
+  `GET /v1/claims` already lists every claim row, and what
+  operators need day to day (who holds what) is already
+  visible as agent rows and board claim holders. No new route
+  is needed; the only work is the UI list itself.
+  (Decision D4.)
 - **Board ticket bodies on screen: never in version one, and
   slimmed on the wire.** Bodies are long, secret-bearing and
   unreadable on a tablet list; the tracker link is one tap
@@ -1254,13 +1277,15 @@ Options:
 2. sessionStorage; re-paste per browser session.
 3. Memory only; re-paste per page load.
 
-**D4: a hub claims read route.** No `GET /v1/claims` exists;
-agent rows and board holders cover the daily question
-(section 2).
+**D4: a hub claims view in the UI.** `GET /v1/claims`
+already exists and W7 admits reader tokens to it (section 8),
+so no route work remains; the question is only whether the
+Hosts view gains a read-only claims list. Agent rows and board
+holders cover the daily question (section 2).
 
 Options:
 1. Defer; no claims view in version one (recommended).
-2. Add GET /v1/claims with the reader tokens (W7).
+2. Read-only claims list on the Hosts view in version two.
 
 **D5: a host projects route.** Without it, projects with no
 current activity are invisible to the log view (section 2).
