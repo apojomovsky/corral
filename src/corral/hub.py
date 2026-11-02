@@ -1,14 +1,15 @@
 """The hub: one SQLite database behind a small loopback HTTP service.
 
-Tickets H1, H2, H4, H5 and H6 of docs/08-hub-multihost.md section 10:
-the hub skeleton, the host registry, the claims table, the lease
-cycle (renew and release with fencing epochs), the operator verbs
-(`remove-host` with the membership epoch, per-ticket `release`, and
-`rotate-token`), the heartbeat carrying lease renewals beside the
-snapshot document with the merged dashboard (`GET /v1/hosts`,
-`GET /v1/snapshot?project=`), and hub operations: backup, export and
-import with fencing epochs preserved, plus the version exchange hosts
-check on every call. Later tickets add drive composition (H3).
+Tickets H1 through H6 of docs/08-hub-multihost.md section 10: the
+hub skeleton, the host registry, the claims table, the lease cycle
+(renew and release with fencing epochs), the claims list for the
+reconnect fetch, the host-side client the drive pass proposes
+through, the operator verbs (`remove-host` with the membership
+epoch, per-ticket `release`, and `rotate-token`), the heartbeat
+carrying lease renewals beside the snapshot document with the merged
+dashboard (`GET /v1/hosts`, `GET /v1/snapshot?project=`), and hub
+operations: backup, export and import with fencing epochs preserved,
+plus the version exchange hosts check on every call.
 
 Every grant is decided by one SQLite transaction: the row is
 unclaimed, or its lease has lapsed, and the new owner takes a strictly
@@ -66,6 +67,12 @@ settings.register(
     "hub.lease_ttl_s", int, DEFAULT_LEASE_TTL_S, "seconds a hub claim grant stays valid"
 )
 settings.register(
+    "hub.host_id",
+    str,
+    "",
+    "this host's operator-assigned hub id (empty means unregistered, hub mode refused)",
+)
+settings.register(
     "hub.stale_after_s",
     int,
     DEFAULT_STALE_AFTER_S,
@@ -89,7 +96,13 @@ class HubError(Exception):
 
 
 class HubUnreachable(Exception):
-    """The hub cannot be reached: no new claims until it is back (exit 3)."""
+    """The hub could not be reached at all (exit 3).
+
+    Refused, timed out, reset, or answered 500: the hub host is down,
+    so the drive keeps held work, skips new claims, and retries later.
+    A 401 or a malformed reply is configuration, not outage, and stays
+    ``HubError`` instead.
+    """
 
     exit_code = 3
 
@@ -751,6 +764,33 @@ def release(
         return kept
 
 
+def list_claims(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every hub claim row: holder, epoch, lease and clocks.
+
+    The reconnect fetch from docs/08-hub-multihost.md section 3 reads
+    this table and compares it ticket by ticket against local claims.
+    Released rows stay listed with an empty holder (their epoch is
+    kept for the next grant); rows never appear for tickets the hub
+    never granted.
+    """
+    rows = conn.execute(
+        "SELECT repo, number, host_id, agent, epoch, lease_expires, updated_at"
+        " FROM claims ORDER BY repo, number"
+    ).fetchall()
+    return [
+        {
+            "repo": repo,
+            "number": number,
+            "host_id": host_id,
+            "agent": agent,
+            "epoch": epoch,
+            "lease_expires": lease_expires,
+            "updated_at": updated_at,
+        }
+        for repo, number, host_id, agent, epoch, lease_expires, updated_at in rows
+    ]
+
+
 def membership_epoch(conn: sqlite3.Connection) -> int:
     """The hub's membership counter, bumped by every host removal."""
     row = conn.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
@@ -1083,6 +1123,7 @@ def _path_major(path: str) -> int | None:
 class HubHandler(http.server.BaseHTTPRequestHandler):
     """Routes: `GET /v1/version` (open), everything else authed.
 
+    `GET /v1/claims` lists every claim row for the reconnect fetch;
     `GET /v1/hosts` lists the membership with reachability;
     `GET /v1/snapshot` merges the last pushed document per host, with
     `?project=` filtering agents to one known project (`all` merges
@@ -1132,6 +1173,21 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         log.warning("hub: rejected request from %s: %s", self.client_address[0], text)
         self._send(401, {"error": text})
 
+    def _get_claims(self, server: HubServer) -> None:
+        try:
+            conn = open_db(server.db_path)
+        except HubError as err:
+            log.warning("hub: store unavailable: %s", err)
+            self._send(500, {"error": "hub store unavailable"})
+            return
+        try:
+            if self._authed_host(conn) is None:
+                self._reject("unknown hub host")
+                return
+            self._send(200, {"claims": list_claims(conn)})
+        finally:
+            conn.close()
+
     def _reader(self, conn: sqlite3.Connection) -> str | None:
         """The calling host for a read route: any registered token reads."""
         return self._authed_host(conn)
@@ -1157,6 +1213,9 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         split = urllib.parse.urlsplit(self.path)
         if split.path == "/v1/version" and not split.query:
             self._send(200, {"api": HUB_API, "schema_version": SCHEMA_VERSION})
+            return
+        if split.path == "/v1/claims" and not split.query:
+            self._get_claims(_server(self))
             return
         if split.path in POST_PATHS:
             self._send(405, {"error": "hub v1 takes GET and POST only"})
@@ -1498,6 +1557,177 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self._send(405, {"error": "hub v1 takes GET and POST only"})
+
+
+class HubClient:
+    """The host side of the hub claim protocol: plain HTTP, standard library only.
+
+    One seam for every hub network call, so drive tests inject a fake
+    here and never touch the network. The token is read from its file
+    at call time, never stored: each request re-reads
+    ``token_path``, and the token never appears in an error. A refused,
+    timed-out, reset, or 500 answer raises ``HubUnreachable`` (exit 3,
+    retry later); a 401, a 400, or a malformed reply raises
+    ``HubError`` (exit 4, configuration); a 409 raises ``Conflict``
+    naming the holder.
+    """
+
+    def __init__(self, url: str, host_id: str, token_path: str, *, timeout_s: float = 10) -> None:
+        self.url = url
+        self.host_id = host_id
+        self.token_path = token_path
+        self.timeout_s = timeout_s
+
+    def _endpoint(self) -> tuple[str, int]:
+        try:
+            parts = urllib.parse.urlsplit(self.url)
+        except ValueError as err:
+            raise HubError(f"hub url {self.url!r} does not parse: {err}") from None
+        if parts.scheme != "http" or not parts.hostname:
+            raise HubError(f"hub url {self.url!r} must be plain http://host:port")
+        return parts.hostname, parts.port or 80
+
+    def _token(self) -> str:
+        try:
+            with open(self.token_path, encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except OSError as err:
+            raise HubError(f"cannot read hub token {self.token_path}: {err}") from None
+        if not token:
+            raise HubError(f"hub token {self.token_path} is empty")
+        return token
+
+    def _request(self, method: str, path: str, body: dict[str, Any] | None) -> tuple[int, Any]:
+        host, port = self._endpoint()
+        raw = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {"Authorization": f"Bearer {self._token()}"}
+        if raw is not None:
+            headers["Content-Type"] = "application/json"
+        try:
+            conn = http.client.HTTPConnection(host, port, timeout=self.timeout_s)
+            try:
+                conn.request(method, path, body=raw, headers=headers)
+                response = conn.getresponse()
+                payload = response.read()
+                return response.status, payload
+            finally:
+                conn.close()
+        except (OSError, http.client.HTTPException) as err:
+            raise HubUnreachable(f"hub at {self.url} is unreachable: {err}") from None
+
+    def _decode(self, payload: bytes) -> dict[str, Any]:
+        try:
+            body = json.loads(payload.decode("utf-8")) if payload else None
+        except (ValueError, UnicodeDecodeError) as err:
+            raise HubError(f"hub at {self.url} answered garbage: {err}") from None
+        if not isinstance(body, dict):
+            raise HubError(f"hub at {self.url} answered a non-object")
+        return body
+
+    def _receipt(self, repo: str, number: int, body: dict[str, Any]) -> Receipt:
+        try:
+            epoch = body["epoch"]
+            lease = body["lease_expires"]
+            agent = body["agent"]
+            holder = body["host_id"]
+        except KeyError as err:
+            raise HubError(f"hub receipt for {repo}#{number} is missing {err}") from None
+        if (
+            not isinstance(agent, str)
+            or not agent
+            or not isinstance(holder, str)
+            or not holder
+            or isinstance(epoch, bool)
+            or not isinstance(epoch, int)
+            or epoch < 1
+            or isinstance(lease, bool)
+            or not isinstance(lease, (int, float))
+        ):
+            raise HubError(f"hub receipt for {repo}#{number} is malformed")
+        return Receipt(repo, number, agent, holder, epoch, float(lease))
+
+    def _checked(self, what: str, repo: str, number: int, status: int, payload: bytes):
+        """The decoded body for a 200, else the typed error the status means."""
+        if status == 500:
+            raise HubUnreachable(f"hub at {self.url} answered 500: store unavailable")
+        decoded = self._decode(payload)
+        if status == 409:
+            holder = decoded.get("holder") if isinstance(decoded, dict) else None
+            if (
+                not isinstance(holder, dict)
+                or not isinstance(holder.get("agent"), str)
+                or not isinstance(holder.get("host_id"), str)
+                or not isinstance(holder.get("epoch"), int)
+            ):
+                raise HubError(f"hub conflict for {repo}#{number} names no holder")
+            raise Conflict(repo, number, holder["agent"], holder["host_id"], holder["epoch"])
+        if status == 401:
+            raise HubError(f"hub at {self.url} refused this host: check hub.host_id and its token")
+        if status != 200:
+            raise HubError(f"hub at {self.url} answered {status} for {what}")
+        return decoded
+
+    def _post(self, path: str, repo: str, number: int, agent: str, epoch: int | None) -> Receipt:
+        body: dict[str, Any] = {
+            "repo": repo,
+            "number": number,
+            "agent": agent,
+            "host_id": self.host_id,
+        }
+        if epoch is not None:
+            body["epoch"] = epoch
+        status, payload = self._request("POST", path, body)
+        decoded = self._checked(f"{repo}#{number}", repo, number, status, payload)
+        return self._receipt(repo, number, decoded)
+
+    def propose(self, repo: str, number: int, agent: str) -> Receipt:
+        """Grant or refuse one claim: the receipt, or ``Conflict`` naming the holder."""
+        return self._post("/v1/claims", repo, number, agent, None)
+
+    def renew(self, repo: str, number: int, agent: str, epoch: int) -> Receipt:
+        """Extend a live lease without changing its epoch, or ``Conflict``."""
+        return self._post("/v1/claims/renew", repo, number, agent, epoch)
+
+    def release(self, repo: str, number: int, agent: str, epoch: int) -> int:
+        """Release a held claim, keeping the epoch. Returns the kept epoch."""
+        body: dict[str, Any] = {
+            "repo": repo,
+            "number": number,
+            "agent": agent,
+            "host_id": self.host_id,
+            "epoch": epoch,
+        }
+        status, payload = self._request("POST", "/v1/claims/release", body)
+        decoded = self._checked(f"{repo}#{number}", repo, number, status, payload)
+        kept = decoded.get("epoch")
+        if isinstance(kept, bool) or not isinstance(kept, int) or kept < 1:
+            raise HubError(f"hub release for {repo}#{number} kept no epoch")
+        return kept
+
+    def claims(self) -> list[dict[str, Any]]:
+        """Every hub claim row, for the reconnect compare. Raises ``HubUnreachable``."""
+        status, payload = self._request("GET", "/v1/claims", None)
+        decoded = self._checked("the claims list", "", 0, status, payload)
+        rows = decoded.get("claims")
+        if not isinstance(rows, list):
+            raise HubError(f"hub at {self.url} answered claims without a list")
+        found = []
+        for row in rows:
+            if (
+                not isinstance(row, dict)
+                or not isinstance(row.get("repo"), str)
+                or isinstance(row.get("number"), bool)
+                or not isinstance(row.get("number"), int)
+                or not isinstance(row.get("host_id"), str)
+                or not isinstance(row.get("agent"), str)
+                or isinstance(row.get("epoch"), bool)
+                or not isinstance(row.get("epoch"), int)
+                or isinstance(row.get("lease_expires"), bool)
+                or not isinstance(row.get("lease_expires"), (int, float))
+            ):
+                raise HubError(f"hub at {self.url} answered a malformed claim row")
+            found.append(row)
+        return found
 
 
 def make_server(

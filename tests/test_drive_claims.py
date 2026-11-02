@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, disk, drive, sync, tracker
+from corral import admission, board, disk, drive, drivehub, sync, tracker
 from corral import host_ledger
 from corral import projects as projects_mod
 from corral import registry, units
@@ -96,6 +96,10 @@ def drive_pass(
         "live_units": frozenset(),
         "gone_s": 3600.0,
     }
+    hub_client = fields.pop("hub_client", None)
+    hub_host_id = fields.pop("hub_host_id", None)
+    if hub_client is not None:
+        values["hub"] = drivehub.HubMode(hub_client, hub_host_id)
     values.update(fields)
     return drive.run_pass(**values)
 
