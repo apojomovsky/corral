@@ -994,8 +994,11 @@ tablet browser and one desktop browser against a loopback or
 private-network server with throwaway state): first load and
 token paste; wrong token; forget token; loopback no-token
 load; each view in light and dark OS themes; kill the server
-mid-view and watch the disconnected banner age honestly;
-restart and recover; a host gone silent in hub mode showing
+mid-view and watch the disconnected banner age honestly while
+polls back off 5, 15, 30, 60s; restart the server and watch the
+page recover without a reload; load the page with the server
+down and watch the never-connected banner retry instead of
+stranding on "connecting"; a host gone silent in hub mode showing
 stale, never dropping; upgrade the server under an open tab
 (the section 7 module-mix caveat); 200% text zoom and keyboard-
 only navigation; tail follow disengaging on scroll-up; CSP
