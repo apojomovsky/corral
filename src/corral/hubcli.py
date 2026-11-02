@@ -1,14 +1,18 @@
 """`corral hub`: the multi-host hub service and its operator verbs.
 
 H1 ships two verbs: `add-host` mints a host id and its bearer token
-(printed once), and `serve` runs the claim service. Every verb acts on
-the hub database from `paths.hub_db_path`, never on a worker host's
-state. Exit codes follow the public table: 0 ok, 2 a held port, 4 a
-usage or configuration error.
+(printed once), and `serve` runs the claim service. H6 adds three
+operations verbs: `export` writes the movable state as JSON (hosts,
+claims with epochs, no token material), `import` loads it into a fresh
+hub, and `backup` copies the database file. Every verb acts on the hub
+database from `paths.hub_db_path`, never on a worker host's state.
+Exit codes follow the public table: 0 ok, 2 a held port, 4 a usage or
+configuration error.
 """
 
 import argparse
 import errno
+import json
 import signal
 import sys
 
@@ -99,11 +103,104 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return OK
 
 
+def cmd_export(args: argparse.Namespace) -> int:
+    from corral import hub, paths
+
+    try:
+        db_path = paths.hub_db_path()
+    except paths.PathError as err:
+        _err(str(err))
+        return USAGE
+    try:
+        store = hub.open_db(db_path)
+    except hub.HubError as err:
+        _err(str(err))
+        return USAGE
+    try:
+        document = hub.export_hub(store)
+    except hub.HubError as err:
+        _err(str(err))
+        return USAGE
+    finally:
+        store.close()
+    raw = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    if not args.file:
+        sys.stdout.write(raw)
+        return OK
+    try:
+        with open(args.file, "w", encoding="utf-8") as handle:
+            handle.write(raw)
+    except OSError as err:
+        _err(f"cannot write export {args.file}: {err}")
+        return USAGE
+    return OK
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    from corral import hub, paths
+
+    try:
+        with open(args.file, encoding="utf-8") as handle:
+            raw = handle.read()
+    except OSError as err:
+        _err(f"cannot read import {args.file}: {err}")
+        return USAGE
+    try:
+        document = json.loads(raw)
+    except ValueError as err:
+        _err(f"cannot parse import {args.file}: {err}")
+        return USAGE
+    try:
+        db_path = paths.hub_db_path()
+    except paths.PathError as err:
+        _err(str(err))
+        return USAGE
+    try:
+        store = hub.open_db(db_path)
+    except hub.HubError as err:
+        _err(str(err))
+        return USAGE
+    try:
+        claims, host_ids = hub.import_hub(store, document)
+    except hub.HubError as err:
+        _err(str(err))
+        return USAGE
+    finally:
+        store.close()
+    print(f"loaded {claims} claims; re-add {len(host_ids)} hosts with their minted tokens:")
+    for host_id in host_ids:
+        print(f"  corral hub add-host --id {host_id}")
+    return OK
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    from corral import hub, paths
+
+    try:
+        db_path = paths.hub_db_path()
+    except paths.PathError as err:
+        _err(str(err))
+        return USAGE
+    try:
+        dest = hub.backup_hub(db_path, args.to)
+    except hub.HubError as err:
+        _err(str(err))
+        return USAGE
+    print(dest)
+    return OK
+
+
 def cmd_hub(args: argparse.Namespace) -> int:
     if args.hub_verb == "add-host":
         return cmd_add_host(args)
     if args.hub_verb == "serve":
         return cmd_serve(args)
+    if args.hub_verb == "export":
+        return cmd_export(args)
+    if args.hub_verb == "import":
+        return cmd_import(args)
+    if args.hub_verb == "backup":
+        return cmd_backup(args)
     _err(f"unknown hub verb {args.hub_verb!r}")
     return USAGE
 
@@ -123,4 +220,13 @@ def add_parser(sub) -> None:
     p.add_argument(
         "--port", type=int, default=0, help="port to bind (default 0, an ephemeral port)"
     )
+    p = verbs.add_parser(
+        "export",
+        help="write the hub's movable state as JSON (hosts, claims with epochs, no secrets)",
+    )
+    p.add_argument("--file", default="", help="write to PATH instead of stdout")
+    p = verbs.add_parser("import", help="load an export into a fresh hub, keeping epochs")
+    p.add_argument("--file", required=True, help="the JSON file `hub export` wrote")
+    p = verbs.add_parser("backup", help="copy the hub database to PATH (never clobbers)")
+    p.add_argument("--to", required=True, help="destination path for the copy")
     hub_cmd.set_defaults(func=cmd_hub)

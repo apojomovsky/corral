@@ -253,6 +253,29 @@ class ClaimRoutingTest(unittest.TestCase):
         gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x")))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
 
+    def test_a_fix_behind_a_reviewer_holder_skips_with_the_claim_kept(self):
+        gated = gate(
+            entry(kind="fix", row_=row(agent="drive-host-1-x")),
+            agent_roles={"drive-host-1-x": "reviewer"},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertIn("waits for release", gated.reason)
+
+    def test_a_resume_behind_a_reviewer_holder_skips_with_the_claim_kept(self):
+        gated = gate(
+            entry(kind="resume", row_=row(agent="drive-host-1-x")),
+            agent_roles={"drive-host-1-x": "reviewer"},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertIn("waits for release", gated.reason)
+
+    def test_a_fix_behind_a_worker_holder_proceeds(self):
+        gated = gate(
+            entry(kind="fix", row_=row(agent="drive-host-1-x")),
+            agent_roles={"drive-host-1-x": "worker"},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+
     def test_a_resume_on_a_foreign_holder_skips_as_foreign_claim(self):
         gated = gate(entry(kind="resume", row_=row(agent="operator-hand")))
         self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
