@@ -17,7 +17,7 @@ import tempfile
 import unittest
 
 from corral import board, drive, registry
-from corral.github.tracker import NEEDS_DECISION
+from corral.tracker import NEEDS_DECISION
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, HOST, NOW, OLD, claimed
@@ -822,6 +822,30 @@ class FixBehindReviewerTest(unittest.TestCase):
         self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
         self.assertIn("waits for release", out)
 
+    def test_a_plan_shows_the_fix_waiting_behind_the_reviewer(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7, agent=REVIEWER)
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=True,
+            found=[("blue", [("app", 7, "fix")])],
+            policy_dir=self.policies,
+            agent_states={REVIEWER: (registry.LIVE, NOW - 10.0)},
+            live_units=frozenset({("app", 7)}),
+            agent_roles={REVIEWER: "reviewer"},
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("waits for release", out.getvalue())
+        self.assertNotIn("fix round on managed holder", out.getvalue())
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual(after.agent, REVIEWER)
+
     def test_a_fix_proceeds_once_the_reviewer_is_released(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -1126,6 +1150,33 @@ class ClaimRaceTest(unittest.TestCase):
         self.assertIn("finished worker id lost", rows[0].reason)
         self.assertEqual((started, blocked, launched), (0, False, set()))
         self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_reviewer_launch_skipped_without_a_launcher_releases_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="review",
+            verdict="review",
+            reason="app#7: unclaimed, review slot",
+            code="",
+        )
+        rows, started, blocked, launched, _ = self.launch(
+            store,
+            gated,
+            launcher=None,
+            released={},
+            finished={("app", 7): (WORKER, "worker")},
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].kind, rows[0].verdict), ("review", "skip"))
+        self.assertEqual(rows[0].code, "launch")
+        self.assertIn("launch skipped (no launcher)", rows[0].reason)
+        self.assertIn("reviewer claim released", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
         self.assertIsNone(store.claim_of("app", 7))
 
     def test_a_resume_over_a_released_row_is_left_held(self):

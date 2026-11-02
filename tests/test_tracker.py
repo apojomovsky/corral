@@ -309,6 +309,21 @@ class PriorityTest(unittest.TestCase):
         self.assertEqual(self.read_priority([{"name": "ready"}]), "")
 
 
+class SharedVocabularyTest(unittest.TestCase):
+    """The adapter ranks and flags by the neutral protocol's words, not its own copies."""
+
+    def test_the_adapter_derives_priority_from_the_shared_order(self):
+        for higher, lower in zip(tracker.PRIORITIES, tracker.PRIORITIES[1:]):
+            with self.subTest(higher=higher, lower=lower):
+                self.assertEqual(
+                    ghtracker.priority_of([f"priority:{lower}", f"priority:{higher}"]),
+                    higher,
+                )
+
+    def test_the_decision_label_is_the_shared_one(self):
+        self.assertIs(ghtracker.NEEDS_DECISION, tracker.NEEDS_DECISION)
+
+
 class PaginationTest(unittest.TestCase):
     def setUp(self):
         self.gh = FakeRun()
