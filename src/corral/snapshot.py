@@ -18,18 +18,33 @@ import time
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
 
-#: The document schema version, printed as `schema_version`.
-SCHEMA_VERSION = 1
+#: The document schema version, printed as `schema_version`. Version 2 adds
+#: the agent `profile` row field: the profile name recorded at launch.
+SCHEMA_VERSION = 2
+
+#: Sections whose `{"error"}` body marks the server degraded.
+#: The one owner of the section names; `serve` reads through this.
+ERROR_SECTIONS = ("agents", "quota", "capacity", "disk", "drive")
 
 
 def _err(text):
     print(f"corral snapshot: {text}", file=sys.stderr)
 
 
+def error_text(exc):
+    """`str(exc)`, or `repr(exc)` when the message is empty."""
+    text = str(exc)
+    return text if text else repr(exc)
+
+
+def is_error_section(value):
+    """Whether a built section is a `{"error": ...}` failure body."""
+    return isinstance(value, dict) and set(value) == {"error"}
+
+
 def _section_error(exc):
     """A failed section: `{"error": text}`, never an empty message."""
-    text = str(exc) if str(exc) else repr(exc)
-    return {"error": text}
+    return {"error": error_text(exc)}
 
 
 def _agent_row(entry, state):
@@ -50,6 +65,7 @@ def _agent_row(entry, state):
         "number": held[1] if held else None,
         "runtime": entry.get("runtime"),
         "role": entry.get("role"),
+        "profile": entry.get("profile"),
         "model": entry.get("model"),
         "state": state,
         "started_at": entry.get("started_at"),
@@ -136,7 +152,7 @@ def _disk(usage_fn):
         try:
             total, used, free = usage_fn(name)
         except Exception as exc:  # noqa: BLE001 - per-path failure, not a section failure
-            out.append({"path": name, "error": str(exc) if str(exc) else repr(exc)})
+            out.append({"path": name, "error": error_text(exc)})
         else:
             out.append({"path": name, "total": total, "used": used, "free": free})
     return {"paths": out}
@@ -204,10 +220,7 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_v
 
 def _all_failed(doc):
     """Whether every readable section failed: nothing at all could be read."""
-    return all(
-        isinstance(doc.get(section), dict) and set(doc[section]) == {"error"}
-        for section in ("agents", "quota", "capacity", "disk", "drive")
-    )
+    return all(is_error_section(doc.get(section)) for section in ERROR_SECTIONS)
 
 
 def _show(doc):
@@ -353,27 +366,28 @@ def _below(path, parent):
         return False
 
 
-def cmd_snapshot(args: argparse.Namespace) -> int:
-    """Run the `snapshot` verb."""
-    from corral import accounts, admission, drive, paths, quota_ledger, quotacli, registry, settings
+def collect_kwargs() -> dict:
+    """Keyword arguments for `build` from the host's local readers.
 
-    try:
-        resolved = settings.load(root=_settings_root(os.getcwd()))
-        cfg = registry.config(resolved)
-        plain = {
-            "admission.total_cap": resolved["admission.total_cap"],
-            "admission.repo_cap": resolved["admission.repo_cap"],
-            "registry.count_toward_cap": cfg["count_toward_cap"],
-        }
-        admission.validate_limits(
-            admission.Limits(
-                total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"]
-            )
-        )
-        low_pct = resolved["quota.low_pct"]
-    except (settings.SettingsError, paths.PathError, admission.LimitsError) as err:
-        _err(str(err))
-        return USAGE
+    One shared helper so the `snapshot` verb and `serve.collect`
+    cannot diverge: settings load, registry config, validated limits,
+    and the registry, quota and drive readers in that order.
+    Settings and limit errors propagate; section readers fail into
+    the returned values, never raise.
+    """
+    from corral import accounts, admission, drive, quota_ledger, quotacli, registry, settings
+
+    resolved = settings.load(root=_settings_root(os.getcwd()))
+    cfg = registry.config(resolved)
+    plain = {
+        "admission.total_cap": resolved["admission.total_cap"],
+        "admission.repo_cap": resolved["admission.repo_cap"],
+        "registry.count_toward_cap": cfg["count_toward_cap"],
+    }
+    admission.validate_limits(
+        admission.Limits(total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"])
+    )
+    low_pct = resolved["quota.low_pct"]
     now = time.time()
     host = socket.gethostname()
     try:
@@ -397,7 +411,27 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         )
     except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
         drive_view = exc
-    doc = build(now, host, registry_view, quota_view, plain, shutil.disk_usage, drive_view)
+    return {
+        "now": now,
+        "host": host,
+        "registry_view": registry_view,
+        "quota_view": quota_view,
+        "settings": plain,
+        "usage_fn": shutil.disk_usage,
+        "drive_view": drive_view,
+    }
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Run the `snapshot` verb."""
+    from corral import admission, paths, settings
+
+    try:
+        kwargs = collect_kwargs()
+    except (settings.SettingsError, paths.PathError, admission.LimitsError) as err:
+        _err(str(err))
+        return USAGE
+    doc = build(**kwargs)
     if _all_failed(doc):
         _err("nothing to report: every section failed")
         return UNREACHABLE
