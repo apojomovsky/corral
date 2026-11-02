@@ -60,6 +60,8 @@ class FakeHub:
         self.conflicts = {}
         self.unreachable = False
         self.peek = lambda repo, number: None
+        self.releases = []
+        self.release_errors = {}
 
     def _check(self, op, repo, number, agent):
         try:
@@ -86,6 +88,9 @@ class FakeHub:
 
     def release(self, repo, number, agent, epoch):
         self._check("release", repo, number, agent)
+        self.releases.append((repo, number, agent, epoch))
+        if (repo, number) in self.release_errors:
+            raise self.release_errors[(repo, number)]
         return epoch
 
     def claims(self):
@@ -200,6 +205,57 @@ class HubComposeTest(unittest.TestCase):
         self.assertEqual(launcher.calls[0][1:3], ("app", 8))
         self.assertIn("race lost", out.getvalue())
         self.assertIn("app#7", out.getvalue())
+
+    def test_local_race_after_a_hub_grant_releases_the_hub_row(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        holder = claimed(store, "app", 7, at=1000.0)
+        hub_fake = FakeHub()
+        hub_fake.receipts[("app", 7)] = 4
+        mode = drivehub.HubMode(hub_fake, HOST)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="start",
+            verdict="start",
+            reason="app#7: unclaimed, start slot",
+            code="",
+        )
+        agent, skipped = drive._mint_claim(store, gated, host=HOST, now=NOW, hub=mode)
+        self.assertIsNone(agent)
+        assert skipped is not None
+        self.assertEqual(skipped.code, "claim")
+        self.assertIn("race lost", skipped.reason)
+        proposes = [call for call in hub_fake.calls if call[0] == "propose"]
+        self.assertEqual(len(proposes), 1)
+        self.assertEqual(hub_fake.releases, [("app", 7, proposes[0][3], 4)])
+        kept = store.claim_of("app", 7)
+        assert kept is not None
+        self.assertEqual((kept.agent, kept.epoch), (holder.agent, holder.epoch))
+
+    def test_local_race_releases_best_effort_when_the_hub_is_gone(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7, at=1000.0)
+        hub_fake = FakeHub()
+        hub_fake.receipts[("app", 7)] = 4
+        hub_fake.release_errors[("app", 7)] = drive.HubGone("hub away")
+        mode = drivehub.HubMode(hub_fake, HOST)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="start",
+            verdict="start",
+            reason="app#7: unclaimed, start slot",
+            code="",
+        )
+        agent, skipped = drive._mint_claim(store, gated, host=HOST, now=NOW, hub=mode)
+        self.assertIsNone(agent)
+        assert skipped is not None
+        self.assertEqual(skipped.code, "claim")
+        self.assertIn("race lost", skipped.reason)
 
     def test_hub_down_skips_new_claims_resumes_held_work_and_exits_3(self):
         store = stored(self.db, [("app", 7, "open"), ("app", 9, "open")])
