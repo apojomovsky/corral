@@ -174,7 +174,7 @@ def ignored_drop_ins(directory: str | None = None) -> list[str]:
     """The drop-in dir entry names no claim file holds, sorted.
 
     A typo such as ``desk.jsnm`` never counts as a claim; the doctor
-    names these files so the miss is visible. A missing directory reads
+    names these entries so the miss is visible. A missing directory reads
     as none. Anything else unreadable is a LedgerError naming it: like a
     malformed claim, an unlistable dir must refuse, never read as empty.
     """
@@ -216,14 +216,20 @@ def _without_drop_ins(ledger: dict, drops: list[dict]) -> dict:
     """`ledger` with only the entries the ledger file itself owns.
 
     The file never stores drop-in claims: merging happens at read, so a
-    read-modify-write strips the entries merged at read, by identity. A
-    drop-in that appears after the read is not stripped: stripping by a
-    fresh name listing would mistake a ledger-owned claim of the same
-    name for a drop-in and lose it from the persisted file.
+    read-modify-write strips the entries merged at read, by identity and
+    by value. Value matters because a change may return copies built by
+    value: a copy of a drop-in is still a drop-in. A drop-in that appears
+    after the read is not stripped: stripping by a fresh name listing
+    would mistake a ledger-owned claim of the same name for a drop-in
+    and lose it from the persisted file.
     """
     merged = {id(entry) for entry in drops}
     stripped = dict(ledger)
-    stripped["foreign"] = [entry for entry in ledger.get("foreign", []) if id(entry) not in merged]
+    stripped["foreign"] = [
+        entry
+        for entry in ledger.get("foreign", [])
+        if id(entry) not in merged and entry not in drops
+    ]
     return stripped
 
 

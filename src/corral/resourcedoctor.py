@@ -56,7 +56,7 @@ class ResourceReadings(NamedTuple):
     Nones when unknown; None means not gathered, and then the pressure
     row skips saturation. ``pressure_caps`` is the saturation line as
     ``(max_load_per_cpu, min_mem_available_pct)``. ``foreign_ignored``
-    names the drop-in dir files no claim holds (a typo such as
+    names the drop-in dir entries no claim holds (a typo such as
     ``desk.jsnm``): never counted by the gate, warned by the row.
     Tests build this directly; only production reads disk.
     """
@@ -309,8 +309,8 @@ def _check_foreign(state: ResourceReadings) -> ResourceRow:
     An unreadable ledger warns unknown: the load was never read, so an
     empty claim list is unknown, not zero. A claim without claimed_at
     reads as 0.0 like the budget gate, so it reports as expired and
-    ignored. Files in the drop-in dir that are not .json are never
-    counted; they warn naming the files.
+    ignored. Entries in the drop-in dir that are not .json are never
+    counted; they warn naming the entries.
     """
     if state.limits_error is not None and "foreign claim" in state.limits_error:
         return ResourceRow(
@@ -357,8 +357,8 @@ def _check_foreign(state: ResourceReadings) -> ResourceRow:
         claims_dir = host_ledger.claims_dir(state.ledger_path)
         warns.append(
             (
-                f"foreign-claim files ignored (not .json, never counted): {', '.join(ignored)}",
-                f"remove or rename the ignored files in {claims_dir},"
+                f"foreign-claim entries ignored (not .json, never counted): {', '.join(ignored)}",
+                f"remove or rename the ignored entries in {claims_dir},"
                 " then run `corral doctor` again",
             )
         )
@@ -367,7 +367,7 @@ def _check_foreign(state: ResourceReadings) -> ResourceRow:
             "resources-foreign",
             "warn",
             "; ".join(detail for detail, _ in warns),
-            warns[0][1],
+            "; ".join(fix for _, fix in warns),
         )
     if live:
         return ResourceRow(

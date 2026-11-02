@@ -424,6 +424,16 @@ class ForeignClaims(unittest.TestCase):
         self.assertEqual(row.status, "warn")
         self.assertIn("desktop", row.detail)
         self.assertIn("desk.jsnm", row.detail)
+        self.assertIn("renew or remove the expired claims", row.fix)
+        self.assertIn("remove or rename the ignored entries", row.fix)
+
+    def test_a_subdirectory_counts_as_an_ignored_entry(self):
+        rows = by_name(resourcedoctor.check(readings(foreign_ignored=("stale.d",))))
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("stale.d", row.detail)
+        self.assertIn("entries ignored", row.detail)
+        self.assertIn("ignored entries", row.fix)
 
     def test_a_foreign_limits_error_fails_the_foreign_row_too(self):
         error = "foreign claim 0 must be a foreign claim, not {}"
