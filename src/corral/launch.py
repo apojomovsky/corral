@@ -548,11 +548,10 @@ def launch(
                         reviewer=reviewer,
                         session_id=session_id,
                     )
+                env = _env(adapter, session, unit)
             except ValueError as err:
                 raise LaunchError(str(err)) from None
-            argv = units.unit_argv(
-                unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
-            )
+            argv = units.unit_argv(unit, workdir, session, command, env, RUNTIME_MAX_S)
         except Exception:
             if session_id is not None:
                 _drop_session_id(session)
@@ -723,11 +722,10 @@ def resume(
                 max_time=runtimes.DEFAULT_MAX_TIME,
                 reviewer=(recorded == "reviewer"),
             )
+            env = _env(adapter, session, unit)
         except ValueError as err:
             raise LaunchError(str(err)) from None
-        argv = units.unit_argv(
-            unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
-        )
+        argv = units.unit_argv(unit, workdir, session, command, env, RUNTIME_MAX_S)
         _register_started(tgt, unit, number, model, recorded)
         try:
             units.start(argv, session, unit, run=run)

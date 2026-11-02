@@ -23,6 +23,8 @@ NAME = "opencode"
 #: Where opencode installs for a user, when PATH does not have it.
 FALLBACK = "~/.opencode/bin/opencode"
 CONFIG_NAME = "opencode.json"
+#: The profile options the last `write_config` recorded, read back by `env`.
+OPTIONS_NAME = "options.json"
 OUT_LOG = "out.log"
 #: opencode's bash tool times out after two minutes by default; builds and the
 #: takeoff ritual take longer, so the default is an hour.
@@ -51,23 +53,36 @@ def argv(
     return command + [prompt]
 
 
-def _timeout_of(session_dir):
-    """The bash timeout for the run: the recorded option, else the default.
+def _read_options(session_dir):
+    """The recorded profile options, or {} when none were recorded.
 
-    Anything but an integer stays on the default: `env` reports the run's
-    environment and never refuses it. Profile validation gates the type at
-    launch; a hand-edited config cannot wedge a resume here.
+    A corrupt file, an unreadable one, or a non-object raises ValueError
+    naming the file, so a launch never silently runs on the wrong setup.
     """
+    path = os.path.join(session_dir, OPTIONS_NAME)
     try:
-        with open(os.path.join(session_dir, CONFIG_NAME), encoding="utf-8") as handle:
-            config = json.load(handle)
-    except (OSError, ValueError):
+        with open(path, encoding="utf-8") as handle:
+            options = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    except ValueError as err:
+        raise ValueError(f"cannot parse {path}: {err}") from err
+    if not isinstance(options, dict):
+        raise ValueError(f"cannot parse {path}: want a JSON object")
+    return options
+
+
+def _timeout_of(session_dir):
+    """The bash timeout for the run: the recorded option, else the default."""
+    options = _read_options(session_dir)
+    if "bash_timeout_ms" not in options:
         return BASH_TIMEOUT_MS
-    if not isinstance(config, dict):
-        return BASH_TIMEOUT_MS
-    value = config.get("bash_timeout_ms", BASH_TIMEOUT_MS)
+    value = options["bash_timeout_ms"]
     if isinstance(value, bool) or not isinstance(value, int):
-        return BASH_TIMEOUT_MS
+        path = os.path.join(session_dir, OPTIONS_NAME)
+        raise ValueError(f"cannot parse {path}: want bash_timeout_ms to be an integer")
     return value
 
 
@@ -82,10 +97,21 @@ def env(session_dir):
 
 
 def write_config(session_dir, config):
-    """Write `opencode.json` into the session dir, atomically."""
+    """Write `opencode.json` into the session dir, atomically.
+
+    Profile options travel beside it in `options.json`, so `env` can read
+    them back; they never land in the file the binary reads.
+    """
+    options = {}
+    rest = dict(config or {})
+    if "bash_timeout_ms" in rest:
+        options["bash_timeout_ms"] = rest.pop("bash_timeout_ms")
     os.makedirs(session_dir, exist_ok=True)
-    text = json.dumps(config, indent=1) + "\n"
+    text = json.dumps(rest, indent=1) + "\n"
     paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), text)
+    if options:
+        text = json.dumps(options, indent=1) + "\n"
+        paths.atomic_write_text(os.path.join(session_dir, OPTIONS_NAME), text)
 
 
 def with_models(config, chains):

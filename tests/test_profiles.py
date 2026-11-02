@@ -258,9 +258,13 @@ class AdapterSchemas(unittest.TestCase):
                     want = entry[0] if isinstance(entry, tuple) else entry
                     self.assertIn(want, (str, int, float, bool))
                     if isinstance(entry, tuple):
-                        self.assertEqual(len(entry), 2)
+                        self.assertIn(len(entry), (2, 3))
                         self.assertIsInstance(entry[1], str)
                         self.assertTrue(entry[1])
+                        if len(entry) == 3:
+                            self.assertTrue(entry[2], f"{name}.{key} allows nothing")
+                            for allowed in entry[2]:
+                                self.assertIsInstance(allowed, (str, int, float))
 
     def test_an_unknown_option_key_fails_for_every_real_runtime(self):
         for name in runtimes.NAMES:
@@ -297,3 +301,31 @@ class AdapterSchemas(unittest.TestCase):
                 with self.assertRaises(settings.SettingsError) as ctx:
                     profiles.validate({name: raw_profile(name, options=options)}, ["provider-a"])
                 self.assertIn(next(iter(options)), str(ctx.exception))
+
+
+class EffortTiers(unittest.TestCase):
+    def test_every_binary_tier_validates(self):
+        for tier in ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"):
+            with self.subTest(tier=tier):
+                parsed = profiles.validate(
+                    {"p": raw_profile("muse", options={"reasoning_effort": tier})},
+                    ["provider-a"],
+                )
+                self.assertEqual(parsed["p"].options, {"reasoning_effort": tier})
+
+    def test_an_empty_tier_fails_validation(self):
+        with self.assertRaises(settings.SettingsError) as ctx:
+            profiles.validate(
+                {"p": raw_profile("muse", options={"reasoning_effort": ""})},
+                ["provider-a"],
+            )
+        self.assertIn("reasoning_effort", str(ctx.exception))
+
+    def test_an_unknown_tier_fails_validation(self):
+        with self.assertRaises(settings.SettingsError) as ctx:
+            profiles.validate(
+                {"p": raw_profile("muse", options={"reasoning_effort": "turbo"})},
+                ["provider-a"],
+            )
+        self.assertIn("reasoning_effort", str(ctx.exception))
+        self.assertIn("turbo", str(ctx.exception))

@@ -561,10 +561,21 @@ class OptionsSchema(unittest.TestCase):
         self.assertEqual(
             muse.RUNTIME.options_schema(),
             {
-                "reasoning_effort": (str, "the --reasoning-effort tier for the run"),
+                "reasoning_effort": (
+                    str,
+                    "the --reasoning-effort tier for the run",
+                    muse.EFFORT_TIERS,
+                ),
                 "parallel_tool_calls": (bool, "whether to pass --parallel-tool-calls"),
             },
         )
+
+    def test_the_effort_tiers_are_the_binary_tiers(self):
+        self.assertEqual(
+            set(muse.EFFORT_TIERS),
+            {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"},
+        )
+        self.assertIn(muse.DEFAULT_EFFORT, muse.EFFORT_TIERS)
 
     def test_a_second_call_returns_the_same_shape(self):
         first = muse.RUNTIME.options_schema()
@@ -572,7 +583,11 @@ class OptionsSchema(unittest.TestCase):
         self.assertEqual(
             muse.RUNTIME.options_schema(),
             {
-                "reasoning_effort": (str, "the --reasoning-effort tier for the run"),
+                "reasoning_effort": (
+                    str,
+                    "the --reasoning-effort tier for the run",
+                    muse.EFFORT_TIERS,
+                ),
                 "parallel_tool_calls": (bool, "whether to pass --parallel-tool-calls"),
             },
         )

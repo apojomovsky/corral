@@ -426,20 +426,33 @@ class OpencodeTimeoutOption(SessionCase):
             "60000",
         )
 
-    def test_a_non_integer_timeout_keeps_the_default(self):
-        opencode.RUNTIME.write_config(self.sdir, {"bash_timeout_ms": True})
-        self.assertEqual(
-            opencode.RUNTIME.env(self.sdir)["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"],
-            str(opencode.BASH_TIMEOUT_MS),
-        )
+    def test_the_session_config_holds_no_corral_only_key(self):
+        opencode.RUNTIME.write_config(self.sdir, {"model": MODEL, "bash_timeout_ms": 60000})
+        with open(os.path.join(self.sdir, "opencode.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"model": MODEL})
+        with open(os.path.join(self.sdir, "options.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"bash_timeout_ms": 60000})
 
-    def test_a_corrupt_config_keeps_the_default(self):
-        with open(os.path.join(self.sdir, "opencode.json"), "w", encoding="utf-8") as handle:
+    def test_a_config_without_a_timeout_writes_no_sidecar(self):
+        opencode.RUNTIME.write_config(self.sdir, {"model": MODEL})
+        self.assertEqual(os.listdir(self.sdir), ["opencode.json"])
+
+    def test_a_non_integer_timeout_refuses_the_run(self):
+        opencode.RUNTIME.write_config(self.sdir, {"bash_timeout_ms": True})
+        with self.assertRaises(ValueError):
+            opencode.RUNTIME.env(self.sdir)
+
+    def test_a_corrupt_options_file_refuses_the_run(self):
+        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
             handle.write("{not json")
-        self.assertEqual(
-            opencode.RUNTIME.env(self.sdir)["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"],
-            str(opencode.BASH_TIMEOUT_MS),
-        )
+        with self.assertRaises(ValueError):
+            opencode.RUNTIME.env(self.sdir)
+
+    def test_a_non_object_options_file_refuses_the_run(self):
+        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
+            handle.write("[1, 2]")
+        with self.assertRaises(ValueError):
+            opencode.RUNTIME.env(self.sdir)
 
 
 class OpencodeHomeProof(SessionCase):

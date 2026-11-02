@@ -2,6 +2,7 @@
 
 import io
 import os
+import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -152,6 +153,13 @@ class OmpTripwire(unittest.TestCase):
         self.assertFalse(r.ok)
         self.assertIn("below 19", r.problem or "")
 
+    def test_the_installer_ref_matches_the_below_bound(self):
+        entry = self.entry()
+        ref = re.search(r"--(?:ref|version)\s+v?(\d+)", entry.install or "")
+        self.assertIsNotNone(ref, "the omp installer names no versioned ref")
+        assert ref is not None
+        self.assertEqual(int(ref.group(1)) + 1, int(entry.below))
+
 
 class OpencodeTripwire(unittest.TestCase):
     """The shipped opencode entry pins major 1: canned 1.x passes, 2.x fails."""
@@ -173,6 +181,13 @@ class OpencodeTripwire(unittest.TestCase):
         r = deps.check(entry, fake({"opencode": "opencode 2.0.1\n"}))
         self.assertFalse(r.ok)
         self.assertIn("below 2", r.problem or "")
+
+    def test_the_installer_ref_matches_the_below_bound(self):
+        entry = self.entry()
+        ref = re.search(r"--(?:ref|version)\s+v?(\d+)", entry.install or "")
+        self.assertIsNotNone(ref, "the opencode installer names no versioned ref")
+        assert ref is not None
+        self.assertEqual(int(ref.group(1)) + 1, int(entry.below))
 
 
 class ShippedList(unittest.TestCase):

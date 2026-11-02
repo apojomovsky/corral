@@ -60,10 +60,17 @@ BUILTIN_DEFAULT = Profile(name=DEFAULT_PROFILE_NAME, runtime="muse")
 
 
 def _want_type(entry):
-    """The expected type from a schema entry: a type, or a (type, meaning) pair."""
+    """The expected type from a schema entry: a type, or a (type, meaning[, allowed]) tuple."""
     if isinstance(entry, tuple):
         return entry[0]
     return entry
+
+
+def _want_allowed(entry):
+    """The allowed values from a schema entry, or None when unconstrained."""
+    if isinstance(entry, tuple) and len(entry) == 3:
+        return entry[2]
+    return None
 
 
 def _matches(value, want) -> bool:
@@ -131,6 +138,12 @@ def _check_options(name: str, runtime: str, raw) -> dict:
             want_name = getattr(want, "__name__", str(want))
             raise ProfileError(
                 f"profile {name!r}: option {key!r} must be {want_name}, not {type(value).__name__}"
+            )
+        allowed = _want_allowed(schema[key])
+        if allowed is not None and value not in allowed:
+            want_values = ", ".join(sorted(str(item) for item in allowed))
+            raise ProfileError(
+                f"profile {name!r}: option {key!r} must be one of {want_values}, not {value!r}"
             )
         options[key] = value
     return options

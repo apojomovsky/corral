@@ -37,6 +37,8 @@ PARALLEL_KEY = "parallel_tool_calls"
 #: The flag values without a recorded option: today's fixed run shape.
 DEFAULT_EFFORT = "high"
 DEFAULT_PARALLEL = True
+#: The `--reasoning-effort` tiers the binary accepts.
+EFFORT_TIERS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 #: The launch prompt the session setup writes; the worker run reads it back.
 PROMPT_NAME = "prompt.md"
 #: The resume message file; the resume run reads the message from here.
@@ -200,7 +202,7 @@ def with_models(config, chains):
 def options_schema():
     """The profile options muse accepts: the effort tier and tool-call shape."""
     return {
-        EFFORT_KEY: (str, "the --reasoning-effort tier for the run"),
+        EFFORT_KEY: (str, "the --reasoning-effort tier for the run", EFFORT_TIERS),
         PARALLEL_KEY: (bool, "whether to pass --parallel-tool-calls"),
     }
 
