@@ -439,11 +439,21 @@ class GraphqlPacer:
         atomic_write_text(self.path, json.dumps(state))
 
 
-def _pacer() -> GraphqlPacer:
-    """The machine-wide pacer, in corral's state dir."""
+def pacing_path() -> str:
+    """The machine-wide bucket file: the only resolver for the default path.
+
+    `_pacer` builds the shared bucket on it, and the test tripwire
+    compares against it, so the guarded default cannot drift from the
+    production one.
+    """
     from corral.paths import state_dir
 
-    return GraphqlPacer(os.path.join(state_dir(), "graphql-pacing.json"))
+    return os.path.join(state_dir(), "graphql-pacing.json")
+
+
+def _pacer() -> GraphqlPacer:
+    """The machine-wide pacer, in corral's state dir."""
+    return GraphqlPacer(pacing_path())
 
 
 def graphql(query: str, run=None, pacer=None, **variables) -> dict:
@@ -453,7 +463,10 @@ def graphql(query: str, run=None, pacer=None, **variables) -> dict:
 
     `run` and `pacer` are injected for tests and default to the real
     ones: `run(args, paced=True)` runs `gh`, and the pacer meters the
-    shared bucket. Only GraphQL variable names may follow them."""
+    shared bucket. Their names are reserved for these seams and are
+    never sent as variables: every other keyword becomes a `-f`/`-F`
+    variable, so a query needing variables named `run` or `pacer`
+    cannot go through this function as written."""
     active_pacer = _pacer() if pacer is None else pacer
     # The parameter shadows the module's `run`: fall back to it by name,
     # so tests patching the module attribute still steer the default.
