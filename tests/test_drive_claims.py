@@ -20,7 +20,7 @@ from corral import admission, board, disk, drive, drivehub, sync, tracker
 from corral import host_ledger
 from corral import projects as projects_mod
 from corral import registry, units
-from corral.runtimes import omp, opencode
+from corral.runtimes import omp
 from tests.test_drive import policy_source, stored
 from tests.test_reviewrecord import git_in
 from tests.test_syncli import git_ok
@@ -505,7 +505,6 @@ class ProductionLauncherStartTest(unittest.TestCase):
         with open(os.path.join(config, "projects.d", "blue.toml"), "w", encoding="utf-8") as handle:
             handle.write(f'name = "blue"\nunit_prefix = "blue-agent"\nroot = "{self.root}"\n')
         self.enterContext(mock.patch.object(omp, "binary", return_value="/fake/omp"))
-        self.enterContext(mock.patch.object(opencode, "binary", return_value="/fake/opencode"))
         self.started = []
 
         def fake_run(argv, timeout=None):

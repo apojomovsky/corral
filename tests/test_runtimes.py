@@ -11,9 +11,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import runtimes as rt
+from corral import models, profiles, runtimes as rt
 from corral import settings
-from corral.runtimes import omp, opencode
+from corral.runtimes import muse, omp
 
 PROMPT = "do the thing"
 MODEL = "provider-a/model-1"
@@ -35,7 +35,7 @@ class SessionCase(unittest.TestCase):
 class Get(unittest.TestCase):
     def test_the_two_runtimes_resolve_by_name(self):
         self.assertEqual(rt.get("omp").name, "omp")
-        self.assertEqual(rt.get("opencode").name, "opencode")
+        self.assertEqual(rt.get("muse").name, "muse")
 
     def test_anything_else_is_an_unknown_runtime(self):
         for name in ("claude-code", "", "OMP"):
@@ -44,15 +44,33 @@ class Get(unittest.TestCase):
         self.assertTrue(issubclass(rt.UnknownRuntime, ValueError))
 
 
+class RemovedOpencode(unittest.TestCase):
+    """Every config that names opencode is refused with the removal message (exit 4)."""
+
+    def test_opencode_is_refused_naming_its_removal(self):
+        with self.assertRaises(rt.UnknownRuntime) as ctx:
+            rt.get("opencode")
+        self.assertEqual(str(ctx.exception), rt.REMOVED_MESSAGE)
+        with self.assertRaises(settings.SettingsError) as ctx:
+            profiles.validate(
+                {"slim": {"runtime": "opencode", "models": {}, "options": {}}}, ["provider-a"]
+            )
+        self.assertIn(rt.REMOVED_MESSAGE, str(ctx.exception))
+        for pool in (["provider-a"], ["provider-a", "opencode"]):
+            with self.subTest(pool=pool), self.assertRaises(models.ModelsError) as ctx:
+                models.validate({"default": ["opencode/model-x"]}, pool)
+            self.assertIn(rt.REMOVED_MESSAGE, str(ctx.exception))
+
+
 class Record(SessionCase):
     def test_an_unrecorded_session_reads_as_omp(self):
         self.assertEqual(rt.recorded(self.sdir), "omp")
 
     def test_the_recorded_runtime_is_read_back(self):
-        rt.record(self.sdir, "opencode")
-        self.assertEqual(rt.recorded(self.sdir), "opencode")
+        rt.record(self.sdir, "muse")
+        self.assertEqual(rt.recorded(self.sdir), "muse")
         with open(os.path.join(self.sdir, "runtime"), encoding="utf-8") as handle:
-            self.assertEqual(handle.read(), "opencode\n")
+            self.assertEqual(handle.read(), "muse\n")
 
     def test_an_empty_record_reads_as_omp(self):
         self.write("runtime", "\n")
@@ -68,9 +86,9 @@ class Record(SessionCase):
 class BinaryResolution(unittest.TestCase):
     def setUp(self):
         omp.binary.cache_clear()
-        opencode.binary.cache_clear()
+        muse.binary.cache_clear()
         self.addCleanup(omp.binary.cache_clear)
-        self.addCleanup(opencode.binary.cache_clear)
+        self.addCleanup(muse.binary.cache_clear)
 
     def test_the_binary_on_path_wins(self):
         with mock.patch("corral.runtimes.omp.shutil.which", return_value="/opt/bin/omp"):
@@ -79,8 +97,8 @@ class BinaryResolution(unittest.TestCase):
     def test_without_one_on_path_the_usual_install_location_is_used(self):
         with mock.patch("corral.runtimes.omp.shutil.which", return_value=None):
             self.assertEqual(omp.binary(), os.path.expanduser("~/.local/bin/omp"))
-        with mock.patch("corral.runtimes.opencode.shutil.which", return_value=None):
-            self.assertEqual(opencode.binary(), os.path.expanduser("~/.opencode/bin/opencode"))
+        with mock.patch("corral.runtimes.muse.shutil.which", return_value=None):
+            self.assertEqual(muse.binary(), os.path.expanduser("~/.local/bin/muse"))
 
     def test_each_binary_is_found_once(self):
         with mock.patch("corral.runtimes.omp.shutil.which", return_value="/opt/bin/omp") as which:
@@ -213,100 +231,16 @@ class OmpSessions(SessionCase):
         self.assertEqual(omp.RUNTIME.activity_file(self.sdir), os.path.abspath(new))
 
 
-class OpencodeArgv(unittest.TestCase):
-    def setUp(self):
-        patch = mock.patch.object(opencode, "binary", return_value="/fake/opencode")
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_a_launch_argv_is_the_json_run_form(self):
-        self.assertEqual(
-            opencode.RUNTIME.argv("/s", PROMPT),
-            ["/fake/opencode", "run", "--format", "json", "--auto", "--pure", PROMPT],
-        )
-
-    def test_resume_and_model_are_added_before_the_prompt(self):
-        self.assertEqual(
-            opencode.RUNTIME.argv("/s", PROMPT, model=MODEL, resume="ses_1"),
-            [
-                "/fake/opencode",
-                "run",
-                "--format",
-                "json",
-                "--auto",
-                "--pure",
-                "--session",
-                "ses_1",
-                "--model",
-                MODEL,
-                PROMPT,
-            ],
-        )
-
-    def test_reviewer_is_a_documented_no_op(self):
-        self.assertEqual(
-            opencode.RUNTIME.argv("/s", PROMPT, reviewer=True),
-            opencode.RUNTIME.argv("/s", PROMPT),
-        )
-
-    def test_the_environment_points_at_the_session_config(self):
-        self.assertEqual(
-            opencode.RUNTIME.env("/s"),
-            {
-                "OPENCODE_CONFIG": os.path.join("/s", "opencode.json"),
-                "OPENCODE_DISABLE_AUTOUPDATE": "1",
-                "OPENCODE_DISABLE_SHARE": "1",
-                "OPENCODE_DISABLE_CLAUDE_CODE": "1",
-                "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": "3600000",
-            },
-        )
-
-
-class OpencodeSessions(SessionCase):
-    def test_the_config_is_written_as_json_into_the_session_dir(self):
-        config = {"$schema": "https://example.com/config.json", "model": MODEL}
-        opencode.RUNTIME.write_config(self.sdir, config)
-        with open(os.path.join(self.sdir, "opencode.json"), encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), config)
-        self.assertEqual(os.listdir(self.sdir), ["opencode.json"])
-
-    def test_the_resume_handle_is_the_last_session_id_in_out_log(self):
-        self.write(
-            "out.log",
-            "\n".join(
-                [
-                    json.dumps({"type": "step_start", "sessionID": "ses_1"}),
-                    "not json",
-                    json.dumps(["no", "session"]),
-                    json.dumps({"type": "text", "sessionID": "ses_2"}),
-                    json.dumps({"type": "step_finish"}),
-                    "",
-                ]
-            ),
-        )
-        self.assertEqual(opencode.RUNTIME.resume_handle(self.sdir), "ses_2")
-
-    def test_no_handle_without_an_out_log_or_a_session_id(self):
-        self.assertIsNone(opencode.RUNTIME.resume_handle(self.sdir))
-        self.write("out.log", json.dumps({"type": "step_start"}) + "\n")
-        self.assertIsNone(opencode.RUNTIME.resume_handle(self.sdir))
-
-    def test_the_activity_file_is_out_log_once_it_exists(self):
-        self.assertIsNone(opencode.RUNTIME.activity_file(self.sdir))
-        path = self.write("out.log", "")
-        self.assertEqual(opencode.RUNTIME.activity_file(self.sdir), path)
-
-
 class Adapters(unittest.TestCase):
     def test_each_adapter_names_its_runtime(self):
         self.assertEqual(omp.RUNTIME.name, "omp")
-        self.assertEqual(opencode.RUNTIME.name, "opencode")
+        self.assertEqual(muse.RUNTIME.name, "muse")
 
     def test_an_unrecorded_session_defaults_to_omp(self):
         self.assertEqual(rt.DEFAULT_RUNTIME, "omp")
 
     def test_each_runtime_covers_the_section_6_checklist_shape(self):
-        for adapter in (omp.RUNTIME, opencode.RUNTIME):
+        for adapter in (omp.RUNTIME, muse.RUNTIME):
             with self.subTest(runtime=adapter.name):
                 for method in (
                     "argv",
@@ -403,99 +337,35 @@ class OmpHomeProof(SessionCase):
             self.assertNotIn(".local/share/", value)
 
 
-class OpencodeOptionsSchema(unittest.TestCase):
-    def test_the_schema_is_pinned(self):
-        self.assertEqual(
-            opencode.RUNTIME.options_schema(),
-            {"bash_timeout_ms": (int, "the bash tool timeout in milliseconds")},
-        )
-
-
-class OpencodeTimeoutOption(SessionCase):
-    def test_the_default_timeout_is_an_hour(self):
-        self.assertEqual(
-            opencode.RUNTIME.env(self.sdir)["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"],
-            str(opencode.BASH_TIMEOUT_MS),
-        )
-        self.assertEqual(opencode.BASH_TIMEOUT_MS, 3600 * 1000)
-
-    def test_setting_the_timeout_moves_the_environment(self):
-        opencode.RUNTIME.write_config(self.sdir, {"bash_timeout_ms": 60000})
-        self.assertEqual(
-            opencode.RUNTIME.env(self.sdir)["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"],
-            "60000",
-        )
-
-    def test_the_session_config_holds_no_corral_only_key(self):
-        opencode.RUNTIME.write_config(self.sdir, {"model": MODEL, "bash_timeout_ms": 60000})
-        with open(os.path.join(self.sdir, "opencode.json"), encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), {"model": MODEL})
-        with open(os.path.join(self.sdir, "options.json"), encoding="utf-8") as handle:
-            self.assertEqual(json.load(handle), {"bash_timeout_ms": 60000})
-
-    def test_a_config_without_a_timeout_writes_no_sidecar(self):
-        opencode.RUNTIME.write_config(self.sdir, {"model": MODEL})
-        self.assertEqual(os.listdir(self.sdir), ["opencode.json"])
-
-    def test_a_non_integer_timeout_refuses_the_run(self):
-        opencode.RUNTIME.write_config(self.sdir, {"bash_timeout_ms": True})
-        with self.assertRaises(ValueError):
-            opencode.RUNTIME.env(self.sdir)
-
-    def test_a_corrupt_options_file_refuses_the_run(self):
-        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
-            handle.write("{not json")
-        with self.assertRaises(ValueError):
-            opencode.RUNTIME.env(self.sdir)
-
-    def test_a_non_object_options_file_refuses_the_run(self):
-        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
-            handle.write("[1, 2]")
-        with self.assertRaises(ValueError):
-            opencode.RUNTIME.env(self.sdir)
-
-
-class OpencodeHomeProof(SessionCase):
-    def setUp(self):
-        super().setUp()
-        patch = mock.patch.object(opencode, "binary", return_value="/fake/opencode")
-        patch.start()
-        self.addCleanup(patch.stop)
-
-    def test_no_argv_entry_points_at_a_home_config_or_state(self):
-        argv = opencode.RUNTIME.argv(self.sdir, PROMPT, model=MODEL, resume="ses_1")
-        for entry in argv:
-            self.assertNotIn(".config/opencode", entry)
-            self.assertNotIn(".local/share/", entry)
-
-    def test_the_session_config_pointer_stays_inside_the_session_dir(self):
-        env = opencode.RUNTIME.env(self.sdir)
-        self.assertEqual(env["OPENCODE_CONFIG"], os.path.join(self.sdir, "opencode.json"))
-        for value in env.values():
-            self.assertNotIn(".config/opencode", value)
-
-
 class PromptAsFlag(unittest.TestCase):
     """The prompt is the last argument; one that starts with `-` would be read as a flag."""
+
+    SESSION_ID = "12345678-1234-5678-1234-567812345678"
 
     def setUp(self):
         patch = mock.patch.object(omp, "binary", return_value="/fake/omp")
         patch.start()
         self.addCleanup(patch.stop)
-        patch = mock.patch.object(opencode, "binary", return_value="/fake/opencode")
+        patch = mock.patch.object(muse, "binary", return_value="/fake/muse")
         patch.start()
         self.addCleanup(patch.stop)
 
+    def argv(self, runtime, prompt):
+        if runtime is muse.RUNTIME:
+            return runtime.argv("/s", prompt, session_id=self.SESSION_ID)
+        return runtime.argv("/s", prompt)
+
     def test_both_runtimes_refuse_a_prompt_that_starts_with_a_dash(self):
-        for runtime in (omp.RUNTIME, opencode.RUNTIME):
+        for runtime in (omp.RUNTIME, muse.RUNTIME):
             for prompt in ("--help", "-p", "-"):
                 with self.subTest(runtime=runtime.name, prompt=prompt):
                     with self.assertRaises(ValueError):
-                        runtime.argv("/s", prompt)
+                        self.argv(runtime, prompt)
 
     def test_a_prompt_that_only_contains_a_dash_is_fine(self):
         self.assertEqual(omp.RUNTIME.argv("/s", "fix -x")[-1], "fix -x")
-        self.assertEqual(opencode.RUNTIME.argv("/s", "fix -x")[-1], "fix -x")
+        argv = muse.RUNTIME.argv("/s", "fix -x", session_id=self.SESSION_ID)
+        self.assertIn(os.path.join("/s", "prompt.md"), argv)
 
 
 class DottedAndReservedKeys(SessionCase):
@@ -542,35 +412,6 @@ class OmpSessionFiles(SessionCase):
             omp.RUNTIME.resume_handle(self.sdir),
             os.path.join(os.path.abspath(self.sdir), "b.jsonl"),
         )
-
-
-class OpencodeSessionIds(SessionCase):
-    def test_a_non_string_session_id_on_the_last_line_is_skipped(self):
-        self.write(
-            "out.log",
-            "\n".join(
-                [
-                    json.dumps({"sessionID": "ses_1"}),
-                    json.dumps({"sessionID": ["ses_2"]}),
-                ]
-            )
-            + "\n",
-        )
-        self.assertEqual(opencode.RUNTIME.resume_handle(self.sdir), "ses_1")
-
-    def test_numeric_and_empty_session_ids_are_skipped(self):
-        self.write(
-            "out.log",
-            "\n".join(
-                [
-                    json.dumps({"sessionID": "ses_1"}),
-                    json.dumps({"sessionID": 7}),
-                    json.dumps({"sessionID": ""}),
-                ]
-            )
-            + "\n",
-        )
-        self.assertEqual(opencode.RUNTIME.resume_handle(self.sdir), "ses_1")
 
 
 class RuntimeSetting(unittest.TestCase):

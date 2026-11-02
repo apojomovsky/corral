@@ -1,8 +1,7 @@
 """An agent's live activity, from its session file, in one line per step.
 
-Three event formats are read, told apart by their shape: omp's session
-`.jsonl` (assistant messages with tool calls and text), opencode's
-`--format json` events (a `part` with a tool use or text), and muse's
+Two event formats are read, told apart by their shape: omp's session
+`.jsonl` (assistant messages with tool calls and text) and muse's
 `--json` stream (records with a `payload_type` and a `payload`). Each
 shows the agent's tool calls with their tool name or outcome, and what
 it says. Thinking, tool output, steps and the prompt are left out, except
@@ -36,8 +35,6 @@ def render(line):
         return []
     if not isinstance(entry, dict):
         return []
-    if isinstance(entry.get("part"), dict):
-        return _render_event(entry)
     if isinstance(entry.get("payload_type"), str):
         return _render_muse(entry)
     message = _dict(entry.get("message"))
@@ -54,18 +51,6 @@ def render(line):
         elif kind == "text" and _text(item.get("text")):
             out.append("   " + _one_line(item["text"]))
     return out
-
-
-def _render_event(entry):
-    """One opencode `--format json` event."""
-    part = entry["part"]
-    if entry.get("type") == "tool_use":
-        args = _dict(_dict(part.get("state")).get("input"))
-        label = args.get("description") or part.get("tool") or "tool"
-        return [_one_line(f"-> {label} | {json.dumps(args)}")]
-    if entry.get("type") == "text" and _text(part.get("text")):
-        return ["   " + _one_line(part["text"])]
-    return []
 
 
 #: Muse `--json` records shown as the agent's visible text, with the

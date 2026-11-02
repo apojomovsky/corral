@@ -283,7 +283,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
-# agents.runtime = "omp"  # agent runtime: omp or opencode or muse
+# agents.runtime = "omp"  # agent runtime: omp or muse
 # agents.unit_prefix = "corral-agent-"  # prefix of transient agent unit names
 #
 # [board]
@@ -391,7 +391,7 @@ name = "empty"
 
 [repo.agents]
 cap = 3
-runtime = "opencode"
+runtime = "muse"
 
 [repo.board]
 ready = "triage"
@@ -717,7 +717,7 @@ class FlagsCase(Fixture):
             "--cap",
             "3",
             "--runtime",
-            "opencode",
+            "muse",
             "--set",
             "board.ready=triage",
             "--set",
@@ -730,7 +730,7 @@ class FlagsCase(Fixture):
         env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["agents.cap"], 3)
-        self.assertEqual(resolved["agents.runtime"], "opencode")
+        self.assertEqual(resolved["agents.runtime"], "muse")
         self.assertEqual(resolved["board.ready"], "triage")
         self.assertIs(resolved["git.commits.conventional"], False)
 
@@ -834,6 +834,11 @@ class ErrorsCase(Fixture):
         code, _, err = self.run_cli("--test-cmd", "make check", "--runtime", "bogus", self.root)
         self.assertEqual(code, 4)
         self.assertIn("--runtime", err)
+
+    def test_removed_runtime_names_the_removal(self):
+        code, _, err = self.run_cli("--test-cmd", "make check", "--runtime", "opencode", self.root)
+        self.assertEqual(code, 4)
+        self.assertIn("opencode support was removed", err)
 
     def test_differing_rerun_prints_diff_and_needs_force(self):
         self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)

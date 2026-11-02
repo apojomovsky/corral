@@ -166,6 +166,8 @@ def _parse(name, table, providers) -> Profile:
                 "want only 'runtime', 'models' and 'options'"
             )
     runtime = table.get("runtime")
+    if runtime in runtimes.REMOVED:
+        raise ProfileError(f"profile {name!r}: {runtimes.REMOVED_MESSAGE}")
     if not isinstance(runtime, str) or runtime not in runtimes.NAMES:
         raise ProfileError(
             f"profile {name!r}: unknown runtime {runtime!r}: "
@@ -928,6 +930,8 @@ def _check_recorded(raw: object, where: str) -> RecordedProfile:
             raise ProfileError(f"{where}: the profile record needs {key!r}")
     name = _check_name(raw["profile"], where)
     runtime = raw["runtime"]
+    if runtime in runtimes.REMOVED:
+        raise ProfileError(f"{where}: {runtimes.REMOVED_MESSAGE}")
     if not isinstance(runtime, str) or runtime not in runtimes.NAMES:
         raise ProfileError(
             f"{where}: the profile record names unknown runtime {runtime!r}: "
