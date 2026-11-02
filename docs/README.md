@@ -12,6 +12,7 @@
 | [`07-board-fields.md`](07-board-fields.md) | the board-field tracker variant: project board fields behind the tracker interface, and the tickets to build it |
 | [`08-hub-multihost.md`](08-hub-multihost.md) | the hub design: multi-host claims, leases, the aggregated dashboard, hub operations, and the rollout tickets |
 | [`09-host-resource-governance.md`](09-host-resource-governance.md) | host resource governance: the host budget, per-project shares, the ledger, and the tickets to build them |
+| [`10-agent-profiles.md`](10-agent-profiles.md) | agent profiles: one selectable setup (runtime, model chains, options) with local, project and per-ticket scope, and the tickets to build it |
 | [`adr/`](adr/) | decision records |
 
 `00-design.md` and `02-accounts-quota.md` are designs: how the system works and what each slice builds. `01-onboarding.md` records decisions (the R1 to R7 requirements and what each one settled) alongside the flow they shape. New decision records go in `adr/`.

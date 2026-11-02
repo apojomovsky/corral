@@ -1,19 +1,30 @@
-"""Board field carriage, ticket 1: extra through the tracker, sync, the store, and the gh seam.
+"""Board field carriage: extra through the tracker, sync, the store, and the gh seam.
 
 No network, no subprocess, no real state dir: the tracker is a fake, the
 store is a temporary file, and every ``graphql``/``paced_run`` call here
 injects a fake run and a fake pacer.
 
-A tripwire installed at import wraps the real pacer factory for the whole
-run: any test that reaches the default pacer file records an offender, and
-the suite fails at the end through the usual guard report. Real
-subprocesses stay covered by the ``gh`` shim on PATH.
+A tripwire installed at import guards the default pacer for the whole
+run: test discovery imports every module before running any test, so the
+guarded factory and the guarded pacer class watch every test. A call to
+the factory, or a direct ``GraphqlPacer`` construction on the default
+pacer path, records an offender and raises at once, so the offending
+test fails fast without touching the shared bucket file; the recorded
+offender also fails the suite at the end through the usual guard
+report. Real subprocesses stay covered by the ``gh`` shim on PATH.
+
+Self-exemption, documented: the guard test below restores the real
+pacer class while it resolves the default path it snapshots. That is
+the only sanctioned reach of the default path in the suite.
 """
 
 import json
 import os
+import sqlite3
+import sys
 import tempfile
 import unittest
+from typing import NoReturn
 from unittest import mock
 
 from corral import board, sync, tracker
@@ -23,23 +34,49 @@ from tests import suiteguard
 from tests.test_tracker import FakeRun, FakeTracker, reading
 
 _REAL_PACER_FACTORY = gh._pacer
+_REAL_PACER_CLASS = gh.GraphqlPacer
 
 
-def _guarded_pacer_factory() -> gh.GraphqlPacer:
-    """The real pacer factory, recording any test that reaches it.
+def _guarded_pacer_factory() -> NoReturn:
+    """The default pacer factory, recording any test that reaches it.
 
     Installed at import so it watches the whole run: test discovery
     imports every module before running any test. A call means some test
     used the default pacer (the state dir file) instead of an injected
-    fake, so it records an offender and the suite fails at the end. It
-    still delegates, so behavior is unchanged.
+    fake, so it records an offender and raises at once instead of
+    delegating: the run fails fast and the shared bucket file is never
+    touched. The recorded offender also fails the suite at the end
+    through the usual guard report.
     """
     suiteguard.record("reached the default GraphQL pacer (no injected pacer)")
-    return _REAL_PACER_FACTORY()
+    raise AssertionError("test reached the default GraphQL pacer: inject a fake pacer")
 
 
 _guarded_pacer_factory._corral_pacer_guard = True  # ty: ignore[unresolved-attribute]
 gh._pacer = _guarded_pacer_factory  # ty: ignore[invalid-assignment]
+
+
+class _GuardedPacerClass(_REAL_PACER_CLASS):
+    """The pacer class, flagging direct construction on the default path.
+
+    The factory guard alone does not catch a test that builds
+    ``GraphqlPacer`` directly on the state dir file, so the class is
+    guarded too: constructing on the default path records an offender
+    and raises, the same way the factory guard does. Any other path
+    builds a real pacer, so file-backed pacer tests keep working.
+    """
+
+    _corral_pacer_guard = True
+
+    def __init__(self, path, *args, **kwargs):
+        default = os.path.abspath(gh.pacing_path())
+        if os.path.abspath(path) == default:
+            suiteguard.record("constructed the default GraphQL pacer (no injected pacer)")
+            raise AssertionError("test constructed the default GraphQL pacer: inject a fake pacer")
+        super().__init__(path, *args, **kwargs)
+
+
+gh.GraphqlPacer = _GuardedPacerClass  # ty: ignore[invalid-assignment]
 
 
 class FakePacer:
@@ -162,6 +199,11 @@ class EffectivePriorityTest(unittest.TestCase):
     def test_empty_ranks_stay_empty(self):
         self.assertEqual(board.effective_priority("", {}), "")
 
+    def test_a_non_string_board_value_keeps_the_label_rank(self):
+        for bad in (["high"], ("high",), {"rank": "high"}, 1, True):
+            with self.subTest(bad=bad):
+                self.assertEqual(board.effective_priority("low", {"priority": bad}), "low")
+
 
 class StoreExtraMergeTest(unittest.TestCase):
     def setUp(self):
@@ -173,6 +215,66 @@ class StoreExtraMergeTest(unittest.TestCase):
     def stored_extra(self, number=7):
         row, _ = self.store.item("app", number, now=3000.0)
         return row.extra
+
+    def corrupt_extra(self, number, raw):
+        path = os.path.join(self.tmp.name, "board.sqlite")
+        raw_conn = sqlite3.connect(path)
+        try:
+            raw_conn.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                (raw, "app", number),
+            )
+            raw_conn.commit()
+        finally:
+            raw_conn.close()
+
+    def test_upsert_on_corrupt_stored_extra_raises(self):
+        self.store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                tracker_updated_at=1000.0,
+                extra={"priority": "high"},
+            ),
+            operators=["alice"],
+            now=1000.0,
+        )
+        self.corrupt_extra(7, "{{{broken")
+        with self.assertRaisesRegex(board.StoreError, r"app#7"):
+            self.store.upsert_item(
+                board.Item(
+                    repo="app",
+                    number=7,
+                    tracker_updated_at=2000.0,
+                    extra={"pool": "dispatch"},
+                ),
+                operators=["alice"],
+                now=2000.0,
+            )
+
+    def test_upsert_on_non_dict_stored_extra_raises(self):
+        self.store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                tracker_updated_at=1000.0,
+                extra={"priority": "high"},
+            ),
+            operators=["alice"],
+            now=1000.0,
+        )
+        self.corrupt_extra(7, "[]")
+        with self.assertRaisesRegex(board.StoreError, r"app#7"):
+            self.store.upsert_item(
+                board.Item(
+                    repo="app",
+                    number=7,
+                    tracker_updated_at=2000.0,
+                    extra={"pool": "dispatch"},
+                ),
+                operators=["alice"],
+                now=2000.0,
+            )
 
     def test_insert_persists_extra(self):
         self.store.upsert_item(
@@ -320,6 +422,52 @@ class StoreExtraMergeTest(unittest.TestCase):
         )
         self.assertEqual(self.stored_extra(), {"pool": "dispatch"})
 
+    def test_none_clears_a_stored_list_key(self):
+        self.store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                tracker_updated_at=1000.0,
+                extra={"blocked_by": ["acme/app#1"], "pool": "dispatch"},
+            ),
+            operators=["alice"],
+            now=1000.0,
+        )
+        self.store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                tracker_updated_at=2000.0,
+                extra={"blocked_by": None},
+            ),
+            operators=["alice"],
+            now=2000.0,
+        )
+        self.assertEqual(self.stored_extra(), {"pool": "dispatch"})
+
+    def test_empty_list_clears_a_stored_scalar_key(self):
+        self.store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                tracker_updated_at=1000.0,
+                extra={"priority": "high", "pool": "dispatch"},
+            ),
+            operators=["alice"],
+            now=1000.0,
+        )
+        self.store.upsert_item(
+            board.Item(
+                repo="app",
+                number=7,
+                tracker_updated_at=2000.0,
+                extra={"priority": []},
+            ),
+            operators=["alice"],
+            now=2000.0,
+        )
+        self.assertEqual(self.stored_extra(), {"pool": "dispatch"})
+
     def test_stale_reading_keeps_stored_extra(self):
         self.store.upsert_item(
             board.Item(
@@ -371,6 +519,234 @@ class SyncExtraTest(unittest.TestCase):
     def stored_extra(self, number):
         row, _ = self.store.item(self.REPO, number, now=self.T0)
         return row.extra
+
+    def corrupt_extra(self, number, raw):
+        path = os.path.join(self.tmp.name, "board.sqlite")
+        raw_conn = sqlite3.connect(path)
+        try:
+            raw_conn.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                (raw, self.REPO, number),
+            )
+            raw_conn.commit()
+        finally:
+            raw_conn.close()
+
+    def corrupt_labels(self, number, raw="bogus"):
+        path = os.path.join(self.tmp.name, "board.sqlite")
+        raw_conn = sqlite3.connect(path)
+        try:
+            raw_conn.execute(
+                "UPDATE items SET labels=? WHERE repo=? AND number=?",
+                (raw, self.REPO, number),
+            )
+            raw_conn.commit()
+        finally:
+            raw_conn.close()
+
+    def test_sync_reports_a_corrupt_row_and_applies_the_rest(self):
+        self.sync(
+            reading(
+                repo=self.REPO,
+                number=1,
+                updated_at=self.T0 - 100,
+                extra={"priority": "high"},
+            ),
+            now=self.T0 - 100,
+        )
+        self.corrupt_extra(1, "{{{broken")
+        result = self.sync(
+            reading(repo=self.REPO, number=1, updated_at=self.T0),
+            reading(
+                repo=self.REPO,
+                number=2,
+                updated_at=self.T0 + 10,
+                extra={"pool": "dispatch"},
+            ),
+            now=self.T0 + 10,
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#1", result.store_errors[0])
+        self.assertEqual(result.store_errors[0].count("\n"), 0)
+        self.assertEqual(self.stored_extra(2), {"pool": "dispatch"})
+
+    def test_sync_reports_an_unusable_reading_and_applies_the_rest(self):
+        result = self.sync(
+            reading(repo=self.REPO, number=1, updated_at=self.T0),
+            reading(
+                repo=self.REPO,
+                number=2,
+                updated_at=self.T0 + 10,
+                extra={"pool": object()},
+            ),
+            now=self.T0 + 10,
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
+        row, _ = self.store.item(self.REPO, 1, now=self.T0 + 10)
+        self.assertEqual(row.title, "Title")
+
+    def test_resync_reports_a_corrupt_row_without_aborting(self):
+        self.sync(
+            reading(
+                repo=self.REPO,
+                number=1,
+                updated_at=self.T0 - 100,
+                extra={"priority": "high"},
+            ),
+            reading(
+                repo=self.REPO,
+                number=2,
+                updated_at=self.T0 - 100,
+                extra={"pool": "dispatch"},
+            ),
+            now=self.T0 - 100,
+        )
+        self.corrupt_extra(1, "{{{broken")
+        result = sync.resync_repo(
+            self.store,
+            FakeTracker(
+                [
+                    reading(
+                        repo=self.REPO,
+                        number=1,
+                        updated_at=self.T0,
+                        agent="daemon-1",
+                    ),
+                    reading(repo=self.REPO, number=2, updated_at=self.T0),
+                ]
+            ),
+            self.REPO,
+            operators=["alice"],
+            now=self.T0,
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#1", result.store_errors[0])
+        self.assertEqual(self.stored_extra(2), {"pool": "dispatch"})
+
+    def test_resync_reports_an_unreadable_row_at_adoption_without_aborting(self):
+        self.sync(
+            reading(
+                repo=self.REPO,
+                number=1,
+                updated_at=self.T0 - 100,
+                extra={"priority": "high"},
+            ),
+            now=self.T0 - 100,
+        )
+        # Corrupt labels, not extra: a stale reading takes the upsert's
+        # no-overwrite path, so the walk succeeds and only the adoption
+        # read below fails on the row.
+        self.corrupt_labels(1)
+        result = sync.resync_repo(
+            self.store,
+            FakeTracker(
+                [
+                    reading(
+                        repo=self.REPO,
+                        number=1,
+                        updated_at=self.T0 - 200,
+                        agent="daemon-1",
+                    ),
+                ]
+            ),
+            self.REPO,
+            operators=["alice"],
+            now=self.T0,
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#1", result.store_errors[0])
+
+    def test_resync_reports_a_corrupt_absent_row_without_aborting(self):
+        self.sync(
+            reading(repo=self.REPO, number=1, updated_at=self.T0 - 100),
+            reading(repo=self.REPO, number=2, updated_at=self.T0 - 100),
+            now=self.T0 - 100,
+        )
+        # Item 2 is gone from the listing and unreadable in the store:
+        # the walk and adoption stay clean, and only the absent-marking
+        # enumeration fails on it.
+        self.corrupt_extra(2, "{{{broken")
+        result = sync.resync_repo(
+            self.store,
+            FakeTracker([reading(repo=self.REPO, number=1, updated_at=self.T0)]),
+            self.REPO,
+            operators=["alice"],
+            now=self.T0,
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
+
+    def test_audit_reports_a_corrupt_row_without_raising(self):
+        self.sync(
+            reading(repo=self.REPO, number=1, updated_at=self.T0 - 100),
+            reading(repo=self.REPO, number=2, updated_at=self.T0 - 100),
+            now=self.T0 - 100,
+        )
+        self.corrupt_extra(2, "[]")
+        result = sync.audit_repo(
+            self.store,
+            FakeTracker(
+                [
+                    reading(repo=self.REPO, number=1, updated_at=self.T0),
+                    reading(repo=self.REPO, number=2, updated_at=self.T0),
+                ]
+            ),
+            self.REPO,
+            operators=["alice"],
+            now=self.T0,
+            limit=10,
+        )
+        self.assertEqual(result.items_seen, 0)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
+
+    def test_audit_reports_an_unusable_reading_and_audits_the_rest(self):
+        self.sync(
+            reading(repo=self.REPO, number=1, updated_at=self.T0 - 100),
+            reading(repo=self.REPO, number=2, updated_at=self.T0 - 100),
+            now=self.T0 - 100,
+        )
+        result = sync.audit_repo(
+            self.store,
+            FakeTracker(
+                [
+                    reading(
+                        repo=self.REPO,
+                        number=1,
+                        title="Audited",
+                        updated_at=self.T0,
+                    ),
+                    reading(
+                        repo=self.REPO,
+                        number=2,
+                        updated_at=self.T0,
+                        extra={"pool": object()},
+                    ),
+                ]
+            ),
+            self.REPO,
+            operators=["alice"],
+            now=self.T0,
+            limit=10,
+        )
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
+        row, _ = self.store.item(self.REPO, 1, now=self.T0)
+        self.assertEqual(row.title, "Audited")
 
     def test_board_concepts_persist_through_sync(self):
         self.sync(
@@ -493,6 +869,15 @@ class RowPriorityTest(unittest.TestCase):
         row = eligibility.row_from_item(board_item(priority="low", extra={}))
         self.assertEqual(row.priority, "low")
 
+    def test_a_list_board_priority_never_reaches_the_policy_row(self):
+        from tests.test_eligibility import item as board_item
+
+        from corral import eligibility
+
+        row = eligibility.row_from_item(board_item(priority="low", extra={"priority": ["high"]}))
+        self.assertEqual(row.priority, "low")
+        self.assertIsInstance(row.priority, str)
+
 
 class GhSeamTest(unittest.TestCase):
     def test_graphql_uses_the_injected_run_and_pacer(self):
@@ -507,6 +892,16 @@ class GhSeamTest(unittest.TestCase):
         self.assertIn("-f", args)
         self.assertIn("owner=acme", args)
         self.assertTrue(kwargs.get("paced"))
+
+    def test_run_and_pacer_names_are_reserved_seams_not_variables(self):
+        run = canned(user={"login": "acme"})
+        pacer = FakePacer()
+        gh.graphql("{x}", run=run, pacer=pacer, owner="acme")
+        args, _ = run.calls[0]
+        for entry in args:
+            self.assertFalse(entry.startswith("run="), entry)
+            self.assertFalse(entry.startswith("pacer="), entry)
+        self.assertIn("owner=acme", args)
 
     def test_graphql_mutation_costs_more_than_a_read(self):
         run = canned(addProjectV2ItemById={})
@@ -604,8 +999,55 @@ class PacerGuardTest(unittest.TestCase):
     def test_tripwire_watches_the_real_pacer_factory(self):
         self.assertTrue(getattr(gh._pacer, "_corral_pacer_guard", False))
 
+    def test_tripwire_watches_direct_pacer_construction(self):
+        self.assertTrue(getattr(gh.GraphqlPacer, "_corral_pacer_guard", False))
+        self.assertIsNot(gh.GraphqlPacer, _REAL_PACER_CLASS)
+
+    def test_guarded_factory_records_and_raises_without_delegating(self):
+        module = sys.modules[__name__]
+        with (
+            mock.patch.object(suiteguard, "record") as record,
+            mock.patch.object(module, "_REAL_PACER_FACTORY") as real,
+        ):
+            with self.assertRaises(AssertionError):
+                gh._pacer()
+        record.assert_called_once_with("reached the default GraphQL pacer (no injected pacer)")
+        real.assert_not_called()
+
+    def test_direct_construction_on_the_default_path_records_and_raises(self):
+        with mock.patch.object(gh, "GraphqlPacer", _REAL_PACER_CLASS):
+            default_path = _REAL_PACER_FACTORY().path
+        with mock.patch.object(suiteguard, "record") as record:
+            with self.assertRaises(AssertionError):
+                gh.GraphqlPacer(default_path)
+        record.assert_called_once_with("constructed the default GraphQL pacer (no injected pacer)")
+
+    def test_resolver_matches_what_the_factory_builds(self):
+        # The one agreement pin: the production resolver and the real
+        # factory must name the same file, so the guard cannot drift.
+        # Constructing the real pacer performs no I/O (path only).
+        with mock.patch.object(gh, "GraphqlPacer", _REAL_PACER_CLASS):
+            factory_path = _REAL_PACER_FACTORY().path
+        self.assertEqual(os.path.abspath(gh.pacing_path()), os.path.abspath(factory_path))
+
+    def test_direct_construction_on_the_resolver_path_records_and_raises(self):
+        with mock.patch.object(suiteguard, "record") as record:
+            with self.assertRaises(AssertionError):
+                gh.GraphqlPacer(gh.pacing_path())
+        record.assert_called_once_with("constructed the default GraphQL pacer (no injected pacer)")
+
+    def test_construction_off_the_default_path_builds_a_real_pacer(self):
+        with tempfile.TemporaryDirectory(prefix="corral-pacer-guard-") as tmp:
+            pacer = gh.GraphqlPacer(os.path.join(tmp, "pacing.json"))
+        self.assertIsInstance(pacer, _REAL_PACER_CLASS)
+
     def test_injected_calls_touch_neither_the_default_file_nor_a_subprocess(self):
-        default_path = _REAL_PACER_FACTORY().path
+        # Self-exemption, documented in the module docstring: the guard
+        # stays installed for every other test, and only here is the
+        # real class restored, to resolve the default path this test
+        # snapshots. Constructing the real pacer reads no file.
+        with mock.patch.object(gh, "GraphqlPacer", _REAL_PACER_CLASS):
+            default_path = _REAL_PACER_FACTORY().path
 
         def snapshot():
             try:

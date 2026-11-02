@@ -694,5 +694,29 @@ class OpenTest(unittest.TestCase):
                     store.mark_absent("app", 404, now=2000.0)
 
 
+class ReposTest(TempStoreTest):
+    def test_repos_lists_every_repo_holding_rows_once(self):
+        store = self.open()
+        store.upsert_item(reading("acme/app", 1), operators=["alice"], now=1000.0)
+        store.upsert_item(reading("acme/api", 2), operators=["alice"], now=1000.0)
+        store.upsert_item(reading("acme/app", 3), operators=["alice"], now=1000.0)
+        self.assertEqual(store.repos(), ["acme/api", "acme/app"])
+
+    def test_repos_lists_no_row_json_so_a_corrupt_row_cannot_break_it(self):
+        store = self.open()
+        store.upsert_item(reading("acme/app", 1), operators=["alice"], now=1000.0)
+        store.upsert_item(reading("acme/api", 2), operators=["alice"], now=1000.0)
+        raw = sqlite3.connect(self.path)
+        try:
+            raw.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                ("{{{broken", "acme/app", 1),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        self.assertEqual(store.repos(), ["acme/api", "acme/app"])
+
+
 if __name__ == "__main__":
     unittest.main()
