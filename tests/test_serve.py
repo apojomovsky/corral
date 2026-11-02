@@ -10,6 +10,8 @@ import ast
 import copy
 import http.client
 import json
+import shutil
+import socket
 import threading
 import unittest
 from unittest import mock
@@ -55,9 +57,9 @@ class FakeBuilder:
 class ServeCase(unittest.TestCase):
     """A live loopback server per test, shut down on cleanup."""
 
-    def start_server(self, build, host=HOST):
+    def start_server(self, build):
         now = [T0]
-        server = serve.make_server(build=build, host=host, clock=lambda: now[0], quiet=True)
+        server = serve.make_server(build=build, clock=lambda: now[0], quiet=True)
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         thread.daemon = True
         thread.start()
@@ -117,13 +119,14 @@ class SnapshotRoute(ServeCase):
 
     def test_builder_failure_is_a_json_error(self):
         def boom():
-            raise OSError("state unreadable")
+            raise OSError("/tmp/secret-path unreadable")
 
         server, _ = self.start_server(boom)
         status, headers, body = self.fetch(server, "GET", "/v1/snapshot")
         self.assertEqual(status, 500)
         self.assertEqual(headers.get("Content-Type"), "application/json")
-        self.assertEqual(json.loads(body), {"error": "state unreadable"})
+        self.assertEqual(json.loads(body), {"error": "snapshot unavailable"})
+        self.assertNotIn("/tmp/secret-path", body.decode("utf-8"))
 
 
 class VersionRoute(ServeCase):
@@ -136,6 +139,24 @@ class VersionRoute(ServeCase):
 
 
 class HealthRoute(ServeCase):
+    def test_health_reports_host_from_document(self):
+        doc = healthy_doc()
+        doc["fleet_header"]["host"] = "host-9"
+        server, _ = self.start_server(FakeBuilder(doc))
+        _, _, body = self.fetch(server, "GET", "/v1/health")
+        self.assertEqual(json.loads(body)["host"], "host-9")
+
+    def test_health_builder_failure_is_500_without_detail(self):
+        def boom():
+            raise OSError("/tmp/secret-path unreadable")
+
+        server, _ = self.start_server(boom)
+        status, headers, body = self.fetch(server, "GET", "/v1/health")
+        self.assertEqual(status, 500)
+        self.assertEqual(headers.get("Content-Type"), "application/json")
+        self.assertEqual(json.loads(body), {"error": "snapshot unavailable"})
+        self.assertNotIn("/tmp/secret-path", body.decode("utf-8"))
+
     def test_health_reports_healthy(self):
         server, _ = self.start_server(FakeBuilder(healthy_doc()))
         status, _, body = self.fetch(server, "GET", "/v1/health")
@@ -195,7 +216,7 @@ class ErrorShapes(ServeCase):
     def test_other_methods_are_405_without_building(self):
         builder = FakeBuilder(healthy_doc())
         server, _ = self.start_server(builder)
-        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE"):
             status, _, body = self.fetch(server, method, "/v1/snapshot")
             self.assertEqual(status, 405, method)
             self.assertIn("error", json.loads(body))
@@ -249,6 +270,50 @@ class ImportClosure(unittest.TestCase):
             for alias in node.names
         ]
         self.assertIn("snapshot", from_corral)
+
+
+class CollectDivergence(unittest.TestCase):
+    def test_collect_and_helper_cannot_diverge(self):
+        from corral import snapshot as snap
+
+        registry_view = view((entry("a1"), "live"))
+        quota = quota_view()
+        resolved = {
+            "admission.total_cap": 4,
+            "admission.repo_cap": 1,
+            "quota.low_pct": 90,
+            "drive.max_starts_per_day": 4,
+        }
+        with (
+            mock.patch("corral.snapshot._settings_root", return_value=None),
+            mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
+            mock.patch("corral.registry.visible", return_value=registry_view),
+            mock.patch("corral.accounts.providers", return_value=["prov-a"]),
+            mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
+            mock.patch("corral.quotacli.snapshot", return_value=quota),
+            mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch("shutil.disk_usage", return_value=(1000, 400, 600)),
+            mock.patch("time.time", return_value=T0),
+            mock.patch("socket.gethostname", return_value=HOST),
+        ):
+            kwargs = snap.collect_kwargs()
+            expected = snap.build(**kwargs)
+        with (
+            mock.patch("corral.snapshot._settings_root", return_value=None),
+            mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
+            mock.patch("corral.registry.visible", return_value=registry_view),
+            mock.patch("corral.accounts.providers", return_value=["prov-a"]),
+            mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
+            mock.patch("corral.quotacli.snapshot", return_value=quota),
+            mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch("shutil.disk_usage", return_value=(1000, 400, 600)),
+            mock.patch("time.time", return_value=T0),
+            mock.patch("socket.gethostname", return_value=HOST),
+        ):
+            actual = serve.collect()
+        self.assertEqual(actual, expected)
 
 
 class CollectWiring(unittest.TestCase):

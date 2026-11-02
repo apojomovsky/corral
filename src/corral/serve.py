@@ -8,9 +8,7 @@ control in this module.
 """
 
 import json
-import os
-import shutil
-import socket
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -25,6 +23,9 @@ API_VERSION = 1
 #: Snapshot sections whose `{"error"}` body marks the server degraded.
 ERROR_SECTIONS = ("agents", "quota", "capacity", "disk", "drive")
 
+#: The generic 500 body: the detail goes to stderr, never the wire.
+UNAVAILABLE = "snapshot unavailable"
+
 
 class _State:
     """One server's injected builder, clock, and counters."""
@@ -32,12 +33,10 @@ class _State:
     def __init__(
         self,
         build: Callable[[], dict],
-        host: str,
         clock: Callable[[], float],
         quiet: bool,
     ) -> None:
         self.build = build
-        self.host = host
         self.clock = clock
         self.started = clock()
         self.lock = threading.Lock()
@@ -76,14 +75,16 @@ class _Handler(BaseHTTPRequestHandler):
             return self.server_state.build(), None
         except Exception as exc:  # noqa: BLE001 - a request never drops the connection
             text = str(exc) if str(exc) else repr(exc)
-            return None, text
+            print(f"corral serve: {text}", file=sys.stderr)
+            return None, UNAVAILABLE
 
     def _serve_snapshot(self) -> None:
         doc, error = self._read_doc()
         if error is not None:
             self._send_json(500, {"error": error})
         else:
-            self._send_json(200, doc if doc is not None else {"error": "empty document"})
+            assert doc is not None
+            self._send_json(200, doc)
 
     def _serve_health(self) -> None:
         state = self.server_state
@@ -98,6 +99,8 @@ class _Handler(BaseHTTPRequestHandler):
             for name in ERROR_SECTIONS
             if isinstance(doc.get(name), dict) and set(doc[name]) == {"error"}
         )
+        header = doc.get("fleet_header")
+        host = header.get("host") if isinstance(header, dict) else None
         with state.lock:
             total = state.total
             not_modified = state.not_modified
@@ -105,7 +108,7 @@ class _Handler(BaseHTTPRequestHandler):
             200,
             {
                 "ok": not degraded,
-                "host": state.host,
+                "host": host,
                 "now": now,
                 "uptime_s": now - state.started,
                 "requests_total": total,
@@ -147,7 +150,6 @@ class _Handler(BaseHTTPRequestHandler):
 
 def make_server(
     build: Callable[[], dict] | None = None,
-    host: str | None = None,
     port: int = 0,
     clock: Callable[[], float] | None = None,
     quiet: bool = False,
@@ -155,14 +157,13 @@ def make_server(
     """A loopback-only `ThreadingHTTPServer` answering the v1 routes.
 
     `build` returns the snapshot document (`collect` by default, the
-    same readers the `snapshot` verb uses). `host` is the fleet host
-    string the health envelope carries. `port` defaults to an ephemeral
-    one; the bound port reads as `server.server_address[1]`.
+    same readers the `snapshot` verb uses). Health reports the host the
+    built document names. `port` defaults to an ephemeral one; the
+    bound port reads as `server.server_address[1]`.
     """
     state = _State(
-        build=build or collect,
-        host=host if host is not None else socket.gethostname(),
-        clock=clock or time.time,
+        build=build if build is not None else collect,
+        clock=clock if clock is not None else time.time,
         quiet=quiet,
     )
 
@@ -177,52 +178,8 @@ def make_server(
 def collect() -> dict:
     """Build the snapshot document from the host's local readers.
 
-    The production builder: the same readers `snapshot.cmd_snapshot`
-    uses, so the API and the CLI can never disagree. Reads files only:
-    no `gh`, no network, no service control.
+    The production builder: the shared `snapshot.collect_kwargs`
+    helper, so the API and the CLI can never disagree. Reads files
+    only: no `gh`, no network, no service control.
     """
-    from corral import accounts, admission, drive, quota_ledger, quotacli, registry, settings
-
-    resolved = settings.load(root=snapshot._settings_root(os.getcwd()))
-    cfg = registry.config(resolved)
-    plain = {
-        "admission.total_cap": resolved["admission.total_cap"],
-        "admission.repo_cap": resolved["admission.repo_cap"],
-        "registry.count_toward_cap": cfg["count_toward_cap"],
-    }
-    admission.validate_limits(
-        admission.Limits(total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"])
-    )
-    low_pct = resolved["quota.low_pct"]
-    now = time.time()
-    host = socket.gethostname()
-    try:
-        registry_view = registry.visible(now, cfg=cfg)
-    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
-        registry_view = exc
-    try:
-        quota_view = quotacli.snapshot(
-            accounts.providers(), quota_ledger.load(), now, low_pct=low_pct
-        )
-    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
-        quota_view = exc
-    try:
-        drive_view = drive.drive_status(
-            now=now,
-            max_starts=resolved["drive.max_starts_per_day"],
-            journal_path=drive.journal_path(),
-            pause_path=drive.pause_path(),
-            day_path=drive.day_path(),
-            lock_path=drive.lock_path(),
-        )
-    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
-        drive_view = exc
-    return snapshot.build(
-        now=now,
-        host=host,
-        registry_view=registry_view,
-        quota_view=quota_view,
-        settings=plain,
-        usage_fn=shutil.disk_usage,
-        drive_view=drive_view,
-    )
+    return snapshot.build(**snapshot.collect_kwargs())
