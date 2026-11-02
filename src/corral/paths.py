@@ -112,6 +112,34 @@ def host_ledger_path(env=None):
     )
 
 
+def hub_state_dir(env=None):
+    """The hub's own state dir: `CORRAL_HUB_STATE`, else `<state>/hub`.
+
+    The hub database lives under its own dir so it never shares files
+    with a worker host's ledgers, even on the same machine.
+    """
+    env = os.environ if env is None else env
+    override = _override("CORRAL_HUB_STATE", env)
+    if override:
+        return override
+    return os.path.join(state_dir(env), "hub")
+
+
+def hub_db_path(env=None):
+    """The hub database: `<hub-state>/hub.sqlite`, resolved here only."""
+    env = os.environ if env is None else env
+    return os.path.join(hub_state_dir(env), "hub.sqlite")
+
+
+def hub_token_path(env=None):
+    """This host's hub token: `<config>/hub-token`, resolved here only.
+
+    The file holds the token minted for this host.
+    It is never the dashboard API token file.
+    """
+    return os.path.join(config_dir(env), "hub-token")
+
+
 REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 
