@@ -475,9 +475,20 @@ class FailClosed(unittest.TestCase):
 
 class DriveRows(unittest.TestCase):
     def test_no_reading_means_no_drive_rows(self):
-        self.assertEqual(names(doctor.run_checks(env())), names(doctor.run_checks(env())))
-        found = [check for check in doctor.run_checks(env()) if check.name.startswith("drive")]
-        self.assertEqual(found, [])
+        self.assertEqual(
+            names(doctor.run_checks(env())),
+            [
+                "deps",
+                "accounts",
+                "settings",
+                "state-dir",
+                "linger",
+                "user-manager",
+                "quota-readers",
+                "registry",
+                "prompts",
+            ],
+        )
 
     def test_an_enabled_timer_is_ok(self):
         checks = doctor.run_checks(env(timer_state="enabled"))
@@ -547,6 +558,288 @@ class DriveRows(unittest.TestCase):
         ordered = names(checks)
         self.assertLess(ordered.index("user-manager"), ordered.index("drive-timer"))
         self.assertLess(ordered.index("drive-timer"), ordered.index("drive-projects"))
+
+
+HUB_URL = "http://host-1:8080"
+
+
+def hub_env(**overrides):
+    fields = {
+        "hub_url": HUB_URL,
+        "hub_auth": doctor.HubAuth("ok", "the token is present"),
+        "hub_probe": doctor.HubProbe("ok", "the hub answers", hub_api=1, hub_schema=1),
+    }
+    fields.update(overrides)
+    return env(**fields)
+
+
+class HubRows(unittest.TestCase):
+    def test_single_host_carries_no_hub_rows(self):
+        checks = doctor.run_checks(env())
+        ordered = names(checks)
+        self.assertNotIn("hub", ordered)
+        self.assertNotIn("hub-token", ordered)
+
+    def test_configured_hub_with_no_readings_carries_no_hub_rows(self):
+        checks = doctor.run_checks(env(hub_url=HUB_URL))
+        ordered = names(checks)
+        self.assertNotIn("hub", ordered)
+        self.assertNotIn("hub-token", ordered)
+
+    def test_healthy_hub_is_two_ok_rows(self):
+        checks = doctor.run_checks(hub_env())
+        rows = {check.name: check for check in checks if check.name.startswith("hub")}
+        self.assertEqual(
+            {name: row.status for name, row in rows.items()},
+            {"hub": "ok", "hub-token": "ok"},
+        )
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_unreachable_hub_warns_and_keeps_exit_zero(self):
+        checks = doctor.run_checks(
+            hub_env(hub_probe=doctor.HubProbe("unreachable", "connection refused"))
+        )
+        found = [check for check in checks if check.name == "hub"]
+        self.assertEqual([check.status for check in found], ["warn"])
+        self.assertIn("refused", found[0].detail)
+        self.assertTrue(found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_refused_token_fails(self):
+        checks = doctor.run_checks(
+            hub_env(hub_probe=doctor.HubProbe("unauthorized", "hub refused the token"))
+        )
+        found = [check for check in checks if check.name == "hub"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertTrue(found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_version_mismatch_fails_naming_both_versions(self):
+        checks = doctor.run_checks(
+            hub_env(
+                hub_probe=doctor.HubProbe(
+                    "version-mismatch",
+                    "hub speaks api 0, this host speaks api 1",
+                    hub_api=0,
+                    hub_schema=1,
+                )
+            )
+        )
+        found = [check for check in checks if check.name == "hub"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertIn("api 0", found[0].detail)
+        self.assertIn("api 1", found[0].detail)
+        self.assertTrue(found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_missing_token_fails_naming_the_fix(self):
+        checks = doctor.run_checks(hub_env(hub_auth=doctor.HubAuth("missing", "no token")))
+        found = [check for check in checks if check.name == "hub-token"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertTrue(found[0].fix)
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_bad_token_fails(self):
+        checks = doctor.run_checks(hub_env(hub_auth=doctor.HubAuth("bad", "the token is empty")))
+        found = [check for check in checks if check.name == "hub-token"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_hub_rows_come_last(self):
+        checks = doctor.run_checks(hub_env(disk="ok"))
+        ordered = names(checks)
+        self.assertLess(ordered.index("disk"), ordered.index("hub-token"))
+        self.assertLess(ordered.index("hub-token"), ordered.index("hub"))
+
+    def test_hub_probe_is_data_never_a_callable(self):
+        probe = doctor.HubProbe("ok", "the hub answers", hub_api=1, hub_schema=1)
+        self.assertFalse(callable(probe))
+        checks = doctor.run_checks(hub_env(hub_probe=probe))
+        self.assertTrue(any(check.name == "hub" for check in checks))
+
+
+class ProductionHubGathering(unittest.TestCase):
+    def test_no_url_means_no_readings(self):
+        self.assertIsNone(doctor.load_hub_auth(None))
+        self.assertIsNone(doctor.load_hub_auth(""))
+        self.assertIsNone(doctor.load_hub_probe(None, None))
+        self.assertIsNone(doctor.load_hub_probe("", None))
+        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+                self.assertIsNone(doctor.read_hub_token())
+
+    def test_missing_token_file_is_missing(self):
+        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+                auth = doctor.load_hub_auth(HUB_URL)
+                self.assertIsNotNone(auth)
+                assert auth is not None
+                self.assertEqual(auth.status, "missing")
+                self.assertIn("hub-token", auth.detail)
+                self.assertIsNone(doctor.read_hub_token())
+
+    def test_owner_only_token_file_is_ok(self):
+        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+            path = os.path.join(config, "hub-token")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("s3cret\n")
+            os.chmod(path, 0o600)
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+                auth = doctor.load_hub_auth(HUB_URL)
+                self.assertIsNotNone(auth)
+                assert auth is not None
+                self.assertEqual(auth.status, "ok")
+                self.assertEqual(doctor.read_hub_token(), "s3cret")
+
+    def test_group_readable_token_file_is_bad(self):
+        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+            path = os.path.join(config, "hub-token")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("s3cret\n")
+            os.chmod(path, 0o640)
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+                auth = doctor.load_hub_auth(HUB_URL)
+                self.assertIsNotNone(auth)
+                assert auth is not None
+                self.assertEqual(auth.status, "bad")
+
+    def test_empty_token_file_is_bad(self):
+        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+            path = os.path.join(config, "hub-token")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write("\n")
+            os.chmod(path, 0o600)
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+                auth = doctor.load_hub_auth(HUB_URL)
+                self.assertIsNotNone(auth)
+                assert auth is not None
+                self.assertEqual(auth.status, "bad")
+                self.assertIsNone(doctor.read_hub_token())
+
+    def test_probe_of_a_live_loopback_hub_is_ok_with_versions(self):
+        import threading
+
+        from corral import hub
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-probe-") as state:
+            db = os.path.join(state, "hub.sqlite")
+            store = hub.open_db(db)
+            store.close()
+            server = hub.make_server("127.0.0.1", 0, db)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.shutdown)
+            self.addCleanup(thread.join, 10)
+            self.addCleanup(server.server_close)
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            probe = doctor.load_hub_probe(url, None)
+            self.assertIsNotNone(probe)
+            assert probe is not None
+            self.assertEqual(probe.status, "ok")
+            self.assertEqual((probe.hub_api, probe.hub_schema), (hub.HUB_API, hub.SCHEMA_VERSION))
+
+    def test_probe_of_a_closed_loopback_port_is_unreachable(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            port = holder.getsockname()[1]
+        probe = doctor.load_hub_probe(f"http://127.0.0.1:{port}", None)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.status, "unreachable")
+        self.assertTrue(probe.detail)
+
+    def test_typed_404_refusal_maps_to_version_mismatch(self):
+        import urllib.error
+        from email.message import Message
+
+        from corral import hub
+
+        body = json.dumps(
+            {
+                "api": hub.HUB_API - 1,
+                "schema_version": hub.SCHEMA_VERSION,
+                "error": f"unsupported hub api {hub.HUB_API - 1}:"
+                f" this hub serves api {hub.HUB_API}",
+            }
+        ).encode("utf-8")
+        refused = urllib.error.HTTPError(
+            HUB_URL + "/v1/version", 404, "Not Found", Message(), io.BytesIO(body)
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=refused):
+            probe = doctor.load_hub_probe(HUB_URL, None)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.status, "version-mismatch")
+        self.assertIn(str(hub.HUB_API - 1), probe.detail)
+        self.assertIn(str(hub.HUB_API), probe.detail)
+        self.assertEqual((probe.hub_api, probe.hub_schema), (hub.HUB_API - 1, hub.SCHEMA_VERSION))
+        checks = doctor.run_checks(hub_env(hub_probe=probe))
+        found = [check for check in checks if check.name == "hub"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_bare_404_without_a_typed_body_stays_unreachable(self):
+        import urllib.error
+        from email.message import Message
+
+        for raw in (b"", b"not json", None):
+            with self.subTest(raw=raw):
+                fp = None if raw is None else io.BytesIO(raw)
+                bare = urllib.error.HTTPError(
+                    HUB_URL + "/v1/version", 404, "Not Found", Message(), fp
+                )
+                with mock.patch("urllib.request.urlopen", side_effect=bare):
+                    probe = doctor.load_hub_probe(HUB_URL, None)
+                self.assertIsNotNone(probe)
+                assert probe is not None
+                self.assertEqual(probe.status, "unreachable")
+                self.assertIn("404", probe.detail)
+
+    def test_probe_never_logs_the_token(self):
+        import threading
+
+        from corral import hub
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-probe-") as state:
+            db = os.path.join(state, "hub.sqlite")
+            store = hub.open_db(db)
+            token = hub.add_host(store, "host-1")
+            store.close()
+            server = hub.make_server("127.0.0.1", 0, db)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(server.shutdown)
+            self.addCleanup(thread.join, 10)
+            self.addCleanup(server.server_close)
+            url = f"http://127.0.0.1:{server.server_address[1]}"
+            import logging
+
+            records: list[str] = []
+
+            class Capture(logging.Handler):
+                def emit(self, record: logging.LogRecord) -> None:
+                    records.append(record.getMessage())
+
+            logger = logging.getLogger("corral.hub")
+            capture = Capture()
+            logger.addHandler(capture)
+            level = logger.level
+            logger.setLevel(logging.DEBUG)
+            try:
+                probe = doctor.load_hub_probe(url, token)
+            finally:
+                logger.setLevel(level)
+                logger.removeHandler(capture)
+            self.assertIsNotNone(probe)
+            assert probe is not None
+            self.assertEqual(probe.status, "ok")
+            self.assertFalse(any(token in line for line in records))
+            self.assertNotIn(token, probe.detail)
 
 
 if __name__ == "__main__":
