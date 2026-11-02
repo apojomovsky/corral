@@ -994,6 +994,50 @@ class CreateRemote(unittest.TestCase):
         self.assertIsNone(git.origin_url)
         self.assertEqual(forge.created, [])
 
+    def test_adopted_clone_url_failure_is_exit_3_with_the_manual_command(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", repos=self.repo(empty=True), fail={"clone_url"})
+        code, out, _ = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, resume=True
+        )
+        self.assertEqual(code, 3)
+        self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
+        self.assertIn("not wired", out)
+        self.assertIn(f"next: gh repo create operator/{FIXTURE} --private", out)
+        self.assertIsNone(git.origin_url)
+        self.assertEqual(forge.created, [])
+
+    def test_conflicting_origin_is_exit_4(self):
+        git = FakeGit(
+            root=self.parent,
+            status="?? README.md\n",
+            origin_url="https://example.com/someone-else/other.git",
+        )
+        forge = FakeForge(user="operator")
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 4)
+        self.assertIn("already points at", err)
+        self.assertIn("refusing to overwrite", err)
+        self.assertEqual(forge.created, [("operator", FIXTURE, True)])
+        self.assertEqual(git.origin_url, "https://example.com/someone-else/other.git")
+
+    def test_resume_rerun_after_success_converges_silently(self):
+        first = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        code, _, err = run_new(path=self.parent, git=first, forge=forge, create_remote=True)
+        self.assertEqual((code, err), (0, ""))
+        url = f"https://example.com/operator/{FIXTURE}.git"
+        self.assertEqual(first.origin_url, url)
+        rerun = FakeGit(root=self.target(), hooks=".githooks", status="", origin_url=url)
+        code, out, _ = run_new(
+            path=self.parent, git=rerun, forge=forge, create_remote=True, resume=True
+        )
+        self.assertEqual(code, 1)
+        self.assertNotIn("next:", out)
+        self.assertEqual(len(forge.created), 1)
+        self.assertEqual(rerun.commits, [])
+        self.assertEqual(rerun.origin_url, url)
+
 
 class RemotePlan(unittest.TestCase):
     """`--plan` prints the outward command and writes nothing."""
@@ -1050,6 +1094,7 @@ class RemotePlan(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn(f"would adopt operator/{FIXTURE} when empty", out)
+        self.assertNotIn("would run gh repo create", out)
         self.assertFalse(os.path.exists(self.target()))
 
 

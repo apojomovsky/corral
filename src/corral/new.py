@@ -237,10 +237,10 @@ def _write_file(target, rel, blob):
     """One scaffold file, created exclusively. Failures are exit 4.
 
     The path is checked, parent directories are created, the path is
-    checked again, then `O_CREAT | O_EXCL` opens the file. A symlinked
-    parent is refused by the first check, before anything is created
-    outside the target; a file appearing between the checks still fails
-    instead of being clobbered.
+    checked again, then `O_CREAT | O_EXCL` opens the file. The checks
+    refuse a symlinked parent that exists at the checks; a concurrent
+    swap in the operator's own tree is not defended. A file appearing
+    between the checks still fails instead of being clobbered.
     """
     full = os.path.join(target, rel)
     _check_writable(target, rel)
@@ -507,7 +507,12 @@ def _apply(opts, git, forge):
     origin_changed = False
     if opts.create_remote:
         if adopted:
-            url = forge.clone_url(repo)
+            try:
+                url = forge.clone_url(repo)
+            except iface.ForgeError as err:
+                sys.stdout.write(f"remote {repo} not wired: {err}\n")
+                sys.stdout.write(f"next: {plan_text}\n")
+                return UNREACHABLE
             sys.stdout.write(f"adopted empty remote {repo}\n")
         else:
             try:
@@ -535,9 +540,10 @@ def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
     """Print the full diff of every file `new` would write, and write nothing.
 
     `plan_text` is the planned create command: printed verbatim without
-    `--create-remote`, `would run` with it. The remote pre-check already
-    ran in `_apply`, so `--plan` never promises a create the real run
-    would refuse.
+    `--create-remote`, `would run` with it, or `would adopt` when
+    `--resume` adopts the remote instead of creating one. The remote
+    pre-check already ran in `_apply`, so `--plan` never promises a
+    create the real run would refuse.
     """
     _refuse_non_directory(target)
     if os.path.isdir(target):
@@ -569,7 +575,8 @@ def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
     if opts.create_remote:
         if adopted:
             sys.stdout.write(f"would adopt {repo} when empty, then set it as origin\n")
-        sys.stdout.write(f"would run {plan_text}\n")
+        else:
+            sys.stdout.write(f"would run {plan_text}\n")
     else:
         sys.stdout.write(plan_text + "\n")
     if os.path.isdir(target) and not needs_init:
