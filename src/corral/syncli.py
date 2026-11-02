@@ -7,7 +7,10 @@ the rolling re-read of the N rows verified least recently. Exit codes:
 0 synced, 1 nothing changed, 3 tracker unreachable, 4 usage or
 configuration error. Corrupt stored rows are usage errors: a sync that
 failed only on those (and synced nothing) exits 4, while tracker
-failures with nothing synced exit 3. Partial failures with something
+failures with nothing synced exit 3. When one pass has both tracker
+failures and corrupt rows with nothing synced, the store check runs
+first and the pass exits 4; both lines still print to stderr, so the
+report names the outage the code masks. Partial failures with something
 synced are still 0; with ``--push`` a sync phase that failed and synced
 nothing is still 3 (or 4 for corrupt rows), even when the mirror pass
 sent a write.
