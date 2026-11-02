@@ -62,6 +62,8 @@ class HubMode:
         except hubmod.HubUnreachable as err:
             self.down = True
             raise drive.HubGone(str(err)) from None
+        except hubmod.HubVersionError as err:
+            raise drive.HubConfigError(str(err)) from None
         except hubmod.HubError as err:
             raise drive.HubConfigError(str(err)) from None
 

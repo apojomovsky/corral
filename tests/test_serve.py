@@ -24,7 +24,19 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import board, cli, coord, coordevents, hub, launch, paths, serve, settings, snapshot
+from corral import (
+    board,
+    cli,
+    coord,
+    coordevents,
+    hub,
+    launch,
+    paths,
+    projects,
+    serve,
+    settings,
+    snapshot,
+)
 from tests.test_snapshot import (
     HOST,
     T0,
@@ -1655,6 +1667,71 @@ class JournalView(ServeCase):
         status, _, body = self.fetch(server, "GET", "/v1/journal?project=demo")
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(body), {"error": "journal unavailable"})
+
+
+class ProjectsRoute(ServeCase):
+    def get_json(self, server, target, token=None):
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            headers = {} if token is None else {"Authorization": f"Bearer {token}"}
+            conn.request("GET", target, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.getheader("Content-Type"), "application/json")
+            return json.loads(body)
+        finally:
+            conn.close()
+
+    def test_projects_lists_names_sorted(self):
+        found = [
+            projects.Project(
+                name="beta",
+                unit_prefix="beta-",
+                root="/tmp/beta",
+                eligibility="policy:register",
+            ),
+            projects.Project(name="alpha", unit_prefix="alpha-", root="/tmp/alpha"),
+        ]
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), projects_fn=lambda: found)
+        self.assertEqual(self.get_json(server, "/v1/projects"), {"projects": ["alpha", "beta"]})
+
+    def test_projects_missing_registry_is_an_empty_list(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
+            missing = os.path.join(tmp, "absent")
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": missing}):
+                server, _ = self.start_server(FakeBuilder(healthy_doc()))
+                self.assertEqual(self.get_json(server, "/v1/projects"), {"projects": []})
+
+    def test_projects_bad_file_is_a_generic_500(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
+            directory = os.path.join(tmp, projects.PROJECTS_DIR)
+            os.makedirs(directory)
+            bad = os.path.join(directory, "broken.toml")
+            with open(bad, "w", encoding="utf-8") as handle:
+                handle.write('name = "broken"\nunknown_key = 1\n')
+            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": tmp}):
+                server, _ = self.start_server(FakeBuilder(healthy_doc()))
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    status, _, body = self.fetch(server, "GET", "/v1/projects")
+                self.assertEqual(status, 500)
+                self.assertEqual(json.loads(body), {"error": "projects unavailable"})
+                self.assertIn("broken.toml", err.getvalue())
+                self.assertNotIn(tmp, body.decode("utf-8"))
+
+    def test_projects_needs_a_token_when_required(self):
+        server, _ = self.start_server(
+            FakeBuilder(healthy_doc()),
+            token_required=True,
+            token_reader=lambda: "tok-1",
+            projects_fn=lambda: [],
+        )
+        status, _, body = self.fetch(server, "GET", "/v1/projects")
+        self.assertEqual(status, 401)
+        self.assertEqual(json.loads(body), {"error": "unauthorized"})
+        self.assertEqual(self.get_json(server, "/v1/projects", token="tok-1"), {"projects": []})
 
 
 class ProductionProjectReaders(unittest.TestCase):
