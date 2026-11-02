@@ -100,12 +100,13 @@ def check(state: ResourceReadings | None) -> list[ResourceRow]:
 def _check_config(state: ResourceReadings) -> ResourceRow:
     """Delegation, table validity, the unset budget and unpriced live roles."""
     if state.limits_error is not None:
-        return ResourceRow(
-            "resources",
-            "fail",
-            state.limits_error,
-            f"fix the [resources] tables in {state.config_path}, then run `corral doctor` again",
-        )
+        if "foreign claim" in state.limits_error:
+            fix = f"fix the foreign claims in {state.ledger_path}, then run `corral doctor` again"
+        else:
+            fix = (
+                f"fix the [resources] tables in {state.config_path}, then run `corral doctor` again"
+            )
+        return ResourceRow("resources", "fail", state.limits_error, fix)
     if state.host is None:
         return ResourceRow(
             "resources",
@@ -161,7 +162,10 @@ def _check_config(state: ResourceReadings) -> ResourceRow:
         )
     if fails:
         return ResourceRow(
-            "resources", "fail", "; ".join(detail for detail, _ in fails), fails[0][1]
+            "resources",
+            "fail",
+            "; ".join(detail for detail, _ in (*fails, *warns)),
+            fails[0][1],
         )
     if warns:
         return ResourceRow(
@@ -253,6 +257,13 @@ def _parse_claim(entry: object, index: int) -> tuple[str, float]:
 
 def _check_foreign(state: ResourceReadings) -> ResourceRow:
     """Foreign claims: malformed fails, expired warns, live reads ok."""
+    if state.limits_error is not None and "foreign claim" in state.limits_error:
+        return ResourceRow(
+            "resources-foreign",
+            "fail",
+            state.limits_error,
+            f"fix the foreign claims in {state.ledger_path}, then run `corral doctor` again",
+        )
     live: list[str] = []
     expired: list[str] = []
     for index, entry in enumerate(state.foreign or []):
@@ -315,10 +326,11 @@ def _actual_number(raw: str | None, divisor: float) -> float | None:
 
 
 #: (Usage dimension, show property, divisor to budget units, unit word).
+#: Slices carry only memory and CPU: the launch sets TasksMax on the
+#: agent unit inside the slice, never on the slice itself.
 _READERS = (
     ("cpu_m", "CPUQuotaPerSecUSec", 1000.0, "millicores"),
     ("memory_mb", "MemoryMax", 1048576.0, "MB"),
-    ("pids", "TasksMax", 1.0, "pids"),
 )
 
 
@@ -333,8 +345,6 @@ def _want(value: object) -> float | None:
 
 
 def _show_number(number: float, word: str) -> str:
-    if word == "pids":
-        return f"{number:g} pids"
     return f"{number:g} {word}"
 
 
@@ -369,8 +379,17 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
     difference warns with the operator refresh step. A missing slice is no
     drift: the next launch creates it.
     """
-    if state.host is None or state.limits_error is not None or state.slices is None:
+    if state.host is None or state.limits_error is not None:
         return None
+    if state.slices is None:
+        return ResourceRow(
+            "resources-slices",
+            "warn",
+            "could not read the resource slices: launches may have drifted"
+            " from their budgets without notice",
+            "check the user manager answers `systemctl --user show`,"
+            " then run `corral doctor` again",
+        )
     limits = resources.Limits(
         host=state.host,
         projects=dict(state.shares),
@@ -456,7 +475,8 @@ def load_slice_actual(
 
     One manager dump per slice through the injected `run` seam. A slice
     the manager does not know is absent, not a failure: the next launch
-    creates it. Pure over `run`.
+    creates it. None when the listing itself failed: the seam raised, or
+    no dump succeeded. Pure over `run`.
     """
     actual = {}
     for name in names:
@@ -467,7 +487,7 @@ def load_slice_actual(
         if getattr(proc, "returncode", 1) != 0:
             continue
         actual[name] = parse_show(getattr(proc, "stdout", "") or "")
-    return actual
+    return actual or None
 
 
 def _read_text(path: str) -> str:

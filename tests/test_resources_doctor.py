@@ -141,6 +141,15 @@ class Delegation(unittest.TestCase):
         self.assertEqual(rows["resources"].status, "fail")
         self.assertIn("cannot read", rows["resources"].detail)
 
+    def test_a_controllers_failure_keeps_the_unpriced_role_warnings(self):
+        rows = by_name(
+            resourcedoctor.check(readings(controllers=frozenset({"cpu"}), live_roles=("triage",)))
+        )
+        row = rows["resources"]
+        self.assertEqual(row.status, "fail")
+        self.assertIn("memory", row.detail)
+        self.assertIn("triage", row.detail)
+
     def test_a_failing_row_exits_1(self):
         rows = by_name(resourcedoctor.check(readings(controllers=frozenset({"cpu"}))))
         checks = [doctor.Check(r.name, r.status, r.detail, r.fix) for r in rows.values()]
@@ -161,6 +170,15 @@ class InvalidTables(unittest.TestCase):
     def test_limits_error_skips_the_slices_row(self):
         rows = by_name(resourcedoctor.check(readings(limits_error="boom")))
         self.assertNotIn("resources-slices", rows)
+
+    def test_foreign_claim_limits_error_points_at_the_ledger(self):
+        rows = by_name(
+            resourcedoctor.check(
+                readings(limits_error="foreign claim 0 must be a foreign claim, not {}")
+            )
+        )
+        self.assertEqual(rows["resources"].status, "fail")
+        self.assertIn("/state/corral/host-resources.json", rows["resources"].fix)
 
 
 class UnpricedRoles(unittest.TestCase):
@@ -275,38 +293,68 @@ class ForeignClaims(unittest.TestCase):
         self.assertEqual(rows["resources-foreign"].status, "fail")
         self.assertIn("/state/corral/host-resources.json", rows["resources-foreign"].fix)
 
+    def test_a_foreign_limits_error_fails_the_foreign_row_too(self):
+        error = "foreign claim 0 must be a foreign claim, not {}"
+        rows = by_name(resourcedoctor.check(readings(limits_error=error)))
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "fail")
+        self.assertIn(error, row.detail)
+        self.assertIn("/state/corral/host-resources.json", row.fix)
+
 
 class SliceDrift(unittest.TestCase):
     def test_no_budget_means_no_slices_row(self):
         rows = by_name(resourcedoctor.check(readings(host=None)))
         self.assertNotIn("resources-slices", rows)
 
-    def test_unreadable_slices_mean_no_row(self):
+    def test_unreadable_slices_warn_instead_of_a_false_ok(self):
         rows = by_name(resourcedoctor.check(readings(slices=None)))
-        self.assertNotIn("resources-slices", rows)
+        row = rows["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("could not read the resource slices", row.detail)
 
     def test_no_slices_yet_is_ok(self):
         rows = by_name(resourcedoctor.check(readings(slices={})))
         self.assertEqual(rows["resources-slices"].status, "ok")
         self.assertIn("no resource slices", rows["resources-slices"].detail.lower())
 
-    def test_matching_slices_are_ok(self):
-        rows = by_name(
-            resourcedoctor.check(
-                readings(
-                    slices={
-                        "corral.slice": props("16777216000", "8000000", "4096"),
-                        "corral-web.slice": props("16777216000", "8000000", "4096"),
-                    }
-                )
-            )
-        )
+    def test_launch_created_slices_matching_the_budget_are_ok(self):
+        launch_slices = {
+            "corral.slice": {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8000000"},
+            "corral-web.slice": {
+                "MemoryMax": "16777216000",
+                "CPUQuotaPerSecUSec": "8000000",
+            },
+        }
+        rows = by_name(resourcedoctor.check(readings(slices=launch_slices)))
+        self.assertEqual(rows["resources-slices"].status, "ok")
+
+    def test_a_tasksmax_on_a_slice_is_not_drift(self):
+        slices = {
+            "corral.slice": {
+                "MemoryMax": "16777216000",
+                "CPUQuotaPerSecUSec": "8000000",
+                "TasksMax": "512",
+            },
+            "corral-web.slice": {
+                "MemoryMax": "16777216000",
+                "CPUQuotaPerSecUSec": "8000000",
+            },
+        }
+        rows = by_name(resourcedoctor.check(readings(slices=slices)))
         self.assertEqual(rows["resources-slices"].status, "ok")
 
     def test_missing_slice_is_created_on_launch_not_drift(self):
         rows = by_name(
             resourcedoctor.check(
-                readings(slices={"corral.slice": props("16777216000", "8000000", "4096")})
+                readings(
+                    slices={
+                        "corral.slice": {
+                            "MemoryMax": "16777216000",
+                            "CPUQuotaPerSecUSec": "8000000",
+                        }
+                    }
+                )
             )
         )
         self.assertEqual(rows["resources-slices"].status, "ok")
@@ -316,8 +364,14 @@ class SliceDrift(unittest.TestCase):
             resourcedoctor.check(
                 readings(
                     slices={
-                        "corral.slice": props("17179869184", "8000000", "4096"),
-                        "corral-web.slice": props("16777216000", "8000000", "4096"),
+                        "corral.slice": {
+                            "MemoryMax": "17179869184",
+                            "CPUQuotaPerSecUSec": "4000000",
+                        },
+                        "corral-web.slice": {
+                            "MemoryMax": "16777216000",
+                            "CPUQuotaPerSecUSec": "8000000",
+                        },
                     }
                 )
             )
@@ -326,6 +380,7 @@ class SliceDrift(unittest.TestCase):
         self.assertEqual(row.status, "warn")
         self.assertIn("corral.slice", row.detail)
         self.assertIn("MemoryMax", row.detail)
+        self.assertIn("CPUQuotaPerSecUSec", row.detail)
         self.assertIn("never reconcile", row.detail)
         self.assertIn("daemon-reload", row.fix)
 
@@ -381,13 +436,13 @@ class SliceDriftUnit(unittest.TestCase):
     def test_each_dimension_reports(self):
         drifts = resourcedoctor.slice_drift(
             R.Usage(cpu_m=8000, memory_mb=16000, pids=4096),
-            {"MemoryMax": "1", "CPUQuotaPerSecUSec": "1", "TasksMax": "1"},
+            {"MemoryMax": "1", "CPUQuotaPerSecUSec": "1"},
         )
-        self.assertEqual(len(drifts), 3)
+        self.assertEqual(len(drifts), 2)
 
     def test_missing_property_is_unset(self):
         drifts = resourcedoctor.slice_drift(R.Usage(cpu_m=8000, memory_mb=16000, pids=4096), {})
-        self.assertEqual(len(drifts), 3)
+        self.assertEqual(len(drifts), 2)
 
     def test_zero_expected_matches_infinity(self):
         self.assertEqual(
@@ -403,14 +458,27 @@ class SliceDriftUnit(unittest.TestCase):
             R.Usage(cpu_m=8000, memory_mb=16000, pids=4096),
             {"MemoryMax": "huge", "CPUQuotaPerSecUSec": "lots", "TasksMax": "many"},
         )
-        self.assertEqual(len(drifts), 3)
+        self.assertEqual(len(drifts), 2)
+
+    def test_a_tasksmax_actual_is_ignored(self):
+        self.assertEqual(
+            resourcedoctor.slice_drift(
+                R.Usage(cpu_m=8000, memory_mb=16000, pids=4096),
+                {
+                    "MemoryMax": "16777216000",
+                    "CPUQuotaPerSecUSec": "8000000",
+                    "TasksMax": "1",
+                },
+            ),
+            [],
+        )
 
     def test_unset_expected_but_set_actual_drifts(self):
         drifts = resourcedoctor.slice_drift(
             R.Usage(cpu_m=0, memory_mb=0, pids=0),
             {"MemoryMax": "100", "CPUQuotaPerSecUSec": "100", "TasksMax": "100"},
         )
-        self.assertEqual(len(drifts), 3)
+        self.assertEqual(len(drifts), 2)
 
 
 class LoadLiveRoles(unittest.TestCase):
@@ -487,11 +555,22 @@ class LoadSliceActual(unittest.TestCase):
             },
         )
 
-    def test_missing_slice_is_absent(self):
+    def test_missing_slice_is_absent_not_a_failure(self):
+        def run(argv):
+            if argv[-1] == "corral-web.slice":
+                return SimpleNamespace(returncode=1, stdout="", stderr="gone")
+            return SimpleNamespace(returncode=0, stdout=show(), stderr="")
+
+        actual = resourcedoctor.load_slice_actual(("corral.slice", "corral-web.slice"), run=run)
+        self.assertIsNotNone(actual)
+        assert actual is not None
+        self.assertEqual(list(actual), ["corral.slice"])
+
+    def test_every_dump_failing_reads_as_no_reading(self):
         def run(argv):
             return SimpleNamespace(returncode=1, stdout="", stderr="gone")
 
-        self.assertEqual(resourcedoctor.load_slice_actual(("corral.slice",), run=run), {})
+        self.assertIsNone(resourcedoctor.load_slice_actual(("corral.slice",), run=run))
 
     def test_an_unreachable_bus_reads_as_no_reading(self):
         def run(argv):
@@ -622,6 +701,7 @@ class ProductionAssembly(unittest.TestCase):
         rows = by_name(resourcedoctor.check(state_readings))
         self.assertEqual(rows["resources"].status, "ok")
         self.assertEqual(rows["resources-foreign"].status, "ok")
+        self.assertEqual(rows["resources-slices"].status, "warn")
 
     def test_no_resolved_means_no_readings(self):
         self.assertIsNone(
