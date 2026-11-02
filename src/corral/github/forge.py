@@ -131,12 +131,120 @@ def _parse_index_item(item):
     return ref, _pr_state(item)
 
 
+def _check_create_shape(owner, name):
+    """``(owner, name)`` for a remote create, else ``ForgeError``.
+
+    Names follow the same rule every repo-named path shares (one path
+    part, no ``.git`` suffix); owners hold no slash or whitespace. The
+    check is fail-closed and pure, so callers map it to a usage error
+    without any network read.
+    """
+    for value, what in ((owner, "owner"), (name, "name")):
+        if not isinstance(value, str) or not value:
+            raise _shape(f"bad {what} {value!r}")
+        if "/" in value or any(ch.isspace() for ch in value):
+            raise _shape(f"bad {what} {value!r}")
+    if name.endswith(".git"):
+        raise _shape(f"bad name {name!r}")
+    return owner, name
+
+
+def _is_not_found(err):
+    """Whether a failed `gh` call answered repo-not-found (else unreachable)."""
+    text = str(err)
+    return "404" in text or "not found" in text.lower()
+
+
+def _is_already_exists(err):
+    """Whether a failed `gh repo create` lost a race to an existing repo."""
+    return "already exists" in str(err).lower()
+
+
 class GithubForge:
     """``corral.forge.Forge`` over ``gh api`` REST calls."""
 
     def __init__(self, run):
         """``run(args)`` returns stdout and raises when ``gh`` fails."""
         self._run = run
+
+    def current_user(self) -> str:
+        try:
+            payload = json.loads(self._get("user"))
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable forge user: {err}") from err
+        login = payload.get("login") if isinstance(payload, dict) else None
+        if not isinstance(login, str) or not login:
+            raise _shape(f"bad forge user {payload!r}")
+        return login
+
+    def repo_exists(self, repo: str) -> bool:
+        """Whether `owner/name` exists, with one blind spot: the API answers
+        a private repository the token cannot see with 404, the same as a
+        missing one, so such a repo reads as `False` and the pre-check
+        passes. Behavior is unchanged (the adapter cannot tell the two
+        apart); the create then reports the already-exists failure."""
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        try:
+            self._run(["api", f"repos/{repo}"])
+        except Exception as err:
+            if _is_not_found(err):
+                return False
+            raise forge.ForgeError(f"forge unreachable: {err}") from err
+        return True
+
+    def create_repo(self, owner: str, name: str, *, private: bool = True) -> str:
+        owner, name = _check_create_shape(owner, name)
+        target = f"{owner}/{name}"
+        visibility = "--private" if private else "--public"
+        try:
+            self._run(["repo", "create", target, visibility])
+        except Exception as err:
+            if _is_already_exists(err):
+                raise forge.ForgeExists(f"remote {target} already exists: {err}") from err
+            raise forge.ForgeError(f"forge unreachable: {err}") from err
+        return self.clone_url(target)
+
+    def repo_empty(self, repo: str) -> bool:
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        try:
+            branches = json.loads(self._get(f"repos/{repo}/branches"))
+            tags = json.loads(self._get(f"repos/{repo}/tags"))
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable empty check for {repo}: {err}") from err
+        if not isinstance(branches, list):
+            raise _shape(f"bad branches for {repo}: {branches!r}")
+        if not isinstance(tags, list):
+            raise _shape(f"bad tags for {repo}: {tags!r}")
+        return not branches and not tags
+
+    def clone_url(self, repo: str) -> str:
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        try:
+            payload = json.loads(self._get(f"repos/{repo}"))
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable forge repo {repo}: {err}") from err
+        url = payload.get("clone_url") if isinstance(payload, dict) else None
+        if not isinstance(url, str) or not url:
+            raise _shape(f"bad clone url for {repo}: {payload!r}")
+        return url
+
+    def describe_create(self, name: str, owner: str | None = None, *, private: bool = True) -> str:
+        if owner is None:
+            _check_create_shape("owner", name)
+        else:
+            _check_create_shape(owner, name)
+        visibility = "--private" if private else "--public"
+        target = f"{owner}/{name}" if owner else name
+        return f"gh repo create {target} {visibility}"
 
     def _get(self, path):
         try:
