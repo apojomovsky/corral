@@ -109,7 +109,7 @@ Everything a project might reasonably do differently is a named setting with a d
 | `review.budget.limit_multiple` | `3` | hard limit as a multiple of the expected duration |
 | `review.budget.floor_minutes` | `30` | hard limit floor, however small the diff |
 | `review.budget.ceiling_minutes` | `120` | agent runtime ceiling for one dispatched reviewer |
-| `agents.runtime` | `omp` | or `opencode` or `muse` |
+| `agents.runtime` | `omp` | or `muse` |
 | `models.*` | roles and fallback chains | must name providers from the host's accounts |
 | `prompts.<role>` | built-in templates | override with a file (see 4) |
 

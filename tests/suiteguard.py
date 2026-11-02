@@ -1,6 +1,6 @@
 """External-call guard for the test suite.
 
-The suite must never reach GitHub, systemd, docker, omp, opencode, claude, loginctl, tailscale or a
+The suite must never reach GitHub, systemd, docker, omp, muse, claude, loginctl, tailscale or a
 non-loopback network address, whichever runner starts it. ``install()`` runs
 from ``tests/__init__.py`` at import, so every entry point gets the same
 protection. Three layers:
@@ -43,7 +43,7 @@ SHIM_TOOLS = (
     "systemctl",
     "systemd-run",
     "omp",
-    "opencode",
+    "muse",
     "claude",
     "docker",
     "loginctl",
