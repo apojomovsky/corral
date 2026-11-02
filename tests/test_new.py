@@ -19,8 +19,10 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from corral import cli, forge as iface, init, new, settings
+from corral import tracker as tracker_iface
 from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
+from tests.test_tracker import FakeTracker
 
 FIXTURE = "demo"
 
@@ -160,6 +162,7 @@ def run_new(
     public=False,
     owner=None,
     resume=False,
+    tracker=None,
 ):
     """`new.run` with captured output: `(code, stdout, stderr)`."""
     opts = new.Options(
@@ -182,10 +185,12 @@ def run_new(
     )
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        if git is None and forge is None:
+        if git is None and forge is None and tracker is None:
             code = new.run(opts)
         else:
-            code = new.run(opts, git=git or FakeGit(root=path), forge=forge)
+            if tracker is None and forge is not None:
+                tracker = FakeTracker()
+            code = new.run(opts, git=git or FakeGit(root=path), forge=forge, tracker=tracker)
     return code, out.getvalue(), err.getvalue()
 
 
@@ -1068,19 +1073,124 @@ class CreateRemote(unittest.TestCase):
     def test_resume_rerun_after_success_converges_silently(self):
         first = FakeGit(root=self.parent, status="?? README.md\n")
         forge = FakeForge(user="operator")
-        code, _, err = run_new(path=self.parent, git=first, forge=forge, create_remote=True)
+        tracker = FakeTracker()
+        code, _, err = run_new(
+            path=self.parent, git=first, forge=forge, tracker=tracker, create_remote=True
+        )
         self.assertEqual((code, err), (0, ""))
         url = f"https://example.com/operator/{FIXTURE}.git"
         self.assertEqual(first.origin_url, url)
         rerun = FakeGit(root=self.target(), hooks=".githooks", status="", origin_url=url)
         code, out, _ = run_new(
-            path=self.parent, git=rerun, forge=forge, create_remote=True, resume=True
+            path=self.parent,
+            git=rerun,
+            forge=forge,
+            tracker=tracker,
+            create_remote=True,
+            resume=True,
         )
         self.assertEqual(code, 1)
         self.assertNotIn("next:", out)
         self.assertEqual(len(forge.created), 1)
         self.assertEqual(rerun.commits, [])
         self.assertEqual(rerun.origin_url, url)
+
+
+class LabelBootstrap(unittest.TestCase):
+    """Ticket 4: `--create-remote` bootstraps the board labels."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def test_create_remote_bootstraps_the_labels_after_the_origin(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        tracker = FakeTracker()
+        code, out, err = run_new(
+            path=self.parent, git=git, forge=forge, tracker=tracker, create_remote=True
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(("ensure_labels", f"operator/{FIXTURE}"), tracker.calls)
+        self.assertIn(f"created label ready on operator/{FIXTURE}\n", out)
+        self.assertIn(f"created label priority:backlog on operator/{FIXTURE}\n", out)
+        self.assertLess(out.index("created remote"), out.index("created label ready"))
+        self.assertLess(out.index("set origin to"), out.index("created label ready"))
+        self.assertIn("next: corral doctor", out)
+
+    def test_refused_labels_are_exit_1_with_fix_lines(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        tracker = FakeTracker(refused={"hold"})
+        code, out, err = run_new(
+            path=self.parent, git=git, forge=forge, tracker=tracker, create_remote=True
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertIn(f"created label ready on operator/{FIXTURE}\n", out)
+        self.assertIn(
+            f"refused label hold on operator/{FIXTURE}: ask an owner to create it",
+            out,
+        )
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+
+    def test_unreachable_labels_are_exit_3_with_the_manual_command(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        tracker = FakeTracker(ensure_error=tracker_iface.TrackerError("down"))
+        code, out, _ = run_new(
+            path=self.parent, git=git, forge=forge, tracker=tracker, create_remote=True
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(len(forge.created), 1)
+        self.assertIn(f"labels on operator/{FIXTURE} not bootstrapped", out)
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+
+    def test_adopted_remotes_bootstrap_too(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(
+            user="operator",
+            repos={
+                f"operator/{FIXTURE}": {
+                    "private": True,
+                    "empty": True,
+                    "url": f"https://example.com/operator/{FIXTURE}.git",
+                }
+            },
+        )
+        tracker = FakeTracker()
+        code, out, err = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=tracker,
+            create_remote=True,
+            resume=True,
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(("ensure_labels", f"operator/{FIXTURE}"), tracker.calls)
+        self.assertIn(f"created label ready on operator/{FIXTURE}\n", out)
+
+    def test_conflicting_origin_never_reaches_the_labels(self):
+        git = FakeGit(
+            root=self.parent,
+            status="?? README.md\n",
+            origin_url="https://example.com/someone-else/other.git",
+        )
+        forge = FakeForge(user="operator")
+        tracker = FakeTracker()
+        code, _, _ = run_new(
+            path=self.parent, git=git, forge=forge, tracker=tracker, create_remote=True
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(tracker.calls, [])
 
 
 class RemotePlan(unittest.TestCase):
@@ -1119,6 +1229,7 @@ class RemotePlan(unittest.TestCase):
         )
         self.assertEqual(code, 0)
         self.assertIn(f"would run gh repo create operator/{FIXTURE} --private", out)
+        self.assertIn(f"would ensure labels on operator/{FIXTURE}", out)
         self.assertFalse(os.path.exists(self.target()))
 
     def test_plan_with_resume_notes_adoption(self):
@@ -1139,6 +1250,7 @@ class RemotePlan(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"would adopt operator/{FIXTURE} when empty", out)
         self.assertNotIn("would run gh repo create", out)
+        self.assertIn(f"would ensure labels on operator/{FIXTURE}", out)
         self.assertFalse(os.path.exists(self.target()))
 
 

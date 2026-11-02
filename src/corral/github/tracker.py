@@ -7,18 +7,32 @@ module: everything else sees ``TrackerItem``.
 """
 
 import json
+import re
 
 from corral import tracker as iface
 from corral.github.gh import is_rate_limited, retry_after_s
-from corral.tracker import NEEDS_DECISION, PRIORITIES
+from corral.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
 
-#: The label prefixes the adapter reads and writes. The priority order
-#: and the decision label live on the provider-neutral protocol; this
-#: adapter only derives the plain strings the store keeps from them.
-_PRIORITY_PREFIX = "priority:"
+#: The bootstrap label colors, a provider detail the interface never
+#: sees. Every `BOOTSTRAP_LABELS` name has an entry here; the ensure
+#: tests assert the two agree.
+_BOOTSTRAP_COLORS = {
+    "ready": "0e8a16",
+    "needs-triage": "fbca04",
+    "needs-decision": "d93f0b",
+    "hold": "5319e7",
+    "priority:urgent": "b60205",
+    "priority:high": "d93f0b",
+    "priority:normal": "fbca04",
+    "priority:low": "0e8a16",
+    "priority:backlog": "cccccc",
+}
+
+#: A label create the account may not perform, in the provider's shape.
+_REFUSED_RE = re.compile(r"\(HTTP 403\)", re.IGNORECASE)
 
 #: Corral-owned fields live on the tracker as labels. One label per field
 #: at most; when several share a prefix the smallest wins and the rest
@@ -33,9 +47,9 @@ def priority_of(names) -> str:
     """
     best = ""
     for name in names or ():
-        if not isinstance(name, str) or not name.startswith(_PRIORITY_PREFIX):
+        if not isinstance(name, str) or not name.startswith(PRIORITY_PREFIX):
             continue
-        suffix = name[len(_PRIORITY_PREFIX) :]
+        suffix = name[len(PRIORITY_PREFIX) :]
         if suffix in PRIORITIES and (not best or PRIORITIES.index(suffix) < PRIORITIES.index(best)):
             best = suffix
     return best
@@ -106,6 +120,16 @@ def _parse_names(entries, field):
             raise _fail(f"bad {field} entry {entry!r}")
         names.append(name)
     return tuple(names)
+
+
+def _is_refused(err):
+    """Whether a failed label create is a permission refusal.
+
+    A 403 in the provider's shape reads as refused (in someone else's
+    organisation the account may not create labels); anything else fails
+    closed through ``_write_error``.
+    """
+    return _REFUSED_RE.search(str(err)) is not None
 
 
 class GithubTracker:
@@ -336,6 +360,59 @@ class GithubTracker:
             )
         except Exception as err:
             raise self._write_error(err) from err
+
+    def ensure_labels(self, repo: str) -> iface.LabelReport:
+        """Create the missing bootstrap labels on ``repo``, leave the rest alone.
+
+        Missing labels are created with the adapter's colors; existing
+        labels are left byte-identical, never overwritten. A 403 on a
+        create reads as refused (the account may not create labels in
+        someone else's organisation) and the pass continues; anything
+        else fails closed through ``_write_error``.
+        """
+        try:
+            payload = json.loads(self._run(["api", f"repos/{repo}/labels"]))
+        except Exception as err:
+            raise self._write_error(err) from err
+        if not isinstance(payload, list):
+            raise _fail(f"labels of {repo} are not a list")
+        have = set()
+        for entry in payload:
+            name = entry.get("name") if isinstance(entry, dict) else None
+            if not isinstance(name, str):
+                raise _fail(f"bad label entry {entry!r} on {repo}")
+            have.add(name)
+        created, kept, refused = [], [], []
+        for wanted in iface.BOOTSTRAP_LABELS:
+            if wanted.name in have:
+                kept.append(wanted.name)
+                continue
+            try:
+                self._run(
+                    [
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{repo}/labels",
+                        "-f",
+                        f"name={wanted.name}",
+                        "-f",
+                        f"color={_BOOTSTRAP_COLORS[wanted.name]}",
+                        "-f",
+                        f"description={wanted.description}",
+                    ]
+                )
+            except Exception as err:
+                # A rate limit answers 403 too: it stays retryable and
+                # never reads as a permission refusal.
+                if is_rate_limited(str(err)):
+                    raise self._write_error(err) from err
+                if _is_refused(err):
+                    refused.append(wanted.name)
+                    continue
+                raise self._write_error(err) from err
+            created.append(wanted.name)
+        return iface.LabelReport(tuple(created), tuple(kept), tuple(refused))
 
     def write(self, repo: str, number: int, field: str, value: str) -> None:
         """Set one corral-owned field through the issues-labels endpoint.

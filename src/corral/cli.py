@@ -14,6 +14,7 @@ from corral import (
     doctor,
     drive,
     gccli,
+    githubcli,
     hubcli,
     init,
     launch,
@@ -237,6 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
+    githubcli.add_parser(sub)
     quotacli.add_parser(sub)
     serve.add_parser(sub)
     snapshot.add_parser(sub)

@@ -1,8 +1,9 @@
 """`corral new`: scaffold a minimal project, then onboard it through `init`.
 
-Tickets 1 to 3 of `docs/06-corral-new.md`, section 8: templates plus
+Tickets 1 to 4 of `docs/06-corral-new.md`, section 8: templates plus
 `--plan`, then the `init` writer, then `--create-remote` through the
-forge interface. `new` creates the target directory, runs `git init -b`
+forge interface, then the label bootstrap through the tracker
+interface. `new` creates the target directory, runs `git init -b`
 with the effective branch, copies the packaged template files, then
 onboards the tree through `init.collect` and `init.apply` with the same
 flags `init` takes, commits the result, and reports the next step. Every
@@ -10,9 +11,10 @@ scaffold write is create-only: missing files are written, identical files
 are kept, and a file that differs from the render refuses (exit 4) unless
 `--force` leaves it alone and converges the rest. With `--create-remote`,
 `new` pre-checks the intended remote through the forge, creates it after
-the commit, and sets it as origin; without it, `new` prints the planned
-create command and runs nothing outward. Later tickets cover the label
-bootstrap and `--template-dir`.
+the commit, sets it as origin, and bootstraps the board labels through
+the tracker (the same operation `corral github setup` performs);
+without it, `new` prints the planned create command and runs nothing
+outward. A later ticket covers `--template-dir`.
 """
 
 import argparse
@@ -25,6 +27,7 @@ from typing import NamedTuple
 
 from corral import forge as iface
 from corral import gc, init, paths
+from corral import tracker as tracker_iface
 
 OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
@@ -338,6 +341,14 @@ def _production_forge():
     return ghforge.GithubForge(paced_run)
 
 
+def _production_tracker():
+    """The live tracker over the production `gh` runner."""
+    from corral.github import tracker as ghtracker
+    from corral.github.gh import paced_run
+
+    return ghtracker.GithubTracker(paced_run)
+
+
 def _check_owner_shape(owner):
     """The remote owner as given: no slash, no whitespace, else exit 4."""
     if not isinstance(owner, str) or not owner or "/" in owner or any(ch.isspace() for ch in owner):
@@ -399,6 +410,23 @@ def _remote_created(repo, forge):
         return False
 
 
+def _bootstrap_labels(repo, tracker):
+    """Ensure the board labels, printing the created/kept/refused report.
+
+    Returns `(changed, refused)`, or None when the tracker is
+    unreachable: the manual `github setup` command is printed as the
+    next step, and the caller exits 3.
+    """
+    try:
+        report = tracker.ensure_labels(repo)
+    except tracker_iface.TrackerError as err:
+        sys.stdout.write(f"labels on {repo} not bootstrapped: {err}\n")
+        sys.stdout.write("next: corral github setup\n")
+        return None
+    sys.stdout.write(tracker_iface.render_ensure(repo, report))
+    return bool(report.created), bool(report.refused)
+
+
 def _ensure_origin(target, url, git):
     """Set `origin` to `url` in `target`, unless it already points there.
 
@@ -424,10 +452,15 @@ def _ensure_origin(target, url, git):
     return True
 
 
-def run(opts, git=gc.git, forge=None):
+def run(opts, git=gc.git, forge=None, tracker=None):
     """Run `new` with injectable seams. Returns the exit code."""
     try:
-        return _apply(opts, git, forge if forge is not None else _production_forge())
+        return _apply(
+            opts,
+            git,
+            forge if forge is not None else _production_forge(),
+            tracker if tracker is not None else _production_tracker(),
+        )
     except iface.ForgeExists as err:
         print(f"corral: {err}", file=sys.stderr)
         return RACE
@@ -439,7 +472,7 @@ def run(opts, git=gc.git, forge=None):
         return USAGE
 
 
-def _apply(opts, git, forge):
+def _apply(opts, git, forge, tracker):
     """Create the tree, init the repo, write the scaffold, onboard, commit."""
     if opts.public and not opts.create_remote:
         raise NewError("--public needs --create-remote: it would mean nothing")
@@ -548,7 +581,23 @@ def _apply(opts, git, forge):
             remote_changed = True
             sys.stdout.write(f"created remote {repo}\n")
         origin_changed = _ensure_origin(target, url, git)
-    if scaffold_changed or init_code == OK or committed or remote_changed or origin_changed:
+        bootstrapped = _bootstrap_labels(repo, tracker)
+        if bootstrapped is None:
+            return UNREACHABLE
+        labels_changed, refused = bootstrapped
+    else:
+        labels_changed, refused = False, False
+    if refused:
+        sys.stdout.write("next: corral github setup\n")
+        return NOTHING
+    if (
+        scaffold_changed
+        or init_code == OK
+        or committed
+        or remote_changed
+        or origin_changed
+        or labels_changed
+    ):
         sys.stdout.write("next: corral doctor\n")
         return OK
     return NOTHING
@@ -595,6 +644,7 @@ def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
             sys.stdout.write(f"would adopt {repo} when empty, then set it as origin\n")
         else:
             sys.stdout.write(f"would run {plan_text}\n")
+        sys.stdout.write(f"would ensure labels on {repo}\n")
     else:
         sys.stdout.write(plan_text + "\n")
     if os.path.isdir(target) and not needs_init:

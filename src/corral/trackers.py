@@ -142,6 +142,14 @@ class BoardBackedTracker(BoardTracker):
         """The one decision label, through the REST adapter."""
         self._issues.add_label(repo, number, label)
 
+    def ensure_labels(self, repo: str) -> iface.LabelReport:
+        """The bootstrap labels, through the REST adapter.
+
+        Labels live on the repository whatever the tracker variant, so
+        a board repo bootstraps through the same adapter call.
+        """
+        return self._issues.ensure_labels(repo)
+
     def _fetch_single(self, project_id, repo, number):
         """The board item node behind ``repo#number``, else ``TrackerError``."""
         owner, name = _split_repo(repo)
