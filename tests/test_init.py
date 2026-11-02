@@ -49,6 +49,8 @@ class FakeGit:
             if not self.hooks:
                 return proc(1, "")
             return proc(0, self.hooks + "\n")
+        if args[:1] == ["init"]:
+            return proc(0, "")
         raise AssertionError(f"unexpected git call {args}")
 
 
@@ -279,6 +281,9 @@ TAIL = """# Defaults: uncomment to override.
 # registry.gone_s = 3600  # seconds without a heartbeat before an agent is dropped
 # registry.stale_s = 600  # seconds without a heartbeat before an agent reads stale
 #
+# [resources]
+# resources.gone_s = 600  # seconds a foreign claim counts against the pool
+#
 # [review]
 # review.required = true  # takeoff needs an approving review record for the head
 #
@@ -387,6 +392,9 @@ commits.conventional = false
 # registry.count_toward_cap = true  # live registered ticket workers take cap slots
 # registry.gone_s = 3600  # seconds without a heartbeat before an agent is dropped
 # registry.stale_s = 600  # seconds without a heartbeat before an agent reads stale
+#
+# [resources]
+# resources.gone_s = 600  # seconds a foreign claim counts against the pool
 #
 # [review]
 # review.required = true  # takeoff needs an approving review record for the head
