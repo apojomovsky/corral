@@ -18,11 +18,18 @@ and the dispatcher would have no moment at which to cancel deliberately.
 When a diff is too large to review inside that cap, the honest answer is
 to split it, which this module says outright instead of handing back a
 budget the dispatcher cannot enforce.
+
+The five numbers are `review.budget.*` settings, so each project tunes
+its own; the defaults are corral's own review gate. `numbers()` is the
+one resolver: every reader goes through it.
 """
 
 import os
 import subprocess
 import textwrap
+from typing import NamedTuple
+
+from corral import settings
 
 # Minutes a reviewer needs before the diff size matters: loading context,
 # building, and running the repository's fast gates at least once. This
@@ -51,6 +58,40 @@ MACHINE_CEILING_MINUTES = 120
 MAX_LIMIT_MINUTES = MACHINE_CEILING_MINUTES - 1
 MAX_EXPECTED_MINUTES = MAX_LIMIT_MINUTES // LIMIT_MULTIPLE
 
+# The defaults above are corral's own review gate (the 3x multiple and the
+# 30-minute floor in AGENTS.md). A project configures its own numbers
+# through these settings; the gate rule stays corral's, not the project's.
+settings.register(
+    "review.budget.base_minutes",
+    int,
+    BASE_MINUTES,
+    "reviewer minutes before the diff size matters (loading, build, fast gates)",
+)
+settings.register(
+    "review.budget.seconds_per_line",
+    int,
+    SECONDS_PER_LINE,
+    "reviewer seconds per changed line in the diff",
+)
+settings.register(
+    "review.budget.limit_multiple",
+    int,
+    LIMIT_MULTIPLE,
+    "hard limit as a multiple of the expected duration",
+)
+settings.register(
+    "review.budget.floor_minutes",
+    int,
+    GATE_MIN_LIMIT_MINUTES,
+    "hard limit floor in minutes, however small the diff",
+)
+settings.register(
+    "review.budget.ceiling_minutes",
+    int,
+    MACHINE_CEILING_MINUTES,
+    "agent runtime ceiling in minutes for one dispatched reviewer",
+)
+
 # Standing checks every bug-fix review makes beyond its one question: the
 # two kinds of miss that recur in merged fixes (a fact resolved in two
 # places that disagree; a key that can hold two live states). The launch
@@ -63,6 +104,88 @@ BUGFIX_REVIEW_CHECKS = (
     "two or more of the thing the code keys on can exist, and that case "
     "is tested."
 )
+
+
+class Numbers(NamedTuple):
+    """The five budget numbers for one project: the one resolved record.
+
+    Every reader below goes through `numbers()`; nothing reads the module
+    constants or the settings registry directly.
+    """
+
+    base_minutes: int
+    seconds_per_line: int
+    limit_multiple: int
+    floor_minutes: int
+    ceiling_minutes: int
+
+
+#: The registered keys, in Numbers field order.
+NUMBERS_KEYS = (
+    "review.budget.base_minutes",
+    "review.budget.seconds_per_line",
+    "review.budget.limit_multiple",
+    "review.budget.floor_minutes",
+    "review.budget.ceiling_minutes",
+)
+
+
+def _number(key, raw):
+    """One budget number: a positive int, else a SettingsError naming the key."""
+    value = raw[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise settings.SettingsError(f"{key} must be a positive integer, not {value!r}")
+    return value
+
+
+def numbers(resolved=None):
+    """The budget numbers, from `resolved` or from the built-in defaults.
+
+    With no resolved settings the result is today's constants, so current
+    behavior is byte-identical. Bad values are a SettingsError naming the
+    key: each number must be positive, the floor must sit below the
+    ceiling, and the smallest printable limit must still clear the floor,
+    for every diff size.
+    """
+    if resolved is None:
+        raw = {key: settings.REGISTRY[key].default for key in NUMBERS_KEYS}
+    else:
+        raw = {key: resolved[key] for key in NUMBERS_KEYS}
+    cfg = Numbers(
+        base_minutes=_number("review.budget.base_minutes", raw),
+        seconds_per_line=_number("review.budget.seconds_per_line", raw),
+        limit_multiple=_number("review.budget.limit_multiple", raw),
+        floor_minutes=_number("review.budget.floor_minutes", raw),
+        ceiling_minutes=_number("review.budget.ceiling_minutes", raw),
+    )
+    if cfg.floor_minutes >= cfg.ceiling_minutes:
+        raise settings.SettingsError(
+            f"review.budget.floor_minutes ({cfg.floor_minutes}) must be below "
+            f"review.budget.ceiling_minutes ({cfg.ceiling_minutes})"
+        )
+    smallest = min(cfg.base_minutes, _max_expected(cfg)) * cfg.limit_multiple
+    if smallest < cfg.floor_minutes:
+        raise settings.SettingsError(
+            "review.budget leaves no printable budget: the smallest limit "
+            f"({smallest} minutes) is below review.budget.floor_minutes "
+            f"({cfg.floor_minutes}); raise review.budget.base_minutes or "
+            "review.budget.limit_multiple, or lower review.budget.floor_minutes"
+        )
+    return cfg
+
+
+def load_numbers(root=None, repo=None):
+    """The budget numbers for this project, from the files on disk.
+
+    `root` is the ops root (None reads host config plus defaults); `repo`
+    selects the `[[repo]]` entry that wins for that repository.
+    """
+    return numbers(settings.load(root=root, repo=repo))
+
+
+def _max_expected(cfg):
+    """Largest expectation whose multiple still stays under the ceiling."""
+    return (cfg.ceiling_minutes - 1) // cfg.limit_multiple
 
 
 def _git(args, cwd=None):
@@ -97,70 +220,76 @@ def changed_lines(base, cwd=None):
     return total
 
 
-def natural_expected_minutes(lines):
+def natural_expected_minutes(lines, cfg=None):
     """What the diff alone asks for, before the ceiling shortens it."""
-    seconds = BASE_MINUTES * 60 + SECONDS_PER_LINE * max(0, lines)
+    cfg = numbers() if cfg is None else cfg
+    seconds = cfg.base_minutes * 60 + cfg.seconds_per_line * max(0, lines)
     return (seconds + 59) // 60
 
 
-def needs_splitting(lines):
+def needs_splitting(lines, cfg=None):
     """Whether one review cannot honestly cover this diff."""
-    return natural_expected_minutes(lines) > MAX_EXPECTED_MINUTES
+    cfg = numbers() if cfg is None else cfg
+    return natural_expected_minutes(lines, cfg) > _max_expected(cfg)
 
 
-def max_reviewable_lines():
+def max_reviewable_lines(cfg=None):
     """Largest diff that still gets a full-length expectation.
 
     Derived from the same bound as the budget, so a diff flagged for
     splitting is exactly one whose expectation had to be shortened.
     """
-    # natural_expected_minutes(n) <= MAX_EXPECTED_MINUTES
-    #   <=> BASE*60 + SECONDS_PER_LINE*n <= MAX_EXPECTED_MINUTES*60
-    room = MAX_EXPECTED_MINUTES * 60 - BASE_MINUTES * 60
-    return max(0, room // SECONDS_PER_LINE)
+    cfg = numbers() if cfg is None else cfg
+    # natural_expected_minutes(n) <= max_expected
+    #   <=> base*60 + seconds_per_line*n <= max_expected*60
+    room = _max_expected(cfg) * 60 - cfg.base_minutes * 60
+    return max(0, room // cfg.seconds_per_line)
 
 
-def budget(lines):
+def budget(lines, cfg=None):
     """(expected_minutes, limit_minutes) for a diff of `lines` lines.
 
     Both are whole minutes, so the printed pair satisfies the gate's floor:
-    the limit is three times the rounded expectation, never the ceiling.
+    the limit is the multiple of the rounded expectation, never the ceiling.
     """
-    expected = min(natural_expected_minutes(lines), MAX_EXPECTED_MINUTES)
-    limit = expected * LIMIT_MULTIPLE
-    # The gate also floors the limit at 30 minutes. That holds because the
-    # base expectation alone is above a third of it; the check keeps the
-    # floor a fact rather than a coincidence if BASE_MINUTES is ever tuned.
-    assert limit >= GATE_MIN_LIMIT_MINUTES, (
-        f"budget {expected}m/{limit}m is below the gate's {GATE_MIN_LIMIT_MINUTES}-minute "
-        "minimum; raise BASE_MINUTES or LIMIT_MULTIPLE"
+    cfg = numbers() if cfg is None else cfg
+    expected = min(natural_expected_minutes(lines, cfg), _max_expected(cfg))
+    limit = expected * cfg.limit_multiple
+    # The floor holds because the smallest printable limit clears it; the
+    # check keeps that a fact rather than a coincidence if the numbers are
+    # ever tuned. `numbers()` refuses settings that would fail it.
+    assert limit >= cfg.floor_minutes, (
+        f"budget {expected}m/{limit}m is below the {cfg.floor_minutes}-minute "
+        "floor; raise review.budget.base_minutes or review.budget.limit_multiple"
     )
     return expected, limit
 
 
-def describe(base, cwd=None):
+def describe(base, cwd=None, cfg=None):
     """Lines of report for a reviewer dispatch, or a reason it cannot be computed."""
+    cfg = numbers() if cfg is None else cfg
     lines = changed_lines(base, cwd=cwd)
     if lines is None:
         return [f"cannot compute a budget: {base}...HEAD does not resolve"]
-    expected, limit = budget(lines)
+    expected, limit = budget(lines, cfg)
     report = [
         f"diff scope: {lines} changed lines against {base}",
         f"expected duration: {expected} minutes",
         f"hard limit: {limit} minutes",
     ]
-    if needs_splitting(lines):
+    if needs_splitting(lines, cfg):
         report.append(
             f"this diff is {lines} lines; one review covers about "
-            f"{max_reviewable_lines()} inside the {MACHINE_CEILING_MINUTES}-minute "
+            f"{max_reviewable_lines(cfg)} inside the {cfg.ceiling_minutes}-minute "
             "machine ceiling. Split it into that many reviews, or scope this one "
             "to the part that carries the risk."
         )
     return report
 
 
-def dispatch_block(base, cwd=None):
+def dispatch_block(base, cwd=None, cfg=None):
     """The paste-able dispatch text, budget plus the gate's own requirements."""
+    cfg = numbers() if cfg is None else cfg
     body = [
         "Review dispatch (canonical rule: AGENTS.md, Review gate):",
         "",
@@ -171,7 +300,7 @@ def dispatch_block(base, cwd=None):
     if lines is None:
         body.append("  budget: unknown, set one by hand (see the reason below)")
     else:
-        expected, limit = budget(lines)
+        expected, limit = budget(lines, cfg)
         body.append(f"  budget: expected {expected} minutes, hard limit {limit} minutes")
     body += textwrap.wrap(
         BUGFIX_REVIEW_CHECKS, width=72, initial_indent="  bug fix: ", subsequent_indent=" " * 11
@@ -195,12 +324,15 @@ def dispatch_block(base, cwd=None):
 def main_cli(argv):
     """`python -m corral.budget [--base <ref>]`: print the dispatch block.
 
-    Mirrors the `corral budget` verb's flag so the two spellings cannot
-    disagree about how the base ref is given.
+    Mirrors the `corral budget` verb's flags so the two spellings cannot
+    disagree about how the base ref or the project settings are given.
     """
+    import sys
+
     from corral.diffscope import default_base
 
     base = default_base()
+    root, repo = None, None
     rest = list(argv)
     while rest:
         arg = rest.pop(0)
@@ -208,7 +340,20 @@ def main_cli(argv):
             base = rest.pop(0)
         elif arg.startswith("--base="):
             base = arg.split("=", 1)[1]
-    print(dispatch_block(base))
+        elif arg == "--root" and rest:
+            root = rest.pop(0)
+        elif arg.startswith("--root="):
+            root = arg.split("=", 1)[1]
+        elif arg == "--repo" and rest:
+            repo = rest.pop(0)
+        elif arg.startswith("--repo="):
+            repo = arg.split("=", 1)[1]
+    try:
+        cfg = load_numbers(root=root, repo=repo)
+    except settings.SettingsError as err:
+        print(f"corral budget: {err}", file=sys.stderr)
+        return 4
+    print(dispatch_block(base, cfg=cfg))
     return 0
 
 

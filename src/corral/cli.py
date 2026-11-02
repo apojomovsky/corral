@@ -166,7 +166,19 @@ def cmd_budget(args: argparse.Namespace) -> int:
 
     from corral import diffscope
 
-    print(budget.dispatch_block(diffscope.default_base(args.base)))
+    if args.root and not os.path.isfile(os.path.join(args.root, settings.PROJECT_FILE)):
+        print(f"corral: no {settings.PROJECT_FILE} in --root {args.root}", file=sys.stderr)
+        return USAGE
+    root = args.root or settings.find_root(os.getcwd())
+    if args.repo and not root:
+        print("corral: --repo needs an ops root (corral.toml)", file=sys.stderr)
+        return USAGE
+    try:
+        cfg = budget.load_numbers(root=root, repo=args.repo)
+    except settings.SettingsError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+    print(budget.dispatch_block(diffscope.default_base(args.base), cfg=cfg))
     return OK
 
 
@@ -218,9 +230,15 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="Prints the dispatch block the review gate asks for: the one "
         "question, the scope, and an expected duration plus hard limit "
         "computed from <base>...HEAD. Paste it into the reviewer prompt "
-        "so the budget is reproducible rather than hand-picked.",
+        "so the budget is reproducible rather than hand-picked. The "
+        "numbers come from the review.budget.* settings, so --repo prints "
+        "that entry's budget.",
     )
     p.add_argument("--base", default=None, help=base_help)
+    p.add_argument(
+        "--root", default=None, help="the ops root (default: nearest corral.toml upward)"
+    )
+    p.add_argument("--repo", default=None, help="resolve for this [[repo]] entry")
     p.set_defaults(func=cmd_budget)
     init.add_parser(sub)
     coordcli.add_parser(sub)

@@ -11,12 +11,34 @@ machine ceiling.
 """
 
 import io
+import os
 import subprocess
+import tempfile
 from contextlib import redirect_stdout
 import unittest
 from unittest import mock
 
 from corral import budget as bu
+from corral import settings as S
+
+
+def resolve_settings(**kw):
+    """Settings resolved with no ambient environment: hermetic by default."""
+    kw.setdefault("env", {})
+    return S.resolve(**kw)
+
+
+CUSTOM = {
+    "base_minutes": 10,
+    "seconds_per_line": 10,
+    "limit_multiple": 2,
+    "floor_minutes": 20,
+    "ceiling_minutes": 60,
+}
+
+
+def custom_project():
+    return {"review": {"budget": dict(CUSTOM)}}
 
 
 class BudgetTest(unittest.TestCase):
@@ -188,6 +210,272 @@ class CliTest(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
             rc = cli.main(["budget", "--base", "HEAD~3"])
+        self.assertEqual(rc, 0)
+        self.assertIn("HEAD~3", out.getvalue())
+
+
+class RegistrationTest(unittest.TestCase):
+    def test_every_number_is_a_registered_int_setting(self):
+        expected = {
+            "review.budget.base_minutes": bu.BASE_MINUTES,
+            "review.budget.seconds_per_line": bu.SECONDS_PER_LINE,
+            "review.budget.limit_multiple": bu.LIMIT_MULTIPLE,
+            "review.budget.floor_minutes": bu.GATE_MIN_LIMIT_MINUTES,
+            "review.budget.ceiling_minutes": bu.MACHINE_CEILING_MINUTES,
+        }
+        for key, default in expected.items():
+            with self.subTest(key=key):
+                self.assertIn(key, S.REGISTRY)
+                self.assertIs(S.REGISTRY[key].type, int)
+                self.assertEqual(S.REGISTRY[key].default, default)
+
+    def test_budget_registers_its_settings(self):
+        self.assertIn("corral.budget", S.PROVIDERS)
+
+    def test_defaults_resolve_with_no_file(self):
+        resolved = resolve_settings()
+        self.assertEqual(resolved["review.budget.base_minutes"], bu.BASE_MINUTES)
+        self.assertEqual(resolved["review.budget.seconds_per_line"], bu.SECONDS_PER_LINE)
+        self.assertEqual(resolved["review.budget.limit_multiple"], bu.LIMIT_MULTIPLE)
+        self.assertEqual(resolved["review.budget.floor_minutes"], bu.GATE_MIN_LIMIT_MINUTES)
+        self.assertEqual(resolved["review.budget.ceiling_minutes"], bu.MACHINE_CEILING_MINUTES)
+
+
+class LayersTest(unittest.TestCase):
+    def test_a_project_file_overrides_each_number(self):
+        resolved = resolve_settings(project=custom_project())
+        for dotted, value in CUSTOM.items():
+            self.assertEqual(resolved[f"review.budget.{dotted}"], value)
+
+    def test_a_repo_entry_wins_for_that_repo_only(self):
+        project = {"repo": [{"name": "a", "review": {"budget": {"base_minutes": 5}}}]}
+        self.assertEqual(
+            resolve_settings(project=project, repo="a")["review.budget.base_minutes"], 5
+        )
+        self.assertEqual(
+            resolve_settings(project=project)["review.budget.base_minutes"], bu.BASE_MINUTES
+        )
+
+    def test_shared_and_repo_layers_combine(self):
+        project = {
+            "review": {"budget": {"base_minutes": 5}},
+            "repo": [{"name": "a", "review": {"budget": {"seconds_per_line": 9}}}],
+        }
+        resolved = resolve_settings(project=project, repo="a")
+        self.assertEqual(resolved["review.budget.base_minutes"], 5)
+        self.assertEqual(resolved["review.budget.seconds_per_line"], 9)
+
+    def test_env_overrides_a_file(self):
+        resolved = resolve_settings(
+            project=custom_project(),
+            env={"CORRAL_REVIEW_BUDGET_BASE_MINUTES": "3"},
+        )
+        self.assertEqual(resolved["review.budget.base_minutes"], 3)
+
+    def test_a_host_limit_clamps_a_project_value(self):
+        resolved = resolve_settings(
+            host={"limits": {"review.budget.base_minutes": 5}},
+            project={"review": {"budget": {"base_minutes": 50}}},
+        )
+        value = resolved.values["review.budget.base_minutes"]
+        self.assertEqual(value.value, 5)
+        self.assertEqual(value.clamped_from, 50)
+
+    def test_an_unknown_budget_key_names_the_file_and_key(self):
+        with self.assertRaisesRegex(S.SettingsError, r"corral\.toml.*'review\.budget\.bogus'"):
+            resolve_settings(project={"review": {"budget": {"bogus": 1}}})
+
+    def test_a_wrong_type_names_the_file_and_key(self):
+        with self.assertRaisesRegex(
+            S.SettingsError, r"corral\.toml.*review\.budget\.base_minutes must be int"
+        ):
+            resolve_settings(project={"review": {"budget": {"base_minutes": "fast"}}})
+
+    def test_a_bool_is_not_an_int(self):
+        with self.assertRaises(S.SettingsError):
+            resolve_settings(project={"review": {"budget": {"base_minutes": True}}})
+
+
+class NumbersTest(unittest.TestCase):
+    def test_no_resolved_settings_reads_as_todays_constants(self):
+        cfg = bu.numbers()
+        self.assertEqual(cfg.base_minutes, bu.BASE_MINUTES)
+        self.assertEqual(cfg.seconds_per_line, bu.SECONDS_PER_LINE)
+        self.assertEqual(cfg.limit_multiple, bu.LIMIT_MULTIPLE)
+        self.assertEqual(cfg.floor_minutes, bu.GATE_MIN_LIMIT_MINUTES)
+        self.assertEqual(cfg.ceiling_minutes, bu.MACHINE_CEILING_MINUTES)
+
+    def test_a_resolved_project_is_read_verbatim(self):
+        cfg = bu.numbers(resolve_settings(project=custom_project()))
+        self.assertEqual(
+            cfg,
+            bu.Numbers(
+                base_minutes=10,
+                seconds_per_line=10,
+                limit_multiple=2,
+                floor_minutes=20,
+                ceiling_minutes=60,
+            ),
+        )
+
+    def test_non_positive_numbers_are_refused(self):
+        for key in CUSTOM:
+            bad = dict(CUSTOM)
+            for value in (0, -1):
+                bad[key] = value
+                with self.subTest(key=key, value=value):
+                    with self.assertRaisesRegex(S.SettingsError, key):
+                        bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
+
+    def test_a_floor_at_or_above_the_ceiling_is_refused(self):
+        bad = dict(CUSTOM, floor_minutes=60)
+        with self.assertRaisesRegex(S.SettingsError, "review.budget.floor_minutes"):
+            bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
+
+    def test_a_floor_no_limit_can_clear_is_refused(self):
+        # base * multiple below the floor: even an empty diff prints a
+        # limit under the gate minimum, so the file is wrong, not the diff.
+        bad = {
+            "base_minutes": 1,
+            "seconds_per_line": 1,
+            "limit_multiple": 1,
+            "floor_minutes": 30,
+            "ceiling_minutes": 120,
+        }
+        with self.assertRaises(S.SettingsError):
+            bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
+
+
+class OneResolverTest(unittest.TestCase):
+    """Every entry point reads the same numbers through `numbers()`."""
+
+    @classmethod
+    def cfg(cls):
+        return bu.Numbers(
+            base_minutes=10,
+            seconds_per_line=10,
+            limit_multiple=2,
+            floor_minutes=20,
+            ceiling_minutes=60,
+        )
+
+    def test_natural_expectation_uses_the_configured_base_and_rate(self):
+        cfg = self.cfg()
+        self.assertEqual(bu.natural_expected_minutes(0, cfg), 10)
+        # (10*60 + 10*60 + 59) // 60 = 20, not the default 16.
+        self.assertEqual(bu.natural_expected_minutes(60, cfg), 20)
+
+    def test_max_expected_and_reviewable_lines_derive_from_the_ceiling(self):
+        cfg = self.cfg()
+        # (60 - 1) // 2 = 29; (29*60 - 10*60) // 10 = 114.
+        self.assertEqual(bu.budget(0, cfg), (10, 20))
+        self.assertEqual(bu.max_reviewable_lines(cfg), 114)
+
+    def test_splitting_flags_exactly_the_shortened_expectations(self):
+        cfg = self.cfg()
+        self.assertFalse(bu.needs_splitting(bu.max_reviewable_lines(cfg), cfg))
+        self.assertTrue(bu.needs_splitting(bu.max_reviewable_lines(cfg) + 1, cfg))
+
+    def test_the_printed_pair_clears_a_configured_floor(self):
+        cfg = self.cfg()
+        for lines in (0, 114, 10_000):
+            expected, limit = bu.budget(lines, cfg)
+            self.assertGreaterEqual(limit, cfg.floor_minutes)
+            self.assertEqual(limit, expected * cfg.limit_multiple)
+            self.assertLess(limit, cfg.ceiling_minutes)
+
+    def test_describe_and_dispatch_use_the_same_numbers(self):
+        cfg = self.cfg()
+        proc = subprocess.CompletedProcess([], 0, "100\t0\tsrc/a.rs\n", "")
+        with mock.patch.object(bu, "_git", return_value=proc):
+            report = bu.describe("origin/master", cfg=cfg)
+            text = bu.dispatch_block("origin/master", cfg=cfg)
+        # (10*60 + 10*100 + 59) // 60 = 27; 27 * 2 = 54.
+        self.assertIn("expected duration: 27 minutes", report)
+        self.assertIn("hard limit: 54 minutes", report)
+        self.assertIn("expected 27 minutes, hard limit 54 minutes", text)
+
+    def test_a_resolved_project_reaches_every_caller(self):
+        cfg = bu.numbers(resolve_settings(project=custom_project()))
+        self.assertEqual(cfg, self.cfg())
+        self.assertEqual(bu.budget(0, cfg), (10, 20))
+
+    def test_defaults_are_byte_identical_to_the_constants(self):
+        # The product default stays as is: with no settings, the numbers
+        # are today's constants and the printed pair is unchanged.
+        self.assertEqual(bu.budget(530), (39, 117))
+        self.assertEqual(bu.max_reviewable_lines(), 240)
+
+
+class BudgetFlagsTest(unittest.TestCase):
+    def run_budget(self, argv, project_toml=None):
+        from corral import cli
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        if project_toml is not None:
+            with open(os.path.join(tmp.name, "corral.toml"), "w", encoding="utf-8") as handle:
+                handle.write(project_toml)
+        config_home = os.path.join(tmp.name, "config")
+        os.makedirs(config_home)
+        proc = subprocess.CompletedProcess([], 0, "100\t0\tsrc/a.rs\n", "")
+        out = io.StringIO()
+        # A hermetic host config: the real ~/.config/corral is never read.
+        with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
+            with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
+                rc = cli.main(["budget", "--root", tmp.name, *argv])
+        return rc, out.getvalue()
+
+    def test_shared_settings_apply_without_a_repo(self):
+        rc, out = self.run_budget(
+            [],
+            "[review.budget]\nbase_minutes = 10\nseconds_per_line = 10\n"
+            "limit_multiple = 2\nfloor_minutes = 20\nceiling_minutes = 60\n",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("expected 27 minutes, hard limit 54 minutes", out)
+
+    def test_repo_flag_selects_the_entry(self):
+        rc, out = self.run_budget(
+            ["--repo", "a"],
+            '[[repo]]\nname = "a"\n[repo.review.budget]\nbase_minutes = 10\n'
+            "seconds_per_line = 10\nlimit_multiple = 2\nfloor_minutes = 20\n"
+            "ceiling_minutes = 60\n",
+        )
+        self.assertEqual(rc, 0)
+        self.assertIn("expected 27 minutes, hard limit 54 minutes", out)
+
+    def test_a_bad_value_is_exit_4(self):
+        from io import StringIO
+        import contextlib
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with open(os.path.join(tmp.name, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write("[review.budget]\nbase_minutes = 0\n")
+        config_home = os.path.join(tmp.name, "config")
+        os.makedirs(config_home)
+        proc = subprocess.CompletedProcess([], 128, "", "")
+        err, out = StringIO(), StringIO()
+        with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
+            with mock.patch.object(bu, "_git", return_value=proc):
+                with contextlib.redirect_stderr(err), redirect_stdout(out):
+                    from corral import cli
+
+                    rc = cli.main(["budget", "--root", tmp.name])
+        self.assertEqual(rc, 4)
+        self.assertIn("review.budget.base_minutes", err.getvalue())
+
+    def test_main_cli_takes_root_and_repo(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        config_home = os.path.join(tmp.name, "config")
+        os.makedirs(config_home)
+        proc = subprocess.CompletedProcess([], 0, "4\t0\tsrc/a.rs\n", "")
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
+            with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
+                rc = bu.main_cli(["--root", tmp.name, "--base", "HEAD~3"])
         self.assertEqual(rc, 0)
         self.assertIn("HEAD~3", out.getvalue())
 

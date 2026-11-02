@@ -75,6 +75,7 @@ def register(key, type_, default, help_):
 #: `config show` lists them. A test keeps this list complete.
 PROVIDERS = (
     "corral.admission",
+    "corral.budget",
     "corral.detect",
     "corral.disk",
     "corral.drive",
