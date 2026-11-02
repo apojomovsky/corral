@@ -98,6 +98,46 @@ export function loadSnapshot(token) {
   return fetchJson("/v1/snapshot", token);
 }
 
+// Board list cadence and page: the list view polls every 15s, 50 rows
+// per request, every request slimmed with body=0 and bounded by a
+// 300s freshness cap the view chose. Named here (not in the view) so
+// the suite can pin the numbers without a JS runner.
+export const BOARD_POLL_MS = 15000;
+export const BOARD_PAGE_SIZE = 50;
+export const BOARD_MAX_AGE_S = 300;
+
+// One page of board rows for the list view: slimmed, freshness-capped
+// and paged. Filters map to the route's own query parameters.
+export function loadBoard(
+  token,
+  { repo = null, state = null, label = null, limit = BOARD_PAGE_SIZE, offset = 0 } = {},
+) {
+  const params = new URLSearchParams();
+  params.set("body", "0");
+  params.set("max_age", String(BOARD_MAX_AGE_S));
+  params.set("limit", String(limit));
+  params.set("offset", String(offset));
+  if (repo) {
+    params.set("repo", repo);
+  }
+  if (state) {
+    params.set("state", state);
+  }
+  if (label) {
+    params.set("label", label);
+  }
+  return fetchJson("/v1/board?" + params.toString(), token);
+}
+
+// The board poll delay: the list cadence on success, the shared
+// backoff once polls fail, capped at the last entry.
+export function nextBoardDelay(failures) {
+  if (failures <= 0) {
+    return BOARD_POLL_MS;
+  }
+  return BACKOFF_MS[Math.min(failures - 1, BACKOFF_MS.length - 1)];
+}
+
 // The agent-detail tail cadence, in milliseconds. Failures back off
 // on the shared table; successes stay on this cadence.
 export const TAIL_POLL_MS = 3000;

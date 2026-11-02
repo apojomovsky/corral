@@ -1,6 +1,7 @@
 // Entry module: routing, view mounting, the poll loop.
 
 import {
+  BOARD_PAGE_SIZE,
   TAIL_POLL_MS,
   VERSION_CHECK_MS,
   capEvents,
@@ -9,6 +10,7 @@ import {
   hasTicket,
   isSupportedApi,
   isSupportedDocument,
+  loadBoard,
   loadConfig,
   loadEvents,
   loadJournalLast,
@@ -18,6 +20,7 @@ import {
   loadTail,
   loadToken,
   loadVersion,
+  nextBoardDelay,
   nextDelay,
   nextLogDelay,
   olderStart,
@@ -29,6 +32,8 @@ import {
 import { canonicalJson, stripVolatile } from "./fmt.js";
 import {
   hideToken,
+  renderBoardRows,
+  renderBoardShell,
   renderConnection,
   renderDetail,
   renderDetailMissing,
@@ -62,6 +67,16 @@ let lastVersion = null;
 let lastVersionCheckMs = 0;
 let versionCheckForced = false;
 let outdated = false;
+// Board list state: applied filters and the page offset. The shell
+// inputs are rebuilt only on mount, so drafts typed between polls
+// are never clobbered; applying resets to the first page.
+let boardFilters = { repo: null, state: null, label: null };
+let boardOffset = 0;
+let liveToken = null;
+// Navigation generation: a poll that resolves after a route switch
+// must neither draw nor reschedule, so each navigation retires the
+// loop it interrupted instead of fighting it over the one timer.
+let pollGen = 0;
 // The tail poll is its own loop beside the snapshot poll: one timer,
 // its own failure count, and operator state that survives polls.
 let tailTimer = null;
@@ -95,6 +110,9 @@ function routeFromHash() {
   const hash = window.location.hash || "#/";
   if (hash === "#/") {
     return { name: "overview", project: null, notice: null, key: null };
+  }
+  if (hash === "#/board") {
+    return { name: "board", project: null, notice: null, key: null };
   }
   if (hash.startsWith("#/?")) {
     let project = null;
@@ -573,6 +591,7 @@ function bindTailButtons(config, getToken) {
 }
 
 async function tick(config, token) {
+  const gen = pollGen;
   const nowMs = Date.now();
   try {
     let versionOk = true;
@@ -669,7 +688,9 @@ async function tick(config, token) {
     note.textContent = "";
     note.appendChild(document.createTextNode("Could not draw this update; the next poll retries."));
   } finally {
-    schedule(config, token);
+    if (gen === pollGen) {
+      schedule(config, token);
+    }
   }
 }
 
@@ -763,6 +784,130 @@ async function pollOlder(token) {
   }
 }
 
+function boardInput(id) {
+  const node = document.getElementById(id);
+  const value = node === null ? "" : node.value.trim();
+  return value === "" ? null : value;
+}
+
+// The board mount: shell once, then rows per poll. Listeners close
+// over the config but read the live token, so a token saved while
+// the board is mounted applies to the next poll without a reload.
+function mountBoard(config) {
+  renderBoardShell(boardFilters);
+  document.getElementById("board-filters").addEventListener("submit", (event) => {
+    event.preventDefault();
+    boardFilters = {
+      repo: boardInput("board-repo"),
+      state: boardInput("board-state"),
+      label: boardInput("board-label"),
+    };
+    boardOffset = 0;
+    failures = 0;
+    void boardTick(config, liveToken);
+  });
+  document.getElementById("board-prev").addEventListener("click", () => {
+    boardOffset = Math.max(0, boardOffset - BOARD_PAGE_SIZE);
+    failures = 0;
+    void boardTick(config, liveToken);
+  });
+  document.getElementById("board-next").addEventListener("click", () => {
+    boardOffset += BOARD_PAGE_SIZE;
+    failures = 0;
+    void boardTick(config, liveToken);
+  });
+}
+
+async function boardTick(config, token) {
+  const gen = pollGen;
+  const nowMs = Date.now();
+  try {
+    let versionOk = true;
+    try {
+      versionOk = await checkVersion(config, token, nowMs);
+    } catch {
+      versionOk = true;
+    }
+    if (!versionOk) {
+      return;
+    }
+    let reply = null;
+    try {
+      reply = await loadBoard(token, {
+        repo: boardFilters.repo,
+        state: boardFilters.state,
+        label: boardFilters.label,
+        limit: BOARD_PAGE_SIZE,
+        offset: boardOffset,
+      });
+    } catch {
+      reply = null;
+    }
+    if (reply && reply.status === 200 && reply.data) {
+      seenMs = Date.now();
+      failures = 0;
+      hideToken();
+      renderShell({
+        mode: config.mode,
+        api: config.api,
+        version: lastVersion,
+        seenMs,
+        serverNowMs: typeof reply.data.now === "number" ? reply.data.now * 1000 : null,
+      });
+      renderBoardRows(reply.data, { limit: BOARD_PAGE_SIZE, offset: boardOffset, nowMs: seenMs });
+      renderConnection({ live: true, seenMs });
+    } else if (reply && reply.status === 401) {
+      showToken({
+        message: "This server needs a token.",
+        help: helpFor(config.mode),
+      });
+      if (seenMs !== null) {
+        renderConnection({ live: false, seenMs });
+      }
+    } else {
+      // Any other status, a status-0 network failure, or a throw:
+      // count the backoff, show stale-with-age when a last good poll
+      // exists (or the never-connected state when none does).
+      failures += 1;
+      renderConnection({ live: false, seenMs });
+    }
+  } catch {
+    // A render throw (a new server shape, an unexpected null) must
+    // never kill the loop: count it, keep the last good data under
+    // its age banner, and say the draw failed.
+    failures += 1;
+    renderConnection({ live: false, seenMs });
+    const note = document.getElementById("notice");
+    note.hidden = false;
+    note.textContent = "";
+    note.appendChild(document.createTextNode("Could not draw the board update; the next poll retries."));
+  } finally {
+    if (gen === pollGen) {
+      scheduleBoard(config, token);
+    }
+  }
+}
+
+function scheduleBoard(config, token) {
+  if (timer !== null) {
+    window.clearTimeout(timer);
+  }
+  if (document.hidden) {
+    return;
+  }
+  timer = window.setTimeout(() => {
+    void boardTick(config, token);
+  }, nextBoardDelay(failures));
+}
+
+function currentTick(config, token) {
+  if (routeFromHash().name === "board") {
+    void boardTick(config, token);
+  } else {
+    void tick(config, token);
+  }
+}
+
 function bindToken(config, setToken) {
   const save = document.getElementById("token-save");
   const forget = document.getElementById("token-forget");
@@ -788,7 +933,7 @@ function bindToken(config, setToken) {
       // The tail timer chain holds its own token closure: drop it so
       // the tick below re-arms the tail on the pasted token.
       stopTail();
-      await tick(config, value);
+      await currentTick(config, value);
       if (!kept) {
         showToken({
           message:
@@ -841,12 +986,17 @@ async function boot() {
   }
   const config = configReply.data;
   let token = loadToken();
+  liveToken = token;
   const route = routeFromHash();
   if (route.name === "unknown") {
     renderShell({ mode: config.mode, api: config.api, version: null, seenMs: Date.now() });
   }
+  if (route.name === "board") {
+    mountBoard(config);
+  }
   bindToken(config, (value) => {
     token = value;
+    liveToken = value;
   });
   bindTailButtons(config, () => token);
   bindLogView(
@@ -858,15 +1008,21 @@ async function boot() {
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) {
       versionCheckForced = true;
-      void tick(config, token);
+      void currentTick(config, token);
     }
   });
   window.addEventListener("hashchange", () => {
-    if (!renderCurrent(config, token)) {
+    failures = 0;
+    pollGen += 1;
+    if (routeFromHash().name === "board") {
+      stopTail();
+      mountBoard(config);
+      void boardTick(config, token);
+    } else if (!renderCurrent(config, token)) {
       void tick(config, token);
     }
   });
-  await tick(config, token);
+  await currentTick(config, token);
 }
 
 void boot();

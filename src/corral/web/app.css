@@ -95,6 +95,7 @@ main {
 main.stale #status-card,
 main.stale #cards,
 main.stale #agents,
+main.stale #board,
 main.stale #detail {
   background: var(--stale-bg);
 }
@@ -240,6 +241,46 @@ main.stale #detail {
   color: var(--fg);
   border: 1px solid var(--line);
   border-radius: 6px;
+}
+
+#board-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: end;
+  margin: 1rem 0;
+}
+
+#board-filters label {
+  margin-right: 0.25rem;
+}
+
+#board-filters input {
+  min-height: 44px;
+  padding: 0.5rem;
+  font: inherit;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+#board-rows {
+  list-style: none;
+  margin: 1rem 0;
+  padding: 0;
+}
+
+#board-pager {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+
+#board-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }
 
 @media (prefers-reduced-motion: reduce) {
