@@ -1187,6 +1187,20 @@ class BoardView(ServeCase):
                     self.assertEqual(status, 400, target)
                     self.assertIn("error", json.loads(body))
 
+    def test_board_bad_max_age_is_a_400(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 3)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            for target in (
+                "/v1/board?max_age=many",
+                "/v1/board?max_age=-1",
+                "/v1/board?max_age=nan",
+            ):
+                with self.subTest(target=target):
+                    status, _, body = self.fetch(server, "GET", target)
+                    self.assertEqual(status, 400, target)
+                    self.assertIn("error", json.loads(body))
+
 
 class FilteredViews(ServeCase):
     def test_agents_view_matches_the_snapshot_sections(self):
@@ -1496,6 +1510,8 @@ class EventsView(ServeCase):
         for target in (
             "/v1/events?project=demo&resolved_since=many",
             "/v1/events?project=demo&resolved_since=",
+            "/v1/events?project=demo&resolved_since=-1",
+            "/v1/events?project=demo&resolved_since=nan",
         ):
             with self.subTest(target=target):
                 status, _, body = self.fetch(server, "GET", target)
@@ -1684,6 +1700,7 @@ class ProductionProjectReaders(unittest.TestCase):
                 handle.write(json.dumps(archived_new) + "\n")
                 handle.write("not json\n")
                 handle.write("\n")
+                handle.write("[1, 2]\n")
             with open(
                 os.path.join(directory, f"{coord.JOURNAL_ARCHIVE_PREFIX}2026-01-01.jsonl"),
                 "w",
