@@ -262,10 +262,10 @@ def _request(value):
         return value
     if isinstance(value, Mapping):
         project = value.get("project", "")
-        role = value.get("role", "worker")
+        role = value.get("role", prompts.DEFAULT_ROLE)
         if not isinstance(project, str) or not isinstance(role, str):
             raise LimitsError(f"request must name a project and a role, not {value!r}")
-        return Request(project=project, role=role or "worker")
+        return Request(project=project, role=role or prompts.DEFAULT_ROLE)
     raise LimitsError(f"request must name a project and a role, not {value!r}")
 
 
@@ -958,21 +958,30 @@ def _optional_number(value, what):
 
 
 def pressure_dict(value):
-    """A Pressure (or plain mapping, or None) as a JSON-ready dict."""
+    """A Pressure (or plain mapping, or None) as a JSON-ready dict.
+
+    `saturated` keeps only real booleans: anything else is a
+    LimitsError (exit 4), so the string "false" never reads saturated.
+    """
     if value is None:
         value = Pressure()
     if isinstance(value, Pressure):
         item = value
     elif isinstance(value, Mapping):
+        saturated = value.get("saturated", False)
+        if not isinstance(saturated, bool):
+            raise LimitsError(f"saturated must be a boolean, not {saturated!r}")
         item = Pressure(
             load_per_cpu=_optional_number(value.get("load_per_cpu"), "load_per_cpu"),
             mem_available_pct=_optional_number(value.get("mem_available_pct"), "mem_available_pct"),
-            saturated=bool(value.get("saturated", False)),
+            saturated=saturated,
             cpu_some_avg10=_optional_number(value.get("cpu_some_avg10"), "cpu_some_avg10"),
             memory_some_avg10=_optional_number(value.get("memory_some_avg10"), "memory_some_avg10"),
         )
     else:
         raise LimitsError(f"pressure must be a Pressure or a mapping, not {value!r}")
+    if not isinstance(item.saturated, bool):
+        raise LimitsError(f"saturated must be a boolean, not {item.saturated!r}")
     return {
         "load_per_cpu": item.load_per_cpu,
         "mem_available_pct": item.mem_available_pct,
@@ -1003,17 +1012,58 @@ def measured_dict(value):
     }
 
 
-def role_charge(roles, role):
-    """The charge for `role`: worker when unset, zeros when unpriced.
+def charge_live_units(view, live_by_owner, names, roles):
+    """`(Charged, charge_by_unit)`: the charged usage of the live units.
 
-    Mirrors the launch gate's lookup, but never raises: the snapshot
-    shows an unknown role at zero instead of refusing the document.
+    The one sum the launch gate and the snapshot both read, so their
+    totals and per-project attribution are identical. `view` is
+    `[(entry, state)]` as `registry.visible` returns, of any state:
+    live means listed by the manager in `live_by_owner`, which maps an
+    owning project to its live unit names (the caller filters to live
+    states and well-formed names first). `names` holds the registered
+    project names, and `roles` maps role names to charges.
+
+    A unit counts for the project its registry ticket names when that
+    project is registered, else the project whose listing owns it: an
+    agent with no ticket project pays its prefix owner, never an empty
+    name. A listed unit with no registry entry reads as the default
+    role with no ticket, so it still charges its owner. A missing role
+    reads as the default role, and an unpriced role charges zero (the
+    launch refuses those instead, so zero never runs free). A crashed
+    agent, registry live but unit gone, holds no share.
     """
-    name = role or prompts.DEFAULT_ROLE
-    found = roles.get(name) if isinstance(roles, Mapping) else None
-    if found is None:
-        return Usage()
-    return _usage(found, f"role {name}")
+    entries = {}
+    for entry, _state in view:
+        entries.setdefault(entry.get("id"), entry)
+    if not isinstance(live_by_owner, Mapping):
+        raise LimitsError(
+            f"live units must be a mapping of owner to unit names, not {live_by_owner!r}"
+        )
+    total = Usage()
+    by_project: dict = {}
+    per_unit: dict = {}
+    for owner, unit_names in live_by_owner.items():
+        for unit in unit_names or ():
+            entry = entries.get(unit) or {}
+            role = entry.get("role") or prompts.DEFAULT_ROLE
+            ticket = entry.get("ticket") or {}
+            named = ticket.get("project") if isinstance(ticket, dict) else None
+            charged_for = named if isinstance(named, str) and named in names else owner
+            found = roles.get(role) if isinstance(roles, Mapping) else None
+            cost = _usage(found if found is not None else Usage(), f"role {role}")
+            total = Usage(
+                cpu_m=total.cpu_m + cost.cpu_m,
+                memory_mb=total.memory_mb + cost.memory_mb,
+                pids=total.pids + cost.pids,
+            )
+            base = by_project.get(charged_for, Usage())
+            by_project[charged_for] = Usage(
+                cpu_m=base.cpu_m + cost.cpu_m,
+                memory_mb=base.memory_mb + cost.memory_mb,
+                pids=base.pids + cost.pids,
+            )
+            per_unit[unit] = (charged_for, cost)
+    return Charged(total=total, by_project=by_project), per_unit
 
 
 def capacity_report(*, host_budget, charged, pressure):
@@ -1022,16 +1072,22 @@ def capacity_report(*, host_budget, charged, pressure):
     The section 2 shape: schema version, host budget (or null when no
     budget is configured), charged totals, per-project charged usage,
     and pressure. Pure: every input is passed in, so the hub path that
-    builds it can never read or write the ledger.
+    builds it can never read or write the ledger. A non-mapping
+    `by_project` is a LimitsError (exit 4), never a raw TypeError.
     """
     if not isinstance(charged, Charged):
         if isinstance(charged, Mapping):
+            projects = charged.get("by_project") or {}
+            if not isinstance(projects, Mapping):
+                raise LimitsError(f"charged by_project must be a mapping, not {projects!r}")
             charged = Charged(
                 total=charged.get("total"),
-                by_project=dict(charged.get("by_project") or {}),
+                by_project=dict(projects),
             )
         else:
             raise LimitsError(f"charged usage must be a Charged table, not {charged!r}")
+    elif not isinstance(charged.by_project, Mapping):
+        raise LimitsError(f"charged by_project must be a mapping, not {charged.by_project!r}")
     total = _usage(charged.total, "charged total")
     by_project = {
         name: _usage(charged.by_project[name], f"charged project {name}")

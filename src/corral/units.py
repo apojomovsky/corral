@@ -381,10 +381,16 @@ def agent_cgroup(project, unit, uid=None):
 
 
 def controllers_path(uid=None):
-    """The user slice's `cgroup.controllers` file: what the manager may enforce with."""
+    """The user slice's `cgroup.controllers` file: what the manager may enforce with.
+
+    Built from `CGROUP_ROOT` beside `user_service_dir`, never a second
+    hard-coded prefix; the uid is validated the same way, so a
+    non-integer never renders into a path.
+    """
     if uid is None:
         uid = os.getuid()
-    return f"/sys/fs/cgroup/user.slice/user-{uid}.slice/cgroup.controllers"
+    _check_uid(uid)
+    return os.path.join(CGROUP_ROOT, "user.slice", f"user-{uid}.slice", "cgroup.controllers")
 
 
 def read_controllers(path=None, *, read=None):

@@ -181,24 +181,33 @@ def default_measured(scope, name, project=None):
         return None
 
 
-def resources_section(registry_view, host, limits, pressure, pressure_notes=(), measured_fn=None):
+def resources_section(
+    registry_view, host, limits, pressure, pressure_notes=(), measured_fn=None, *, live_by_owner
+):
     """The `resources` snapshot section from plain data.
 
-    Charged usage sums the static role costs of live agents on this
-    host, exactly the prices admission charges: a role the entry never
-    recorded reads as worker, an unpriced role reads as zero (the
-    launch gate refuses those instead). Stale, finished and foreign
-    agents hold no share and charge zero. This is the registry view of
-    the pool: the admit-time computation additionally intersects with
-    the units listing, so a dead unit frees its share at once.
+    Charged usage is `resources.charge_live_units` over the registry
+    view and `live_by_owner`, the same sum the launch gate admits
+    from, so totals and per-project attribution are identical: a unit
+    counts for the project its ticket names when registered, else the
+    project whose listing owns it, never an empty name. A registry
+    entry whose unit is gone holds no share and reads zero, as does
+    every entry of another state; only listed units charge. A missing
+    role reads as the default role, and an unpriced role reads as
+    zero. `live_by_owner` maps an owning project to its live unit
+    names (the collector filters to live states and well-formed
+    names); its keys are the registered project names. `host` scopes
+    nothing in the sum, the listing already does, and stays for the
+    callers that pass the host they listed on.
 
-    Measured use comes from `measured_fn(scope, name, project)`, one
-    call per live agent and per charged project; a missing project
-    never calls it, and a failing call reads null. `pressure_notes`
-    names the unreadable pressure files. Raises the registry exception
-    when the registry could not be read, so the section errors with it.
+    Measured use comes from `measured_fn(scope, name, project)`: one
+    call per charged agent under its owning project, one per charged
+    project; a failing call reads null. `pressure_notes` names the
+    unreadable pressure files and any unreadable units listing. Raises
+    the registry exception when the registry could not be read, so the
+    section errors with it.
     """
-    from corral import registry, resources
+    from corral import resources
 
     if isinstance(registry_view, Exception):
         raise registry_view
@@ -213,32 +222,22 @@ def resources_section(registry_view, host, limits, pressure, pressure_notes=(), 
         host_budget = limits.get("host")
     else:
         raise resources.LimitsError(f"limits must be a Limits table, not {limits!r}")
+    if not isinstance(live_by_owner, Mapping):
+        raise resources.LimitsError(
+            f"live units must be a mapping of owner to unit names, not {live_by_owner!r}"
+        )
+    names = set(live_by_owner)
+    charged, per_unit = resources.charge_live_units(registry_view, live_by_owner, names, roles)
     zeros = resources.Usage()
-    total = resources.Usage()
-    by_project = {}
     rows = []
     for entry, state in registry_view:
         row = _agent_row(entry, state)
-        live_here = state == registry.LIVE and entry.get("host") == host
-        if live_here:
-            cost = resources.role_charge(roles, entry.get("role"))
-            name = row["project"] or ""
-            by_project[name] = resources.Usage(
-                cpu_m=by_project.get(name, zeros).cpu_m + cost.cpu_m,
-                memory_mb=by_project.get(name, zeros).memory_mb + cost.memory_mb,
-                pids=by_project.get(name, zeros).pids + cost.pids,
-            )
-            total = resources.Usage(
-                cpu_m=total.cpu_m + cost.cpu_m,
-                memory_mb=total.memory_mb + cost.memory_mb,
-                pids=total.pids + cost.pids,
-            )
+        if row["id"] in per_unit:
+            owner, cost = per_unit[row["id"]]
             measured = None
-            if row["project"] and measured_fn is not None:
+            if measured_fn is not None:
                 try:
-                    measured = resources.measured_dict(
-                        measured_fn("agent", row["id"], row["project"])
-                    )
+                    measured = resources.measured_dict(measured_fn("agent", row["id"], owner))
                 except Exception:  # noqa: BLE001 - a missing leaf reads null
                     measured = None
             rows.append(
@@ -263,8 +262,8 @@ def resources_section(registry_view, host, limits, pressure, pressure_notes=(), 
                 }
             )
     measured_by_project = {}
-    for name in by_project:
-        if not name or measured_fn is None:
+    for name in charged.by_project:
+        if measured_fn is None:
             measured_by_project[name] = None
             continue
         try:
@@ -273,7 +272,7 @@ def resources_section(registry_view, host, limits, pressure, pressure_notes=(), 
             measured_by_project[name] = None
     report = resources.capacity_report(
         host_budget=host_budget,
-        charged=resources.Charged(total=total, by_project=by_project),
+        charged=charged,
         pressure=pressure,
     )
     return {
@@ -555,6 +554,32 @@ def _below(path, parent):
         return False
 
 
+def live_by_owner(registered, own_prefix):
+    """`{owner: [live unit names]}` for every registered project prefix.
+
+    The listing the charged sum intersects the registry with: only
+    live, well-formed units count, the same filter the launch gate
+    applies. Owners are project names; every registered project gets
+    a key even with no live units, so its name stays attributable. A
+    default prefix no registration uses is listed too under the
+    prefix itself as owner, the launch gate's single-project key, so
+    an unregistered host charges the same under both.
+    """
+    from corral import units
+
+    prefixes = {project.name: project.unit_prefix for project in registered}
+    if own_prefix not in prefixes.values():
+        prefixes[own_prefix] = own_prefix
+    out = {}
+    for owner, prefix in prefixes.items():
+        out[owner] = [
+            name
+            for name, active, _sub in units.list_units(prefix)
+            if active in units.LIVE_STATES and units.parse_unit(prefix, name)
+        ]
+    return out
+
+
 def collect_kwargs() -> dict:
     """Keyword arguments for `build` from the host's local readers.
 
@@ -570,6 +595,7 @@ def collect_kwargs() -> dict:
         accounts,
         admission,
         drive,
+        projects,
         quota_ledger,
         quotacli,
         registry,
@@ -613,12 +639,29 @@ def collect_kwargs() -> dict:
     except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
         drive_view = exc
     pressure, pressure_notes = resources.read_pressure()
+    notes = list(pressure_notes)
     try:
-        resources_view = resources_section(
-            registry_view, host, limits, pressure, pressure_notes, default_measured
-        )
-    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+        registered = projects.load_all()
+    except Exception as exc:  # noqa: BLE001 - without names nothing is attributable
         resources_view = exc
+    else:
+        try:
+            listing = live_by_owner(registered, resolved["agents.unit_prefix"])
+        except Exception as exc:  # noqa: BLE001 - an unread listing charges nothing, noted
+            notes.append(f"units listing unreadable: {error_text(exc)}")
+            listing = {}
+        try:
+            resources_view = resources_section(
+                registry_view,
+                host,
+                limits,
+                pressure,
+                notes,
+                default_measured,
+                live_by_owner=listing,
+            )
+        except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+            resources_view = exc
     return {
         "now": now,
         "host": host,

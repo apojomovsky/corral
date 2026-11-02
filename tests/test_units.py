@@ -411,6 +411,27 @@ class DelegationTest(unittest.TestCase):
         self.assertIn("user-1000.slice", path)
         self.assertTrue(path.endswith("cgroup.controllers"))
 
+    def test_the_controllers_file_builds_from_the_cgroup_root(self):
+        with mock.patch.object(units, "CGROUP_ROOT", "/fake/cgroup"):
+            self.assertEqual(
+                units.controllers_path(uid=1000),
+                "/fake/cgroup/user.slice/user-1000.slice/cgroup.controllers",
+            )
+
+    def test_the_controllers_file_agrees_with_the_service_dir(self):
+        for uid in (0, 1000):
+            with self.subTest(uid=uid):
+                self.assertEqual(
+                    os.path.dirname(units.controllers_path(uid=uid)),
+                    os.path.dirname(units.user_service_dir(uid=uid)),
+                )
+
+    def test_a_non_integer_uid_is_refused(self):
+        for bad in (True, "1000", -1, 1.5):
+            with self.subTest(uid=bad):
+                with self.assertRaises(units.UnitsError):
+                    units.controllers_path(uid=bad)
+
     def test_delegated_controllers_parse_the_file(self):
         available = units.delegated_controllers(read=lambda path: "cpu memory pids\n")
         self.assertEqual(available, frozenset({"cpu", "memory", "pids"}))

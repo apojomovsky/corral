@@ -8,7 +8,10 @@ raise ``LimitsError`` (exit 4).
 """
 
 import unittest
+from typing import Any
+from unittest import mock
 
+from corral import prompts
 from corral import resources as R
 
 NOW = 1_000_000.0
@@ -668,6 +671,161 @@ class CapacityReport(unittest.TestCase):
             pressure={"load_per_cpu": None, "mem_available_pct": None, "saturated": False},
         )
         self.assertEqual(list(report["by_project"]), ["a", "b"])
+
+
+class ChargeLiveUnits(unittest.TestCase):
+    """The shared charged-usage sum the gate and the snapshot both read.
+
+    Live means listed by the manager: a registry entry whose unit is
+    gone holds no share, so a crash frees the pool at once. A unit
+    counts for the project its ticket names, else the project whose
+    listing owns it, never an empty name.
+    """
+
+    ROLES = {
+        "worker": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+        "reviewer": {"cpu_m": 500, "memory_mb": 1024, "pids": 50},
+    }
+
+    def test_a_crashed_agent_holds_no_share(self):
+        rows = [
+            (
+                {
+                    "id": "pa-lib-5",
+                    "role": "worker",
+                    "ticket": {"project": "proj-a", "repo": "lib", "number": 5},
+                },
+                "live",
+            )
+        ]
+        charged, per_unit = R.charge_live_units(rows, {"proj-a": []}, {"proj-a"}, self.ROLES)
+        self.assertEqual(charged.total, R.Usage())
+        self.assertEqual(charged.by_project, {})
+        self.assertEqual(per_unit, {})
+
+    def test_a_live_agent_without_a_ticket_pays_its_prefix_owner(self):
+        rows = [({"id": "pb-web-3", "role": "reviewer", "ticket": None}, "live")]
+        charged, per_unit = R.charge_live_units(
+            rows, {"proj-b": ["pb-web-3"]}, {"proj-a", "proj-b"}, self.ROLES
+        )
+        self.assertEqual(charged.total, R.Usage(500, 1024, 50))
+        self.assertEqual(charged.by_project, {"proj-b": R.Usage(500, 1024, 50)})
+        self.assertNotIn("", charged.by_project)
+        self.assertEqual(per_unit, {"pb-web-3": ("proj-b", R.Usage(500, 1024, 50))})
+
+    def test_a_ticket_naming_no_registered_project_pays_the_listing_owner(self):
+        rows = [
+            (
+                {
+                    "id": "pb-web-3",
+                    "role": "worker",
+                    "ticket": {"project": "ghost", "repo": "web", "number": 3},
+                },
+                "live",
+            )
+        ]
+        charged, _per_unit = R.charge_live_units(
+            rows, {"proj-b": ["pb-web-3"]}, {"proj-b"}, self.ROLES
+        )
+        self.assertEqual(charged.by_project, {"proj-b": R.Usage(1000, 2048, 100)})
+
+    def test_a_ticket_naming_a_project_pays_that_project(self):
+        rows = [
+            (
+                {
+                    "id": "pb-web-3",
+                    "role": "worker",
+                    "ticket": {"project": "proj-a", "repo": "web", "number": 3},
+                },
+                "live",
+            )
+        ]
+        charged, _per_unit = R.charge_live_units(
+            rows, {"proj-b": ["pb-web-3"]}, {"proj-a", "proj-b"}, self.ROLES
+        )
+        self.assertEqual(charged.by_project, {"proj-a": R.Usage(1000, 2048, 100)})
+
+    def test_an_unpriced_role_charges_zero_but_still_attributes(self):
+        rows = [({"id": "pa-lib-5", "role": "bogus", "ticket": None}, "live")]
+        charged, _per_unit = R.charge_live_units(
+            rows, {"proj-a": ["pa-lib-5"]}, {"proj-a"}, self.ROLES
+        )
+        self.assertEqual(charged.total, R.Usage())
+        self.assertEqual(charged.by_project, {"proj-a": R.Usage()})
+
+    def test_a_missing_role_is_priced_as_the_default_role(self):
+        rows = [({"id": "pa-lib-5", "ticket": None}, "live")]
+        charged, _per_unit = R.charge_live_units(
+            rows, {"proj-a": ["pa-lib-5"]}, {"proj-a"}, self.ROLES
+        )
+        self.assertEqual(charged.total, R.Usage(1000, 2048, 100))
+
+
+class RequestDefaults(unittest.TestCase):
+    def test_a_role_less_request_is_priced_as_the_default_role(self):
+        with mock.patch.object(prompts, "DEFAULT_ROLE", "reviewer"):
+            verdict = R.admit({"project": "web"}, charged(), limits(), NOW)
+        self.assertEqual(verdict.cost, R.Usage(500, 1024, 50))
+
+    def test_a_role_less_request_mapping_names_the_default_role(self):
+        self.assertEqual(
+            R._request({"project": "web"}),
+            R.Request(project="web", role=prompts.DEFAULT_ROLE),
+        )
+
+
+class CapacityReportShape(unittest.TestCase):
+    def test_a_non_mapping_by_project_is_a_limits_error(self):
+        bad_inputs: tuple[Any, ...] = (["proj-a"], "proj-a", 5)
+        for bad in bad_inputs:
+            with self.subTest(by_project=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.capacity_report(
+                        host_budget=None,
+                        charged={
+                            "total": triple(),
+                            "by_project": bad,
+                        },
+                        pressure=R.Pressure(),
+                    )
+                with self.assertRaises(R.LimitsError):
+                    R.capacity_report(
+                        host_budget=None,
+                        charged=R.Charged(total=R.Usage(), by_project=bad),
+                        pressure=R.Pressure(),
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_a_non_boolean_saturated_is_a_limits_error(self):
+        bad_inputs: tuple[Any, ...] = ("false", "true", 0, 1, None)
+        for bad in bad_inputs:
+            with self.subTest(saturated=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.capacity_report(
+                        host_budget=None,
+                        charged=charged(),
+                        pressure={"load_per_cpu": None, "saturated": bad},
+                    )
+                with self.assertRaises(R.LimitsError):
+                    R.capacity_report(
+                        host_budget=None,
+                        charged=charged(),
+                        pressure=R.Pressure(saturated=bad),
+                    )
+
+    def test_real_booleans_and_a_missing_flag_stay_valid(self):
+        for good in (True, False):
+            with self.subTest(saturated=good):
+                report = R.capacity_report(
+                    host_budget=None,
+                    charged=charged(),
+                    pressure={"saturated": good},
+                )
+                self.assertIs(report["pressure"]["saturated"], good)
+        report = R.capacity_report(
+            host_budget=None, charged=charged(), pressure={"load_per_cpu": None}
+        )
+        self.assertIs(report["pressure"]["saturated"], False)
 
 
 if __name__ == "__main__":

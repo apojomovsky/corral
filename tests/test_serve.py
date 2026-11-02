@@ -56,7 +56,13 @@ def healthy_doc():
     """A fully readable snapshot document from canned views."""
     rows = view((entry("a1"), "live"))
     resources_view = snapshot.resources_section(
-        rows, HOST, doc_limits(), doc_pressure(), [], lambda *args: None
+        rows,
+        HOST,
+        doc_limits(),
+        doc_pressure(),
+        [],
+        lambda *args: None,
+        live_by_owner={"proj-a": ["a1"]},
     )
     return snapshot.build(
         T0,
@@ -382,6 +388,8 @@ class CollectDivergence(unittest.TestCase):
         with (
             mock.patch("corral.snapshot._settings_root", return_value=None),
             mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
             mock.patch("corral.registry.visible", return_value=registry_view),
             mock.patch("corral.accounts.providers", return_value=["prov-a"]),
@@ -886,6 +894,8 @@ class CollectWiring(unittest.TestCase):
         with (
             mock.patch("corral.snapshot._settings_root", return_value=None),
             mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
             mock.patch("corral.registry.visible", return_value=registry_view),
             mock.patch("corral.accounts.providers", return_value=["prov-a"]),

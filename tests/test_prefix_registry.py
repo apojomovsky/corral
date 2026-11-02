@@ -166,6 +166,10 @@ class LaunchRegistersTest(PrefixOps):
 
 
 class SnapshotCapTest(PrefixOps):
+    def units_for(self, prefix):
+        """The fake manager's listing under one prefix, like `list-units PREFIX*`."""
+        return [row for row in self.system.list_fn(prefix) if row[0].startswith(prefix)]
+
     def snapshot_json(self, cwd):
         out = io.StringIO()
         old = os.getcwd()
@@ -174,6 +178,7 @@ class SnapshotCapTest(PrefixOps):
             with (
                 mock.patch("corral.accounts.providers", return_value=[]),
                 mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
+                mock.patch("corral.units.list_units", side_effect=self.units_for),
                 redirect_stdout(out),
             ):
                 self.assertEqual(cli.main(["snapshot", "--json"]), 0)
@@ -195,6 +200,9 @@ class SnapshotCapTest(PrefixOps):
         self.assertEqual(doc["capacity"]["live"], 1)
         self.assertEqual(doc["capacity"]["by_project"], {"ops": 1})
         self.assertIn(unit, [row["id"] for row in doc["agents"]])
+        self.assertEqual(
+            doc["resources"]["by_project"], {"ops": {"cpu_m": 0, "memory_mb": 0, "pids": 0}}
+        )
 
 
 class RegisterBeforeStartTest(PrefixOps):
@@ -375,6 +383,10 @@ class SnapshotOutsideTreeTest(PrefixOps):
             h.write(f'\n[[repo]]\nname = "{name}"\nclone = {{ path = "{outside}" }}\n')
         return outside
 
+    def units_for(self, prefix):
+        """The fake manager's listing under one prefix, like `list-units PREFIX*`."""
+        return [row for row in self.system.list_fn(prefix) if row[0].startswith(prefix)]
+
     def snapshot_json(self, cwd):
         out = io.StringIO()
         old = os.getcwd()
@@ -383,6 +395,7 @@ class SnapshotOutsideTreeTest(PrefixOps):
             with (
                 mock.patch("corral.accounts.providers", return_value=[]),
                 mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
+                mock.patch("corral.units.list_units", side_effect=self.units_for),
                 redirect_stdout(out),
             ):
                 self.assertEqual(cli.main(["snapshot", "--json"]), 0)
