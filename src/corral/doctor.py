@@ -19,6 +19,8 @@ import subprocess
 import sys
 import time
 import tomllib
+import urllib.error
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 from corral import (
@@ -26,6 +28,7 @@ from corral import (
     boarddoctor,
     deps,
     drive,
+    hub,
     paths,
     projects,
     prompts,
@@ -47,6 +50,34 @@ class Check(NamedTuple):
     status: str  # "ok" | "warn" | "fail"
     detail: str
     fix: str
+
+
+class HubProbe(NamedTuple):
+    """The hub version probe, gathered once by production, carried as data.
+
+    `status` is one of "ok", "unreachable", "unauthorized" or
+    "version-mismatch"; `detail` already names the hub and the failure.
+    `hub_api` and `hub_schema` are the hub's reported versions, 0 when
+    the hub never answered. Tests inject values; only production calls
+    the network, exactly once per report.
+    """
+
+    status: str
+    detail: str
+    hub_api: int = 0
+    hub_schema: int = 0
+
+
+class HubAuth(NamedTuple):
+    """This host's hub token file, gathered once by production, as data.
+
+    `status` is one of "ok", "missing" or "bad" (unreadable, empty, or
+    readable beyond its owner); `detail` names the file and the
+    problem. Tests inject values.
+    """
+
+    status: str
+    detail: str
 
 
 class Env(NamedTuple):
@@ -90,6 +121,16 @@ class Env(NamedTuple):
     #: "missing", or "unreachable: ..."): None means the caller has no
     #: reading, and then the report carries no `drive-timer` row.
     timer_state: str | None = None
+    #: The resolved `hub.url`: None or empty means single-host, and then
+    #: the report carries no hub rows. Every hub call site branches on
+    #: this once, so single-host behavior is the absence of the step.
+    hub_url: str | None = None
+    #: This host's hub token file. None means the caller has no reading,
+    #: and then the report carries no `hub-token` row.
+    hub_auth: HubAuth | None = None
+    #: The hub version probe. None means the caller has no reading, and
+    #: then the report carries no `hub` row.
+    hub_probe: HubProbe | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -377,6 +418,77 @@ def _check_boards(env: Env) -> list[Check]:
     ]
 
 
+def _check_hub_auth(url: str | None, auth: HubAuth | None) -> list[Check]:
+    """The hub-token row: no row without a configured hub or a reading."""
+    if not url or auth is None:
+        return []
+    if auth.status == "ok":
+        return [
+            Check(
+                "hub-token",
+                "ok",
+                "this host's hub token is present and owner-only",
+                "",
+            )
+        ]
+    return [
+        Check(
+            "hub-token",
+            "fail",
+            auth.detail,
+            "install the token the operator minted for this host, then run `corral doctor` again",
+        )
+    ]
+
+
+def _check_hub(url: str | None, probe: HubProbe | None) -> list[Check]:
+    """The hub row: no row without a configured hub or a reading.
+
+    An unreachable hub warns: the outage is operational, hosts keep
+    their held work, and the drive already exits 3 where it matters. A
+    refused token or a version mismatch fails: both are configuration
+    errors the operator must fix.
+    """
+    if not url or probe is None:
+        return []
+    if probe.status == "ok":
+        return [
+            Check(
+                "hub",
+                "ok",
+                f"the hub answers at {url} (api {probe.hub_api}, schema {probe.hub_schema})",
+                "",
+            )
+        ]
+    if probe.status == "unreachable":
+        return [
+            Check(
+                "hub",
+                "warn",
+                probe.detail,
+                "check the hub is running and hub.url names it, then run `corral doctor` again",
+            )
+        ]
+    if probe.status == "unauthorized":
+        return [
+            Check(
+                "hub",
+                "fail",
+                probe.detail,
+                "install the token the operator minted for this host,"
+                " then run `corral doctor` again",
+            )
+        ]
+    return [
+        Check(
+            "hub",
+            "fail",
+            probe.detail,
+            "upgrade the hub and the hosts in lockstep, then run `corral doctor` again",
+        )
+    ]
+
+
 def run_checks(env: Env) -> list[Check]:
     """Every check, in report order. Pure over the seams in `env`."""
     return [
@@ -393,6 +505,8 @@ def run_checks(env: Env) -> list[Check]:
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_disk(env.disk),
+        *_check_hub_auth(env.hub_url, env.hub_auth),
+        *_check_hub(env.hub_url, env.hub_probe),
     ]
 
 
@@ -622,6 +736,156 @@ def load_timer_state() -> str:
         return f"unreachable: {err}"
 
 
+def read_hub_token() -> str | None:
+    """This host's hub token, read at call time. None when it cannot be read.
+
+    The value is never logged or stored: callers pass it to the probe
+    and drop it. Only the CLI calls this; tests never call this.
+    """
+    try:
+        path = paths.hub_token_path()
+    except paths.PathError:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError:
+        return None
+    return token or None
+
+
+def load_hub_auth(url: str | None) -> HubAuth | None:
+    """The hub-token reading for the live report, or None without a hub.
+
+    Only the CLI calls this; tests inject HubAuth data. The detail
+    names the file and the problem, never the token value.
+    """
+    if not url:
+        return None
+    try:
+        path = paths.hub_token_path()
+    except paths.PathError as err:
+        return HubAuth("bad", str(err))
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return HubAuth(
+            "missing",
+            f"no hub token at {path}: install the token the operator minted for this host",
+        )
+    except OSError as err:
+        return HubAuth("bad", f"hub token at {path} cannot be read: {err}")
+    if mode & 0o077:
+        return HubAuth(
+            "bad",
+            f"hub token at {path} is readable beyond its owner: make it owner-only",
+        )
+    try:
+        with open(path, encoding="utf-8") as handle:
+            token = handle.read().strip()
+    except OSError as err:
+        return HubAuth("bad", f"hub token at {path} cannot be read: {err}")
+    if not token:
+        return HubAuth(
+            "bad",
+            f"hub token at {path} is empty: install the token the operator minted",
+        )
+    return HubAuth("ok", "this host's hub token is present and owner-only")
+
+
+def _typed_version_refusal(err: urllib.error.HTTPError) -> HubProbe | None:
+    """A typed version refusal carried on an HTTP error, or None.
+
+    An older hub refuses with a typed body carrying its versions; that
+    refusal runs through `hub.check_version` so a real mismatch fails
+    instead of warning as unreachable. An absent or unreadable body is
+    None, and the caller keeps the unreachable warning.
+    """
+    try:
+        raw = err.read()
+    except Exception:  # noqa: BLE001 - an unreadable error body is report data
+        return None
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        api, schema = body["api"], body["schema_version"]
+        if (
+            isinstance(api, bool)
+            or not isinstance(api, int)
+            or isinstance(schema, bool)
+            or not isinstance(schema, int)
+        ):
+            return None
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
+        return None
+    try:
+        hub.check_version(api, schema)
+    except hub.HubVersionError as version_err:
+        return HubProbe("version-mismatch", str(version_err), hub_api=api, hub_schema=schema)
+    return None
+
+
+def load_hub_probe(url: str | None, token: str | None) -> HubProbe | None:
+    """Probe the hub's version route once, or None without a hub.
+
+    One GET of `/v1/version` with the host token: unreachable, refused
+    (401), and version-mismatched hubs each map to their row. A failed
+    probe is report data, never a traceback. Only the CLI calls this;
+    tests inject HubProbe data instead.
+    """
+    if not url:
+        return None
+    target = url.rstrip("/") + "/v1/version"
+    request = urllib.request.Request(target, headers={"Accept": "application/json"})
+    if token:
+        request.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            status = response.status
+            raw = response.read(65536)
+    except urllib.error.HTTPError as err:
+        if err.code == 401:
+            return HubProbe(
+                "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
+            )
+        refusal = _typed_version_refusal(err)
+        if refusal is not None:
+            return refusal
+        return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+    except Exception as err:  # noqa: BLE001 - a failed probe is report data, never a traceback
+        return HubProbe("unreachable", f"the hub at {url} cannot be reached: {err}")
+    if status != 200:
+        return HubProbe("unreachable", f"the hub at {url} answered HTTP {status}")
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        api, schema = body["api"], body["schema_version"]
+        if (
+            isinstance(api, bool)
+            or not isinstance(api, int)
+            or isinstance(schema, bool)
+            or not isinstance(schema, int)
+        ):
+            raise ValueError("hub version reply holds non-integer versions")
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError, AttributeError) as err:
+        return HubProbe(
+            "unreachable", f"the hub at {url} answered an unreadable version reply: {err}"
+        )
+    try:
+        hub.check_version(api, schema)
+    except hub.HubVersionError as err:
+        return HubProbe("version-mismatch", str(err), hub_api=api, hub_schema=schema)
+    return HubProbe("ok", f"the hub answers at {url}", hub_api=api, hub_schema=schema)
+
+
+def _production_hub_url(resolved: settings.Resolved | None) -> str:
+    """The resolved `hub.url`, or "" when unset or unreadable (single-host)."""
+    if resolved is None:
+        return ""
+    try:
+        return str(resolved["hub.url"])
+    except KeyError:
+        return ""
+
+
 def production_env() -> Env:
     """The live environment. Only the CLI calls this; tests never call this.
 
@@ -659,6 +923,10 @@ def production_env() -> Env:
     board_sites, board_error = load_board_sites(settings_error)
     project_problems = load_project_problems()
     timer_state = load_timer_state()
+    hub_url = _production_hub_url(resolved)
+    hub_token = read_hub_token() if hub_url else None
+    hub_auth = load_hub_auth(hub_url)
+    hub_probe = load_hub_probe(hub_url, hub_token)
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,
@@ -682,6 +950,9 @@ def production_env() -> Env:
         board_error=board_error,
         project_problems=project_problems,
         timer_state=timer_state,
+        hub_url=hub_url or None,
+        hub_auth=hub_auth,
+        hub_probe=hub_probe,
     )
 
 

@@ -8,7 +8,7 @@ An opinionated core for running fleets of headless coding agents on Linux hosts.
 
 You bring the projects: a board, the rules for which ticket is ready, the prompts. corral keeps the agents in one pen. It launches them as systemd user units, keeps their sessions, routes their models, watches the provider quota every project shares, caps how many run at once, and cleans up after them without losing work.
 
-Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; the hub skeleton (`corral hub serve`, `hub add-host`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: claims across hosts, a dashboard API, `corral new`.
+Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; the hub skeleton (`corral hub serve`, `hub add-host`) with its operations (`hub export`, `hub import`, `hub backup`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: claims across hosts, a dashboard API, `corral new`.
 
 ## Opinions
 
@@ -116,6 +116,9 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | **Hub** | |
 | `corral hub serve [--bind ADDR] [--port N]` | run the hub claim service on loopback (a public bind warns on stderr and keeps serving); prints the listening address; hosts name it with `hub.url` (empty means single-host); exit 2 when the port is held |
 | `corral hub add-host --id ID` | mint a host id and its bearer token in the hub database (prints the token once); exit 4 when the id is taken or badly shaped |
+| `corral hub export [--file PATH]` | write the hub's movable state as JSON (hosts, claims with epochs, no token material); snapshots excluded, hosts re-push |
+| `corral hub import --file PATH` | load an export into a fresh hub, keeping every epoch; refuses a hub that already holds state; re-add each host afterwards |
+| `corral hub backup --to PATH` | copy the hub database to PATH (refuses to clobber); restore by replacing the file while the hub is stopped |
 | **Hygiene** | |
 | `corral gc [--repo PATH] [--apply] [--json]` | plan-only hygiene audit: landed, superseded and merged branches print as `git branch -d`; worktree cleanup and prune need `--apply`, branches are never deleted. `merged-pr` comes from the forge's PR index for the clone's origin repo, empty with a note when the forge is unreachable |
 | `corral disk [--apply] [--json]` | disk pressure and the reclaim plan, largest first: stale `pr-*.md` drafts, finished tickets' session dirs, the `corral gc` worktree rows, and other large dirs (plan only; `--apply` removes only safe `pr-body` and `session` rows). Pressure is `low` under 10% or 5 GiB free and `critical` under half of either (`disk.min_free_pct`, `disk.min_free_gb`); a critical disk refuses launches with exit 75. `corral doctor` carries the same reading |
