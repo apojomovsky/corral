@@ -96,6 +96,22 @@ def sessions_dir(env=None):
     return _override("CORRAL_SESSIONS", env) or os.path.join(state_dir(env), "sessions")
 
 
+def host_ledger_path(env=None):
+    """The host-wide resource ledger file, shared by every project on this host.
+
+    The one deliberate exception to the override rule: a shared ledger
+    must not move under a running fleet, so `CORRAL_STATE` is ignored
+    here and the XDG state base decides alone. Callers never read the
+    environment straight; they go through this helper.
+    """
+    env = os.environ if env is None else env
+    return os.path.normpath(
+        os.path.join(
+            _xdg_base("XDG_STATE_HOME", "~/.local/state", env), "corral", "host-resources.json"
+        )
+    )
+
+
 def hub_state_dir(env=None):
     """The hub's own state dir: `CORRAL_HUB_STATE`, else `<state>/hub`.
 
@@ -122,6 +138,16 @@ def hub_token_path(env=None):
     It is never the dashboard API token file.
     """
     return os.path.join(config_dir(env), "hub-token")
+
+
+def api_token_path(env=None):
+    """The dashboard API token: `<config>/token`, resolved here only.
+
+    The file holds the Bearer [REDACTED] `corral serve --new-token` mints and
+    a non-loopback `corral serve` bind requires. Read at call time, never
+    a setting.
+    """
+    return os.path.join(config_dir(env), "token")
 
 
 REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")

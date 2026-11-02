@@ -25,17 +25,23 @@ def req(project="web", role="worker"):
     return R.Request(project=project, role=role)
 
 
-def limits(host=(8000, 16000, 4096), projects=None, roles=None, foreign=(), gone_s=600.0):
+def limits(
+    host=(8000, 16000, 4096), projects=None, roles=None, foreign=(), gone_s=600.0, pressure=None
+):
     if host is not None:
         host = triple(*host)
     if roles is None:
         roles = {"worker": dict(WORKER), "reviewer": dict(REVIEWER)}
+    kwargs = {}
+    if pressure is not None:
+        kwargs["pressure"] = pressure
     return R.Limits(
         host=host,
         projects=dict(projects or {}),
         roles=dict(roles),
         foreign=list(foreign),
         gone_s=gone_s,
+        **kwargs,
     )
 
 
@@ -380,12 +386,202 @@ class ValidateLimits(unittest.TestCase):
         self.assertEqual(R.LimitsError.exit_code, 4)
 
 
+class Join(unittest.TestCase):
+    def base(self, host=(8000, 16000, 4096)):
+        return R.Limits(
+            host=R.Usage(*host) if host is not None else None,
+            roles={"worker": R.Usage(**WORKER)},
+            gone_s=600.0,
+        )
+
+    def test_shares_and_claims_join_into_one_limits(self):
+        joined = R.join(
+            self.base(),
+            {"web": {"weight": 1, "cpu_floor_m": 500}},
+            [{"name": "desk", "cpu_m": 100, "claimed_at": NOW}],
+            where="config.toml",
+        )
+        self.assertEqual(joined.host, R.Usage(8000, 16000, 4096))
+        self.assertEqual(joined.projects["web"].cpu_floor_m, 500)
+        self.assertEqual(len(joined.foreign), 1)
+        R.validate_limits(joined)
+
+    def test_a_missing_share_reads_as_floor_zero(self):
+        joined = R.join(self.base(), {"web": None}, [], where="config.toml")
+        self.assertEqual(joined.projects["web"], R.Share())
+
+    def test_floors_at_the_host_pass(self):
+        R.join(self.base(), {"a": {"cpu_floor_m": 8000}}, [], where="config.toml")
+
+    def test_floors_above_the_host_name_the_file_and_key(self):
+        with self.assertRaisesRegex(R.settings.SettingsError, r"config\.toml.*cpu_m") as caught:
+            R.join(
+                self.base(),
+                {"a": {"cpu_floor_m": 5000}, "b": {"cpu_floor_m": 4000}},
+                [],
+                where="config.toml",
+            )
+        message = str(caught.exception)
+        self.assertIn("9000", message)
+        self.assertIn("8000", message)
+
+    def test_no_host_budget_skips_the_floor_sum(self):
+        joined = R.join(self.base(host=None), {"a": {"cpu_floor_m": 5000}}, [], where="c")
+        self.assertIsNone(joined.host)
+
+    def test_a_floor_above_its_ceiling_is_still_a_limits_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.join(
+                self.base(),
+                {"a": {"cpu_floor_m": 2000, "cpu_ceiling_m": 1000}},
+                [],
+                where="config.toml",
+            )
+
+    def test_an_admit_on_joined_limits_enforces_the_share(self):
+        joined = R.join(
+            self.base(host=(2000, 16000, 4096)),
+            {"web": {"weight": 1}},
+            [],
+            where="config.toml",
+        )
+        load = charged(total=(1500, 0, 0), by_project={"web": (1500, 0, 0)})
+        verdict = R.admit(req("web", "worker"), load, joined, NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "project-share"))
+
+
+class ShareCap(unittest.TestCase):
+    def test_no_host_budget_reads_as_no_share(self):
+        self.assertIsNone(R.share_cap(limits(host=None), "web", NOW))
+
+    def test_an_empty_host_splits_nothing_yet(self):
+        cap = R.share_cap(limits(), "web", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (8000, 16000, 4096))
+
+    def test_the_remainder_splits_by_weight(self):
+        host = limits(projects={"a": {"weight": 3}, "b": {"weight": 1}})
+        cap = R.share_cap(host, "a", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 6000)
+
+    def test_a_floor_is_kept_and_a_ceiling_caps(self):
+        host = limits(projects={"a": {"weight": 1, "cpu_floor_m": 500, "cpu_ceiling_m": 1000}})
+        cap = R.share_cap(host, "a", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 1000)
+
+    def test_a_live_foreign_claim_shrinks_the_share(self):
+        host = limits(
+            projects={"a": {"weight": 1}},
+            foreign=[claim(cpu_m=6000, memory_mb=11000)],
+        )
+        cap = R.share_cap(host, "a", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 2000)
+
+    def test_an_unknown_project_gets_the_default_weight(self):
+        host = limits(host=(1000, 16000, 4096), projects={"a": {"weight": 1}})
+        cap = R.share_cap(host, "newcomer", NOW)
+        assert cap is not None
+        self.assertEqual(cap.cpu_m, 500)
+
+    def test_a_negative_gone_s_is_a_configuration_error(self):
+        bad = limits()
+        with self.assertRaises(R.LimitsError):
+            R.share_cap(R.Limits(host=bad.host, gone_s=-1.0), "web", NOW)
+
+
 class Codes(unittest.TestCase):
     def test_codes_are_stable_strings(self):
         self.assertEqual(
             (R.OK, R.HOST_FULL, R.PROJECT_SHARE, R.PROJECT_CEILING, R.ROLE_COST),
             ("ok", "host-full", "project-share", "project-ceiling", "role-cost"),
         )
+        self.assertEqual(R.PRESSURE, "pressure")
+
+
+def hot(load_per_cpu=8.0, mem_available_pct=50.0):
+    return {"load_per_cpu": load_per_cpu, "mem_available_pct": mem_available_pct}
+
+
+class Saturated(unittest.TestCase):
+    def test_a_saturated_host_refuses_while_shares_are_free(self):
+        verdict = R.admit(req(), charged(), limits(), NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (False, "pressure"))
+        self.assertIn("load", verdict.reason)
+
+    def test_low_memory_refuses_and_names_memory(self):
+        verdict = R.admit(req(), charged(), limits(), NOW, pressure=hot(0.2, 3.0))
+        self.assertEqual((verdict.allowed, verdict.code), (False, "pressure"))
+        self.assertIn("MemAvailable", verdict.reason)
+
+    def test_an_unknown_reading_never_blocks(self):
+        verdict = R.admit(
+            req(),
+            charged(),
+            limits(),
+            NOW,
+            pressure={"load_per_cpu": None, "mem_available_pct": None},
+        )
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_no_reading_is_an_unknown_reading(self):
+        verdict = R.admit(req(), charged(), limits(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_saturation_waits_even_below_the_floor(self):
+        poor = limits(projects={"web": {"weight": 1, "cpu_floor_m": 7000}})
+        verdict = R.admit(req(), charged((8000, 16000, 4096)), poor, NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (False, "pressure"))
+
+    def test_no_host_budget_passes_a_saturated_host(self):
+        verdict = R.admit(req(), charged(), limits(host=None), NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_lax_thresholds_admit_a_hot_host(self):
+        lax = limits()
+        lax = R.Limits(
+            host=lax.host,
+            projects=lax.projects,
+            roles=lax.roles,
+            foreign=lax.foreign,
+            gone_s=lax.gone_s,
+            pressure={"max_load_per_cpu": 16.0, "min_mem_available_pct": 1.0},
+        )
+        verdict = R.admit(req(), charged(), lax, NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_garbage_reading_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError) as caught:
+            R.admit(req(), charged(), limits(), NOW, pressure={"load_per_cpu": "hot"})
+        self.assertIn("pressure", str(caught.exception))
+
+
+class PressureCaps(unittest.TestCase):
+    def test_defaults_are_conservative(self):
+        caps = R.caps()
+        self.assertEqual((caps.max_load_per_cpu, caps.min_mem_available_pct), (2.0, 10.0))
+
+    def test_limits_without_caps_read_as_defaults(self):
+        verdict = R.admit(req(), charged(), limits(), NOW, pressure=hot(1.0, 50.0))
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_zero_max_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"max_load_per_cpu": 0}))
+
+    def test_a_negative_min_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"min_mem_available_pct": -1.0}))
+
+    def test_a_min_above_a_hundred_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"min_mem_available_pct": 101.0}))
+
+    def test_a_non_number_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"max_load_per_cpu": "lots"}))
 
 
 if __name__ == "__main__":

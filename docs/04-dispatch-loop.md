@@ -326,9 +326,11 @@ foreign claims were skipped at gate step 2.
   are newer than now minus 24 hours, and each pass prunes older ones.
   (The section 7 day cap is date-keyed instead: it bounds starts per
   calendar day, while this window bounds restart rate around an
-  incident.) Only stop-plus-launch restarts consume the budget. Fix
-  rounds are not restarts: a `resume` that reuses the live unit and
-  session never consumes it. Past the budget, give up: post the
+  incident.) Only stop-plus-launch restarts consume the budget. Of
+  the fix rounds, only the restarts do: a `resume` that reuses the
+  live unit and session never consumes it, while a fix round that
+  restarts on the same branch stamps the budget like any other
+  restart. Past the budget, give up: post the
   tail of what was observed with `Tracker.comment`, add
   `needs-decision` with `Tracker.add_label` (the decision-write seam
   above; the outbox carries neither), then release the claim. A

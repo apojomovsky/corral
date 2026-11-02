@@ -281,6 +281,176 @@ class UnitArgvTest(unittest.TestCase):
         self.assertEqual(argv[-2:], ["omp", "-p"])
 
 
+class SliceArgvTest(unittest.TestCase):
+    def test_unit_argv_without_limits_is_byte_identical(self):
+        with mock.patch.dict(os.environ, {"PATH": "/p/bin"}):
+            plain = units.unit_argv("u", "/w", "/s", ["x"], [], 60)
+            with_limits = units.unit_argv(
+                "u",
+                "/w",
+                "/s",
+                ["x"],
+                [],
+                60,
+                slice=None,
+                memory_max=None,
+                cpu_quota=None,
+                tasks_max=None,
+                controllers=None,
+            )
+        self.assertEqual(with_limits, plain)
+
+    def test_unit_argv_carries_the_slice_and_its_limits(self):
+        argv = units.unit_argv(
+            "u",
+            "/w",
+            "/s",
+            ["x"],
+            [],
+            60,
+            slice="corral-web.slice",
+            memory_max=2048,
+            cpu_quota=1000,
+            tasks_max=100,
+        )
+        self.assertIn("--property=Slice=corral-web.slice", argv)
+        self.assertIn("--property=MemoryMax=2048M", argv)
+        self.assertIn("--property=CPUQuota=100%", argv)
+        self.assertIn("--property=TasksMax=100", argv)
+        self.assertLess(
+            argv.index("--property=Slice=corral-web.slice"),
+            argv.index("--working-directory=/w"),
+        )
+
+    def test_a_fractional_cpu_quota_formats_without_trailing_zeros(self):
+        argv = units.unit_argv("u", "/w", "/s", ["x"], [], 60, cpu_quota=555)
+        self.assertIn("--property=CPUQuota=55.5%", argv)
+
+    def test_unset_or_zero_limits_are_skipped(self):
+        argv = units.unit_argv(
+            "u", "/w", "/s", ["x"], [], 60, memory_max=0, cpu_quota=None, tasks_max=0
+        )
+        self.assertFalse([a for a in argv if a.startswith("--property=MemoryMax=")])
+        self.assertFalse([a for a in argv if a.startswith("--property=CPUQuota=")])
+        self.assertFalse([a for a in argv if a.startswith("--property=TasksMax=")])
+
+    def test_a_controller_without_delegation_is_skipped(self):
+        argv = units.unit_argv(
+            "u",
+            "/w",
+            "/s",
+            ["x"],
+            [],
+            60,
+            slice="corral-web.slice",
+            memory_max=2048,
+            cpu_quota=1000,
+            tasks_max=100,
+            controllers={"cpu", "pids"},
+        )
+        self.assertIn("--property=Slice=corral-web.slice", argv)
+        self.assertNotIn("--property=MemoryMax=2048M", argv)
+        self.assertIn("--property=CPUQuota=100%", argv)
+
+    def test_an_unknown_controller_name_is_ignored(self):
+        argv = units.unit_argv(
+            "u", "/w", "/s", ["x"], [], 60, memory_max=2048, controllers={"memory", "bogus"}
+        )
+        self.assertIn("--property=MemoryMax=2048M", argv)
+
+    def test_a_bad_limit_is_a_usage_error(self):
+        for bad in (True, "2048", -1):
+            with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
+                units.unit_argv("u", "/w", "/s", ["x"], [], 60, memory_max=bad)
+
+
+class SliceNamesTest(unittest.TestCase):
+    def test_the_host_slice_is_fixed(self):
+        self.assertEqual(units.HOST_SLICE, "corral.slice")
+
+    def test_a_project_names_its_slice(self):
+        self.assertEqual(units.project_slice("web"), "corral-web.slice")
+
+    def test_a_prefix_key_names_a_slice(self):
+        self.assertEqual(units.project_slice("corral-agent-"), "corral-corral-agent-.slice")
+
+    def test_a_bad_project_cannot_name_a_slice(self):
+        for bad in ("", "a/b", "a b"):
+            with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
+                units.project_slice(bad)
+
+
+class DelegationTest(unittest.TestCase):
+    def test_the_controllers_file_names_the_user_slice(self):
+        path = units.controllers_path(uid=1000)
+        self.assertIn("user-1000.slice", path)
+        self.assertTrue(path.endswith("cgroup.controllers"))
+
+    def test_delegated_controllers_parse_the_file(self):
+        available = units.delegated_controllers(read=lambda path: "cpu memory pids\n")
+        self.assertEqual(available, frozenset({"cpu", "memory", "pids"}))
+
+    def test_a_missing_required_controller_refuses_naming_it(self):
+        with self.assertRaisesRegex(units.UnitsError, "memory"):
+            units.delegated_controllers(read=lambda path: "cpu pids\n")
+        self.assertEqual(units.UnitsError.exit_code, 4)
+
+    def test_an_unreadable_file_refuses_naming_it(self):
+        def read(path):
+            raise OSError("no cgroup here")
+
+        with self.assertRaisesRegex(units.UnitsError, "cgroup.controllers"):
+            units.delegated_controllers(path="/none/cgroup.controllers", read=read)
+
+
+class EnsureSliceTest(unittest.TestCase):
+    def test_creating_a_slice_runs_systemd_run_with_its_limits(self):
+        fake = FakeRun()
+        units.ensure_slice(
+            "corral-web.slice",
+            parent="corral.slice",
+            memory_max=2048,
+            cpu_quota=1000,
+            run=fake,
+        )
+        (argv,) = fake.calls
+        self.assertEqual(argv[0], "systemd-run")
+        self.assertIn("--unit=corral-web.slice", argv)
+        self.assertIn("--slice=corral.slice", argv)
+        self.assertIn("--property=MemoryMax=2048M", argv)
+        self.assertIn("--property=CPUQuota=100%", argv)
+
+    def test_a_slice_without_a_parent_needs_no_slice_line(self):
+        fake = FakeRun()
+        units.ensure_slice("corral.slice", memory_max=16000, run=fake)
+        self.assertFalse([a for a in fake.calls[0] if a.startswith("--slice=")])
+
+    def test_an_existing_slice_reads_as_created(self):
+        fake = FakeRun(result=done([], 1, "", "Unit corral.slice already exists."))
+        units.ensure_slice("corral.slice", run=fake)  # no raise
+
+    def test_a_refused_property_names_it_with_exit_4(self):
+        fake = FakeRun(result=done([], 1, "", "Failed to set property MemoryMax: denied"))
+        with self.assertRaisesRegex(units.UnitsError, "MemoryMax") as caught:
+            units.ensure_slice("corral.slice", memory_max=16000, run=fake)
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_an_unreachable_bus_is_exit_3(self):
+        fake = FakeRun(result=done([], 1, "", "Failed to connect to bus: refused"))
+        with self.assertRaises(units.Unreachable) as caught:
+            units.ensure_slice("corral.slice", run=fake)
+        self.assertEqual(caught.exception.exit_code, 3)
+
+    def test_a_bad_slice_name_is_refused(self):
+        with self.assertRaises(units.UnitsError):
+            units.ensure_slice("corral.slice.service", run=FakeRun())
+
+    def test_creating_a_slice_needs_no_units_log(self):
+        fake = FakeRun()
+        units.ensure_slice("corral.slice", run=fake)
+        self.assertEqual(fake.calls[0][0], "systemd-run")
+
+
 class StartTest(Dirs):
     def argv(self, unit):
         return ["systemd-run", "--user", f"--unit={unit}", "omp"]
@@ -567,9 +737,12 @@ class SealTest(unittest.TestCase):
                 ("units.py", "systemctl", "list_units"),
                 ("units.py", "systemctl", STOP_NAME),
                 ("units.py", "systemd-run", "unit_argv"),
+                ("units.py", "systemd-run", "slice_argv"),
                 ("drive.py", "systemctl", "timer_state"),
                 ("drive.py", "systemctl", "_timer_systemctl"),
                 ("doctor.py", "systemctl", "_check_drive_timer"),
+                ("resourcedoctor.py", "systemctl", "load_slice_actual"),
+                ("resourcedoctor.py", "systemctl", "_check_slices"),
             },
         )
 
