@@ -507,6 +507,18 @@ class DropIns(LedgerCase):
         self.assertEqual(out["foreign"], [])
         self.assertEqual(hl.load(self.path)["foreign"][0]["name"], "desk")
 
+    def test_a_drop_in_added_mid_update_keeps_the_ledger_owned_claim(self):
+        self.write(json.dumps({**hl.empty(), "foreign": [{"name": "desk", "cpu_m": 1}]}))
+
+        def change(ledger):
+            self.drop("desk.json", {"name": "desk", "cpu_m": 999, "claimed_at": 1.0})
+            return {**ledger, "host_budget": {"cpu_m": 1}}
+
+        out = hl.update(change, path=self.path, state_dir=self.state)
+        self.assertEqual(out["foreign"], [{"name": "desk", "cpu_m": 1}])
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["foreign"], [{"name": "desk", "cpu_m": 1}])
+
     def test_an_unlistable_claims_dir_refuses(self):
         with open(os.path.join(self.dir, "file-not-dir"), "w", encoding="utf-8") as handle:
             handle.write("x")

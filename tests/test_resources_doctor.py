@@ -4,6 +4,7 @@ Pure checks over `resourcedoctor.ResourceReadings`, fakes at every seam:
 no systemd, no cgroup filesystem, no ledger outside a temp dir.
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -369,9 +370,60 @@ class ForeignClaims(unittest.TestCase):
         self.assertIn("no foreign claims", rows["resources-foreign"].detail)
 
     def test_malformed_claim_fails(self):
-        rows = by_name(resourcedoctor.check(readings(foreign=[{"name": "desktop"}])))
+        rows = by_name(
+            resourcedoctor.check(readings(foreign=[{"name": "desktop", "claimed_at": "soon"}]))
+        )
         self.assertEqual(rows["resources-foreign"].status, "fail")
         self.assertIn("/state/corral/host-resources.json", rows["resources-foreign"].fix)
+
+    def test_a_claim_without_claimed_at_warns_as_expired_and_ignored(self):
+        rows = by_name(resourcedoctor.check(readings(foreign=[{"name": "desktop"}])))
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("desktop", row.detail)
+        self.assertIn("expired", row.detail)
+        self.assertIn("ignored", row.detail)
+
+    def test_a_claim_with_a_null_claimed_at_fails(self):
+        rows = by_name(
+            resourcedoctor.check(readings(foreign=[{"name": "desktop", "claimed_at": None}]))
+        )
+        self.assertEqual(rows["resources-foreign"].status, "fail")
+
+    def test_ignored_non_json_files_warn_and_name_them(self):
+        rows = by_name(resourcedoctor.check(readings(foreign_ignored=("desk.jsnm",))))
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("desk.jsnm", row.detail)
+        self.assertIn("foreign-claims", row.fix)
+
+    def test_ignored_files_warn_beside_live_claims(self):
+        rows = by_name(
+            resourcedoctor.check(
+                readings(
+                    foreign=[self.claim("desktop", 60.0)],
+                    foreign_ignored=("desk.jsnm", "notes.txt"),
+                )
+            )
+        )
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("desk.jsnm", row.detail)
+        self.assertIn("notes.txt", row.detail)
+
+    def test_ignored_files_join_an_expired_claim_in_one_warn_row(self):
+        rows = by_name(
+            resourcedoctor.check(
+                readings(
+                    foreign=[self.claim("desktop", 3600.0)],
+                    foreign_ignored=("desk.jsnm",),
+                )
+            )
+        )
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("desktop", row.detail)
+        self.assertIn("desk.jsnm", row.detail)
 
     def test_a_foreign_limits_error_fails_the_foreign_row_too(self):
         error = "foreign claim 0 must be a foreign claim, not {}"
@@ -848,6 +900,137 @@ class ProductionAssembly(unittest.TestCase):
         assert state_readings is not None
         rows = by_name(resourcedoctor.check(state_readings))
         self.assertEqual(rows["resources-ledger"].status, "fail")
+
+
+class ProductionGather(unittest.TestCase):
+    """load_resource_readings over a temp host: defaults, errors, drop-ins.
+
+    A fake resolved settings object (settings.resolve over plain dicts, no
+    files or env), a temp ledger with a temp foreign-claims dir, and fakes
+    at the project, registry, path and ledger seams.
+    """
+
+    HOST = {"host": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096}}
+
+    def gather(
+        self,
+        host_tables,
+        ledger_text=None,
+        drops=None,
+        registered=None,
+        claims_mode="ok",
+    ):
+        from corral import host_ledger, paths, projects, settings
+
+        tmp = tempfile.TemporaryDirectory(prefix="corral-gather-")
+        self.addCleanup(tmp.cleanup)
+        state = os.path.join(tmp.name, "state")
+        os.makedirs(os.path.join(state, "corral"))
+        ledger_path = os.path.join(state, "corral", "host-resources.json")
+        with open(ledger_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                ledger_text
+                if ledger_text is not None
+                else ('{"version": 1, "host_budget": null, "projects": {}, "foreign": []}')
+            )
+        with open(os.path.join(state, "corral", "host-state-dir"), "w", encoding="utf-8") as handle:
+            handle.write(state)
+        claims_dir = os.path.join(state, "corral", host_ledger.FOREIGN_CLAIMS_DIR)
+        if claims_mode == "file":
+            with open(claims_dir, "w", encoding="utf-8") as handle:
+                handle.write("not a dir")
+        else:
+            os.makedirs(claims_dir, exist_ok=True)
+            for name, payload in (drops or {}).items():
+                with open(os.path.join(claims_dir, name), "w", encoding="utf-8") as handle:
+                    handle.write(payload if isinstance(payload, str) else json.dumps(payload))
+            if claims_mode == "unreadable":
+                os.chmod(claims_dir, 0o000)
+                self.addCleanup(os.chmod, claims_dir, 0o755)
+        resolved = settings.resolve(host={"resources": host_tables}, env={})
+        with (
+            mock.patch.object(projects, "load_all", return_value=list(registered or [])),
+            mock.patch.object(registry, "visible", return_value=[]),
+            mock.patch.object(host_ledger, "ledger_path", return_value=ledger_path),
+            mock.patch.object(paths, "state_dir", return_value=state),
+        ):
+
+            def read(path):
+                if "cgroup" in path or path.startswith("/proc/"):
+                    return "cpu memory pids\n"
+                with open(path, encoding="utf-8") as handle:
+                    return handle.read()
+
+            return doctor.load_resource_readings(
+                resolved,
+                list_fn=lambda prefix: [],
+                run=lambda argv: SimpleNamespace(returncode=1, stdout="", stderr=""),
+                read=read,
+                now=1_000_000.0,
+            )
+
+    def heavy_project(self):
+        from corral import projects
+
+        return projects.Project(
+            name="web",
+            unit_prefix="corral-agent-",
+            root="/ops",
+            resources={"weight": 1, "cpu_floor_m": 9000},
+        )
+
+    def test_limits_failure_keeps_the_shared_gone_s_default(self):
+        readings = self.gather(self.HOST, registered=[self.heavy_project()])
+        assert readings is not None
+        self.assertIsNotNone(readings.limits_error)
+        self.assertEqual(readings.gone_s, R.DEFAULT_GONE_S)
+
+    def test_limits_failure_falls_back_to_the_builtin_pressure_caps(self):
+        from corral import pressure
+
+        readings = self.gather(self.HOST, registered=[self.heavy_project()])
+        assert readings is not None
+        self.assertIsNotNone(readings.limits_error)
+        self.assertEqual(
+            readings.pressure_caps,
+            (pressure.DEFAULT_MAX_LOAD_PER_CPU, pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT),
+        )
+
+    @unittest.skipIf(os.geteuid() == 0, "an unreadable dir still lists for root")
+    def test_an_unreadable_claims_dir_fails_the_ledger_row(self):
+        readings = self.gather(self.HOST, claims_mode="unreadable")
+        assert readings is not None
+        self.assertIsNotNone(readings.ledger_error)
+        self.assertIn("foreign-claim", readings.ledger_error)
+        rows = by_name(resourcedoctor.check(readings))
+        self.assertEqual(rows["resources-ledger"].status, "fail")
+
+    def test_a_file_claims_dir_fails_the_ledger_row(self):
+        readings = self.gather(self.HOST, claims_mode="file")
+        assert readings is not None
+        self.assertIsNotNone(readings.ledger_error)
+        rows = by_name(resourcedoctor.check(readings))
+        self.assertEqual(rows["resources-ledger"].status, "fail")
+
+    def test_gather_merges_drop_ins_and_reports_ignored_files(self):
+        ledger_text = (
+            '{"version": 1, "host_budget": null, "projects": {},'
+            ' "foreign": [{"name": "ledger", "cpu_m": 100,'
+            ' "memory_mb": 128, "pids": 1, "claimed_at": 999999.0}]}'
+        )
+        drops = {
+            "desk.json": {"name": "desk", "cpu_m": 10, "claimed_at": 999999.0},
+            "desk.jsnm": "a typo, never counted",
+        }
+        readings = self.gather(self.HOST, ledger_text=ledger_text, drops=drops)
+        assert readings is not None
+        self.assertIsNone(readings.limits_error)
+        self.assertEqual(sorted(entry["name"] for entry in readings.foreign), ["desk", "ledger"])
+        self.assertEqual(readings.foreign_ignored, ("desk.jsnm",))
+        rows = by_name(resourcedoctor.check(readings))
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("desk.jsnm", row.detail)
 
 
 if __name__ == "__main__":
