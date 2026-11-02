@@ -1221,6 +1221,17 @@ class RemotePlan(unittest.TestCase):
         self.assertIn(f"gh repo create acme/{FIXTURE} --private", out)
         self.assertFalse(os.path.exists(self.target()))
 
+    def test_plan_with_a_bad_owner_is_exit_4_before_any_write(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge()
+        code, _, err = run_new(
+            path=self.parent, git=git, forge=forge, plan=True, owner="not an owner"
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("owner", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(forge.created, [])
+
     def test_plan_with_create_remote_prints_would_run(self):
         git = FakeGit(root=self.parent)
         forge = FakeForge(user="operator")

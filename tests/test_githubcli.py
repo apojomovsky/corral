@@ -97,14 +97,24 @@ class ExitCodeTest(SetupRootCase):
         self.assertIn("acme/app", self.err.getvalue())
         self.assertEqual(self.out.getvalue(), "")
 
-    def test_partial_failure_with_a_create_is_still_0(self):
+    def test_partial_failure_with_a_create_is_3(self):
         with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
         good = FakeTracker()
         bad = FakeTracker(ensure_error=iface.TrackerError("down"))
         code = self.run_setup({"acme/app": good, "acme/lib": bad}.__getitem__)
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 3)
         self.assertIn("created label ready on acme/app\n", self.out.getvalue())
+        self.assertIn("acme/lib", self.err.getvalue())
+
+    def test_failure_with_a_create_and_a_refusal_is_3(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TWO)
+        mixed = FakeTracker(refused={"hold"})
+        bad = FakeTracker(ensure_error=iface.TrackerError("down"))
+        code = self.run_setup({"acme/app": mixed, "acme/lib": bad}.__getitem__)
+        self.assertEqual(code, 3)
+        self.assertIn("refused label hold on acme/app", self.out.getvalue())
         self.assertIn("acme/lib", self.err.getvalue())
 
     def test_total_failure_is_exit_3(self):

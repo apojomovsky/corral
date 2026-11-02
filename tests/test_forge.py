@@ -9,7 +9,7 @@ import json
 import unittest
 from unittest import mock
 
-from corral import forge
+from corral import forge, paths
 from corral.github import forge as ghforge
 
 BASE_SHA = "a" * 40
@@ -112,6 +112,19 @@ class FakeForge:
 
     def describe_create(self, name, owner=None, *, private=True):
         self.calls.append(("describe_create", name, owner, private))
+        if owner is None:
+            if not paths.plain_repo_name(name):
+                raise forge.ForgeError(f"unusable forge name {name!r}")
+        else:
+            if (
+                not isinstance(owner, str)
+                or not owner
+                or "/" in owner
+                or any(ch.isspace() for ch in owner)
+            ):
+                raise forge.ForgeError(f"unusable forge owner {owner!r}")
+            if not paths.plain_repo_name(name):
+                raise forge.ForgeError(f"unusable forge name {name!r}")
         visibility = "--private" if private else "--public"
         target = f"{owner}/{name}" if owner else name
         return f"gh repo create {target} {visibility}"

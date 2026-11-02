@@ -4,9 +4,10 @@ Runs the idempotent ensure operation on every named ``[[repo]]`` entry
 (the same operation ``new --create-remote`` runs after creating the
 repository): missing labels are created, existing labels are left
 byte-identical, refused ones are reported with a fix line. Exit codes:
-0 a label was created and none was refused, 1 a label was refused or
-everything was already kept, 3 a tracker was unreachable with nothing
-created, 4 usage or configuration error.
+0 something was created with nothing refused and nothing failed,
+1 something was refused or everything was already kept,
+3 any repository failed (even when another one created labels),
+4 usage or configuration error.
 """
 
 import argparse
@@ -29,11 +30,11 @@ def setup_root(root, names, *, tracker_factory, git, out, err) -> int:
     ``tracker_factory`` maps a tracker repo (``owner/name``) to its
     tracker, built by the one factory (labels or board); ``git`` is the
     origin-lookup seam `corral sync` resolves tracker repos with. All
-    seams injected; exit codes follow the module docstring: any refused
+    seams injected; exit codes follow the module docstring: any failed
+    repository is 3 even when another repo created labels, any refused
     label is 1 even when another repo created labels, a pass that
-    created something and refused nothing is 0, a pass that created
-    nothing but failed somewhere is 3, and a pass that created nothing
-    and failed nowhere is 1.
+    created something with nothing refused and nothing failed is 0,
+    and a pass that created nothing and failed nowhere is 1.
     """
     try:
         wanted = settings.repo_names(root)
@@ -70,12 +71,12 @@ def setup_root(root, names, *, tracker_factory, git, out, err) -> int:
         out.write(iface.render_ensure(tracker_repo, report))
         made += len(report.created)
         refused += len(report.refused)
+    if failed:
+        return UNREACHABLE
     if refused:
         return NOTHING
     if made:
         return OK
-    if failed:
-        return UNREACHABLE
     return NOTHING
 
 

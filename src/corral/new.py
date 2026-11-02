@@ -349,22 +349,16 @@ def _production_tracker():
     return ghtracker.GithubTracker(paced_run)
 
 
-def _check_owner_shape(owner):
-    """The remote owner as given: no slash, no whitespace, else exit 4."""
-    if not isinstance(owner, str) or not owner or "/" in owner or any(ch.isspace() for ch in owner):
-        raise NewError(f"unresolvable owner {owner!r}: pass --owner OWNER")
-    return owner
-
-
 def _resolve_owner(opts, forge):
     """The remote owner: `--owner` when given, else the forge current user.
 
-    A failed current-user call propagates as `ForgeError` (exit 3); an
-    empty answer reads as exit 4, never as a guess.
+    Returned unchecked: the one shape check lives in the forge-side
+    `describe_create`, which `_plan_text` maps to exit 4. A failed
+    current-user call propagates as `ForgeError` (exit 3).
     """
     if opts.owner is not None:
-        return _check_owner_shape(opts.owner)
-    return _check_owner_shape(forge.current_user())
+        return opts.owner
+    return forge.current_user()
 
 
 def _plan_text(forge, name, owner, private):
@@ -372,10 +366,13 @@ def _plan_text(forge, name, owner, private):
 
     Pure: `describe_create` never calls the runner, so this runs before
     any local write and (without `--owner`) without any network read.
-    Shape errors are impossible here: the name and the owner are
-    validated before this runs, so a `ForgeError` propagates as exit 3.
+    A `ForgeError` here is a shape error (a bad name or owner), so it
+    maps to exit 4, never to exit 3.
     """
-    return forge.describe_create(name, owner, private=private)
+    try:
+        return forge.describe_create(name, owner, private=private)
+    except iface.ForgeError as err:
+        raise NewError(f"unresolvable remote owner {owner!r} for {name!r}: {err}") from None
 
 
 def _remote_precheck(opts, forge, owner):
@@ -486,8 +483,6 @@ def _apply(opts, git, forge, tracker):
         owner = _resolve_owner(opts, forge)
         repo, plan_text, adopted = _remote_precheck(opts, forge, owner)
     else:
-        if opts.owner is not None:
-            _check_owner_shape(opts.owner)
         owner, repo, adopted = None, None, False
         plan_text = _plan_text(forge, opts.name, opts.owner, True)
     parent = os.path.abspath(opts.path) if opts.path else os.getcwd()

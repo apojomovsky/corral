@@ -345,7 +345,16 @@ class SharedVocabularyTest(unittest.TestCase):
 
 
 class LabelApi:
-    """A `gh` double for the labels endpoints: a canned list, recorded posts."""
+    """A `gh` double for the labels endpoints: paged lists, recorded posts.
+
+    The list endpoint pages like the adapter requests it
+    (`?per_page=N&page=M`); an unpaged list call is rejected so a test
+    that misses pagination fails instead of passing on one short page.
+    `conflict` names labels whose create answers 422 already-exists
+    (the concurrent-setup shape) and then reads back, like a label the
+    other setup just created; `fail_single` names labels whose
+    single-label read fails, for the fail-closed re-read path.
+    """
 
     PATH = "repos/acme/app/labels"
 
@@ -355,29 +364,56 @@ class LabelApi:
         refuse=(),
         fail_list=None,
         fail_names=(),
+        fail_single=(),
+        conflict=(),
         list_payload: object = None,
     ):
         self.have = dict(have)
         self.refuse = set(refuse)
         self.fail_list = fail_list
         self.fail_names = set(fail_names)
+        self.fail_single = set(fail_single)
+        self.conflict = set(conflict)
         self.list_payload = list_payload
         self.calls = []
         self.posted = []
 
+    def _page(self, query):
+        params = dict(pair.split("=", 1) for pair in query.split("&") if "=" in pair)
+        per_page = int(params.get("per_page", "100"))
+        page = int(params.get("page", "1"))
+        names = list(self.have)
+        start = (page - 1) * per_page
+        return [
+            {"name": name, "color": color, "description": desc}
+            for name, (color, desc) in [(n, self.have[n]) for n in names[start : start + per_page]]
+        ]
+
     def __call__(self, args):
         self.calls.append(list(args))
         if list(args[:2]) == ["api", self.PATH]:
+            raise AssertionError(f"unpaged labels list {args!r}: request per_page and pages")
+        if len(args) == 2 and args[0] == "api" and args[1].startswith(self.PATH + "?"):
             if self.fail_list is not None:
                 raise self.fail_list
             if self.list_payload is not None:
                 return json.dumps(self.list_payload)
-            return json.dumps(
-                [
-                    {"name": name, "color": color, "description": desc}
-                    for name, (color, desc) in self.have.items()
-                ]
-            )
+            _, _, query = args[1].partition("?")
+            return json.dumps(self._page(query))
+        if (
+            len(args) == 2
+            and args[0] == "api"
+            and args[1].startswith(self.PATH + "/")
+            and "?" not in args[1]
+        ):
+            name = args[1][len(self.PATH) + 1 :]
+            if name in self.fail_single:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            try:
+                color, desc = self.have[name]
+            except KeyError:
+                raise RuntimeError("gh: Not Found (HTTP 404)") from None
+            return json.dumps({"name": name, "color": color, "description": desc})
         if list(args[:4]) == ["api", "--method", "POST", self.PATH]:
             fields = {}
             for flag, value in zip(args[4::2], args[5::2]):
@@ -389,6 +425,12 @@ class LabelApi:
                 raise RuntimeError("gh: connection reset")
             if name in self.refuse:
                 raise RuntimeError("gh: Resource not accessible by token (HTTP 403)")
+            if name in self.conflict:
+                self.have[name] = (fields.get("color"), fields.get("description"))
+                raise RuntimeError(
+                    'gh: Validation Failed: {"resource": "Label",'
+                    ' "code": "already_exists"} (HTTP 422)'
+                )
             self.posted.append(fields)
             self.have[name] = (fields.get("color"), fields.get("description"))
             return json.dumps({"name": name})
@@ -559,6 +601,41 @@ class EnsureLabelsTest(unittest.TestCase):
                 api = LabelApi(list_payload=payload)
                 with self.assertRaises(tracker.TrackerError):
                     ghtracker.GithubTracker(api).ensure_labels("acme/app")
+
+    def test_a_wanted_label_on_a_later_page_is_kept_not_created(self):
+        old_per_page = ghtracker.PER_PAGE
+        ghtracker.PER_PAGE = 2
+        self.addCleanup(setattr, ghtracker, "PER_PAGE", old_per_page)
+        extra = {f"extra-{index:02d}": ("cccccc", "unrelated") for index in range(36)}
+        have = dict(extra)
+        for name in self.names():
+            have[name] = ("0e8a16", "board label")
+        api = LabelApi(have=have)
+        report = ghtracker.GithubTracker(api).ensure_labels("acme/app")
+        self.assertEqual(report.created, ())
+        self.assertEqual(set(report.kept), set(self.names()))
+        self.assertEqual(api.posted, [])
+        self.assertTrue(
+            any(call == ["api", f"{LabelApi.PATH}?per_page=2&page=2"] for call in api.calls),
+            f"no second page requested in {api.calls!r}",
+        )
+
+    def test_a_422_on_create_is_kept_after_a_reread(self):
+        api = LabelApi(conflict={"ready"})
+        report = ghtracker.GithubTracker(api).ensure_labels("acme/app")
+        self.assertIn("ready", report.kept)
+        self.assertNotIn("ready", report.created)
+        self.assertEqual(report.refused, ())
+        self.assertEqual(
+            [posted["name"] for posted in api.posted],
+            [name for name in self.names() if name != "ready"],
+        )
+        self.assertIn(["api", f"{LabelApi.PATH}/ready"], api.calls)
+
+    def test_a_422_followed_by_a_missing_label_fails_closed(self):
+        api = LabelApi(conflict={"ready"}, fail_single={"ready"})
+        with self.assertRaises(tracker.TrackerError):
+            ghtracker.GithubTracker(api).ensure_labels("acme/app")
 
 
 class PaginationTest(unittest.TestCase):

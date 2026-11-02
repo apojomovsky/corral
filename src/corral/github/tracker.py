@@ -34,6 +34,12 @@ _BOOTSTRAP_COLORS = {
 #: A label create the account may not perform, in the provider's shape.
 _REFUSED_RE = re.compile(r"\(HTTP 403\)", re.IGNORECASE)
 
+#: A label create that lost a race to an existing label, in the
+#: provider's shape: the 422 status plus the already-exists wording.
+#: Both must match, so a 422 for a malformed create never reads as kept.
+_ALREADY_EXISTS_STATUS_RE = re.compile(r"\(HTTP 422\)", re.IGNORECASE)
+_ALREADY_EXISTS_PHRASE_RE = re.compile(r"already[_-]?exists", re.IGNORECASE)
+
 #: Corral-owned fields live on the tracker as labels. One label per field
 #: at most; when several share a prefix the smallest wins and the rest
 #: are pruned on the next write of that field.
@@ -130,6 +136,20 @@ def _is_refused(err):
     closed through ``_write_error``.
     """
     return _REFUSED_RE.search(str(err)) is not None
+
+
+def _is_already_exists(err):
+    """Whether a failed label create lost a race to an existing label.
+
+    Only the provider's own shape counts: the 422 status plus the
+    already-exists wording, so a 422 for a malformed create still fails
+    closed through ``_write_error``.
+    """
+    text = str(err)
+    return (
+        _ALREADY_EXISTS_STATUS_RE.search(text) is not None
+        and _ALREADY_EXISTS_PHRASE_RE.search(text) is not None
+    )
 
 
 class GithubTracker:
@@ -361,27 +381,61 @@ class GithubTracker:
         except Exception as err:
             raise self._write_error(err) from err
 
+    def _list_label_names(self, repo: str) -> set[str]:
+        """Every label name on ``repo``, across all list pages.
+
+        Pages ``per_page`` at a time until a short page ends the list,
+        like ``pr_index``. A missing or malformed page fails closed: a
+        truncated list would read a present label as missing, post a
+        create, and lose on the already-exists answer.
+        """
+        have = set()
+        page = 1
+        while True:
+            try:
+                payload = json.loads(
+                    self._run(["api", f"repos/{repo}/labels?per_page={PER_PAGE}&page={page}"])
+                )
+            except Exception as err:
+                raise self._write_error(err) from err
+            if not isinstance(payload, list):
+                raise _fail(f"labels of {repo} are not a list")
+            for entry in payload:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if not isinstance(name, str):
+                    raise _fail(f"bad label entry {entry!r} on {repo}")
+                have.add(name)
+            if len(payload) < PER_PAGE:
+                return have
+            page += 1
+
+    def _read_label_name(self, repo: str, name: str) -> str:
+        """The one label ``name`` on ``repo``, fresh, else ``TrackerError``.
+
+        The proof for a create that answered already-exists: only a
+        label that reads back counts as kept. A failed read fails
+        closed, never as kept.
+        """
+        try:
+            payload = json.loads(self._run(["api", f"repos/{repo}/labels/{name}"]))
+        except Exception as err:
+            raise self._write_error(err) from err
+        if not isinstance(payload, dict) or payload.get("name") != name:
+            raise _fail(f"bad label {payload!r} on {repo}")
+        return name
+
     def ensure_labels(self, repo: str) -> iface.LabelReport:
         """Create the missing bootstrap labels on ``repo``, leave the rest alone.
 
         Missing labels are created with the adapter's colors; existing
         labels are left byte-identical, never overwritten. A 403 on a
         create reads as refused (the account may not create labels in
-        someone else's organisation) and the pass continues; anything
-        else fails closed through ``_write_error``.
+        someone else's organisation) and the pass continues; a 422
+        already-exists on a create reads as kept once the label reads
+        back (a concurrent setup created it first); anything else fails
+        closed through ``_write_error``.
         """
-        try:
-            payload = json.loads(self._run(["api", f"repos/{repo}/labels"]))
-        except Exception as err:
-            raise self._write_error(err) from err
-        if not isinstance(payload, list):
-            raise _fail(f"labels of {repo} are not a list")
-        have = set()
-        for entry in payload:
-            name = entry.get("name") if isinstance(entry, dict) else None
-            if not isinstance(name, str):
-                raise _fail(f"bad label entry {entry!r} on {repo}")
-            have.add(name)
+        have = self._list_label_names(repo)
         created, kept, refused = [], [], []
         for wanted in iface.BOOTSTRAP_LABELS:
             if wanted.name in have:
@@ -409,6 +463,9 @@ class GithubTracker:
                     raise self._write_error(err) from err
                 if _is_refused(err):
                     refused.append(wanted.name)
+                    continue
+                if _is_already_exists(err):
+                    kept.append(self._read_label_name(repo, wanted.name))
                     continue
                 raise self._write_error(err) from err
             created.append(wanted.name)

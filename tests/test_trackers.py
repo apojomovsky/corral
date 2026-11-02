@@ -234,7 +234,7 @@ class BackedEnsureTest(unittest.TestCase):
 
         def run(args):
             calls.append(list(args))
-            if list(args) == ["api", f"repos/{REPO}/labels"]:
+            if list(args) == ["api", f"repos/{REPO}/labels?per_page=100&page=1"]:
                 return "[]"
             if list(args[:4]) == ["api", "--method", "POST", f"repos/{REPO}/labels"]:
                 return "{}"
