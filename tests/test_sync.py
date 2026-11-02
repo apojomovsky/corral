@@ -417,6 +417,39 @@ class StoreErrorKindTest(StoreCase):
         self.assertEqual(len(result.store_errors), 1)
         self.assertIn(f"{REPO}#1", result.store_errors[0])
 
+    def test_sync_repo_reports_two_corrupt_rows_and_applies_the_third(self):
+        # Two corrupt rows in one repo: each is one store-error line
+        # naming its row, and the pass still moves on to the healthy row.
+        for number in (1, 2, 3):
+            self.stored(number, tracker_updated_at=T0 - 100)
+        raw = sqlite3.connect(self.path)
+        try:
+            for number in (1, 2):
+                raw.execute(
+                    "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                    ("{{{broken", REPO, number),
+                )
+            raw.commit()
+        finally:
+            raw.close()
+        fake = FakeTracker(
+            [
+                reading(number=1, updated_at=T0),
+                reading(number=2, updated_at=T0),
+                reading(number=3, updated_at=T0),
+            ]
+        )
+        result = sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 2)
+        self.assertIn(f"{REPO}#1", result.store_errors[0])
+        self.assertIn(f"{REPO}#2", result.store_errors[1])
+        for line in result.store_errors:
+            self.assertNotIn("\n", line)
+        row, _ = self.store.item(REPO, 3, now=T0)
+        self.assertEqual(row.title, "Title")
+
 
 if __name__ == "__main__":
     unittest.main()

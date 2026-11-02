@@ -617,31 +617,9 @@ class NumbersConstructionTest(unittest.TestCase):
             ),
         )
 
-    def test_budget_with_each_field_at_zero_is_a_settings_error(self):
-        # The constructor refuses the zero before budget() can divide by
-        # it: a SettingsError names the field, never a ZeroDivisionError.
-        for field in (
-            "base_minutes",
-            "seconds_per_line",
-            "limit_multiple",
-            "floor_minutes",
-            "ceiling_minutes",
-        ):
-            with self.subTest(field=field):
-                with self.assertRaises(S.SettingsError):
-                    bu.budget(0, bu.Numbers(**self.valid(**{field: 0})))
-
-    def test_max_reviewable_lines_with_each_field_at_zero_is_a_settings_error(self):
-        for field in (
-            "base_minutes",
-            "seconds_per_line",
-            "limit_multiple",
-            "floor_minutes",
-            "ceiling_minutes",
-        ):
-            with self.subTest(field=field):
-                with self.assertRaises(S.SettingsError):
-                    bu.max_reviewable_lines(bu.Numbers(**self.valid(**{field: 0})))
+    # Two budget()/max_reviewable_lines() zero-field tests were deleted
+    # here: Numbers(**{field: 0}) raises in __post_init__ before either
+    # function runs, so both duplicated test_each_field_at_zero_is_refused.
 
 
 class OneResolverTest(unittest.TestCase):
