@@ -233,6 +233,25 @@ class TicketLayer(unittest.TestCase):
         self.assertEqual((found.profile.name, found.provenance.layer), ("fast", 2))
 
 
+class FlagShortCircuit(unittest.TestCase):
+    def test_a_declared_flag_skips_the_store_and_tracker_read(self):
+        tgt = target(resolve(project={"profiles": {"fast": {"runtime": "muse"}}}))
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        fake = FakeTracker([])
+        fake.item_errors[(REPO, NUMBER)] = "down"
+        found = select(tgt, flag="fast", store=store, tracker=fake)
+        self.assertEqual((found.profile.name, found.provenance.layer), ("fast", 1))
+        self.assertEqual(store.calls, [])
+
+    def test_an_undeclared_flag_still_reads_the_store(self):
+        tgt = target(resolve(project={"profiles": {"fast": {"runtime": "muse"}}}))
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        with self.assertRaises(launch.LaunchError) as ctx:
+            select(tgt, flag="nope", store=store)
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertNotEqual(store.calls, [])
+
+
 class Chains(unittest.TestCase):
     def project(self):
         return {

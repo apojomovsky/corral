@@ -23,7 +23,8 @@ from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import accounts, cli, hold, launch, launchcli, models, paths, registry, runtimes
+from corral import accounts, cli, hold, launch, launchcli, models, paths, profiles
+from corral import registry, runtimes
 from corral import settings, units
 from corral.runtimes import muse, omp, opencode
 from tests.test_profiles_launch import FakeStore
@@ -1701,15 +1702,31 @@ runtime = "muse"
             "worker",
             "--title",
             "feat: go",
-            "--profile",
-            "fast",
             store=store,
             tracker=FakeTracker([]),
         )
         self.assertEqual(code, 4)
         self.assertIn("profile assignment", err)
 
-    def test_launch_with_a_dead_tracker_is_exit_3(self):
+    def test_launch_with_profile_survives_a_truncated_store(self):
+        self.write_profiles()
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            store=store,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+
+    def test_launch_without_a_profile_and_a_dead_tracker_is_exit_3(self):
         self.write_profiles()
         store = FakeStore(found=SimpleNamespace(labels=["ready"], extra={}), fresh=False)
         tracker = FakeTracker([])
@@ -1722,12 +1739,181 @@ runtime = "muse"
             "worker",
             "--title",
             "feat: go",
+            store=store,
+            tracker=tracker,
+        )
+        self.assertEqual(code, 3)
+
+    def test_launch_with_profile_survives_a_dead_tracker(self):
+        self.write_profiles()
+        store = FakeStore(found=SimpleNamespace(labels=["ready"], extra={}), fresh=False)
+        tracker = FakeTracker([])
+        tracker.item_errors[("lib", 5)] = "down"
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
             "--profile",
             "fast",
             store=store,
             tracker=tracker,
         )
-        self.assertEqual(code, 3)
+        self.assertEqual((code, err), (0, ""))
+
+    def test_launch_records_the_profile_for_resume(self):
+        self.write_profiles()
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        recorded = profiles.recorded_profile(paths.newest_session("lib", 5, "worker"))
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, "fast")
+        self.assertEqual(recorded.runtime, "muse")
+        self.assertEqual(recorded.layer, 1)
+
+    def test_resume_without_flags_reuses_the_recorded_profile_after_expiry(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                text + '[profiles.fast]\nruntime = "muse"\n[profiles.slow]\nruntime = "omp"\n'
+            )
+        tgt = launch.target(self.root, "lib")
+        now = 1_800_000_000.0
+        live = profiles.Selections(
+            default="slow",
+            override=profiles.Override(scope="global", profile="fast", until=now + 3600),
+        )
+        unit, _ = launch.launch(
+            tgt,
+            5,
+            "do the thing",
+            title="feat: go",
+            role="worker",
+            model="provider-a/model-x",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            pool_fn=lambda: [],
+            ledger_fn=lambda: {"readings": {}, "marks": {}},
+            now_fn=lambda: now,
+            selections=live,
+            store=FakeStore(),
+            tracker=None,
+        )
+        self.system.finish(unit)
+        session = paths.newest_session("lib", 5, "worker")
+        recorded = profiles.recorded_profile(session)
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, "fast")
+        expired = profiles.Selections(
+            default="slow",
+            override=profiles.Override(scope="global", profile="fast", until=now - 10),
+        )
+        resumed, _ = launch.resume(
+            tgt,
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            role="worker",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            pool_fn=lambda: [],
+            ledger_fn=lambda: {"readings": {}, "marks": {}},
+            now_fn=lambda: now + 7200,
+            selections=expired,
+            store=FakeStore(),
+            tracker=None,
+        )
+        (found,) = [e for e in registry.load_all() if e["id"] == resumed]
+        self.assertEqual(found["model"], "provider-a/model-x")
+        self.assertIn("model-x", " ".join(self.system.started[-1]))
+
+    def test_resume_with_runtime_alone_runs_the_named_runtime(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        with open(os.path.join(session, "out.log"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"sessionID": "session-1"}) + "\n")
+        code, out, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", "--runtime", "opencode"
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.registered_runtime(out.split()[2]), "opencode")
+
+    def test_resume_with_an_unknown_runtime_alone_is_exit_4(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        code, _, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", "--runtime", "nope"
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("nope", err)
+
+    def test_resume_with_profile_records_the_new_profile(self):
+        self.write_profiles()
+        self.write_tracker_repo()
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text + '[profiles.slow]\nruntime = "muse"\n')
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "slow",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        recorded = profiles.recorded_profile(paths.newest_session("lib", 5, "worker"))
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, "slow")
 
     def test_resume_with_profile_runs_the_profile_runtime(self):
         self.write_profiles()

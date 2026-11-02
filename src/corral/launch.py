@@ -374,8 +374,9 @@ class SelectedProfile:
     `model` is the `--model` refinement, or None for the runtime default;
     `chains` are the profile's re-routed model chains; `provenance` names
     the deciding layer and source, with any `--model`/`--runtime`
-    refinement noted in its source. The session record persists this
-    (profiles ticket 4); until then it lives only in this return value.
+    refinement noted in its source. `launch` writes this to the session
+    dir next to the runtime record, and a resume without flags runs the
+    recorded profile instead of resolving again.
     """
 
     profile: profiles.Profile
@@ -457,7 +458,11 @@ def select_profile(
     ledger = quota_ledger.load() if ledger is None else ledger
     if selections is None:
         selections = profiles.load_selections()
-    name, source = _store_assignment(store, tracker, tgt, number, moment)
+    if isinstance(flag, str) and flag in parsed:
+        name, source = None, ""
+        tracker = None
+    else:
+        name, source = _store_assignment(store, tracker, tgt, number, moment)
     profile, provenance = profiles.resolve(
         parsed,
         selections,
@@ -685,6 +690,13 @@ def launch(
         session_id = _write_session(
             session, adapter, session_runtime, prompt, runtime_config, chains, role
         )
+        if selection is not None:
+            try:
+                profiles.record_profile(
+                    session, selection.profile, selection.provenance, model=selection.model
+                )
+            except (profiles.ProfileError, OSError) as err:
+                raise LaunchError(f"cannot write the agent's profile record: {err}") from None
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, _next_unit_gen(leaves))
             try:
@@ -818,12 +830,16 @@ def resume(
     """Resume ticket `number`'s newest session of `role` in a new unit.
 
     Returns `(unit, workdir)`. `role` None resumes the worker session.
-    Without flags the runtime is the one the session recorded at launch,
-    and the reviewer mode is the one the launch ran with: a resumed
-    reviewer stays read-only. With `--profile` (or `--model`/`--runtime`)
-    the flag layer decides for the resumed run instead, the same way it
-    does at launch; reusing the recorded profile without flags lands with
-    the session record (profiles ticket 4).
+    Without flags the run reuses the profile the session recorded at
+    launch (runtime and model head), so a session started under an
+    override keeps its setup after the override expires; a session from
+    before profiles were recorded falls back to its recorded runtime.
+    With `--profile` (or `--model`/`--runtime`) the flag layer decides
+    for the resumed run instead, the same way it does at launch, and the
+    new profile is recorded over the old one. A lone `--runtime` without
+    any declared profile still switches the run to that runtime.
+    The reviewer mode is the one the launch ran with: a resumed reviewer
+    stays read-only.
     Raises LaunchError when there is no session to resume, and HeldError
     when the ticket is held for a human. `hold_reason_fn(tgt, number)`
     returns the hold text, or None when the ticket is free to resume; it
@@ -856,7 +872,15 @@ def resume(
             now=(now_fn or time.time)(),
         )
     if selection is None:
-        adapter = _adapter(runtimes.recorded(session))
+        recorded = profiles.recorded_profile(session)
+        if recorded is not None:
+            adapter = _adapter(recorded.runtime)
+            if model is None:
+                model = recorded.model
+        else:
+            adapter = _adapter(runtimes.recorded(session))
+        if runtime is not None:
+            adapter = _adapter(runtime)
     else:
         adapter = _adapter(selection.runtime)
         model = selection.model
@@ -890,8 +914,22 @@ def resume(
             raise _no_session(tgt, number, role, "session to resume")
         if selection is not None:
             adapter = _adapter(selection.runtime)
+            try:
+                profiles.record_profile(
+                    session, selection.profile, selection.provenance, model=selection.model
+                )
+            except (profiles.ProfileError, OSError) as err:
+                raise LaunchError(f"cannot write the agent's profile record: {err}") from None
         else:
-            adapter = _adapter(runtimes.recorded(session))
+            reread = profiles.recorded_profile(session)
+            if reread is not None:
+                adapter = _adapter(reread.runtime)
+                if model is None:
+                    model = reread.model
+            else:
+                adapter = _adapter(runtimes.recorded(session))
+            if runtime is not None:
+                adapter = _adapter(runtime)
         recorded = _recorded_role(session)
         handle = adapter.resume_handle(session)
         if handle is None:
@@ -926,7 +964,7 @@ def resume(
             number,
             model,
             recorded,
-            runtime=selection.runtime if selection is not None else None,
+            runtime=selection.runtime if selection is not None else runtime,
         )
         try:
             units.start(argv, session, unit, run=run)
