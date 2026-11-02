@@ -680,14 +680,15 @@ def _close_previous(tgt, number, list_fn):
     return closed
 
 
-def _register_started(tgt, unit, number, model, role=None, runtime=None):
+def _register_started(tgt, unit, number, model, role=None, runtime=None, profile=None):
     """Register the unit before it starts, so agent list and snapshot show it.
 
     The ticket names the registered project of the ops root, so the
     agent counts for the same project its unit prefix counts for. The
     role is recorded too, so snapshot shows reviewer vs worker. `runtime`
     overrides the target's runtime: the profile path registers the
-    resolved (possibly refined) runtime instead.
+    resolved (possibly refined) runtime instead. `profile` is the
+    resolved profile's name, so snapshot shows the recorded profile.
     Raises LaunchError naming the unit when the registry cannot record
     it; the unit is not running yet.
     """
@@ -700,6 +701,7 @@ def _register_started(tgt, unit, number, model, role=None, runtime=None):
             ticket=ticket,
             model=model,
             role=role,
+            profile=profile,
         )
     except (registry.RegistryError, OSError) as err:
         raise LaunchError(f"cannot register the agent {unit}: {err}") from None
@@ -917,7 +919,15 @@ def launch(
             if session_id is not None:
                 _drop_session_id(session)
             raise
-        _register_started(tgt, unit, number, model, role, runtime=session_runtime)
+        _register_started(
+            tgt,
+            unit,
+            number,
+            model,
+            role,
+            runtime=session_runtime,
+            profile=selection.profile.name if selection is not None else None,
+        )
         try:
             _ensure_slices(decided, run)
             units.start(argv, session, unit, run=run)
@@ -1067,6 +1077,7 @@ def resume(
         )
     if selection is None:
         recorded = profiles.recorded_profile(session)
+        profile_name = recorded.name if recorded is not None else None
         if recorded is not None:
             adapter = _adapter(recorded.runtime)
             if model is None:
@@ -1078,6 +1089,7 @@ def resume(
     else:
         adapter = _adapter(selection.runtime)
         model = selection.model
+        profile_name = selection.profile.name
     recorded = _recorded_role(session)
     handle = adapter.resume_handle(session)
     if handle is None:
@@ -1132,6 +1144,7 @@ def resume(
                 raise LaunchError(f"cannot write the agent's profile record: {err}") from None
         else:
             reread = profiles.recorded_profile(session)
+            profile_name = reread.name if reread is not None else None
             if reread is not None:
                 adapter = _adapter(reread.runtime)
                 if model is None:
@@ -1186,6 +1199,7 @@ def resume(
             model,
             recorded,
             runtime=selection.runtime if selection is not None else runtime,
+            profile=profile_name,
         )
         try:
             _ensure_slices(decided, run)
