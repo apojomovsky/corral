@@ -40,6 +40,14 @@ settings.register(
     "seconds before a freshness-gated read re-reads a board row live",
 )
 
+#: Agent-id namespaces never adopted from tracker labels: ids the
+#: dispatch loop mints. A label carrying one stays unadopted and is
+#: reported, so a foreign label can never read as a managed holder.
+#: Mirrors `drive.MANAGED_PREFIX` (the loop owns that namespace; this
+#: module sits below it, so the value is repeated here and a test pins
+#: the copies).
+RESERVED_AGENT_PREFIXES = ("drive-",)
+
 #: The cursor name this module keeps in the store's cursor table.
 CURSOR_NAME = "tracker"
 
@@ -216,9 +224,12 @@ def resync_repo(
     This is the only path that rebuilds claims: when the tracker shows
     an agent and the store holds no claim and no queued or sent agent
     write for the item, the claim is adopted with a recovery epoch. A
-    stored claim naming a different agent with nothing queued is a
-    conflict between hosts: the store wins, and the item is reported in
-    ``conflicts`` instead. Incremental sync and audit never adopt.
+    shown agent inside the reserved loop namespaces is never adopted:
+    the row stays unclaimed and is reported, so a foreign label can
+    never read as a managed holder. A stored claim naming a different
+    agent with nothing queued is a conflict between hosts: the store
+    wins, and the item is reported in ``conflicts`` instead.
+    Incremental sync and audit never adopt.
     """
     seen = 0
     listed: set[int] = set()
@@ -255,6 +266,12 @@ def resync_repo(
     }
     for shown_repo, shown_number, shown_agent in shown:
         if (shown_repo, shown_number) in spoken:
+            continue
+        if shown_agent.startswith(RESERVED_AGENT_PREFIXES):
+            conflicts.append(
+                f"{shown_repo}#{shown_number}: tracker shows reserved id"
+                f" {shown_agent!r}, left unclaimed"
+            )
             continue
         try:
             stored, _ = store.item(shown_repo, shown_number, now=now)

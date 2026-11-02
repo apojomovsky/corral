@@ -595,9 +595,9 @@ def _registration_conflicts(directory, target, name, prefix, root):
         seen = raw.get("unit_prefix")
         # Raw text: normalize the spelling the way every load does, so a
         # cross-spelling collision still reads as one prefix.
-        if isinstance(seen, str) and projects.terminated(seen) == prefix:
+        if isinstance(seen, str) and projects.terminated(seen) == projects.terminated(prefix):
             raise InitError(
-                f"{target}: unit_prefix {prefix!r} is already "
+                f"{target}: unit_prefix {projects.terminated(prefix)!r} is already "
                 f"registered by project {stem!r} ({path})"
             )
         claimed = raw.get("root")

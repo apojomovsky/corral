@@ -181,6 +181,22 @@ class TimerState(unittest.TestCase):
         self.assertEqual(seen, [["systemctl", "--user", "is-enabled", drive.TIMER_NAME]])
 
 
+class PeriodSetting(unittest.TestCase):
+    def test_period_is_a_registered_setting_defaulting_to_the_shipped_cadence(self):
+        self.assertEqual(drive.settings.REGISTRY["drive.period"].default, drive.TIMER_ON_CALENDAR)
+
+    def test_a_blank_period_is_rejected(self):
+        with self.assertRaises(drive.settings.SettingsError):
+            drive.settings.resolve(host={"drive.period": "  "}, project={}, env={})
+
+    def test_timer_text_renders_a_given_period(self):
+        text = drive.timer_text("*-*-* *:00:00")
+        self.assertIn("OnCalendar=*-*-* *:00:00", text)
+
+    def test_timer_text_defaults_to_the_shipped_cadence(self):
+        self.assertIn(f"OnCalendar={drive.TIMER_ON_CALENDAR}", drive.timer_text())
+
+
 class InstallTimer(unittest.TestCase):
     def test_install_writes_both_units_then_reloads_and_enables(self):
         env = home_env()
@@ -284,13 +300,51 @@ class InstallVerb(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
 
-        with mock.patch.object(drive, "install_timer", return_value=("/s", "/t")) as installed:
+        with (
+            mock.patch.object(drive, "install_timer", return_value=("/s", "/t")) as installed,
+            mock.patch.object(drive.settings, "load", return_value={"drive.period": "*:0/5"}),
+        ):
             with redirect_stdout(io.StringIO()):
                 code = drivehub.cmd_drive(
                     argparse.Namespace(plan=False, drive_verb="install-timer")
                 )
-        installed.assert_called_once_with()
+        installed.assert_called_once_with(period="*:0/5")
         self.assertEqual(code, 0)
+
+    def test_install_resolves_the_period_from_settings(self):
+        import io
+        from contextlib import redirect_stdout
+
+        with (
+            mock.patch.object(drive, "install_timer", return_value=("/s", "/t")) as installed,
+            mock.patch.object(drive.settings, "load", return_value={"drive.period": "hourly"}),
+        ):
+            with redirect_stdout(io.StringIO()):
+                code = drivehub.cmd_drive(
+                    argparse.Namespace(plan=False, drive_verb="install-timer")
+                )
+        installed.assert_called_once_with(period="hourly")
+        self.assertEqual(code, 0)
+
+    def test_install_with_unreadable_settings_is_exit_four(self):
+        import io
+        from contextlib import redirect_stderr
+
+        with (
+            mock.patch.object(
+                drive, "install_timer", side_effect=AssertionError("must not install")
+            ),
+            mock.patch.object(
+                drive.settings,
+                "load",
+                side_effect=drive.settings.SettingsError("host config: boom"),
+            ),
+        ):
+            with redirect_stderr(io.StringIO()):
+                code = drivehub.cmd_drive(
+                    argparse.Namespace(plan=False, drive_verb="install-timer")
+                )
+        self.assertEqual(code, 4)
 
     def test_a_pass_never_reaches_the_install_step(self):
         with mock.patch.object(
@@ -333,7 +387,10 @@ class InstallVerb(unittest.TestCase):
         from contextlib import redirect_stdout
 
         out = io.StringIO()
-        with mock.patch.object(drive, "install_timer", return_value=("/u/svc", "/u/tmr")):
+        with (
+            mock.patch.object(drive, "install_timer", return_value=("/u/svc", "/u/tmr")),
+            mock.patch.object(drive.settings, "load", return_value={"drive.period": "*:0/5"}),
+        ):
             with redirect_stdout(out):
                 code = drivehub.cmd_drive(
                     argparse.Namespace(plan=False, drive_verb="install-timer")
@@ -341,6 +398,28 @@ class InstallVerb(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("/u/svc", out.getvalue())
         self.assertIn(drive.TIMER_NAME, out.getvalue())
+
+    def test_install_writes_a_given_period(self):
+        env = home_env()
+        seen = []
+
+        def run(argv, timeout):
+            seen.append(argv)
+            return proc("")
+
+        _, timer_path = drive.install_timer(env=env, run=run, period="*-*-* *:00:00")
+        with open(timer_path, encoding="utf-8") as handle:
+            self.assertIn("OnCalendar=*-*-* *:00:00", handle.read())
+
+    def test_install_defaults_to_the_shipped_cadence(self):
+        env = home_env()
+
+        def run(argv, timeout):
+            return proc("")
+
+        _, timer_path = drive.install_timer(env=env, run=run)
+        with open(timer_path, encoding="utf-8") as handle:
+            self.assertIn(f"OnCalendar={drive.TIMER_ON_CALENDAR}", handle.read())
 
     def test_install_failure_maps_to_the_public_exit_codes(self):
         import io
@@ -350,7 +429,10 @@ class InstallVerb(unittest.TestCase):
             (drive.TimerError("cannot write"), 4),
             (units.Unreachable("no bus"), 3),
         ):
-            with mock.patch.object(drive, "install_timer", side_effect=error):
+            with (
+                mock.patch.object(drive, "install_timer", side_effect=error),
+                mock.patch.object(drive.settings, "load", return_value={"drive.period": "*:0/5"}),
+            ):
                 with redirect_stderr(io.StringIO()):
                     code = drivehub.cmd_drive(
                         argparse.Namespace(plan=False, drive_verb="install-timer")
