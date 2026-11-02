@@ -276,6 +276,87 @@ class OperatorCommandTest(unittest.TestCase):
         code, _ = self.run_hub("rotate-token", "--id", "host-9")
         self.assertEqual(code, 4)
 
+    def test_open_store_failures_are_usage_errors_with_stderr(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import paths
+
+        for argv in (
+            ("remove-host", "--id", "host-1"),
+            ("release", "app", "7"),
+            ("rotate-token", "--id", "host-1"),
+        ):
+            with self.subTest(argv=argv):
+                args = self.parse(*argv)
+                err = io.StringIO()
+                with mock.patch.object(
+                    paths, "hub_db_path", side_effect=paths.PathError("no state")
+                ):
+                    with redirect_stderr(err):
+                        code = args.func(args)
+                self.assertEqual(code, 4)
+                self.assertTrue(err.getvalue())
+
+    def test_unopenable_database_is_a_usage_error_for_every_verb(self):
+        import io
+        import json
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import hub as hub_module
+        from corral import paths
+        from corral import settings
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-cli-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                export_file = os.path.join(state, "hub-export.json")
+                with open(export_file, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "export_version": hub.EXPORT_VERSION,
+                            "hosts": [],
+                            "projects": [],
+                            "claims": [],
+                            "membership_epoch": 0,
+                        },
+                        handle,
+                    )
+                # backup_hub reads the source with sqlite3 directly instead
+                # of open_db, so the patched open_db below is inert for it:
+                # a garbage source exercises its unopenable branch for real.
+                db_path = paths.hub_db_path()
+                os.makedirs(os.path.dirname(db_path), exist_ok=True)
+                with open(db_path, "wb") as handle:
+                    handle.write(b"this is not a database")
+                for argv in (
+                    ("add-host", "--id", "host-1"),
+                    ("serve",),
+                    ("export",),
+                    ("import", "--file", export_file),
+                    ("backup", "--to", os.path.join(state, "hub-backup.sqlite")),
+                    ("remove-host", "--id", "host-1"),
+                    ("release", "app", "7"),
+                    ("rotate-token", "--id", "host-1"),
+                ):
+                    with self.subTest(argv=argv):
+                        args = self.parse(*argv)
+                        err = io.StringIO()
+                        with mock.patch.object(
+                            settings,
+                            "load",
+                            return_value={"hub.lease_ttl_s": 90, "hub.stale_after_s": 90},
+                        ):
+                            with mock.patch.object(
+                                hub_module, "open_db", side_effect=hub.HubError("disk gone")
+                            ):
+                                with redirect_stderr(err):
+                                    with redirect_stdout(io.StringIO()):
+                                        code = args.func(args)
+                        self.assertEqual(code, 4)
+                        self.assertTrue(err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
