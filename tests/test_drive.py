@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, cli, drive, drivehub, launch, quota_ledger
+from corral import admission, board, cli, drive, drivehub, launch, quota_ledger, settings
 from corral import projects as projects_mod
 from tests.test_tracker import FakeTracker, reading
 
@@ -559,7 +559,9 @@ class HoldLabelWiringTest(unittest.TestCase):
             return 0
 
         store = mock.MagicMock()
-        host_settings = {"drive.max_starts_per_day": 50, "board.hold_label": "paused"}
+        host_settings = settings.resolve(
+            env={}, flags={"drive.max_starts_per_day": 50, "board.hold_label": "paused"}
+        )
         old = os.environ.get("CORRAL_STATE")
         os.environ["CORRAL_STATE"] = self.tmp.name
         try:

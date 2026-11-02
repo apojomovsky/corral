@@ -8,6 +8,7 @@ tracker is an in-memory double; the launcher and stop seam are
 recording fakes. No `gh`, no systemd, no network, no real state dir.
 """
 
+import argparse
 import io
 import os
 import sqlite3
@@ -15,8 +16,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, drivehub, hub, registry
-from tests.test_drive import stored
+from corral import board, drive, drivehub, hub, registry, settings
+from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, FakeStop, claimed
 from tests.test_tracker import FakeTracker, reading
@@ -735,27 +736,112 @@ class HubStuckWiringTest(unittest.TestCase):
         self.assertEqual(found.epoch, made.epoch)
 
 
+def resolved_with(hub_url="", hub_host_id=""):
+    """A real `settings.Resolved`, so a dict can no longer stand in at the seam."""
+    return settings.resolve(host={"hub": {"url": hub_url, "host_id": hub_host_id}}, env={})
+
+
 class HubClientForTest(unittest.TestCase):
     def test_no_url_means_no_client(self):
-        self.assertIsNone(
-            drivehub.hub_client_for({"hub.url": "", "hub.host_id": ""}, token_path="/t")
-        )
+        self.assertIsNone(drivehub.hub_client_for(resolved_with(), token_path="/t"))
 
     def test_url_without_host_id_is_refused(self):
         with self.assertRaises(drive.HubConfigError):
-            drivehub.hub_client_for(
-                {"hub.url": "http://host-1:8000", "hub.host_id": ""}, token_path="/t"
-            )
+            drivehub.hub_client_for(resolved_with(hub_url="http://host-1:8000"), token_path="/t")
 
     def test_client_carries_url_host_and_token_path(self):
         client = drivehub.hub_client_for(
-            {"hub.url": "http://host-1:8000", "hub.host_id": "host-1"}, token_path="/t/hub-token"
+            resolved_with(hub_url="http://host-1:8000", hub_host_id="host-1"),
+            token_path="/t/hub-token",
         )
         assert client is not None
         self.assertEqual(
             (client.url, client.host_id, client.token_path),
             ("http://host-1:8000", "host-1", "/t/hub-token"),
         )
+
+
+class CmdDrivePlanTest(unittest.TestCase):
+    """`cmd_drive --plan` over a real temporary root: exit 0, zero hub calls.
+
+    The store, host config, project registry and ops root are real
+    files in temporary directories; the seeded rows stand for
+    tracker-synced state (`--plan` never contacts a tracker). The
+    systemd seam reads empty through a stubbed `units.list_units`,
+    and agent state reads empty from the fresh temp state dir. With
+    no hub configured no hub client is ever built; with `hub.url`
+    set the plan still makes zero hub calls, through a recording
+    fake standing at the client seam.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-cmd-")
+        self.addCleanup(self.tmp.cleanup)
+        self.state = os.path.join(self.tmp.name, "state")
+        self.config = os.path.join(self.tmp.name, "config")
+        self.ops = os.path.join(self.tmp.name, "ops")
+        os.makedirs(os.path.join(self.config, "projects.d"))
+        os.makedirs(self.ops)
+        store = stored(os.path.join(self.state, "board.sqlite"), [("app", 7, "open")])
+        store.close()
+        with open(os.path.join(self.ops, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write("")
+        with open(os.path.join(self.ops, "policy.py"), "w", encoding="utf-8") as handle:
+            handle.write(policy_source([("app", 7, "start")]))
+        with open(
+            os.path.join(self.config, "projects.d", "blue.toml"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(
+                "name = 'blue'\n"
+                "unit_prefix = 'blue-agent-'\n"
+                f"root = {self.ops!r}\n"
+                "eligibility = 'policy.py:eligible'\n"
+            )
+        env = {"CORRAL_STATE": self.state, "CORRAL_CONFIG": self.config}
+        self._env_patch = mock.patch.dict(os.environ, env)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        units_patch = mock.patch("corral.units.list_units", return_value=[])
+        units_patch.start()
+        self.addCleanup(units_patch.stop)
+
+    def run_plan(self):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive.sys, "stdout", out),
+            mock.patch.object(drive.sys, "stderr", err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=True, drive_verb=None))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_plan_with_no_hub_configured_exits_zero(self):
+        class BombClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("single-host plan must not build a hub client")
+
+        with mock.patch.object(drivehub.hubmod, "HubClient", BombClient):
+            code, logged, errors = self.run_plan()
+        self.assertEqual(code, 0)
+        self.assertIn("app#7", logged)
+        self.assertEqual(errors, "")
+
+    def test_plan_with_hub_configured_makes_zero_hub_calls(self):
+        with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[hub]\nurl = "http://host-1:8000"\nhost_id = "host-1"\n')
+
+        class FakeHubClient:
+            built = []
+
+            def __init__(self, url, host_id, token_path, **kwargs):
+                FakeHubClient.built.append((url, host_id, token_path))
+                self.calls = []
+
+        with mock.patch.object(drivehub.hubmod, "HubClient", FakeHubClient):
+            code, logged, errors = self.run_plan()
+        self.assertEqual(code, 0)
+        self.assertIn("app#7", logged)
+        self.assertEqual(errors, "")
+        self.assertEqual(FakeHubClient.built, [])
 
 
 class HubVersionMappingTest(unittest.TestCase):
