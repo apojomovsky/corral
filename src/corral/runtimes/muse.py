@@ -208,13 +208,22 @@ def options_schema():
 
 
 def _effort_of(config, session_dir):
-    """The `--reasoning-effort` value: the recorded option, else the default."""
+    """The `--reasoning-effort` value: the recorded option, else the default.
+
+    A recorded string outside the binary's tiers refuses the run, so a
+    hand-edited config fails closed instead of reaching the binary.
+    """
     if EFFORT_KEY not in config:
         return DEFAULT_EFFORT
     effort = config[EFFORT_KEY]
+    path = os.path.join(session_dir, CONFIG_NAME)
     if not isinstance(effort, str):
-        path = os.path.join(session_dir, CONFIG_NAME)
         raise ValueError(f"cannot parse {path}: want reasoning_effort to be a string")
+    if effort not in EFFORT_TIERS:
+        tiers = ", ".join(sorted(EFFORT_TIERS))
+        raise ValueError(
+            f"cannot parse {path}: want reasoning_effort to be one of {tiers}, not {effort!r}"
+        )
     return effort
 
 

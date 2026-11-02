@@ -631,6 +631,11 @@ class ProfileOptions(SessionCase):
         with self.assertRaisesRegex(ValueError, "muse.json"):
             muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
 
+    def test_an_out_of_tier_effort_refuses_the_run(self):
+        self.write_options({"reasoning_effort": "turbo"})
+        with self.assertRaisesRegex(ValueError, "muse.json"):
+            muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+
     def test_a_non_boolean_parallel_flag_refuses_the_run(self):
         self.write_options({"parallel_tool_calls": "yes"})
         with self.assertRaisesRegex(ValueError, "muse.json"):
