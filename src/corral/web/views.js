@@ -3,7 +3,16 @@
 // Bar geometry rides on SVG attributes, never CSS: the policy
 // allows no inline style, so a width can only be an attribute.
 
-import { agentKey, detailHash, hasTicket, isErrorSection, snapshotProjects } from "./api.js";
+import {
+  LOG_EVENTS_CAP,
+  LOG_JOURNAL_CAP,
+  LOG_KINDS,
+  agentKey,
+  detailHash,
+  hasTicket,
+  isErrorSection,
+  snapshotProjects,
+} from "./api.js";
 import {
   cleanText,
   formatAge,
@@ -11,6 +20,7 @@ import {
   formatClock,
   formatPct,
   parseEpoch,
+  parseIso,
 } from "./fmt.js";
 
 // The element namespace for inline charts. A namespace identifier,
@@ -469,10 +479,17 @@ function agentsSection(agents, project, nowMs) {
   return section;
 }
 
-function chipsNodes(projects, selected) {
+// One chip row builder for both views: the log view links back to
+// its own route, the overview to its own. The base stays explicit
+// so the two link shapes cannot drift apart unnoticed.
+function chipsNodes(projects, selected, base) {
   const nodes = [];
   const all = document.createElement("a");
-  all.setAttribute("href", "#/");
+  if (base === "#/log") {
+    all.setAttribute("href", "#/log");
+  } else {
+    all.setAttribute("href", "#/");
+  }
   all.textContent = "All";
   if (selected === null) {
     all.setAttribute("aria-current", "true");
@@ -480,7 +497,11 @@ function chipsNodes(projects, selected) {
   nodes.push(all);
   for (const name of projects) {
     const chip = document.createElement("a");
-    chip.setAttribute("href", "#/?project=" + encodeURIComponent(name));
+    if (base === "#/log") {
+      chip.setAttribute("href", "#/log?project=" + encodeURIComponent(name));
+    } else {
+      chip.setAttribute("href", "#/?project=" + encodeURIComponent(name));
+    }
     chip.textContent = cleanText(name);
     if (name === selected) {
       chip.setAttribute("aria-current", "true");
@@ -490,8 +511,28 @@ function chipsNodes(projects, selected) {
   return nodes;
 }
 
-export function renderChips(projects, selected) {
-  document.getElementById("chips").replaceChildren(...chipsNodes(projects, selected));
+export function renderChips(projects, selected, base) {
+  document.getElementById("chips").replaceChildren(...chipsNodes(projects, selected, base));
+}
+
+// The view tabs. The board arrives with its own view and hub mode
+// adds hosts; each view renders its own tab as current.
+export function renderTabs(current) {
+  const nav = document.getElementById("tabs");
+  nav.textContent = "";
+  const tabs = [
+    ["#/", "Overview", "overview"],
+    ["#/log", "Log", "log"],
+  ];
+  for (const [href, label, name] of tabs) {
+    const link = document.createElement("a");
+    link.setAttribute("href", href);
+    link.textContent = label;
+    if (name === current) {
+      link.setAttribute("aria-current", "true");
+    }
+    nav.appendChild(link);
+  }
 }
 
 function headerLine(header) {
@@ -522,6 +563,7 @@ function headerLine(header) {
 // the last good page in place for the poll loop's catch instead of
 // a half-drawn update.
 export function renderOverview(doc, { project, nowMs, notice }) {
+  renderTabs("overview");
   const chips = chipsNodes(snapshotProjects(doc), project);
   const cards = [
     headerLine(doc.fleet_header),
@@ -563,6 +605,8 @@ function fieldValue(value) {
 // overview; the tail pane is owned by the tail poll and stays put
 // across field re-renders.
 export function renderDetail(row, { nowMs }) {
+  // No tab is current on a detail: the tabs name the list views only.
+  renderTabs(null);
   const info = row && typeof row === "object" ? row : {};
   const project =
     typeof info.project === "string" && info.project !== "" ? info.project : null;
@@ -600,6 +644,7 @@ export function renderDetail(row, { nowMs }) {
 // A detail key that names nothing in the fresh document. States the
 // miss in the detail pane; never a guessed neighbour.
 export function renderDetailMissing() {
+  renderTabs(null);
   document.getElementById("chips").hidden = true;
   document.getElementById("cards").hidden = true;
   document.getElementById("agents").hidden = true;
@@ -643,6 +688,190 @@ export function renderTailPaused(paused) {
 export function renderTailButtons(paused, follow) {
   document.getElementById("tail-pause").textContent = paused ? "tail: resume" : "tail: pause";
   document.getElementById("tail-follow").textContent = follow ? "follow: on" : "follow: off";
+}
+
+function eventLine(row, nowMs) {
+  const kind = row.kind === null || row.kind === undefined ? "unknown" : String(row.kind);
+  const ref = row.ref === null || row.ref === undefined ? "no ref" : String(row.ref);
+  const raw = row.evidence === null || row.evidence === undefined ? "" : String(row.evidence);
+  const evidence = raw === "" ? "no evidence" : raw;
+  return kind + " " + ref + ": " + evidence + " (" + formatAge(parseIso(row.first_seen), nowMs) + ")";
+}
+
+function eventsCard(view, nowMs) {
+  const total = typeof view.eventsTotal === "number" ? view.eventsTotal : view.events.length;
+  const section = card("needs attention (" + String(total) + ")");
+  if (view.eventsState === "missing") {
+    section.appendChild(el("p", "Choose a project to see its log."));
+    return section;
+  }
+  if (view.eventsState === "unknown") {
+    section.appendChild(el("p", "Unknown project " + String(view.project) + "."));
+    return section;
+  }
+  if (view.eventsState === "failed") {
+    section.appendChild(el("p", "Cannot load events right now; the next poll retries."));
+    return section;
+  }
+  if (view.events.length === 0) {
+    section.appendChild(el("p", "No unresolved events."));
+    return section;
+  }
+  const list = document.createElement("ul");
+  for (const row of view.events) {
+    const item = document.createElement("li");
+    item.appendChild(el("span", eventLine(row, nowMs)));
+    list.appendChild(item);
+  }
+  section.appendChild(list);
+  if (total > view.events.length) {
+    section.appendChild(
+      el("p", "Showing " + String(view.events.length) + " of " + String(total) + "."),
+    );
+  }
+  return section;
+}
+
+function kindChips(selected) {
+  const wrap = document.createElement("div");
+  wrap.setAttribute("class", "kinds");
+  const all = document.createElement("button");
+  all.setAttribute("type", "button");
+  all.setAttribute("data-log-kind", "");
+  all.textContent = "all";
+  if (selected === null) {
+    all.setAttribute("aria-current", "true");
+  }
+  wrap.appendChild(all);
+  for (const kind of LOG_KINDS) {
+    const chip = document.createElement("button");
+    chip.setAttribute("type", "button");
+    chip.setAttribute("data-log-kind", kind);
+    chip.textContent = cleanText(kind);
+    if (kind === selected) {
+      chip.setAttribute("aria-current", "true");
+    }
+    wrap.appendChild(chip);
+  }
+  return wrap;
+}
+
+function journalEntryNode(row, nowMs) {
+  const kind = row.kind === null || row.kind === undefined ? "unknown" : String(row.kind);
+  const holder = row.holder === null || row.holder === undefined ? "unknown" : String(row.holder);
+  const item = document.createElement("li");
+  item.appendChild(el("span", formatAge(parseIso(row.at), nowMs) + " " + kind + " " + holder));
+  const refs = Array.isArray(row.refs) ? row.refs : [];
+  if (refs.length > 0) {
+    item.appendChild(el("span", " refs: " + refs.map((ref) => String(ref)).join(", ")));
+  }
+  const text = row.text === null || row.text === undefined ? "" : String(row.text);
+  item.appendChild(el("p", text === "" ? "(empty entry)" : text));
+  return item;
+}
+
+function journalCard(view, nowMs) {
+  const total = typeof view.journalTotal === "number" ? view.journalTotal : 0;
+  const section = card("journal (" + String(total) + ")");
+  if (view.journalState === "missing") {
+    section.appendChild(el("p", "Choose a project above to read its logbook."));
+    return section;
+  }
+  if (view.journalState === "unknown") {
+    section.appendChild(el("p", "Unknown project " + String(view.project) + "."));
+    return section;
+  }
+  section.appendChild(kindChips(view.kind));
+  if (view.journalState === "failed") {
+    section.appendChild(el("p", "Cannot load the journal right now; the next poll retries."));
+    return section;
+  }
+  if (view.journal.length === 0) {
+    section.appendChild(el("p", "No entries yet."));
+    return section;
+  }
+  const list = document.createElement("ul");
+  for (const row of view.journal) {
+    list.appendChild(journalEntryNode(row, nowMs));
+  }
+  section.appendChild(list);
+  section.appendChild(
+    el(
+      "p",
+      "Showing " +
+        String(view.journalStart + 1) +
+        "-" +
+        String(view.journalStart + view.journal.length) +
+        " of " +
+        String(total) +
+        ".",
+    ),
+  );
+  if (view.history) {
+    section.appendChild(el("p", "Browsing history; the newest entries pause here."));
+    const latest = document.createElement("button");
+    latest.setAttribute("type", "button");
+    latest.setAttribute("data-log-latest", "");
+    latest.textContent = "back to latest";
+    section.appendChild(latest);
+  }
+  if (view.journalStart > 0 && view.journal.length < LOG_JOURNAL_CAP) {
+    const older = document.createElement("button");
+    older.setAttribute("type", "button");
+    older.setAttribute("data-log-older", "");
+    older.textContent = "load older";
+    section.appendChild(older);
+  } else if (view.journal.length >= LOG_JOURNAL_CAP) {
+    section.appendChild(
+      el(
+        "p",
+        "Showing the newest " +
+          String(LOG_JOURNAL_CAP) +
+          " entries; narrow the kind filter to see older ones.",
+      ),
+    );
+  }
+  return section;
+}
+
+// The log view: one project at a time, its unresolved stack over
+// its logbook. "All" shows the project picker, never a merged log.
+export function renderLog(view, { nowMs, notice }) {
+  renderTabs("log");
+  // The detail view hides these sections; coming back unhides them.
+  document.getElementById("detail").hidden = true;
+  const nav = document.getElementById("chips");
+  nav.hidden = false;
+  renderChips(view.choices, view.project, "#/log");
+  const note = document.getElementById("notice");
+  note.textContent = "";
+  if (notice) {
+    note.hidden = false;
+    note.appendChild(document.createTextNode(cleanText(notice)));
+  } else {
+    note.hidden = true;
+  }
+  const cards = document.getElementById("cards");
+  cards.textContent = "";
+  if (view.derivedOnly) {
+    cards.appendChild(el("p", "Project list is derived from activity only."));
+  }
+  if (view.project === null) {
+    const section = card("log");
+    section.appendChild(el("p", "Choose a project to see its log."));
+    cards.appendChild(section);
+  } else if (view.unknown) {
+    const section = card("log");
+    section.appendChild(el("p", "Unknown project " + String(view.project) + "."));
+    cards.appendChild(section);
+  } else {
+    cards.appendChild(eventsCard(view, nowMs));
+    cards.appendChild(journalCard(view, nowMs));
+  }
+  cards.hidden = false;
+  const agents = document.getElementById("agents");
+  agents.hidden = false;
+  agents.textContent = "";
 }
 
 // A fatal gate: the API major moved or the document schema is too
