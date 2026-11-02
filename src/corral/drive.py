@@ -801,9 +801,14 @@ def timer_text(period=None) -> str:
     """The shipped timer unit: wake the pass, catching up one missed tick. Pure.
 
     `period` is the `OnCalendar=` cadence; None renders the shipped
-    default. A blank period renders verbatim and fails loudly at the
-    manager, never silently: the settings check refuses it first.
+    default. A blank period raises `TimerError` (exit 4): the seam fails
+    closed no matter which caller passes it.
     """
+    if period is not None:
+        try:
+            _nonblank_period(period)
+        except ValueError as err:
+            raise TimerError(str(err)) from None
     return (
         "[Unit]\n"
         "Description=run the corral dispatch pass on its schedule\n"
@@ -917,8 +922,10 @@ def install_timer(
     CLI reaches it only through `corral drive install-timer`. `period`
     is the `OnCalendar=` cadence baked into the timer unit (None keeps
     the shipped default); the install-timer step resolves it from the
-    `drive.period` setting.
+    `drive.period` setting. A blank period raises `TimerError` before
+    anything is written.
     """
+    timer = timer_text(period)
     directory = timer_dir(env)
     try:
         os.makedirs(directory, exist_ok=True)
@@ -927,7 +934,7 @@ def install_timer(
     service_path, timer_path = unit_paths(env)
     try:
         paths.atomic_write_text(service_path, service_text(corral_bin))
-        paths.atomic_write_text(timer_path, timer_text(period))
+        paths.atomic_write_text(timer_path, timer)
     except OSError as err:
         raise TimerError(f"cannot write the timer units: {err}") from None
     _timer_systemctl(["daemon-reload"], run)
@@ -3417,7 +3424,14 @@ def _launching_pass(
     else:
         present_agents = frozenset(present_agents or ())
         live_units = frozenset(live_units or ())
-    authors = finished_holders(store, agent_states=agent_states) if agent_states is not None else {}
+    if agent_states is not None:
+        try:
+            authors = finished_holders(store, agent_states=agent_states)
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"corral drive: finished holder capture skipped ({problem})", file=err)
+            authors = {}
+    else:
+        authors = {}
     finished = resolve_finished(finished_for, authors)
     if agent_states is not None:
         try:

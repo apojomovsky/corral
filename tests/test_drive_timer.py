@@ -196,6 +196,12 @@ class PeriodSetting(unittest.TestCase):
     def test_timer_text_defaults_to_the_shipped_cadence(self):
         self.assertIn(f"OnCalendar={drive.TIMER_ON_CALENDAR}", drive.timer_text())
 
+    def test_timer_text_refuses_a_blank_period(self):
+        for period in ("", "   "):
+            with self.assertRaises(drive.TimerError) as ctx:
+                drive.timer_text(period)
+            self.assertEqual(ctx.exception.exit_code, 4)
+
 
 class InstallTimer(unittest.TestCase):
     def test_install_writes_both_units_then_reloads_and_enables(self):
@@ -267,6 +273,20 @@ class InstallTimer(unittest.TestCase):
             with self.assertRaises(units.Unreachable) as ctx:
                 drive.install_timer(env=home_env(), run=units.default_run)
         self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_a_blank_period_writes_nothing_and_is_exit_4(self):
+        env = home_env()
+
+        def run(argv, timeout):
+            raise AssertionError("a refused period must not reach systemctl")
+
+        for period in ("", "   "):
+            with self.assertRaises(drive.TimerError) as ctx:
+                drive.install_timer(env=env, run=run, period=period)
+            self.assertEqual(ctx.exception.exit_code, 4)
+        service_path, timer_path = drive.unit_paths(env=env)
+        self.assertFalse(os.path.exists(service_path))
+        self.assertFalse(os.path.exists(timer_path))
 
     def test_an_unwritable_home_is_exit_4(self):
         # A file where the unit dir belongs pins the exit code without

@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from corral import board, drive, registry
 from corral.tracker import NEEDS_DECISION
@@ -485,6 +486,31 @@ class ReviewPassTest(unittest.TestCase):
         self.assertEqual(launcher.calls[0][3], "review")
         self.assertIsNone(store.claim_of("app", 7))
         self.assertIn("reviewer claim released", out)
+
+    def test_a_persistent_lock_on_the_holder_capture_skips_the_step_and_keeps_claims(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        with mock.patch.object(
+            drive,
+            "finished_holders",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            code, _, err = self.run_review(
+                store,
+                [("blue", [("app", 7, "review")])],
+                fake,
+                launcher,
+                agent_states={RIVAL: (FINISHED, NOW - 10.0)},
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("finished holder capture skipped", err)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
     def test_a_failed_reviewer_launch_with_a_release_race_keeps_the_rival_claim(self):
         store = stored(self.db, [("app", 7, "open")])
