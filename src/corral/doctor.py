@@ -4,9 +4,10 @@ One report over the checks that already exist, plus the host checks that do
 not. It changes nothing and installs nothing; a failing check prints the
 command a human would run, in the style of `corral deps`.
 
-Every external call comes through `Env`: `run` reads `loginctl`,
-`list_fn` lists the systemd user units, and the rest arrives as plain data
-assembled by `production_env`. Only the CLI builds that; tests inject fakes.
+Every external call comes through `Env`: `run` reads `loginctl` and the
+slice dumps, `list_fn` lists the systemd user units, and the rest arrives
+as plain data assembled by `production_env`. Only the CLI builds that;
+tests inject fakes.
 """
 
 import argparse
@@ -35,6 +36,8 @@ from corral import (
     projects,
     prompts,
     registry,
+    resourcedoctor,
+    resources,
     settings,
     units,
 )
@@ -82,24 +85,6 @@ class HubAuth(NamedTuple):
     detail: str
 
 
-class ResourceState(NamedTuple):
-    """The host-budget inputs the `resources` row reports on, as plain data.
-
-    `budget_set` tells whether a host budget configures enforcement;
-    `expired` names the foreign claims older than `gone_s` (ignored by
-    admission, warned here); `claims_error` names an unreadable claims
-    channel; `pressure` is one of "ok", "saturated" or "unknown" with
-    the numbers in `pressure_detail`. Tests inject values; only
-    production gathers them.
-    """
-
-    budget_set: bool
-    expired: Sequence[str]
-    claims_error: str | None
-    pressure: str
-    pressure_detail: str
-
-
 class Env(NamedTuple):
     """Everything `run_checks` reads. Only the first rows are required arguments."""
 
@@ -124,6 +109,9 @@ class Env(NamedTuple):
     #: The disk pressure (`ok`, `low`, `critical`, `unknown`), or None when
     #: the caller has no reading: then the report carries no disk row.
     disk: str | None = None
+    #: The host-budget readings for the `resources*` rows. None means the
+    #: caller has no reading, and then the report carries no resources row.
+    resource_readings: resourcedoctor.ResourceReadings | None = None
     #: Repos in board mode to check, with the seams that check them:
     #: `board_fetch` resolves one board config to its live schema and
     #: `board_open_store` opens the store parity rows come from. Empty
@@ -151,9 +139,6 @@ class Env(NamedTuple):
     #: The hub version probe. None means the caller has no reading, and
     #: then the report carries no `hub` row.
     hub_probe: HubProbe | None = None
-    #: The host-budget inputs for the `resources` row. None means the
-    #: caller has no reading, and then the report carries no row.
-    resources: ResourceState | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -422,52 +407,14 @@ def _check_disk(pressure: str | None) -> list[Check]:
     ]
 
 
-def _check_resources(state: ResourceState | None) -> list[Check]:
-    """The `resources` row: budget, foreign claims and host pressure.
-
-    No state, no row. An unreadable claims channel fails; a saturated
-    host fails (launches wait); expired claims, an unset budget and an
-    unknown pressure warn; anything else reads ok. The detail joins
-    every part, so one row carries the whole budget story.
-    """
-    if state is None:
+def _check_resources(env: Env) -> list[Check]:
+    """The host-budget rows: no row without a reading, else one per aspect."""
+    if env.resource_readings is None:
         return []
-    if state.claims_error is not None:
-        return [
-            Check(
-                "resources",
-                "fail",
-                f"foreign claims unreadable: {state.claims_error}",
-                "fix the ledger and the drop-in claims dir beside it,"
-                " then run `corral doctor` again",
-            )
-        ]
-    notes: list[str] = []
-    status = "ok"
-    if not state.budget_set:
-        status = "warn"
-        notes.append("no host budget configured: the budget gate passes everything")
-    if state.expired:
-        status = "warn"
-        names = ", ".join(state.expired)
-        notes.append(f"foreign claim(s) expired and ignored: {names}")
-    if state.pressure == "saturated":
-        status = "fail"
-        notes.append(f"host saturated ({state.pressure_detail}): launches wait")
-    elif state.pressure == "unknown":
-        status = "warn" if status == "ok" else status
-        notes.append("host pressure unknown: a pressure file could not be read")
-    if status == "ok":
-        return [Check("resources", "ok", "host budget and pressure ok", "")]
-    fix = "wait for the load to drop, then retry the launch"
-    if status == "warn":
-        if not state.budget_set:
-            fix = "set [resources.host] in the host config to enforce shares"
-        elif state.expired:
-            fix = "drop the stale claim or declare it again, then run `corral doctor` again"
-        else:
-            fix = "check the pressure files read, then run `corral doctor` again"
-    return [Check("resources", status, "; ".join(notes), fix)]
+    return [
+        Check(row.name, row.status, row.detail, row.fix)
+        for row in resourcedoctor.check(env.resource_readings)
+    ]
 
 
 def _check_boards(env: Env) -> list[Check]:
@@ -576,94 +523,10 @@ def run_checks(env: Env) -> list[Check]:
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_disk(env.disk),
-        *_check_resources(env.resources),
+        *_check_resources(env),
         *_check_hub_auth(env.hub_url, env.hub_auth),
         *_check_hub(env.hub_url, env.hub_probe),
     ]
-
-
-def resource_state(
-    *,
-    budget_set: bool,
-    claims: Sequence[Mapping],
-    claims_error: str | None,
-    gone_s: float,
-    now: float,
-    reading: tuple[float | None, float | None],
-    max_load_per_cpu: float,
-    min_mem_available_pct: float,
-) -> ResourceState:
-    """The `resources` row inputs from gathered data: pure, never raising.
-
-    `claims` are the merged foreign-claim dicts with `name` and
-    `claimed_at`; entries older than `gone_s` at `now` read as expired.
-    `reading` is `(load_per_cpu, mem_available_pct)`, Nones unknown.
-    """
-    expired = tuple(
-        str(entry["name"])
-        for entry in claims
-        if isinstance(entry.get("claimed_at"), (int, float)) and now - entry["claimed_at"] > gone_s
-    )
-    measured = pressure.Reading(load_per_cpu=reading[0], mem_available_pct=reading[1])
-    hot, detail = pressure.saturated(
-        measured,
-        max_load_per_cpu=max_load_per_cpu,
-        min_mem_available_pct=min_mem_available_pct,
-    )
-    if hot:
-        status = "saturated"
-    elif reading[0] is None and reading[1] is None:
-        status = "unknown"
-    else:
-        status = "ok"
-    return ResourceState(
-        budget_set=budget_set,
-        expired=expired,
-        claims_error=claims_error,
-        pressure=status,
-        pressure_detail=detail,
-    )
-
-
-def load_resource_state(resolved) -> ResourceState | None:
-    """Gather the `resources` row inputs. None when there is no host config.
-
-    Fallible gathering degrades to data: an unreadable ledger or claims
-    dir is a `claims_error`, never a traceback. Only the CLI calls this;
-    tests call `resource_state` with plain data.
-    """
-    if resolved is None:
-        return None
-    tables = resolved.resources
-    budget_set = tables is not None and tables.host is not None
-    try:
-        gone_s = float(resolved["resources.gone_s"])
-    except (KeyError, TypeError, ValueError):
-        gone_s = 600.0
-    now = time.time()
-    try:
-        claims: Sequence[Mapping] = host_ledger.load()["foreign"]
-        claims_error = None
-    except (host_ledger.LedgerError, OSError) as err:
-        claims = ()
-        claims_error = str(err)
-    measured = pressure.production_read()
-    if tables is not None and tables.pressure is not None:
-        max_load = tables.pressure.max_load_per_cpu
-        min_mem = tables.pressure.min_mem_available_pct
-    else:
-        max_load = pressure.DEFAULT_MAX_LOAD_PER_CPU
-        min_mem = pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT
-    return resource_state(
-        budget_set=budget_set,
-        claims=claims,
-        claims_error=claims_error,
-        gone_s=gone_s,
-        now=now,
-        reading=(measured.load_per_cpu, measured.mem_available_pct),
-        max_load_per_cpu=max_load,
-        min_mem_available_pct=min_mem,
-    )
 
 
 def exit_code(checks: Sequence[Check]) -> int:
@@ -872,6 +735,163 @@ def load_disk_pressure(resolved) -> str:
         return _disk.UNKNOWN
 
 
+def _read_text(path: str) -> str:
+    """One file read for the resource sensors; tests inject a fake."""
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _read_pressure(reader) -> tuple[float | None, float | None]:
+    """The measured host pressure through the injected file reader.
+
+    Unreadable or unparsable files read as unknown (None), never raising:
+    a half-blind host still decides on the half it can see, and unknown
+    never blocks admission. `reader` is the same seam the sensor check
+    uses, so tests inject one fake for both.
+    """
+    try:
+        loadavg = reader(pressure.LOADAVG_PATH)
+    except OSError:
+        loadavg = None
+    try:
+        meminfo = reader(pressure.MEMINFO_PATH)
+    except OSError:
+        meminfo = None
+    try:
+        ncpu = os.cpu_count()
+    except Exception:  # noqa: BLE001 - any counter failure reads as unknown
+        ncpu = None
+    reading = pressure.read(loadavg, meminfo, ncpu)
+    return (reading.load_per_cpu, reading.mem_available_pct)
+
+
+def load_resource_readings(
+    resolved: settings.Resolved | None,
+    *,
+    list_fn: Callable[[str], list],
+    run: Callable[[Sequence[str]], object],
+    read=None,
+    now=None,
+) -> resourcedoctor.ResourceReadings | None:
+    """The host-budget readings for the `resources*` rows, or None without settings.
+
+    Best effort per aspect: an unreadable ledger, marker, delegation file,
+    sensor or slice listing is report data, never a traceback. Only the CLI
+    calls this; tests inject `ResourceReadings` data instead.
+    """
+    if resolved is None:
+        return None
+    reader = read or _read_text
+    moment = now if now is not None else time.time()
+    try:
+        registered = projects.load_all()
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError):
+        registered = []
+    ledger_path = host_ledger.ledger_path()
+    try:
+        ledger = host_ledger.load(ledger_path)
+    except host_ledger.LedgerError as err:
+        ledger, ledger_error = None, str(err)
+    else:
+        ledger_error = None
+    try:
+        state = paths.state_dir()
+    except paths.PathError as err:
+        state, marker, marker_error = "", None, str(err)
+    else:
+        marker_path = host_ledger.marker_path(ledger_path)
+        try:
+            marker, marker_error = reader(marker_path).strip(), None
+        except FileNotFoundError:
+            marker, marker_error = None, None
+        except (OSError, ValueError) as err:
+            marker, marker_error = None, f"cannot read the ledger marker at {marker_path}: {err}"
+    try:
+        available = units.read_controllers(read=reader)
+    except units.UnitsError as err:
+        available, controllers_error = None, str(err)
+    else:
+        controllers_error = None
+    sensor_errors = resourcedoctor.load_sensor_errors(read=reader)
+    pressure_values = _read_pressure(reader)
+    names = [units.HOST_SLICE]
+    for entry in registered:
+        try:
+            names.append(units.project_slice(entry.name))
+        except units.UnitsError:
+            continue
+    slices = resourcedoctor.load_slice_actual(names, run=run)
+    prefixes = {entry.unit_prefix for entry in registered}
+    try:
+        prefixes.add(str(resolved["agents.unit_prefix"]))
+    except KeyError:
+        pass
+    try:
+        registry_cfg = registry.config(resolved)
+    except (settings.SettingsError, paths.PathError):
+        registry_cfg = None
+    entries: dict = {}
+    if registry_cfg is not None:
+        try:
+            listed = registry.visible(moment, registry_cfg)
+        except (paths.PathError, settings.SettingsError, registry.RegistryError):
+            listed = []
+        for entry, _row_state in listed:
+            entries.setdefault(entry.get("id"), entry)
+    live_roles = resourcedoctor.load_live_roles(prefixes, list_fn=list_fn, entries=entries)
+    tables = resolved.resources
+    priced = frozenset(tables.roles) if tables is not None else frozenset()
+    try:
+        where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
+    except paths.PathError:
+        where = "the host config"
+    try:
+        base = resources.config(resolved)
+        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        foreign = (ledger or {}).get("foreign", [])
+        if not isinstance(foreign, list):
+            foreign = []
+        limits = resources.join(base, shares, foreign, where=where)
+    except (settings.SettingsError, resources.LimitsError) as err:
+        limits, limits_error = None, str(err)
+    else:
+        limits_error = None
+    if limits is not None and limits.pressure is not None:
+        pressure_caps = (
+            limits.pressure.max_load_per_cpu,
+            limits.pressure.min_mem_available_pct,
+        )
+    else:
+        pressure_caps = (
+            pressure.DEFAULT_MAX_LOAD_PER_CPU,
+            pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
+        )
+    return resourcedoctor.ResourceReadings(
+        host=limits.host if limits is not None else None,
+        shares=dict(limits.projects) if limits is not None else {},
+        foreign=list(limits.foreign) if limits is not None else [],
+        gone_s=limits.gone_s if limits is not None else 0.0,
+        now=moment,
+        limits_error=limits_error,
+        priced_roles=priced,
+        live_roles=live_roles,
+        controllers=available,
+        controllers_error=controllers_error,
+        ledger=ledger,
+        ledger_error=ledger_error,
+        ledger_path=ledger_path,
+        marker=marker,
+        marker_error=marker_error,
+        state_dir=state,
+        marker_path=host_ledger.marker_path(ledger_path),
+        sensor_errors=sensor_errors,
+        slices=slices,
+        config_path=where,
+        pressure=pressure_values,
+        pressure_caps=pressure_caps,
+    )
+
+
 def load_project_problems() -> list[str]:
     """The registry problems for the live report: bad files and policy
     entries that do not resolve. A gathering failure is one problem
@@ -1076,7 +1096,9 @@ def production_env() -> Env:
     dep_results, deps_error = load_dep_results()
     prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
     disk_pressure = load_disk_pressure(resolved)
-    resource_inputs = load_resource_state(resolved)
+    resource_readings = load_resource_readings(
+        resolved, list_fn=production_list_fn, run=production_run
+    )
     board_sites, board_error = load_board_sites(settings_error)
     project_problems = load_project_problems()
     timer_state = load_timer_state()
@@ -1101,7 +1123,7 @@ def production_env() -> Env:
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
         disk=disk_pressure,
-        resources=resource_inputs,
+        resource_readings=resource_readings,
         board_sites=board_sites,
         board_fetch=production_board_fetch,
         board_open_store=store.open_store,
