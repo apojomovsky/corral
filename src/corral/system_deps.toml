@@ -71,8 +71,9 @@ install = 'loginctl enable-linger "$USER"'
 
 [[dep]]
 name = "omp"
-why = "agent runtime"
+why = "agent runtime (major 18 until the cutover to 19)"
 probe = ["omp", "--version"]
+below = "19"
 paths = ["~/.local/bin/omp"]
 install = "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.12.6"
 
