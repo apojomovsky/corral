@@ -206,6 +206,24 @@ class DispatchBlockTest(unittest.TestCase):
         self.assertIn("Split it", text)
         self.assertIn("530 lines", text)
 
+    def test_the_trailer_uses_the_configured_numbers(self):
+        # The regression this guards: the header computed from cfg while
+        # the trailer resolved fresh defaults, so one block printed two
+        # contradictory budgets.
+        cfg = bu.Numbers(
+            base_minutes=10,
+            seconds_per_line=10,
+            limit_multiple=2,
+            floor_minutes=20,
+            ceiling_minutes=60,
+        )
+        proc = subprocess.CompletedProcess([], 0, "100\t0\tsrc/a.rs\n", "")
+        with mock.patch.object(bu, "_git", return_value=proc):
+            text = bu.dispatch_block("origin/master", cfg=cfg)
+        self.assertIn("expected 27 minutes, hard limit 54 minutes", text)
+        self.assertIn("expected duration: 27 minutes", text)
+        self.assertIn("hard limit: 54 minutes", text)
+
 
 class CliTest(unittest.TestCase):
     def test_budget_verb_prints_the_block(self):
@@ -403,6 +421,21 @@ class NumbersTest(unittest.TestCase):
             S.SettingsError, r"floor_minutes \(60, from env\).*ceiling_minutes \(60, from project\)"
         ):
             bu.numbers(resolved)
+
+    def test_a_clamped_value_reports_the_host_limits(self):
+        # A host [limits] clamp rewrites the value after the project set
+        # it, so the cross-key error must name the host limits rather
+        # than the layer the value was set by.
+        resolved = resolve_settings(
+            host={"limits": {"review.budget.base_minutes": 5}},
+            project={"review": {"budget": dict(CUSTOM, base_minutes=50)}},
+        )
+        with self.assertRaisesRegex(S.SettingsError, r"base_minutes 5 set by host limits"):
+            bu.numbers(resolved)
+
+    def test_a_missing_setting_is_a_settings_error(self):
+        with self.assertRaisesRegex(S.SettingsError, "review.budget.base_minutes"):
+            bu.numbers({})
 
     def test_a_floor_no_limit_can_clear_is_refused(self):
         # base * multiple below the floor: even an empty diff prints a

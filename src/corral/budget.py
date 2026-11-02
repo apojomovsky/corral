@@ -174,6 +174,19 @@ def _setting_int(raw, key):
     return value
 
 
+def _origin(resolved, key):
+    """The layer to blame for `key` in a cross-key error.
+
+    A value the host [limits] table clamped reports the host limits,
+    not the layer that set it: the clamp is what made it the number
+    the checks below compare.
+    """
+    item = resolved.values[key]
+    if item.clamped_from is not None:
+        return "host limits"
+    return item.origin
+
+
 def numbers(resolved=None):
     """The budget numbers, from `resolved` or from the built-in defaults.
 
@@ -181,14 +194,20 @@ def numbers(resolved=None):
     behavior is byte-identical. Each number's own range (a positive int) is
     checked where the value is set, naming the file and key. The checks
     that compare two numbers stay here, and each names the layer behind
-    the offending values, which the resolved settings already record.
+    the offending values, which the resolved settings already record. A
+    mapping missing a key is a SettingsError naming it, not a KeyError.
     """
     if resolved is None:
         raw = {key: settings.REGISTRY[key].default for key in NUMBERS_KEYS}
         origins = dict.fromkeys(NUMBERS_KEYS, settings.DEFAULT)
     else:
-        raw = {key: resolved[key] for key in NUMBERS_KEYS}
-        origins = {key: resolved.values[key].origin for key in NUMBERS_KEYS}
+        try:
+            raw = {key: resolved[key] for key in NUMBERS_KEYS}
+            origins = {key: _origin(resolved, key) for key in NUMBERS_KEYS}
+        except KeyError as err:
+            raise settings.SettingsError(
+                f"budget setting {err.args[0]!r} is missing from the resolved settings"
+            ) from None
     cfg = Numbers(
         base_minutes=_setting_int(raw, "review.budget.base_minutes"),
         seconds_per_line=_setting_int(raw, "review.budget.seconds_per_line"),
@@ -363,7 +382,7 @@ def dispatch_block(base, cwd=None, cfg=None):
         "runs out of budget still leaves the work it did.",
         "",
     ]
-    body += describe(base, cwd=cwd)
+    body += describe(base, cwd=cwd, cfg=cfg)
     return "\n".join(body)
 
 
