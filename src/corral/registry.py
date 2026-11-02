@@ -266,6 +266,7 @@ def register(
     ticket=None,
     model=None,
     role=None,
+    profile=None,
     parent=None,
     pid=None,
     transcript=None,
@@ -284,6 +285,9 @@ def register(
     source, so a hook retry never drops an inferred ticket. ``role`` is
     the prompt role the agent was launched with (worker, reviewer or
     triage), or None; a re-register without one keeps the previous role.
+    ``profile`` is the agent profile the launch resolved, or None; like
+    the role, a re-register without one keeps the previous profile, so
+    snapshot shows the recorded profile while the agent runs.
     """
     if not agent_id or not agent_id.strip():
         raise RegistryError("agent id must not be empty")
@@ -294,6 +298,8 @@ def register(
 
         if role not in prompts.ROLES:
             raise RegistryError(f"unknown role {role!r}: want one of {', '.join(prompts.ROLES)}")
+    if profile is not None and (not isinstance(profile, str) or not profile):
+        raise RegistryError(f"profile must be a non-empty string, not {profile!r}")
     ticket = _check_ticket(ticket)
     if pid is not None and (isinstance(pid, bool) or not isinstance(pid, int) or pid < 1):
         raise RegistryError(f"bad pid {pid!r}: want a positive integer")
@@ -311,6 +317,8 @@ def register(
             source = EXPLICIT if ticket else None
         if role is None and running:
             role = old.get("role")
+        if profile is None and running:
+            profile = old.get("profile")
         entry = {
             "id": agent_id,
             "runtime": runtime,
@@ -318,6 +326,7 @@ def register(
             "ticket_source": source,
             "model": model,
             "role": role,
+            "profile": profile,
             "parent": parent,
             "pid": pid,
             "transcript": transcript,

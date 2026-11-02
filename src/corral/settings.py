@@ -186,6 +186,14 @@ class Resolved:
     #: Committed means committed: the host config cannot set these, and a
     #: host ``[profile]`` or ``[role]`` table reads as unknown.
     profile_committed: dict = field(default_factory=dict)
+    #: Where each declared profile came from: name to the winning source
+    #: path (the host config path when both files declare it). `profile
+    #: show` and the doctor read this; `resolve` above is the one place
+    #: that merges the two files, so it records both sides here.
+    profile_sources: dict = field(default_factory=dict)
+    #: Shadowed names: name to the committed source path the local table
+    #: hides. Empty when no name is declared in both files.
+    profile_shadowed: dict = field(default_factory=dict)
 
     def __getitem__(self, key):
         return self.values[key].value
@@ -670,6 +678,11 @@ def resolve(
             "repos": repo_profiles,
             "roles": role_profiles,
         },
+        profile_sources={
+            **{name: project_name for name in project_profiles},
+            **{name: host_name for name in host_profiles},
+        },
+        profile_shadowed={name: project_name for name in project_profiles if name in host_profiles},
     )
 
 

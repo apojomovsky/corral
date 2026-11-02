@@ -105,6 +105,18 @@ class SettingsCarriage(unittest.TestCase):
         )
         self.assertEqual(resolved.profiles, {"fast": {"runtime": "muse"}})
 
+    def test_profile_sources_name_the_winning_file_per_name(self):
+        resolved = resolve(
+            project={"profiles": {"fast": {"runtime": "omp"}, "slim": {"runtime": "omp"}}},
+            host={"profiles": {"fast": {"runtime": "muse"}}},
+        )
+        self.assertEqual(resolved.profile_sources, {"fast": "host config", "slim": "corral.toml"})
+        self.assertEqual(resolved.profile_shadowed, {"fast": "corral.toml"})
+
+    def test_profile_sources_are_empty_without_declarations(self):
+        resolved = resolve(project={})
+        self.assertEqual((resolved.profile_sources, resolved.profile_shadowed), ({}, {}))
+
     def test_a_non_table_profiles_value_is_exit_4(self):
         for where in ({"project": {"profiles": "fast"}}, {"host": {"profiles": ["fast"]}}):
             with self.subTest(where=where):
