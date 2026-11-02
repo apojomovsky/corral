@@ -748,11 +748,16 @@ def _nonblank_period(value):
 
     The settings layer names the file and key around this rule. The
     value renders verbatim into the installed `OnCalendar=` line, so a
-    blank cadence would install a timer that never wakes: it fails
-    here, exit 4, before anything is written.
+    blank cadence would install a timer that never wakes, and a control
+    character would bake a malformed unit that fails only later at
+    daemon-reload: both fail here, exit 4, before anything is written.
     """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"must be a non-blank OnCalendar cadence, not {value!r}")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+        raise ValueError(
+            f"must be a non-blank OnCalendar cadence without control characters, not {value!r}"
+        )
     return value
 
 

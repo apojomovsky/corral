@@ -206,18 +206,81 @@ class LoadRepoSites(unittest.TestCase):
         self.load(git=git)
         self.assertEqual(git.calls, [(["remote", "get-url", "origin"], self.clone)])
 
-    def test_origin_set_with_all_labels_is_ok_apart_from_the_branch(self):
+    def test_origin_with_labels_and_an_advertised_branch_is_ok(self):
         url = "https://github.com/acme/demo.git"
         fake = FakeTracker(labels=[("acme/demo", NAMES)])
         sites = self.load(
             git=FakeGit(root=self.clone, origin_url=url),
             factory={"acme/demo": fake}.__getitem__,
         )
-        self.assertEqual(sites, (repodoctor.RepoSite("demo", url, labels="ok"),))
+        self.assertEqual(sites, (repodoctor.RepoSite("demo", url, branch="ok", labels="ok"),))
         found = by_name(rows(*sites))
         self.assertEqual(found["labels:demo"].status, "ok")
         self.assertEqual(found["remote:demo"].status, "ok")
-        self.assertIn("was not checked", found["remote:demo"].detail)
+        self.assertIn("exists on the remote", found["remote:demo"].detail)
+        self.assertEqual(doctor.exit_code(rows(*sites)), 0)
+
+    def test_branch_read_is_one_ls_remote_call(self):
+        url = "https://github.com/acme/demo.git"
+        fake = FakeTracker(labels=[("acme/demo", NAMES)])
+        git = FakeGit(root=self.clone, origin_url=url)
+        self.load(
+            git=git,
+            factory={"acme/demo": fake}.__getitem__,
+        )
+        self.assertEqual(
+            git.calls,
+            [
+                (["remote", "get-url", "origin"], self.clone),
+                (["ls-remote", "--symref", url, "HEAD"], self.clone),
+            ],
+        )
+
+    def test_deleted_default_branch_fails_the_remote_row_despite_ok_labels(self):
+        url = "https://github.com/acme/demo.git"
+        fake = FakeTracker(labels=[("acme/demo", NAMES)])
+        sites = self.load(
+            git=FakeGit(root=self.clone, origin_url=url, remote_head=None),
+            factory={"acme/demo": fake}.__getitem__,
+        )
+        self.assertEqual(sites[0].branch, "missing")
+        found = by_name(rows(*sites))
+        self.assertEqual(found["labels:demo"].status, "ok")
+        self.assertEqual(found["remote:demo"].status, "fail")
+        self.assertIn("default branch", found["remote:demo"].detail)
+        self.assertIn("push the default branch", found["remote:demo"].fix)
+        self.assertEqual(doctor.exit_code(rows(*sites)), 1)
+
+    def test_failed_branch_read_warns_naming_the_cause(self):
+        url = "https://github.com/acme/demo.git"
+        fake = FakeTracker(labels=[("acme/demo", NAMES)])
+        sites = self.load(
+            git=FakeGit(root=self.clone, origin_url=url, fail={"ls-remote"}),
+            factory={"acme/demo": fake}.__getitem__,
+        )
+        self.assertEqual(len(sites), 1)
+        self.assertIsNotNone(sites[0].cause)
+        found = by_name(rows(*sites))
+        self.assertEqual(found["remote:demo"].status, "warn")
+        self.assertIn("default branch", found["remote:demo"].detail)
+        self.assertEqual(found["labels:demo"].status, "ok")
+        self.assertEqual(doctor.exit_code(rows(*sites)), 0)
+
+    def test_unrunnable_branch_read_warns_naming_the_cause(self):
+        url = "https://github.com/acme/demo.git"
+        fake = FakeTracker(labels=[("acme/demo", NAMES)])
+
+        def git(args, cwd):
+            if args == ["remote", "get-url", "origin"]:
+                return SimpleNamespace(returncode=0, stdout=url + "\n", stderr="")
+            self.assertEqual(args[:2], ["ls-remote", "--symref"])
+            return None
+
+        sites = self.load(git=git, factory={"acme/demo": fake}.__getitem__)
+        self.assertIsNotNone(sites[0].cause)
+        found = by_name(rows(*sites))
+        self.assertEqual(found["remote:demo"].status, "warn")
+        self.assertIn("default branch", found["remote:demo"].detail)
         self.assertEqual(doctor.exit_code(rows(*sites)), 0)
 
     def test_no_such_remote_reads_as_no_remote(self):
@@ -371,7 +434,7 @@ class FreshScaffoldEndToEnd(unittest.TestCase):
             git=FakeGit(root=target, origin_url=url),
             tracker_factory={"acme/demo": fake}.__getitem__,
         )
-        self.assertEqual(sites, (repodoctor.RepoSite(FIXTURE, url, labels="ok"),))
+        self.assertEqual(sites, (repodoctor.RepoSite(FIXTURE, url, branch="ok", labels="ok"),))
         checks = doctor.run_checks(env(repo_sites=sites))
         found = by_name(checks)
         self.assertEqual(found[f"remote:{FIXTURE}"].status, "ok")

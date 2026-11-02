@@ -85,6 +85,13 @@ class Share:
     pids_ceiling: int | None = None
 
 
+#: A foreign claim without a `claimed_at` reads as epoch zero: older
+#: than any positive `gone_s`, so the gate expires it at once. The one
+#: owner of the default the dataclass, the gate (`_claim`), and the
+#: doctor row (`resourcedoctor._parse_claim`) all read through.
+DEFAULT_CLAIMED_AT = 0.0
+
+
 @dataclass(frozen=True)
 class ForeignClaim:
     """Load corral does not control, declared by hand with an explicit reservation."""
@@ -93,7 +100,7 @@ class ForeignClaim:
     cpu_m: int = 0
     memory_mb: int = 0
     pids: int = 0
-    claimed_at: float = 0.0
+    claimed_at: float = DEFAULT_CLAIMED_AT
 
 
 @dataclass(frozen=True)
@@ -185,6 +192,18 @@ def _moment(value, what):
     return value
 
 
+def _table(value, what):
+    """A project or role table: a mapping of names to entries, else LimitsError.
+
+    A missing table reads as empty; any other non-mapping (a list, a
+    string, a number, None) is a configuration error, never the bare
+    TypeError `dict` would raise.
+    """
+    if not isinstance(value, Mapping):
+        raise LimitsError(f"limits {what} must be a mapping, not {value!r}")
+    return dict(value)
+
+
 def _usage(value, what):
     """A Usage from a Usage, a plain mapping, or None (zeros)."""
     if value is None:
@@ -202,7 +221,7 @@ def _usage(value, what):
             )
         except LimitsError:
             raise
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - a malformed table reads as LimitsError
             raise LimitsError(f"{what} must be a usage triple, not {value!r}: {err}") from None
     raise LimitsError(f"{what} must be a usage triple, not {value!r}")
 
@@ -232,7 +251,7 @@ def _share(value, what):
             )
         except LimitsError:
             raise
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - a malformed table reads as LimitsError
             raise LimitsError(f"{what} must be a project share, not {value!r}: {err}") from None
     raise LimitsError(f"{what} must be a project share, not {value!r}")
 
@@ -256,11 +275,13 @@ def _claim(value, what):
                 cpu_m=_amount(value.get("cpu_m", 0), f"{what} cpu_m"),
                 memory_mb=_amount(value.get("memory_mb", 0), f"{what} memory_mb"),
                 pids=_amount(value.get("pids", 0), f"{what} pids"),
-                claimed_at=_moment(value.get("claimed_at", 0.0), f"{what} claimed_at"),
+                claimed_at=_moment(
+                    value.get("claimed_at", DEFAULT_CLAIMED_AT), f"{what} claimed_at"
+                ),
             )
         except LimitsError:
             raise
-        except Exception as err:
+        except Exception as err:  # noqa: BLE001 - a malformed table reads as LimitsError
             raise LimitsError(f"{what} must be a foreign claim, not {value!r}: {err}") from None
     else:
         raise LimitsError(f"{what} must be a foreign claim, not {value!r}")
@@ -281,7 +302,7 @@ def _request(value):
         role = value.get("role", prompts.DEFAULT_ROLE)
         if not isinstance(project, str) or not isinstance(role, str):
             raise LimitsError(f"request must name a project and a role, not {value!r}")
-        return Request(project=project, role=role or prompts.DEFAULT_ROLE)
+        return Request(project=project, role=role)
     raise LimitsError(f"request must name a project and a role, not {value!r}")
 
 
@@ -398,8 +419,8 @@ def validate_limits(limits):
         if isinstance(limits, Mapping):
             limits = Limits(
                 host=limits.get("host"),
-                projects=dict(limits.get("projects") or {}),
-                roles=dict(limits.get("roles") or {}),
+                projects=_table(limits.get("projects", {}), "projects"),
+                roles=_table(limits.get("roles", {}), "roles"),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
@@ -517,8 +538,8 @@ def share_cap(limits, project, now):
         if isinstance(limits, Mapping):
             limits = Limits(
                 host=limits.get("host"),
-                projects=dict(limits.get("projects") or {}),
-                roles=dict(limits.get("roles") or {}),
+                projects=_table(limits.get("projects", {}), "projects"),
+                roles=_table(limits.get("roles", {}), "roles"),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
@@ -576,8 +597,8 @@ def admit(request, charged, limits, now, pressure=None):
         if isinstance(limits, Mapping):
             limits = Limits(
                 host=limits.get("host"),
-                projects=dict(limits.get("projects") or {}),
-                roles=dict(limits.get("roles") or {}),
+                projects=_table(limits.get("projects", {}), "projects"),
+                roles=_table(limits.get("roles", {}), "roles"),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),

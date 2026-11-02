@@ -903,10 +903,11 @@ def production_list_fn(prefix: str) -> list:
 
 
 def production_git(args: Sequence[str], cwd: str):
-    """A local git seam for the origin lookup. Only the CLI builds it.
+    """The git seam for the origin and default-branch lookups. Only the CLI builds it.
 
-    Read-only verbs (`remote get-url`) stay local; anything git cannot
-    run reads as None so the caller degrades to a warn row, never a
+    `remote get-url` stays local; `ls-remote --symref` reaches the
+    remote the same way the labels read does. Anything git cannot run
+    reads as None so the caller degrades to a warn row, never a
     traceback. Tests inject a fake.
     """
     from corral.gitenv import clean_env
@@ -968,13 +969,46 @@ def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
     return tuple(sites), error
 
 
+def _default_branch(origin: str, path: str, git) -> tuple[str, str | None]:
+    """The remote's advertised default branch state through the git seam.
+
+    One `git ls-remote --symref` against the remote: a `ref:` line for
+    `HEAD` names the default branch ("ok"); a clean read that
+    advertises none means the remote has no default branch ("missing",
+    so the row fails instead of reading as an ok note). A failed or
+    unrunnable read maps to a cause, so the row warns naming it, never
+    a traceback. The labels read already reaches the network, so this
+    read adds no new kind of access; it asks the remote itself rather
+    than trusting the clone's cached `origin/HEAD`.
+    """
+    try:
+        proc = git(["ls-remote", "--symref", origin, "HEAD"], path)
+    except Exception as err:  # noqa: BLE001 - a failed git read is report data
+        return "unknown", f"cannot read the default branch on {origin}: {err}"
+    if proc is None:
+        return "unknown", f"cannot read the default branch on {origin}: cannot run git in {path}"
+    if getattr(proc, "returncode", 1) != 0:
+        detail = (getattr(proc, "stderr", "") or "").strip() or (
+            f"git exited {getattr(proc, 'returncode', 1)}"
+        )
+        return "unknown", f"cannot read the default branch on {origin}: {detail}"
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        head, _, target = line.partition("\t")
+        if target == "HEAD" and head.startswith("ref: refs/heads/"):
+            branch = head[len("ref: refs/heads/") :]
+            if branch:
+                return "ok", None
+    return "missing", None
+
+
 def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.RepoSite:
     """One repo's remote readings: the origin URL plus label presence.
 
-    Read-only: one local `git remote get-url` per clone (no network)
-    plus one label listing per tracker repo, and only when a remote is
-    set. Every gather failure degrades to an "unknown" reading naming
-    the repo and the cause, never a raise.
+    Read-only: one local `git remote get-url` per clone (no network),
+    one label listing per tracker repo, and one `git ls-remote
+    --symref` for the remote's default branch, all only when a remote
+    is set. Every gather failure degrades to an "unknown" reading
+    naming the repo and the cause, never a raise.
     """
     try:
         resolved = settings.load(root, repo=name)
@@ -1021,7 +1055,12 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
         missing = repo_tracker.missing_labels(tracker_repo)
     except Exception as err:  # noqa: BLE001 - a failed read is report data
         return repodoctor.RepoSite(name, origin, cause=str(err))
-    return repodoctor.RepoSite(name, origin, labels="missing" if missing else "ok")
+    branch, branch_cause = _default_branch(origin, path, git)
+    if branch_cause is not None:
+        return repodoctor.RepoSite(
+            name, origin, labels="missing" if missing else "ok", cause=branch_cause
+        )
+    return repodoctor.RepoSite(name, origin, branch=branch, labels="missing" if missing else "ok")
 
 
 def load_repo_sites(

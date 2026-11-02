@@ -227,6 +227,16 @@ class HostFull(unittest.TestCase):
         self.assertEqual((verdict.allowed, verdict.code), (False, "host-full"))
         self.assertIn("8000", verdict.reason)
 
+    def test_total_plus_cost_exactly_at_available_is_allowed(self):
+        load = charged(total=(7000, 0, 0), by_project={"a": (0, 0, 0), "b": (7000, 0, 0)})
+        verdict = R.admit(req("a"), load, self.host(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_one_unit_past_available_is_host_full(self):
+        load = charged(total=(7001, 0, 0), by_project={"a": (0, 0, 0), "b": (7001, 0, 0)})
+        verdict = R.admit(req("a"), load, self.host(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "host-full"))
+
     def test_a_full_memory_pool_names_memory(self):
         host = limits(
             host=(64000, 3000, 4096),
@@ -274,6 +284,14 @@ class FloorBypassDimensions(unittest.TestCase):
         verdict = R.admit(req("a", "small"), load, self.host(), NOW)
         self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
 
+    def test_exactly_at_floor_in_a_full_pool_waits(self):
+        load = charged(
+            total=(8000, 3500, 0),
+            by_project={"a": (1000, 500, 0), "b": (7000, 3000, 0)},
+        )
+        verdict = R.admit(req("a", "small"), load, self.host(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "host-full"))
+
 
 class ForeignClaims(unittest.TestCase):
     def host(self, foreign):
@@ -302,11 +320,32 @@ class ForeignClaims(unittest.TestCase):
         verdict = R.admit(req(), charged(), host, NOW)
         self.assertEqual((verdict.allowed, verdict.code), (False, "role-cost"))
 
+    def test_a_cost_exactly_at_the_shrunk_pool_is_allowed(self):
+        host = limits(
+            projects={"web": {"weight": 1}},
+            foreign=[claim(cpu_m=7000, memory_mb=11000)],
+        )
+        verdict = R.admit(req(), charged(), host, NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_cost_one_unit_past_the_shrunk_pool_is_role_cost(self):
+        host = limits(
+            projects={"web": {"weight": 1}},
+            foreign=[claim(cpu_m=7001, memory_mb=11000)],
+        )
+        verdict = R.admit(req(), charged(), host, NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "role-cost"))
+
     def test_a_claim_past_the_pool_refuses_as_role_cost(self):
         host = self.host([claim(cpu_m=7500, memory_mb=15000)])
         verdict = R.admit(req(), charged(), host, NOW)
         self.assertEqual((verdict.allowed, verdict.code), (False, "role-cost"))
         self.assertIn("7500", verdict.reason)
+
+    def test_missing_claimed_at_reads_as_the_shared_default(self):
+        self.assertEqual(R.ForeignClaim(name="desktop").claimed_at, R.DEFAULT_CLAIMED_AT)
+        parsed = R._claim({"name": "desktop"}, "foreign claim 9")
+        self.assertEqual(parsed.claimed_at, R.DEFAULT_CLAIMED_AT)
 
 
 class PlainData(unittest.TestCase):
@@ -386,6 +425,45 @@ class ValidateLimits(unittest.TestCase):
         self.check(lambda: limits(foreign=[{"name": "x", "claimed_at": "soon"}]), "claimed_at")
 
     def test_the_error_is_a_configuration_error(self):
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+
+class NonMappingTables(unittest.TestCase):
+    MISSING = object()
+
+    def table(self, projects=MISSING, roles=MISSING):
+        if projects is self.MISSING:
+            projects = {"web": {"weight": 1}}
+        if roles is self.MISSING:
+            roles = {"worker": dict(WORKER)}
+        return {
+            "host": triple(8000, 16000, 4096),
+            "projects": projects,
+            "roles": roles,
+            "foreign": [],
+            "gone_s": 600.0,
+        }
+
+    def test_non_mapping_projects_are_a_limits_error(self):
+        for bad in ([], ["web"], "web", 5, None):
+            with self.subTest(projects=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.validate_limits(self.table(projects=bad))
+                with self.assertRaises(R.LimitsError):
+                    R.admit(req(), charged(), self.table(projects=bad), NOW)
+                with self.assertRaises(R.LimitsError):
+                    R.share_cap(self.table(projects=bad), "web", NOW)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_non_mapping_roles_are_a_limits_error(self):
+        for bad in ([], ["worker"], "worker", 5, None):
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.validate_limits(self.table(roles=bad))
+                with self.assertRaises(R.LimitsError):
+                    R.admit(req(), charged(), self.table(roles=bad), NOW)
+                with self.assertRaises(R.LimitsError):
+                    R.share_cap(self.table(roles=bad), "web", NOW)
         self.assertEqual(R.LimitsError.exit_code, 4)
 
 
@@ -958,6 +1036,18 @@ class RequestDefaults(unittest.TestCase):
             R._request({"project": "web"}),
             R.Request(project="web", role=prompts.DEFAULT_ROLE),
         )
+
+    def test_an_explicit_empty_role_is_not_coerced_to_the_default(self):
+        self.assertEqual(
+            R._request({"project": "web", "role": ""}),
+            R.Request(project="web", role=""),
+        )
+
+    def test_an_explicit_empty_role_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError) as caught:
+            R.admit({"project": "web", "role": ""}, charged(), limits(), NOW)
+        self.assertIn("unknown role", str(caught.exception))
+        self.assertEqual(R.LimitsError.exit_code, 4)
 
 
 class CapacityReportShape(unittest.TestCase):
