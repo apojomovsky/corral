@@ -69,7 +69,7 @@ class FakeRun:
 class FakeTracker:
     """An in-memory tracker double. Tests preload items and program failures."""
 
-    def __init__(self, items=(), *, labels=(), refused=(), ensure_error=None):
+    def __init__(self, items=(), *, labels=(), refused=(), ensure_error=None, labels_error=None):
         self.by_key = {(item.repo, item.number): item for item in items}
         self.changes_error = None
         self.item_errors = {}
@@ -80,6 +80,7 @@ class FakeTracker:
         self.repo_labels = {repo: set(names) for repo, names in labels}
         self.refused = set(refused)
         self.ensure_error = ensure_error
+        self.labels_error = labels_error
         self.calls = []
 
     def add(self, item):
@@ -137,6 +138,14 @@ class FakeTracker:
         self.calls.append(("add_label", repo, number, label))
         if (repo, number) in self.label_errors:
             raise self.label_errors[(repo, number)]
+
+    def missing_labels(self, repo):
+        """Names of the bootstrap labels absent on ``repo``; a programmed error raises."""
+        self.calls.append(("missing_labels", repo))
+        if self.labels_error is not None:
+            raise self.labels_error
+        have = self.repo_labels.get(repo, set())
+        return tuple(label.name for label in tracker.BOOTSTRAP_LABELS if label.name not in have)
 
     def ensure_labels(self, repo):
         """Idempotent in-memory bootstrap: create, keep, or refuse."""

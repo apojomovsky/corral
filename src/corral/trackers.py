@@ -150,6 +150,10 @@ class BoardBackedTracker(BoardTracker):
         """
         return self._issues.ensure_labels(repo)
 
+    def missing_labels(self, repo: str) -> tuple[str, ...]:
+        """Names of the bootstrap labels absent on ``repo``, through the adapter."""
+        return self._issues.missing_labels(repo)
+
     def _fetch_single(self, project_id, repo, number):
         """The board item node behind ``repo#number``, else ``TrackerError``."""
         owner, name = _split_repo(repo)
