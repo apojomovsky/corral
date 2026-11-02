@@ -22,6 +22,10 @@ OK, UNREACHABLE, USAGE = 0, 3, 4
 #: the agent `profile` row field: the profile name recorded at launch.
 SCHEMA_VERSION = 2
 
+#: Sections whose `{"error"}` body marks the server degraded.
+#: The one owner of the section names; `serve` reads through this.
+ERROR_SECTIONS = ("agents", "quota", "capacity", "disk", "drive")
+
 
 def _err(text):
     print(f"corral snapshot: {text}", file=sys.stderr)
@@ -216,10 +220,7 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_v
 
 def _all_failed(doc):
     """Whether every readable section failed: nothing at all could be read."""
-    return all(
-        is_error_section(doc.get(section))
-        for section in ("agents", "quota", "capacity", "disk", "drive")
-    )
+    return all(is_error_section(doc.get(section)) for section in ERROR_SECTIONS)
 
 
 def _show(doc):
