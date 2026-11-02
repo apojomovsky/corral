@@ -488,12 +488,11 @@ def backup_hub(source: str, dest: str) -> str:
     """Copy the hub database to `dest` and return it.
 
     The stdlib online backup API copies a running hub safely; the copy
-    is owner-only like the live store. An existing `dest` is refused
-    instead of clobbered: remove it first. Restore is a file
-    replacement while the hub is stopped.
+    is owner-only like the live store. `dest` is created exclusively
+    before anything connects, so an existing file is refused instead of
+    clobbered and a failed copy leaves nothing behind. Restore is a
+    file replacement while the hub is stopped.
     """
-    if os.path.exists(dest):
-        raise HubError(f"backup destination {dest} exists: remove it first")
     parent = os.path.dirname(dest)
     if parent:
         try:
@@ -501,26 +500,42 @@ def backup_hub(source: str, dest: str) -> str:
         except OSError as err:
             raise HubError(f"cannot create backup dir {parent}: {err}") from None
     try:
-        src = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
-    except sqlite3.Error as err:
-        raise HubError(f"cannot read hub store {source}: {err}") from None
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise HubError(f"backup destination {dest} exists: remove it first") from None
+    except OSError as err:
+        raise HubError(f"cannot write backup {dest}: {err}") from None
+    os.close(fd)
     try:
         try:
-            dst = sqlite3.connect(dest, timeout=_BUSY_TIMEOUT_MS / 1000)
+            src = sqlite3.connect(
+                f"file:{source}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT_MS / 1000
+            )
         except sqlite3.Error as err:
-            raise HubError(f"cannot write backup {dest}: {err}") from None
+            raise HubError(f"cannot read hub store {source}: {err}") from None
         try:
-            os.chmod(dest, 0o600)
-        except OSError as err:
-            raise HubError(f"cannot secure backup {dest}: {err}") from None
-        try:
-            src.backup(dst)
-        except sqlite3.Error as err:
-            raise HubError(f"cannot copy hub store {source} to {dest}: {err}") from None
+            try:
+                dst = sqlite3.connect(dest, timeout=_BUSY_TIMEOUT_MS / 1000)
+            except sqlite3.Error as err:
+                raise HubError(f"cannot write backup {dest}: {err}") from None
+            try:
+                os.chmod(dest, 0o600)
+            except OSError as err:
+                raise HubError(f"cannot secure backup {dest}: {err}") from None
+            try:
+                src.backup(dst)
+            except sqlite3.Error as err:
+                raise HubError(f"cannot copy hub store {source} to {dest}: {err}") from None
+            finally:
+                dst.close()
         finally:
-            dst.close()
-    finally:
-        src.close()
+            src.close()
+    except (HubError, OSError, sqlite3.Error):
+        try:
+            os.unlink(dest)
+        except OSError:
+            pass
+        raise
     return dest
 
 

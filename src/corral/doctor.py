@@ -12,7 +12,6 @@ assembled by `production_env`. Only the CLI builds that; tests inject fakes.
 import argparse
 import functools
 import getpass
-import http.client
 import json
 import os
 import re
@@ -794,6 +793,37 @@ def load_hub_auth(url: str | None) -> HubAuth | None:
     return HubAuth("ok", "this host's hub token is present and owner-only")
 
 
+def _typed_version_refusal(err: urllib.error.HTTPError) -> HubProbe | None:
+    """A typed version refusal carried on an HTTP error, or None.
+
+    An older hub refuses with a typed body carrying its versions; that
+    refusal runs through `hub.check_version` so a real mismatch fails
+    instead of warning as unreachable. An absent or unreadable body is
+    None, and the caller keeps the unreachable warning.
+    """
+    try:
+        raw = err.read()
+    except Exception:  # noqa: BLE001 - an unreadable error body is report data
+        return None
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        api, schema = body["api"], body["schema_version"]
+        if (
+            isinstance(api, bool)
+            or not isinstance(api, int)
+            or isinstance(schema, bool)
+            or not isinstance(schema, int)
+        ):
+            return None
+    except (ValueError, UnicodeDecodeError, KeyError, TypeError, AttributeError):
+        return None
+    try:
+        hub.check_version(api, schema)
+    except hub.HubVersionError as version_err:
+        return HubProbe("version-mismatch", str(version_err), hub_api=api, hub_schema=schema)
+    return None
+
+
 def load_hub_probe(url: str | None, token: str | None) -> HubProbe | None:
     """Probe the hub's version route once, or None without a hub.
 
@@ -817,6 +847,9 @@ def load_hub_probe(url: str | None, token: str | None) -> HubProbe | None:
             return HubProbe(
                 "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
             )
+        refusal = _typed_version_refusal(err)
+        if refusal is not None:
+            return refusal
         return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
     except Exception as err:  # noqa: BLE001 - a failed probe is report data, never a traceback
         return HubProbe("unreachable", f"the hub at {url} cannot be reached: {err}")

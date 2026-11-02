@@ -1134,6 +1134,25 @@ class BackupTest(StoreCase):
         with self.assertRaises(hub.HubError):
             hub.backup_hub(os.path.join(self.tmp.name, "absent.sqlite"), dest + ".new")
 
+    def test_a_failing_backup_leaves_no_destination_behind(self):
+        junk = os.path.join(self.tmp.name, "junk.sqlite")
+        with open(junk, "w", encoding="utf-8") as handle:
+            handle.write("not a database\n")
+        dest = os.path.join(self.tmp.name, "copy", "hub-backup.sqlite")
+        with self.assertRaises(hub.HubError):
+            hub.backup_hub(junk, dest)
+        self.assertFalse(os.path.exists(dest))
+        missing_dest = os.path.join(self.tmp.name, "missing-backup.sqlite")
+        with self.assertRaises(hub.HubError):
+            hub.backup_hub(os.path.join(self.tmp.name, "absent.sqlite"), missing_dest)
+        self.assertFalse(os.path.exists(missing_dest))
+
+    def test_backup_destination_is_created_owner_only(self):
+        dest = os.path.join(self.tmp.name, "hub-backup.sqlite")
+        self.assertFalse(os.path.exists(dest))
+        hub.backup_hub(self.db, dest)
+        self.assertEqual(oct(os.stat(dest).st_mode & 0o777), "0o600")
+
 
 class VersionCheckTest(unittest.TestCase):
     def test_matching_versions_pass(self):

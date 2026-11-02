@@ -742,6 +742,53 @@ class ProductionHubGathering(unittest.TestCase):
         self.assertEqual(probe.status, "unreachable")
         self.assertTrue(probe.detail)
 
+    def test_typed_404_refusal_maps_to_version_mismatch(self):
+        import urllib.error
+        from email.message import Message
+
+        from corral import hub
+
+        body = json.dumps(
+            {
+                "api": hub.HUB_API - 1,
+                "schema_version": hub.SCHEMA_VERSION,
+                "error": f"unsupported hub api {hub.HUB_API - 1}:"
+                f" this hub serves api {hub.HUB_API}",
+            }
+        ).encode("utf-8")
+        refused = urllib.error.HTTPError(
+            HUB_URL + "/v1/version", 404, "Not Found", Message(), io.BytesIO(body)
+        )
+        with mock.patch("urllib.request.urlopen", side_effect=refused):
+            probe = doctor.load_hub_probe(HUB_URL, None)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.status, "version-mismatch")
+        self.assertIn(str(hub.HUB_API - 1), probe.detail)
+        self.assertIn(str(hub.HUB_API), probe.detail)
+        self.assertEqual((probe.hub_api, probe.hub_schema), (hub.HUB_API - 1, hub.SCHEMA_VERSION))
+        checks = doctor.run_checks(hub_env(hub_probe=probe))
+        found = [check for check in checks if check.name == "hub"]
+        self.assertEqual([check.status for check in found], ["fail"])
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_bare_404_without_a_typed_body_stays_unreachable(self):
+        import urllib.error
+        from email.message import Message
+
+        for raw in (b"", b"not json", None):
+            with self.subTest(raw=raw):
+                fp = None if raw is None else io.BytesIO(raw)
+                bare = urllib.error.HTTPError(
+                    HUB_URL + "/v1/version", 404, "Not Found", Message(), fp
+                )
+                with mock.patch("urllib.request.urlopen", side_effect=bare):
+                    probe = doctor.load_hub_probe(HUB_URL, None)
+                self.assertIsNotNone(probe)
+                assert probe is not None
+                self.assertEqual(probe.status, "unreachable")
+                self.assertIn("404", probe.detail)
+
     def test_probe_never_logs_the_token(self):
         import threading
 
