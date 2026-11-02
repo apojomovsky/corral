@@ -5,9 +5,12 @@ Runs the incremental feed for the ops root's repositories (each
 origin), with ``--resync`` for a full rebuild and ``--audit N`` for
 the rolling re-read of the N rows verified least recently. Exit codes:
 0 synced, 1 nothing changed, 3 tracker unreachable, 4 usage or
-configuration error. Partial failures with something synced are still 0;
-with ``--push`` a sync phase that failed and synced nothing is still 3,
-even when the mirror pass sent a write.
+configuration error. Corrupt stored rows are usage errors: a sync that
+failed only on those (and synced nothing) exits 4, while tracker
+failures with nothing synced exit 3. Partial failures with something
+synced are still 0; with ``--push`` a sync phase that failed and synced
+nothing is still 3 (or 4 for corrupt rows), even when the mirror pass
+sent a write.
 """
 
 import argparse
@@ -116,8 +119,10 @@ def _board_step(store, tracker, tracker_repo, *, operators, now):
 
     Only the board's own failures are caught here (a live check the
     budget or the board refused): the step records a board-outage line,
-    keeps the old cursor, and the pass continues on store data. Anything
-    else (a programming error, a store failure) propagates.
+    keeps the old cursor, and the pass continues on store data. A row
+    the poll cannot apply is already a line in the board result, not a
+    raise. Anything else (a programming error, any other store failure)
+    propagates.
     """
     try:
         schema = tracker.board_schema()
@@ -237,11 +242,13 @@ def sync_root(
             return USAGE
         board_seen = board_result.items_seen if board_result is not None else 0
         board_errors = list(board_result.errors) if board_result is not None else []
+        board_store_errors = list(board_result.store_errors) if board_result is not None else []
         results[name] = {
             "tracker": tracker_repo,
             "seen": result.items_seen + board_seen,
             "cursor": result.cursor,
             "errors": list(result.errors) + board_errors,
+            "store_errors": list(result.store_errors) + board_store_errors,
             "conflicts": list(result.conflicts),
         }
         if board_result is not None:
@@ -252,10 +259,15 @@ def sync_root(
             _err(line, err)
         for line in board_errors:
             _err(line, err)
+        for line in result.store_errors:
+            _err(line, err)
+        for line in board_store_errors:
+            _err(line, err)
         for line in result.conflicts:
             _err(f"claim conflict: {line} (corral wins)", err)
     seen = sum(row["seen"] for row in results.values())
     failed = sum(len(row["errors"]) for row in results.values())
+    store_failed = sum(len(row["store_errors"]) for row in results.values())
     pushed: dict | None = None
     if push:
         from corral import mirror
@@ -303,6 +315,8 @@ def sync_root(
                 out.write(f"mirror: rate limited, retry after {pushed['stopped']:g}s\n")
     landed = seen + (pushed["sent"] if pushed is not None else 0)
     bad = failed + (len(pushed["errors"]) if pushed is not None else 0)
+    if store_failed and not seen:
+        return USAGE
     if failed and not seen:
         return UNREACHABLE
     if landed:

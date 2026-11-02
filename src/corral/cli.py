@@ -14,6 +14,7 @@ from corral import (
     doctor,
     drive,
     gccli,
+    hubcli,
     init,
     launch,
     launchcli,
@@ -225,6 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     coordcli.add_parser(sub)
     diskcli.add_parser(sub)
     drive.add_parser(sub)
+    hubcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)

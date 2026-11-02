@@ -19,6 +19,7 @@ from unittest import mock
 
 from corral import admission, board, drive, launch, quota_ledger
 from corral import projects as projects_mod
+from tests.test_tracker import FakeTracker, reading
 
 
 def stored(path, items):
@@ -523,6 +524,45 @@ class HoldLabelWiringTest(unittest.TestCase):
         self.assertEqual(seen.get("hold_label"), "paused")
         self.assertEqual(launcher_seen.get("hold_label"), "paused")
         self.assertEqual(loaded.call_count, 1)
+
+
+class DriveSyncExitTest(unittest.TestCase):
+    """The claiming pass buckets sync failures: corrupt rows exit 4."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-sync-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+
+    def test_corrupt_row_exits_4_naming_the_row(self):
+        store = stored(self.db, [("acme/app", 7, "open"), ("acme/api", 2, "open")])
+        self.addCleanup(store.close)
+        raw = sqlite3.connect(self.db)
+        try:
+            raw.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                ("{{{broken", "acme/app", 7),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        table = {
+            "acme/app": FakeTracker([]),
+            "acme/api": FakeTracker([reading(repo="acme/api", number=2, updated_at=2000.0)]),
+        }
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=False,
+            tracker_factory=table.__getitem__,
+            now=2000.0,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("acme/app#7", err.getvalue())
 
 
 if __name__ == "__main__":
