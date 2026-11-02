@@ -118,6 +118,26 @@ class JournalApiTest(unittest.TestCase):
         coord.append_entry("note", "t", holder="h", generation=1, root=self.root, now=T0)
         self.assertFalse(os.path.exists(old))
 
+    def test_archive_names_lists_only_dated_archives_sorted(self):
+        directory = os.path.join(self.root, "coord")
+        os.makedirs(directory, exist_ok=True)
+        for name in (
+            "journal-2026-10-02.jsonl",
+            "journal-2026-10-01.jsonl",
+            "journal-draft.jsonl",
+            "journal-.jsonl",
+            "notes.jsonl",
+        ):
+            with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                handle.write("{}\n")
+        self.assertEqual(
+            coord.journal_archive_names(directory),
+            ["journal-2026-10-01.jsonl", "journal-2026-10-02.jsonl"],
+        )
+
+    def test_archive_names_missing_directory_is_empty(self):
+        self.assertEqual(coord.journal_archive_names(os.path.join(self.root, "coord")), [])
+
     def test_brief_json_has_every_key(self):
         coord.append_entry(
             "handoff", "in flight: X", holder="h", generation=1, root=self.root, now=T0
