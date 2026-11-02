@@ -1467,6 +1467,45 @@ def release_orphans(store, *, now, gone_s, present_agents, live_units, out, even
     return released
 
 
+def drop_stale_claim(store, repo, number, *, stop_unit, out, now) -> bool:
+    """Stop the units and drop a local claim the hub superseded.
+
+    The reconnect rule from docs/08-hub-multihost.md section 2: stop
+    the ticket's units through the injected stop seam, drop the local
+    claim state without touching the hub row, and log. Never resumes
+    and never re-proposes; the next pass may propose only tickets the
+    hub shows as unclaimed. Returns True when the ticket is clear (or
+    was already clear) and False when the stop or the drop failed, in
+    which case the claim is kept for the next pass. A release race
+    (the row changed under the pass) is left held, never retried here.
+    """
+    ref = f"{repo}#{number}"
+    try:
+        claim = store.claim_of(repo, number)
+    except (board.StoreError, sqlite3.Error) as problem:
+        print(f"{ref}: stale-claim read refused ({problem}), left held", file=out)
+        return False
+    if claim is None or not claim.agent:
+        print(f"{ref}: no local claim, nothing to drop", file=out)
+        return True
+    try:
+        stop_unit(repo, number)
+    except Exception as problem:
+        print(f"{ref}: stale-claim stop failed ({problem}), claim kept", file=out)
+        return False
+    try:
+        store.release(repo, number, claim.agent, claim.epoch, now=now)
+    except board.Claimed:
+        print(f"{ref}: stale-claim drop raced a re-claim, left held", file=out)
+        return False
+    print(
+        f"{ref}: stopped units and dropped the stale claim by `{claim.agent}`"
+        f" (local epoch {claim.epoch} superseded)",
+        file=out,
+    )
+    return True
+
+
 #: Automatic restarts per ticket in any sliding window.
 RESTART_BUDGET = 3
 RESTART_WINDOW_S = 24 * 60 * 60
@@ -1780,12 +1819,18 @@ def handle_stuck(
     events=None,
     start_budget=None,
     day_cap=None,
+    hub_epoch_of=None,
 ):
     """Restart or give up on stuck managed claims. Returns (restarted, capped).
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
-    foreign claims are never touched. A stuck row refreshes its claim
+    foreign claims are never touched. In hub mode `hub_epoch_of` maps
+    (repo, number) to the hub row's fencing epoch (None when the hub
+    shows no row); a local epoch the hub superseded skips instead of
+    restarting, and an unreadable hub epoch skips without stopping, so
+    the pass never stop-plus-launches work it no longer owns. With no
+    seam the sweep behaves as today (single-host). A stuck row refreshes its claim
     heartbeat on every restart attempt (success or failure) before any
     stop or launch, so the orphan rule defers to stuck handling and a
     failing ticket can no longer escape into a fresh agent id. The
@@ -1835,6 +1880,19 @@ def handle_stuck(
         if claim.claimed_at >= now:
             continue
         ref = f"{claim.repo}#{claim.number}"
+        if hub_epoch_of is not None:
+            try:
+                hub_epoch = hub_epoch_of(claim.repo, claim.number)
+            except Exception as problem:
+                print(f"{ref}: hub epoch unreadable ({problem}), restart skipped", file=out)
+                continue
+            if hub_epoch is not None and hub_epoch != claim.epoch:
+                print(
+                    f"{ref}: hub epoch {hub_epoch} supersedes local epoch {claim.epoch},"
+                    " restart skipped",
+                    file=out,
+                )
+                continue
         seen = agent_states.get(claim.agent)
         if seen is None or not isinstance(seen[1], (int, float)):
             known, age = False, float("inf")
@@ -3016,6 +3074,7 @@ def _launching_pass(
     journal_path=None,
     day_path=None,
     max_starts=None,
+    hub_epoch_of=None,
 ) -> int:
     """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
@@ -3264,6 +3323,7 @@ def _launching_pass(
                 events=events if journal_path is not None else None,
                 start_budget=stuck_budget,
                 day_cap=max_starts,
+                hub_epoch_of=hub_epoch_of,
             )
             started += stuck_restarted
         except (board.StoreError, sqlite3.Error) as problem:
@@ -3388,6 +3448,7 @@ def run_pass(
     pause_path=None,
     day_path=None,
     max_starts=None,
+    hub_epoch_of=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
@@ -3416,7 +3477,9 @@ def run_pass(
     `launcher` when None) relaunches it, `restarts_path` persists the
     budget (in memory when None), and `stuck_project(repo, number)`
     names the owning project. With no stop or launch seam a stuck row is
-    left held; a failed seam keeps the claim. `finished_for`
+    left held; a failed seam keeps the claim. `hub_epoch_of` maps
+    (repo, number) to the hub row's fencing epoch for the stuck epoch
+    check (None means single-host: no check). `finished_for`
     ({(repo, number): (agent id, role)} for the newest finished entry per
     ticket) feeds the reviewer and fix-round readiness alongside the
     same-pass releases. `agent_roles` ({agent id: role} for visible
@@ -3487,6 +3550,7 @@ def run_pass(
                 journal_path=journal_path,
                 day_path=day_path,
                 max_starts=max_starts,
+                hub_epoch_of=hub_epoch_of,
                 **args,
             )
     except LockHeld as held:
