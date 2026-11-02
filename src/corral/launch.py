@@ -340,6 +340,29 @@ def _ensure_slices(decided, run):
     )
 
 
+def _require_role_price(tgt, role, where):
+    """Refuse an unpriced role while a host budget is set (exit 4).
+
+    With a host budget every launch is charged by role: a role with no
+    ``[resources.role.<name>]`` table would run free and set no per-agent
+    limits, so the launch refuses instead, naming the role, the missing
+    table and the host config file. With no host budget the gate passes
+    everything and unpriced roles launch untouched. Unknown roles are
+    not priced either, but they stay a ``LimitsError`` from the budget
+    gate: no table could exist for them.
+    """
+    name = role or prompts.DEFAULT_ROLE
+    if name not in prompts.ROLES:
+        return
+    tables = tgt.resolved.resources
+    if tables is None or name not in tables.roles:
+        raise LaunchError(
+            f"role {name!r} has no [resources.role.{name}] price in {where}: "
+            "the host budget is set, so every launch is charged; "
+            "add the table to price this role"
+        )
+
+
 def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None):
     """Refuse a ticket that is already live, a pressured host, or a host with no free slot.
 
@@ -376,11 +399,12 @@ def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None
     ledger = host_ledger_fn()
     limits = None
     now = None
+    where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
     if base.host is not None:
         shares = {entry.name: (entry.resources or {}) for entry in registered}
-        where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
         limits = resources.join(base, shares, ledger.get("foreign", []), where=where)
         now = (now_fn or time.time)()
+        _require_role_price(tgt, role, where)
     refusal = disk.refusal_text(tgt.resolved, usage=usage)
     if refusal is not None:
         raise CapFull(refusal)

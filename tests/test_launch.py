@@ -290,6 +290,10 @@ class AdmitTest(OpsCase):
 
 HOST_BUDGET = "[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n"
 
+WORKER_PRICE = "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+
+REVIEWER_PRICE = "[resources.role.reviewer]\ncpu_m = 500\nmemory_mb = 1024\n"
+
 NOW = 1_000_000.0
 
 
@@ -411,7 +415,7 @@ class BudgetWiringTest(OpsCase):
         self.assertEqual(self.system.started, [])
 
     def test_an_exhausted_quota_still_refuses_when_the_budget_is_roomy(self):
-        self.host_config(HOST_BUDGET)
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
             handle.write(TOML + "[models.worker]\nchain = ['fresh/model']\n")
         pool = [accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0)]
@@ -448,6 +452,70 @@ class BudgetWiringTest(OpsCase):
         self.assertIn("auditor", str(caught.exception))
         self.assertEqual(caught.exception.exit_code, 4)
 
+    def test_an_unpriced_role_under_a_host_budget_is_refused_with_4(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaisesRegex(launch.LaunchError, "reviewer") as caught:
+            self.admit(role="reviewer")
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertIn("[resources.role.reviewer]", str(caught.exception))
+        self.assertIn("config.toml", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+
+    def test_an_unpriced_launch_starts_nothing(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaises(launch.LaunchError):
+            launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                role="reviewer",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+                controllers_read=lambda path: "cpu memory pids",
+            )
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.session("lib", 5)))
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_priced_reviewer_launches_with_its_own_charge(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE + REVIEWER_PRICE)
+        self.register_web()
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            role="reviewer",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            controllers_read=lambda path: "cpu memory pids",
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        agent = self.system.started[-1]
+        self.assertIn("--property=Slice=corral-web.slice", agent)
+        self.assertIn("--property=MemoryMax=1024M", agent)
+
+    def test_no_host_budget_leaves_an_unpriced_role_untouched(self):
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            role="reviewer",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(len(self.system.started), 1)
+        self.assertFalse([a for a in self.system.started[0] if "Slice=" in a])
+
     def test_a_reviewer_fits_where_a_worker_does_not(self):
         self.host_config(
             "[resources.host]\ncpu_m = 1500\nmemory_mb = 16000\npids = 4096\n"
@@ -460,7 +528,7 @@ class BudgetWiringTest(OpsCase):
         self.admit(role="reviewer")
 
     def test_an_expired_foreign_claim_frees_the_pool(self):
-        self.host_config(HOST_BUDGET)
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
         self.system.ledger["foreign"] = [
             {"name": "desk", "cpu_m": 8000, "memory_mb": 16000, "claimed_at": NOW - 601.0}
         ]
@@ -505,7 +573,7 @@ class BudgetWiringTest(OpsCase):
         self.assertEqual(launchcli._exit_code(caught.exception), 4)
 
     def test_slices_are_created_parents_first_with_their_limits(self):
-        self.host_config(HOST_BUDGET)
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
         self.register_web()
         unit, _ = launch.launch(
             self.target("lib", "omp"),
@@ -530,10 +598,11 @@ class BudgetWiringTest(OpsCase):
         self.assertIn("--property=CPUQuota=800%", project_slice)
         self.assertIn("--unit=corral-agent-lib-5", agent)
         self.assertIn("--property=Slice=corral-web.slice", agent)
-        self.assertFalse([a for a in agent if a.startswith("--property=MemoryMax=")])
+        self.assertIn("--property=MemoryMax=2048M", agent)
+        self.assertIn("--property=CPUQuota=100%", agent)
 
     def test_a_missing_required_controller_is_exit_4_before_anything_runs(self):
-        self.host_config(HOST_BUDGET)
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
         self.register_web()
         with self.assertRaisesRegex(units.UnitsError, "memory") as caught:
             launch.launch(

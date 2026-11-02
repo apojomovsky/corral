@@ -610,9 +610,10 @@ class Tables:
     ``host`` is the ``[resources.host]`` machine total, None when the
     file sets no budget: no enforcement, the gate passes everything.
     ``roles`` holds only the roles with a ``[resources.role.<name>]``
-    table; ``config`` prices every other known role at zero. Tables never
-    come from the project file or a repo entry: the host budget is one
-    machine fact, and those layers read as unknown settings instead.
+    table; ``config`` prices every other known role at zero, and the
+    launch refuses an unpriced role while a host budget is set. Tables
+    never come from the project file or a repo entry: the host budget is
+    one machine fact, and those layers read as unknown settings instead.
     """
 
     host: Usage | None
@@ -658,7 +659,8 @@ def check_tables(raw, where):
     Strict on the ``[models]`` precedent: unknown tables (there is no
     project or instance layer at host level), unknown keys, unknown role
     names, and partial host triples are SettingsError naming the file
-    and the key. A missing role table prices that role at zero later.
+    and the key. A missing role table prices that role at zero later,
+    and the launch refuses that role while a host budget is set.
     """
     if raw is None:
         return None
@@ -691,10 +693,11 @@ def check_tables(raw, where):
 def config(resolved=None):
     """The effective host-level budget as Limits: the budget or None, every role's charge.
 
-    Unpriced roles cost nothing. Project shares come from the project
-    registry and foreign claims from the ledger ticket; this is the host
-    part only. Raises SettingsError when ``resources.gone_s`` is out of
-    range.
+    Unpriced roles cost nothing here; the launch refuses them while a
+    host budget is set, so a zero charge never runs free. Project shares
+    come from the project registry and foreign claims from the ledger
+    ticket; this is the host part only. Raises SettingsError when
+    ``resources.gone_s`` is out of range.
     """
     resolved = resolved if resolved is not None else settings.load()
     tables = resolved.resources
