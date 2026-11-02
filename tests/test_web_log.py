@@ -245,5 +245,65 @@ class LogSourceDiscipline(unittest.TestCase):
         self.assertIn('id="tabs"', html)
 
 
+def app_body(name):
+    app = web_text("app.js")
+    at = app.find(name)
+    assert at > -1, name
+    return app[at : app.find("\n}\n", at)]
+
+
+class LogFingerprintIncludesKind(unittest.TestCase):
+    """Item 4: the tickLog render-skip fingerprint covers the kind."""
+
+    def test_fingerprint_names_log_kind(self):
+        body = app_body("async function tickLog(")
+        at = body.find("const fingerprint =")
+        self.assertGreater(at, -1)
+        window = body[at : at + 800]
+        self.assertIn("logKind", window)
+
+
+class OlderFailureStaysInCard(unittest.TestCase):
+    """Item 5: a failed load-older stays in the journal card."""
+
+    def test_older_failure_touches_no_global_failure_state(self):
+        body = app_body("async function pollOlder(")
+        at = body.find("if (!(reply")
+        self.assertGreater(at, -1)
+        failure = body[at : at + 900]
+        self.assertNotIn("failures += 1", failure)
+        self.assertNotIn("renderConnection(", failure)
+
+    def test_older_failure_shows_the_journal_retry_text(self):
+        body = app_body("async function pollOlder(")
+        at = body.find("if (!(reply")
+        self.assertGreater(at, -1)
+        window = body[at : at + 1200]
+        self.assertIn("journalState", window)
+        self.assertIn("renderLog(", window)
+
+
+class JournalWindowRecomputesStart(unittest.TestCase):
+    """Item 6: the newest window recomputes start from its own reply."""
+
+    def test_load_journal_last_recomputes_from_the_window_reply(self):
+        api = web_text("api.js")
+        at = api.find("export async function loadJournalLast(")
+        self.assertGreater(at, -1)
+        body = api[at : api.find("\n}\n", at)]
+        fetches = [m.start() for m in re.finditer(r"await fetchJson\(", body)]
+        self.assertGreaterEqual(len(fetches), 2)
+        second = body[fetches[1] :]
+        self.assertTrue(
+            "windowReply.data.total" in second or "windowReply.data.cursor" in second,
+            second[:600],
+        )
+
+    def test_tick_log_derives_start_from_the_window_cursor(self):
+        body = app_body("async function tickLog(")
+        self.assertIn("parsedCursor", body)
+        self.assertIn("journalReply.data.cursor", body)
+
+
 if __name__ == "__main__":
     unittest.main()
