@@ -69,10 +69,10 @@ Ownership follows `00-design.md` field ownership with no new rule:
 - People win people-owned fields. A reader overwrites only the concepts
   it carries; a concept absent from a reading means keep, never clear.
   The store's upsert merges `extra` by key, and only an explicit cleared
-  encoding from the board adapter removes a concept: a scalar concept
-  with value `None` in the adapter's reading means cleared (the upsert
-  deletes that key), an absent key means keep, and an empty list clears
-  a list concept. A REST feed reading that carries no board concepts
+  encoding from the board adapter removes a concept: a value of `None`
+  or an empty list in the adapter's reading means cleared (the upsert
+  deletes that key whatever the stored type), while an absent key means
+  keep. A REST feed reading that carries no board concepts
   therefore leaves the stored board `extra` untouched. These concepts
   are never enqueued, and the adapter offers no write path for them
   (no method, not a refused one).
@@ -334,7 +334,7 @@ fails if either real one is touched:
 | --- | --- |
 | `graphql()` and `paced_run()` honor the injected `run` and pacer; nothing reaches the real pacer file or subprocess | fake `run` argv plus fake pacer call log |
 | Issue parse plus board concepts land in `extra`; unknown option keeps stored value with an error line | fake `run` payloads |
-| An issue edit through the REST feed preserves the stored board `extra`; only the cleared encoding removes a concept (`None` deletes a scalar key, absent keeps, empty list clears a list) | fake `run` feed plus temp store with board `extra` |
+| An issue edit through the REST feed preserves the stored board `extra`; only the cleared encoding removes a concept (`None` or an empty list deletes the key whatever the stored type, absent keeps) | fake `run` feed plus temp store with board `extra` |
 | An unparseable `blocked_by` entry is carried raw in `extra`, the ticket reads as blocked, and the doctor names the item and entry | fake `run` payloads, temp store, doctor check |
 | Board poll pages with `after`, stops on short page; malformed page is `TrackerError`, never partial | fake `run` pages |
 | Board-only edit (issue `updated_at` unchanged) detected by poll and audit | fake `run`, temp store with aged row |
@@ -361,15 +361,15 @@ Each is sized for one agent, with acceptance criteria.
    never shared), precedence helper for priority in one place (board
    `priority` wins when present, else the label-derived rank), and the
    store's upsert merges `extra` by key (a reading overwrites only the
-   concepts it carries), under the cleared encoding (`None` deletes a
-   scalar key, absent keeps, empty list clears a list). `graphql()` and
+   concepts it carries), under the cleared encoding (`None` or an empty
+   list deletes the key whatever the stored type, absent keeps). `graphql()` and
    `paced_run()` accept an injected `run` and an injected pacer,
    defaulting to the real ones. Criteria: existing fake trackers compile
    untouched; board-concept rows persist and read back through `extra`;
    a REST feed reading preserves stored board `extra`; a board reading
-   with `None` for a scalar concept deletes that key and an absent key
-   keeps it; the guard test fails if any test reaches the real pacer
-   state file or a real subprocess.
+   with `None` or an empty list for a concept deletes that key whatever
+   the stored type, and an absent key keeps it; the guard test fails if
+   any test reaches the real pacer state file or a real subprocess.
 2. Board settings and validation. Registry scalars, plus `settings.py`
    popping and validating the per-repo `board` tables in `resolve()`
    on the `[models]` and `[private]` precedent (strict concept keys,

@@ -4,8 +4,10 @@ import argparse
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
+from typing import Any
 from unittest import mock
 
 from corral import board, cli, settings, sync, syncli, tracker
@@ -115,6 +117,63 @@ class ExitCodeTest(SyncRootCase):
         fake = FakeTracker([reading(number=1, updated_at=T0)])
         fake.items_break_after = 0
         self.assertEqual(self.run_sync(fake, resync=True), 3)
+
+    def corrupt(self, number):
+        raw = sqlite3.connect(os.path.join(self.root, "board.sqlite"))
+        try:
+            raw.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                ("{{{broken", REPO, number),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+    def seed(self, number, **over):
+        params: dict[str, Any] = {
+            "repo": REPO,
+            "number": number,
+            "kind": "issue",
+            "title": "Title",
+            "body": "Body",
+            "state": "open",
+            "author": "acme",
+            "labels": [],
+            "priority": "",
+            "assignees": [],
+            "url": "",
+            "tracker_updated_at": T0 - 100,
+            "from_fork": False,
+        }
+        params.update(over)
+        self.store.upsert_item(board.Item(**params), operators=["acme"], now=T0 - 100)
+
+    def test_corrupt_only_sync_exits_4_naming_the_row(self):
+        self.seed(1)
+        self.corrupt(1)
+        fake = FakeTracker([reading(number=1, author="acme", updated_at=T0)])
+        self.assertEqual(self.run_sync(fake), 4)
+        self.assertIn(f"{REPO}#1", self.err.getvalue())
+
+    def test_corrupt_only_resync_exits_4(self):
+        self.seed(1)
+        self.corrupt(1)
+        fake = FakeTracker([reading(number=1, author="acme", updated_at=T0)])
+        self.assertEqual(self.run_sync(fake, resync=True), 4)
+        self.assertIn(f"{REPO}#1", self.err.getvalue())
+
+    def test_partial_corruption_still_exits_0(self):
+        self.seed(1)
+        self.seed(2)
+        self.corrupt(1)
+        fake = FakeTracker(
+            [
+                reading(number=1, author="acme", updated_at=T0),
+                reading(number=2, author="acme", updated_at=T0),
+            ]
+        )
+        self.assertEqual(self.run_sync(fake), 0)
+        self.assertIn(f"{REPO}#1", self.err.getvalue())
 
     def test_unknown_repo_exits_4(self):
         self.assertEqual(self.run_sync(FakeTracker(), names=["nope"]), 4)
