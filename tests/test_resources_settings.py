@@ -147,6 +147,11 @@ class GoneS(unittest.TestCase):
     def test_gone_s_defaults_to_ten_minutes(self):
         self.assertEqual(resolve()["resources.gone_s"], 600)
 
+    def test_the_settings_default_agrees_with_the_resources_constant(self):
+        """The registered default and resources.DEFAULT_GONE_S are one fact."""
+        self.assertEqual(S.REGISTRY["resources.gone_s"].default, int(R.DEFAULT_GONE_S))
+        self.assertEqual(resolve()["resources.gone_s"], int(R.DEFAULT_GONE_S))
+
     def test_gone_s_is_settable_in_any_layer(self):
         self.assertEqual(resolve(host={"resources.gone_s": 60})["resources.gone_s"], 60)
         self.assertEqual(resolve(project={"resources.gone_s": 30})["resources.gone_s"], 30)

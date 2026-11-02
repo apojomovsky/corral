@@ -21,7 +21,7 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
-from corral import pressure, prompts, resources, units
+from corral import host_ledger, pressure, prompts, resources, units
 
 #: The pressure files the doctor probes. An unreadable one reads as
 #: unknown: admission continues on charged tags and the pressure row warns.
@@ -55,8 +55,10 @@ class ResourceReadings(NamedTuple):
     is the measured host pressure as ``(load_per_cpu, mem_available_pct)``,
     Nones when unknown; None means not gathered, and then the pressure
     row skips saturation. ``pressure_caps`` is the saturation line as
-    ``(max_load_per_cpu, min_mem_available_pct)``. Tests build this
-    directly; only production reads disk.
+    ``(max_load_per_cpu, min_mem_available_pct)``. ``foreign_ignored``
+    names the drop-in dir entries no claim holds (a typo such as
+    ``desk.jsnm``): never counted by the gate, warned by the row.
+    Tests build this directly; only production reads disk.
     """
 
     host: resources.Usage | None
@@ -81,6 +83,7 @@ class ResourceReadings(NamedTuple):
     config_path: str
     pressure: tuple[float | None, float | None] | None = None
     pressure_caps: tuple[float, float] = _DEFAULT_PRESSURE_CAPS
+    foreign_ignored: tuple = ()
 
 
 class ResourceRow(NamedTuple):
@@ -277,12 +280,19 @@ def _check_pressure(state: ResourceReadings) -> ResourceRow:
 
 
 def _parse_claim(entry: object, index: int) -> tuple[str, float]:
-    """(name, claimed_at) for one raw ledger claim, else a ValueError naming it."""
+    """(name, claimed_at) for one raw ledger claim, else a ValueError naming it.
+
+    A missing claimed_at reads as 0.0, the same default the budget gate
+    validates, so the row reports the claim as expired and ignored
+    rather than failing it.
+    """
     if not isinstance(entry, Mapping):
         raise ValueError(f"foreign claim {index} must be an object, not {entry!r}")
     name = entry.get("name")
     if not isinstance(name, str) or not name:
         raise ValueError(f"foreign claim {index} needs a non-empty name, not {name!r}")
+    if "claimed_at" not in entry:
+        return name, 0.0
     claimed_at = entry.get("claimed_at")
     if (
         isinstance(claimed_at, bool)
@@ -294,10 +304,13 @@ def _parse_claim(entry: object, index: int) -> tuple[str, float]:
 
 
 def _check_foreign(state: ResourceReadings) -> ResourceRow:
-    """Foreign claims: malformed fails, expired warns, live reads ok.
+    """Foreign claims: malformed fails, expired or ignored warns, live reads ok.
 
     An unreadable ledger warns unknown: the load was never read, so an
-    empty claim list is unknown, not zero.
+    empty claim list is unknown, not zero. A claim without claimed_at
+    reads as 0.0 like the budget gate, so it reports as expired and
+    ignored. Entries in the drop-in dir that are not .json are never
+    counted; they warn naming the entries.
     """
     if state.limits_error is not None and "foreign claim" in state.limits_error:
         return ResourceRow(
@@ -329,14 +342,32 @@ def _check_foreign(state: ResourceReadings) -> ResourceRow:
             expired.append(name)
         else:
             live.append(name)
+    warns: list[tuple[str, str]] = []
     if expired:
+        warns.append(
+            (
+                f"foreign {', '.join(sorted(expired))} expired"
+                f" under gone_s ({state.gone_s:g}s) and {_plural(len(expired), 'is', 'are')}"
+                " ignored by the budget gate",
+                "renew or remove the expired claims, then run `corral doctor` again",
+            )
+        )
+    ignored = sorted(set(state.foreign_ignored or ()))
+    if ignored:
+        claims_dir = host_ledger.claims_dir(state.ledger_path)
+        warns.append(
+            (
+                f"foreign-claim entries ignored (not .json, never counted): {', '.join(ignored)}",
+                f"remove or rename the ignored entries in {claims_dir},"
+                " then run `corral doctor` again",
+            )
+        )
+    if warns:
         return ResourceRow(
             "resources-foreign",
             "warn",
-            f"foreign {', '.join(sorted(expired))} expired"
-            f" under gone_s ({state.gone_s:g}s) and {_plural(len(expired), 'is', 'are')}"
-            " ignored by the budget gate",
-            "renew or remove the expired claims, then run `corral doctor` again",
+            "; ".join(detail for detail, _ in warns),
+            "; ".join(fix for _, fix in warns),
         )
     if live:
         return ResourceRow(
