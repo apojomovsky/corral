@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from corral import board, drive, registry
 from corral.tracker import NEEDS_DECISION
@@ -102,6 +103,91 @@ class FinishedHoldersTest(unittest.TestCase):
         after = store.claim_of("app", 7)
         assert after is not None
         self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+
+    def test_a_transient_lock_on_the_scan_retries_then_reports(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def flaky_items(*args, **kwargs):
+            calls.append(1)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return original_items(*args, **kwargs)
+
+        store.items = flaky_items
+        try:
+            holders = drive.finished_holders(store, agent_states={WORKER: (FINISHED, NOW)})
+        finally:
+            store.items = original_items
+        self.assertEqual(holders, {("app", 7): WORKER})
+
+    def test_a_transient_lock_on_a_claim_read_retries_then_reports(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        original_claim_of = store.claim_of
+        calls = []
+
+        def flaky_claim_of(repo, number):
+            calls.append(1)
+            if len(calls) < 2:
+                raise sqlite3.OperationalError("database is locked")
+            return original_claim_of(repo, number)
+
+        store.claim_of = flaky_claim_of
+        try:
+            holders = drive.finished_holders(store, agent_states={WORKER: (FINISHED, NOW)})
+        finally:
+            store.claim_of = original_claim_of
+        self.assertEqual(holders, {("app", 7): WORKER})
+
+    def test_a_persistent_lock_on_the_scan_raises_for_the_caller_to_skip(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def locked(*args, **kwargs):
+            calls.append(1)
+            raise sqlite3.OperationalError("database is locked")
+
+        store.items = locked
+        try:
+            with self.assertRaises(sqlite3.Error):
+                drive.finished_holders(store, agent_states={WORKER: (FINISHED, NOW)})
+        finally:
+            store.items = original_items
+        self.assertGreater(len(calls), 1)
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+
+    def test_a_non_transient_scan_error_raises_at_once(self):
+        for problem in (
+            board.StoreError("unusable row app#7"),
+            sqlite3.Error("disk write failed"),
+        ):
+            store = stored(self.db, [("app", 7, "open")])
+            self.addCleanup(store.close)
+            claimed(store, "app", 7)
+            original_items = store.items
+            calls = []
+
+            def broken(*args, **kwargs):
+                calls.append(1)
+                raise problem
+
+            store.items = broken
+            try:
+                with self.assertRaises(type(problem)):
+                    drive.finished_holders(store, agent_states={WORKER: (FINISHED, NOW)})
+            finally:
+                store.items = original_items
+            self.assertEqual(len(calls), 1)
 
 
 class ResolveFinishedTest(unittest.TestCase):
@@ -400,6 +486,31 @@ class ReviewPassTest(unittest.TestCase):
         self.assertEqual(launcher.calls[0][3], "review")
         self.assertIsNone(store.claim_of("app", 7))
         self.assertIn("reviewer claim released", out)
+
+    def test_a_persistent_lock_on_the_holder_capture_skips_the_step_and_keeps_claims(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        with mock.patch.object(
+            drive,
+            "finished_holders",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            code, _, err = self.run_review(
+                store,
+                [("blue", [("app", 7, "review")])],
+                fake,
+                launcher,
+                agent_states={RIVAL: (FINISHED, NOW - 10.0)},
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("finished holder capture skipped", err)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
     def test_a_failed_reviewer_launch_with_a_release_race_keeps_the_rival_claim(self):
         store = stored(self.db, [("app", 7, "open")])

@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, drive, drivehub, launch, quota_ledger
+from corral import admission, board, cli, drive, drivehub, launch, quota_ledger
 from corral import projects as projects_mod
 from tests.test_tracker import FakeTracker, reading
 
@@ -272,6 +272,23 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertIn("app#7: start", out)
 
+    def test_plan_with_a_persistent_holder_lock_skips_the_capture(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with mock.patch.object(
+            drive,
+            "finished_holders",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            code, out, err = self.run_pass(
+                store,
+                found=[("blue", [("app", 7, "start")])],
+                agent_states={},
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: start", out)
+        self.assertIn("finished holder capture skipped", err)
+
     def test_non_plan_pass_takes_and_releases_the_lock(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -431,6 +448,64 @@ class LockPathTest(unittest.TestCase):
                 os.environ["CORRAL_STATE"] = old
 
 
+class StatePathsTest(unittest.TestCase):
+    def test_every_drive_state_path_comes_from_the_state_dir(self):
+        tmp = tempfile.TemporaryDirectory(prefix="corral-drive-state-")
+        self.addCleanup(tmp.cleanup)
+        old = os.environ.get("CORRAL_STATE")
+        os.environ["CORRAL_STATE"] = tmp.name
+        try:
+            from corral import paths
+
+            state = paths.state_dir()
+            self.assertEqual(drive.lock_path(), os.path.join(state, "drive.lock"))
+            self.assertEqual(drive.drive_dir(), os.path.join(state, "drive"))
+            self.assertEqual(drive.journal_path(), os.path.join(state, "drive", "journal.jsonl"))
+            self.assertEqual(drive.pause_path(), os.path.join(state, "drive.pause"))
+            self.assertEqual(drive.day_path(), os.path.join(state, "drive.starts.json"))
+            self.assertEqual(drive.restarts_path(), os.path.join(state, "drive-restarts.json"))
+        finally:
+            if old is None:
+                del os.environ["CORRAL_STATE"]
+            else:
+                os.environ["CORRAL_STATE"] = old
+
+
+class HostFullExitTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-full-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_full_host_with_no_starts_exits_zero_not_75(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        out, err = io.StringIO(), io.StringIO()
+        launcher = mock.MagicMock()
+        code = hermetic_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            live=frozenset({("blue", "app", 1)}),
+            limits=admission.Limits(total=1, projects={"blue": {"floor": 0, "ceiling": None}}),
+            launcher=launcher,
+            host="host-1",
+        )
+        # A saturated host is not an error: the pass did its dispatch
+        # work, so it exits 0, never cli.NO_SLOT (75, "no free slot").
+        self.assertEqual(code, drive.OK)
+        self.assertNotEqual(code, cli.NO_SLOT)
+        self.assertIn("host full", out.getvalue())
+        launcher.assert_not_called()
+
+
 class CmdDriveTest(unittest.TestCase):
     def test_unreadable_store_is_exit_four(self):
         tmp = tempfile.TemporaryDirectory(prefix="corral-drive-cmd-")
@@ -524,6 +599,11 @@ class HoldLabelWiringTest(unittest.TestCase):
         self.assertEqual(seen.get("hold_label"), "paused")
         self.assertEqual(launcher_seen.get("hold_label"), "paused")
         self.assertEqual(loaded.call_count, 1)
+
+    def test_a_claiming_pass_reads_max_starts_from_the_resolved_settings(self):
+        code, seen, _, _ = self.passing_cmd(plan=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen.get("max_starts"), 50)
 
 
 class DriveSyncExitTest(unittest.TestCase):

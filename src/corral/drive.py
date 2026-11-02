@@ -737,10 +737,32 @@ def drive_lock(path):
 TIMER_NAME = "corral-drive.timer"
 SERVICE_NAME = "corral-drive.service"
 
-#: How often the installed timer wakes a pass: every five minutes, the
-#: cadence the design sets. An operator changes it by editing the
-#: installed unit file; corral never rewrites an installed unit.
+#: How often the installed timer wakes a pass: the default `drive.period`,
+#: baked into the unit at install time. Changing the setting takes a
+#: reinstall; a hand-edited unit keeps working until one overwrites it.
 TIMER_ON_CALENDAR = "*:0/5"
+
+
+def _nonblank_period(value):
+    """One timer cadence's shape, for the settings layer: a non-blank string.
+
+    The settings layer names the file and key around this rule. The
+    value renders verbatim into the installed `OnCalendar=` line, so a
+    blank cadence would install a timer that never wakes: it fails
+    here, exit 4, before anything is written.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"must be a non-blank OnCalendar cadence, not {value!r}")
+    return value
+
+
+settings.register(
+    "drive.period",
+    str,
+    TIMER_ON_CALENDAR,
+    "systemd OnCalendar cadence at which the installed timer wakes a pass",
+    check=_nonblank_period,
+)
 
 #: The corral binary the shipped service starts, in systemd specifier
 #: form: the `make install` location. An install elsewhere edits the
@@ -775,14 +797,24 @@ def service_text(corral_bin=TIMER_CORRAL_BIN) -> str:
     )
 
 
-def timer_text() -> str:
-    """The shipped timer unit: wake the pass, catching up one missed tick. Pure."""
+def timer_text(period=None) -> str:
+    """The shipped timer unit: wake the pass, catching up one missed tick. Pure.
+
+    `period` is the `OnCalendar=` cadence; None renders the shipped
+    default. A blank period raises `TimerError` (exit 4): the seam fails
+    closed no matter which caller passes it.
+    """
+    if period is not None:
+        try:
+            _nonblank_period(period)
+        except ValueError as err:
+            raise TimerError(str(err)) from None
     return (
         "[Unit]\n"
-        "Description=run the corral dispatch pass every five minutes\n"
+        "Description=run the corral dispatch pass on its schedule\n"
         "\n"
         "[Timer]\n"
-        f"OnCalendar={TIMER_ON_CALENDAR}\n"
+        f"OnCalendar={TIMER_ON_CALENDAR if period is None else period}\n"
         "Persistent=true\n"
         "\n"
         "[Install]\n"
@@ -879,14 +911,21 @@ def _timer_systemctl(args, run):
         raise TimerError(f"cannot run {' '.join(argv)}: {tail}")
 
 
-def install_timer(*, env=None, run=units.default_run, corral_bin=TIMER_CORRAL_BIN) -> tuple:
+def install_timer(
+    *, env=None, run=units.default_run, corral_bin=TIMER_CORRAL_BIN, period=None
+) -> tuple:
     """Install and enable the user timer: the one explicit operator step.
 
     Writes the service and timer units, reloads the manager, then
     `enable --now` the timer. Returns the (service, timer) paths. Only
     this function writes or enables units: passes never call it, and the
-    CLI reaches it only through `corral drive install-timer`.
+    CLI reaches it only through `corral drive install-timer`. `period`
+    is the `OnCalendar=` cadence baked into the timer unit (None keeps
+    the shipped default); the install-timer step resolves it from the
+    `drive.period` setting. A blank period raises `TimerError` before
+    anything is written.
     """
+    timer = timer_text(period)
     directory = timer_dir(env)
     try:
         os.makedirs(directory, exist_ok=True)
@@ -895,7 +934,7 @@ def install_timer(*, env=None, run=units.default_run, corral_bin=TIMER_CORRAL_BI
     service_path, timer_path = unit_paths(env)
     try:
         paths.atomic_write_text(service_path, service_text(corral_bin))
-        paths.atomic_write_text(timer_path, timer_text())
+        paths.atomic_write_text(timer_path, timer)
     except OSError as err:
         raise TimerError(f"cannot write the timer units: {err}") from None
     _timer_systemctl(["daemon-reload"], run)
@@ -1246,9 +1285,7 @@ def _pass(
         quota_for,
         pool,
     ) = ctx
-    released = (
-        finished_holders(store, agent_states=agent_states) if agent_states is not None else {}
-    )
+    released = _capture_finished_holders(store, agent_states=agent_states, err=err)
     finished = resolve_finished(finished_for, released)
     gated_rows, problems = _gate_all(
         items,
@@ -1446,34 +1483,60 @@ def is_orphan(claim, *, now, gone_s, present_agents, live_units) -> bool:
     return now - claim.claimed_at > 2 * gone_s
 
 
+def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
+    """The provably-dead claims, in store order. Pure reads.
+
+    The scan half of `release_orphans`: each store row whose claim the
+    orphan rule calls dead. Runs through the shared retry policy; a
+    persistent failure propagates for the caller to skip the step with
+    every claim kept.
+    """
+
+    def scan():
+        found = []
+        for item in store.items():
+            claim = store.claim_of(item.repo, item.number)
+            if not is_orphan(
+                claim,
+                now=now,
+                gone_s=gone_s,
+                present_agents=present_agents,
+                live_units=live_units,
+            ):
+                continue
+            found.append(claim)
+        return found
+
+    return _retry_scan(scan)
+
+
 def release_orphans(store, *, now, gone_s, present_agents, live_units, out, events=None) -> int:
     """Release every provably-dead claim, one logbook line each.
 
-    Returns the released count. Each claim's agent and epoch go
-    straight from the store row into `Store.release`, which releases
+    Returns the released count. The scan runs first, through the
+    shared retry policy; each found claim's agent and epoch then go
+    straight from the scan into `Store.release`, which releases
     only on a matching agent plus epoch and raises `Claimed`
     otherwise. A `Claimed` there means the row changed under the pass
     (re-claimed elsewhere), so it is no longer an orphan: the row is
     skipped with a logbook line, never retried in the same pass. A
-    successful release clears the holder and leaves the epoch for the
-    next claim to mint, which fences a stale holder still acting on the
-    old epoch; the worktree and branch stay untouched. Rows with no
-    claim are left alone: adoption happens only in resync, never here.
-    When `events` is a list, each release appends its journal entry.
+    failed write likewise propagates, never retried here: the caller
+    skips the step with the claim kept. A successful release clears
+    the holder and leaves the epoch for the next claim to mint, which
+    fences a stale holder still acting on the old epoch; the worktree
+    and branch stay untouched. Rows with no claim are left alone:
+    adoption happens only in resync, never here. When `events` is a
+    list, each release appends its journal entry.
     """
+    orphans = _orphan_claims(
+        store,
+        now=now,
+        gone_s=gone_s,
+        present_agents=present_agents,
+        live_units=live_units,
+    )
     released = 0
-    for item in store.items():
-        claim = store.claim_of(item.repo, item.number)
-        if claim is None:
-            continue
-        if not is_orphan(
-            claim,
-            now=now,
-            gone_s=gone_s,
-            present_agents=present_agents,
-            live_units=live_units,
-        ):
-            continue
+    for claim in orphans:
         ref = f"{claim.repo}#{claim.number}"
         try:
             store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
@@ -1564,11 +1627,45 @@ class HubConfigError(Exception):
 RESTART_BUDGET = 3
 RESTART_WINDOW_S = 24 * 60 * 60
 
-#: Loop-head store reads tolerated per stuck sweep: a raw sqlite error
-#: (a lock a concurrent writer holds) retries this many times before the
-#: sweep gives up for the pass. Corrupt rows raise at once instead: a
-#: retry cannot heal them.
-STUCK_READ_ATTEMPTS = 3
+#: Store scans retried before a step gives up: a transient sqlite lock
+#: (a lock a concurrent writer holds) retries this many times before
+#: the scan raises for the caller to skip the step. Anything else
+#: (a corrupt row, a failed disk write) raises at once instead: a
+#: retry cannot heal it. Writes never retry: a failed write skips the
+#: row or the step with the claim kept, never retried in the same pass.
+SCAN_READ_ATTEMPTS = 3
+
+
+def _transient_lock(error) -> bool:
+    """Whether a store error is a transient sqlite lock, safe to retry. Pure.
+
+    Only a locked or busy database retries: another writer holds the
+    lock, so the next attempt may proceed. Every other store error
+    fails closed at once.
+    """
+    if not isinstance(error, sqlite3.OperationalError):
+        return False
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
+
+
+def _retry_scan(read):
+    """The value `read()` returns, retrying transient locks.
+
+    The shared scan policy for the stuck sweep, the finished-claims
+    scan and the orphan scan: transient locks retry up to
+    `SCAN_READ_ATTEMPTS`, then the last error propagates for the
+    caller to skip the step with every claim kept; any other store
+    error raises at once.
+    """
+    for _ in range(SCAN_READ_ATTEMPTS - 1):
+        try:
+            return read()
+        except sqlite3.Error as error:
+            if not _transient_lock(error):
+                raise
+    return read()
+
 
 #: The restart-budget state file inside the state dir.
 RESTARTS_NAME = "drive-restarts.json"
@@ -1659,16 +1756,11 @@ def classify_stuck(*, known, age, unit_live, stale_s, gone_s):
 def _stuck_rows(store):
     """The store rows for the stuck sweep, tolerating transient locks.
 
-    Retries raw sqlite errors up to STUCK_READ_ATTEMPTS, then raises for
-    the caller to skip the sweep with every claim kept. Store errors
-    (corrupt rows) raise at once: a retry cannot heal them.
+    Scans through the shared retry policy, then raises for the caller
+    to skip the sweep with every claim kept. Store errors (corrupt
+    rows) raise at once: a retry cannot heal them.
     """
-    for _ in range(STUCK_READ_ATTEMPTS - 1):
-        try:
-            return list(store.items())
-        except sqlite3.Error:
-            continue
-    return list(store.items())
+    return list(_retry_scan(store.items))
 
 
 def give_up_body(repo, number, *, observed, restarts):
@@ -1693,19 +1785,25 @@ def _finished_claims(store, agent_states):
 
     The one scan `release_finished` and `finished_holders` share: each
     store row whose holder is a managed agent with a finished entry. A
-    missing state map reads as nothing finished.
+    missing state map reads as nothing finished. The scan runs through
+    the shared retry policy; a persistent failure propagates for the
+    caller to skip the step with every claim kept.
     """
     states = agent_states or {}
-    found = []
-    for item in store.items():
-        claim = store.claim_of(item.repo, item.number)
-        if claim is None or not claim.agent or not is_managed_agent(claim.agent):
-            continue
-        seen = states.get(claim.agent)
-        if seen is None or seen[0] != registry.FINISHED:
-            continue
-        found.append(claim)
-    return found
+
+    def scan():
+        found = []
+        for item in store.items():
+            claim = store.claim_of(item.repo, item.number)
+            if claim is None or not claim.agent or not is_managed_agent(claim.agent):
+                continue
+            seen = states.get(claim.agent)
+            if seen is None or seen[0] != registry.FINISHED:
+                continue
+            found.append(claim)
+        return found
+
+    return _retry_scan(scan)
 
 
 def release_finished(store, *, agent_states, now, out, events=None):
@@ -1754,6 +1852,25 @@ def finished_holders(store, *, agent_states) -> dict:
     return {
         (claim.repo, claim.number): claim.agent for claim in _finished_claims(store, agent_states)
     }
+
+
+def _capture_finished_holders(store, *, agent_states, err) -> dict:
+    """The pre-release worker ids for this pass, never raising.
+
+    Both passes read this capture: the launching pass before it
+    releases finished claims, the plan pass to show the verdicts the
+    real pass would print. A missing state map reads as nothing
+    finished. A persistent store failure skips the capture with one
+    log line and reads as nothing finished, so the pass continues
+    with every claim kept instead of failing the pass.
+    """
+    if agent_states is None:
+        return {}
+    try:
+        return finished_holders(store, agent_states=agent_states)
+    except (board.StoreError, sqlite3.Error) as problem:
+        print(f"corral drive: finished holder capture skipped ({problem})", file=err)
+        return {}
 
 
 def resolve_finished(finished_for, released) -> dict:
@@ -3335,7 +3452,7 @@ def _launching_pass(
     else:
         present_agents = frozenset(present_agents or ())
         live_units = frozenset(live_units or ())
-    authors = finished_holders(store, agent_states=agent_states) if agent_states is not None else {}
+    authors = _capture_finished_holders(store, agent_states=agent_states, err=err)
     finished = resolve_finished(finished_for, authors)
     if agent_states is not None:
         try:
@@ -3711,11 +3828,18 @@ def cmd_install_timer(args: argparse.Namespace) -> int:
     """Install and enable the user timer: the explicit operator step.
 
     The only path that writes or enables units. Passes never reach it:
-    the `drive` verb calls it only for `install-timer`.
+    the `drive` verb calls it only for `install-timer`. The cadence
+    comes from the `drive.period` setting, resolved here: a reinstall
+    picks up a changed period.
     """
     _ = args
     try:
-        service_path, timer_path = install_timer()
+        period = settings.load(root=None)["drive.period"]
+    except settings.SettingsError as problem:
+        print(f"corral drive: {problem}", file=sys.stderr)
+        return USAGE
+    try:
+        service_path, timer_path = install_timer(period=period)
     except units.Unreachable as problem:
         print(f"corral drive: {problem}", file=sys.stderr)
         return UNREACHABLE

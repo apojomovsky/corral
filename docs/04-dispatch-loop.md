@@ -144,10 +144,14 @@ Per-candidate gate order, cheapest first:
      the holder is a managed agent, meaning an id this loop minted
      (recognized by its `drive-` prefix; every other reader still
      treats the id as opaque, and fencing still uses only
-     `Claim.epoch`). Any other holder is a foreign claim (operator
-     work adopted by resync, another host's agent, a hand claim):
+     `Claim.epoch`). Minted only by `drive.mint_agent`, parsed only
+     by `drive.is_managed_agent`: one minter, one parser, one
+     prefix. Any other holder is a foreign claim (operator work
+     adopted by resync, another host's agent, a hand claim):
      skip with reason "foreign claim" and never touch it. No resume,
-     no restart, no release.
+     no restart, no release. A tracker label carrying the `drive-`
+     prefix is never adopted by resync, so a foreign label can never
+     read as a managed holder.
    - Claimed row plus `review`: skip while the worker still holds
      the claim. The review is scheduled on a later pass, after the
      section 5 completion release frees the row.
@@ -162,12 +166,16 @@ Per-candidate gate order, cheapest first:
    refused role is a skip for that candidate only; another project's
    chains may route around the exhausted provider.
 
-Exit 75 handling differs by source:
+Exit 75 handling differs by source. A saturated host is not an
+error: the pass did its dispatch work (every candidate got a
+verdict), so 75 stays a per-candidate refusal for one blocked
+action, never the pass verdict for a full fleet:
 
 - `TOTAL_FULL` with the project at or above its floor: stop scanning
   new starts entirely, but keep scanning `resume`/`fix` and
   below-floor candidates, which admission may still allow. When none
-  remain, end the pass with exit 0 and record "host full".
+  remain, end the pass with exit 0 and record "host full". A full
+  host with zero starts still exits 0.
 - `PROJECT_CEILING` or `REPO_CAP`: skip the candidate, keep scanning
   other projects and repos.
 - Quota refusal (exit 75 from the launch path): skip the candidate and
@@ -444,7 +452,8 @@ the modules named.
    (exit 2 when held), reads the store, prints the candidate table,
    writes nothing. Criteria: `--plan` on a temp store prints verdict
    rows and leaves store and outbox byte-identical; second concurrent
-   pass exits 2.
+   pass exits 2; the lock file derives from `paths.state_dir()`,
+   like every other drive state path.
 2. Project registration and the eligibility hook. `eligibility` entry
    in `projects.d`, loader, `TicketRow` and `StartRequest` types, pure
    call with rows and `now`. Criteria: stub policies over fixture rows
@@ -484,14 +493,19 @@ the modules named.
    resumes do not consume it; past budget posts through the ticket 7
    decision-write seam, then releases, and a failed write keeps the
    claim; `finished` holders take the section 5 completion release
-   before any stuck handling.
+   before any stuck handling; the restart-budget timestamps live in
+   the state dir, resolved through the one path helper.
 9. Observability: journal and snapshot section. Criteria: each pass
    appends well-formed lines; snapshot shows the section 6 fields;
    corrupt journal yields a section error, not a crash.
 10. Safety: pause file and day cap. Criteria: pause file exits 1 with
     the file's reason and starts nothing; cap counts starts not
-    resumes or plans and resets on date change.
+    resumes or plans and resets on date change; the pause file and
+    the day counter live in the state dir, and the cap resolves
+    `drive.max_starts_per_day` through the single settings resolver.
 11. Timer unit, doctor checks and docs. Criteria: user timer installed
-    and enabled by an explicit operator step; doctor reports missing
+    and enabled by an explicit operator step; the installed unit
+    carries the `drive.period` cadence resolved through the single
+    settings resolver; doctor reports missing
     timer, bad registration entries and unreadable policy modules;
     README commands row added if a verb ships.

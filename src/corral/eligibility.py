@@ -164,10 +164,10 @@ def _load_file(path: str, *, entry: str, project: str, base: str | None = None) 
     if not os.path.isfile(path):
         raise EligibilityError(f"project {project}: eligibility {entry!r} has no file {path!r}")
     name = "corral_policy_" + os.path.abspath(path).encode().hex()
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise EligibilityError(f"project {project}: eligibility {entry!r} cannot load {path!r}")
     try:
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            raise EligibilityError(f"project {project}: eligibility {entry!r} cannot load {path!r}")
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)

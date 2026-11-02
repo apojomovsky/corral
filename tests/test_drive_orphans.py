@@ -8,6 +8,7 @@ No `gh`, no systemd, no network, no real state dir.
 
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -175,6 +176,87 @@ class ReleaseOrphansTest(unittest.TestCase):
         self.assertIsNotNone(found)
         assert found is not None
         self.assertEqual(found.agent, "drive-host-1-19999-acme--app-7")
+
+    def test_a_transient_lock_on_the_scan_retries_then_releases(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def flaky_items(*args, **kwargs):
+            calls.append(1)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return original_items(*args, **kwargs)
+
+        store.items = flaky_items
+        try:
+            released, logged = self.recover(store)
+        finally:
+            store.items = original_items
+        self.assertEqual(released, 1)
+        self.assertIn("released dead claim", logged)
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_persistent_lock_on_the_scan_raises_for_the_caller_to_skip(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def locked(*args, **kwargs):
+            calls.append(1)
+            raise sqlite3.OperationalError("database is locked")
+
+        store.items = locked
+        try:
+            with self.assertRaises(sqlite3.Error):
+                self.recover(store)
+        finally:
+            store.items = original_items
+        self.assertGreater(len(calls), 1)
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+
+    def test_a_non_transient_scan_error_raises_at_once(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def broken(*args, **kwargs):
+            calls.append(1)
+            raise board.StoreError("boom")
+
+        store.items = broken
+        try:
+            with self.assertRaises(board.StoreError):
+                self.recover(store)
+        finally:
+            store.items = original_items
+        self.assertEqual(len(calls), 1)
+
+    def test_a_locked_write_is_not_retried_in_the_same_pass(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        calls = []
+
+        def locked_write(repo, number, agent, epoch, *, now):
+            calls.append(1)
+            raise sqlite3.OperationalError("database is locked")
+
+        store.release = locked_write  # type: ignore[method-assign]
+        with self.assertRaises(sqlite3.Error):
+            self.recover(store)
+        self.assertEqual(len(calls), 1)
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
 
     def test_uncertain_rows_are_left_alone_without_lines(self):
         store = stored(
