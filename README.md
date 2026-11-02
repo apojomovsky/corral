@@ -8,7 +8,7 @@ An opinionated core for running fleets of headless coding agents on Linux hosts.
 
 You bring the projects: a board, the rules for which ticket is ready, the prompts. corral keeps the agents in one pen. It launches them as systemd user units, keeps their sessions, routes their models, watches the provider quota every project shares, caps how many run at once, and cleans up after them without losing work.
 
-Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; `corral serve` (the read-only dashboard API on loopback: the snapshot, version and health routes plus filtered views of agents, quota, capacity, disks, the board, tail, events and journal, and the stream); the hub skeleton (`corral hub serve`, `hub add-host`) with its operations (`hub export`, `hub import`, `hub backup`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: claims across hosts; `corral new`.
+Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, host resource budgets, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; `corral serve` (the read-only dashboard API on loopback: the snapshot, version and health routes plus filtered views of agents, quota, capacity, disks, the board, tail, events and journal, and the stream); the hub skeleton (`corral hub serve`, `hub add-host`) with its operations (`hub export`, `hub import`, `hub backup`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: claims across hosts; `corral new`.
 
 ## Opinions
 
@@ -93,7 +93,7 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | `corral paths [state\|config\|cache\|sessions] [--mkdir]` | the directories corral keeps on this host, after `CORRAL_*` and XDG overrides |
 | `corral config show [--origin] [--repo NAME] [--root PATH]` | every setting with its resolved value; `--origin` names the layer it came from and marks values clamped by a host limit |
 | **Running agents** | |
-| `corral launch REPO N (--prompt-file F \| --role ROLE) [--title T] [--model M] [--runtime R] [--profile NAME] [--runtime-config JSON] [--root PATH]` | start an agent on ticket N of a repo in its own worktree, as a transient unit; `--role` renders the built-in worker, reviewer or triage prompt (title from the board store or `--title`); `--profile` selects the agent profile for this launch, `--model`/`--runtime` refine it for one run; exit 75 when every slot is taken, 2 when the ticket is already live |
+| `corral launch REPO N (--prompt-file F \| --role ROLE) [--title T] [--model M] [--runtime R] [--profile NAME] [--runtime-config JSON] [--root PATH]` | start an agent on ticket N of a repo in its own worktree, as a transient unit; `--role` renders the built-in worker, reviewer or triage prompt (title from the board store or `--title`); `--profile` selects the agent profile for this launch, `--model`/`--runtime` refine it for one run; exit 75 when every slot is taken or the host resource budget refuses, 2 when the ticket is already live |
 | `corral resume REPO N --message TEXT [--model M] [--runtime R] [--profile NAME] [--role ROLE] [--root PATH]` | resume the ticket's newest session of a role (default worker) in a new unit; `--profile` (with `--model`/`--runtime` refinements) decides the profile for the resumed run, otherwise the session's recorded profile runs; each role keeps its own session, so resuming the worker never picks up a reviewer's session; refused with exit 1 while the ticket carries the hold label (a human removes the label); exit 4 when there is no session to resume |
 | `corral stop REPO N [--root PATH]` | stop the ticket's live agents that its own log proves it started; exit 1 when none is live, exit 2 when a live unit the log does not prove ours is left running (named on stderr, never stopped) |
 | `corral tail REPO N [--last K] [--role ROLE] [--root PATH]` | show the ticket's agent activity, from the newest session file of a role (default worker) |
@@ -148,6 +148,39 @@ chain = ["provider-a/model-x", "provider-b/model-y"]
 Every entry names a provider from the pool as `provider/model`; an unknown provider is a configuration error (exit 4), and an id starting with `-` is refused. The per-launch overlay carries each chain with exhausted providers removed, so a launch routes around quota that is gone; when a required role has no live provider left, the launch is refused with exit 75, naming the role and its earliest known reset.
 
 A `[[repo]]` entry whose project coordinates through hosted board fields sets `tracker.variant = "board"` (default `"labels"`) and maps its board in a `[repo.board]` table: the board owner plus the board number (or node id), the corral-owned text fields, the people-owned columns, and a `priority_map` of board option ids to ranks. A variant outside `"labels"` and `"board"` is a configuration error (exit 4) naming the repo and the key, as are unknown concept keys; the option ids are opaque and display names are comments only. Details: [`docs/07-board-fields.md`](docs/07-board-fields.md).
+
+The host config may also set a host resource budget: CPU millicores (`cpu_m`), memory megabytes (`memory_mb`) and `pids` for every project together, plus the charge each agent role pays per launch. With no `[resources.host]` table nothing is enforced: launches set no slice or limit properties, and `corral doctor` warns that host limits are unset. Once the table is set, every launch is charged by its role (a role with no charge table is refused, exit 4), and the launch creates nested slices (`corral.slice`, then `corral-<project>.slice`) carrying the host and project CPU and memory limits, and starts the agent unit under them with its own CPU, memory and pid limits, for the kernel to enforce. The host table needs all three dimensions; a missing dimension in a role table reads as zero.
+
+```toml
+# ~/.config/corral/config.toml
+[resources.host]
+cpu_m = 8000
+memory_mb = 16000
+pids = 4096
+
+[resources.role.worker]
+cpu_m = 1000
+memory_mb = 2048
+pids = 256
+
+[resources.role.reviewer]
+cpu_m = 500
+memory_mb = 1024
+pids = 128
+
+[resources.role.triage]
+cpu_m = 250
+memory_mb = 512
+pids = 64
+
+[resources.pressure]
+max_load_per_cpu = 2.0
+min_mem_available_pct = 10.0
+```
+
+Each project's registration in `projects.d/<name>.toml` may add a `[resources]` share beside its count floor and ceiling: a `weight` (default 1) splitting what remains of the host budget after every floor, per-dimension floors (`cpu_floor_m`, `memory_floor_mb`, `pids_floor`, default 0) guaranteed even past a full pool, and optional ceilings (`cpu_ceiling_m`, `memory_ceiling_mb`, `pids_ceiling`). A weight of zero keeps only the floors. An exhausted budget or share refuses the launch with exit 75 and the numbers that refused it; bad tables, floors summing above the host budget, a missing required cgroup controller (`cpu`, `memory`, `pids`) or a corrupt host ledger are exit 4. Changed limits do not rewrite a live slice: the doctor's `resources-slices` row reports the drift until the operator refreshes it.
+
+`[resources.pressure]` sets the saturation line for load corral does not control: past `max_load_per_cpu` (default 2.0) or below `min_mem_available_pct` (default 10.0), new launches refuse with exit 75 even with shares free. Running agents are never paused or killed by pressure, and an unreadable reading never blocks. An outside fleet declares its own load with one JSON file per claim (`<name>.json`; other names are ignored) in the `foreign-claims.d/` directory beside the host ledger (`~/.local/state/corral/host-resources.json`, or under `XDG_STATE_HOME` when set; the ledger path ignores `CORRAL_STATE`, so every project on the host shares one pool). A claim names `name`, `cpu_m`, `memory_mb` and `pids`, with `claimed_at` in epoch seconds (default: the file's modification time); claims subtract from the pool and expire after `resources.gone_s` seconds (default 600), after which the doctor warns and the pool is freed. A marker beside the ledger records the state dir that owns the host: a launch from another state dir refuses with exit 4, so two fleets never share a host unknowingly. Details: [`docs/09-host-resource-governance.md`](docs/09-host-resource-governance.md).
 
 The ops root's `corral.toml` may also list private terms that must never reach the shared side:
 

@@ -9,6 +9,7 @@ real state, config or session dirs; the environment is cleared of CORRAL_*
 and points at temp dirs.
 """
 
+import argparse
 import copy
 import dataclasses
 import io
@@ -2725,6 +2726,21 @@ runtime = "muse"
             "m",
         )
         self.assertEqual((code, err), (0, ""))
+
+
+class NoSliceStopgap(unittest.TestCase):
+    """The managed slice hierarchy replaced the manual `--slice` stopgap."""
+
+    def test_no_verb_takes_a_slice_flag(self):
+        parser = cli.build_parser()
+        subs = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        for verb in ("launch", "resume"):
+            options = {
+                option for action in subs.choices[verb]._actions for option in action.option_strings
+            }
+            self.assertNotIn("--slice", options, verb)
 
 
 if __name__ == "__main__":

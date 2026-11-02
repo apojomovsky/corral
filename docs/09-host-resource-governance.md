@@ -1,7 +1,7 @@
 # 09: host resource governance across projects on one host
 
-Status: proposed 2026-11-01, re-scoped after review round 1 to one
-corral per machine. Design only; no code ships with this doc.
+Status: approved 2026-11-01, re-scoped after review round 1 to one
+corral per machine. Implemented by the tickets in section 9.
 
 Admission today counts agents (`admission.admit`, `registry.counted_tickets`).
 It knows nothing about CPU or memory. Test suites and builds run by agents
@@ -266,11 +266,6 @@ memory_mb = 1024
 There is no `[resources.instance]` table and no instance weight: with one
 corral per machine the host budget divides directly between projects.
 
-Plus launch flags for one-off overrides: `--cpu-m` and `--memory-mb`,
-validated positive integers, exit 4 otherwise. The stopgap `--slice` flag
-(section 9) is the only other flag; it is removed when the managed hierarchy
-lands.
-
 Defaults: no host budget configured means no enforcement. The budget gate
 passes everything and the doctor warns that host limits are unset. This is
 the one place the design does not fail closed, deliberately: every existing
@@ -394,17 +389,6 @@ section 7.
 8. Docs and README. Commands-table rows for any new verb or flag,
    settings documentation, removal of the section 9 stopgap. Criteria:
    `test_readme.py` passes; the stopgap flag is gone without a leftover.
-
-Manual stopgap, replaced by the rollout: one slice unit file plus one
-launch flag. The operator installs
-`~/.config/systemd/user/corral-cap.slice` with `MemoryMax=` and `CPUQuota=`
-under `[Slice]`, and launches with
-`corral launch ... --slice corral-cap.slice`, a passthrough flag validated
-to end in `.slice` (exit 4 otherwise) that appends one `--slice=` line to
-the `systemd-run` argv. UNVERIFIED: whether linger must be on for the user
-slice to outlive logout; the read-only check is
-`loginctl show-user "$USER" --property=Linger`. It caps the aggregate
-coarsely with no per-project fairness; tickets 1 to 4 replace it.
 
 ## 10. Open decisions
 
