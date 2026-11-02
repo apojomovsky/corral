@@ -20,6 +20,7 @@ here ever falls back to another profile silently: `lookup` refuses an
 undeclared name instead of substituting the default.
 """
 
+import json
 import math
 import os
 import re
@@ -27,7 +28,7 @@ import tomllib
 
 from dataclasses import dataclass, field
 
-from corral import models, paths, runtimes, settings
+from corral import accounts, models, paths, runtimes, settings
 
 #: The profile used when nothing else selects one.
 DEFAULT_PROFILE_NAME = "default"
@@ -352,6 +353,47 @@ def _check_override(raw, where: str) -> Override:
     )
 
 
+def override_until(
+    temp: object = None, until: object = None, *, now: object, where: str = "override"
+) -> float | None:
+    """The override expiry for `--temp`/`--until`: epoch seconds, or None.
+
+    Exactly one of `temp` (a duration like `2h`, counted from `now`) or
+    `until` (epoch seconds) may be given; neither reads as no override.
+    Durations share `accounts.parse_duration` with quota marks, so both
+    accept the same strings; a bad duration or instant is exit 4 naming
+    the value.
+    """
+    if temp is not None and until is not None:
+        raise ProfileError(f"{where}: pass exactly one of --temp or --until, not both")
+    moment = _check_until(now, where)
+    if temp is None and until is None:
+        return None
+    if temp is not None:
+        try:
+            seconds = accounts.parse_duration(temp, f"{where} --temp")
+        except accounts.AccountsError as err:
+            raise ProfileError(str(err)) from None
+        return moment + seconds
+    if isinstance(until, str):
+        try:
+            until = float(until.strip())
+        except ValueError:
+            raise ProfileError(f"{where}: --until must be epoch seconds, not {until!r}") from None
+    return _check_until(until, where)
+
+
+def is_expired(override: Override, now: object) -> bool:
+    """Whether `override` is past its `until` at `now`: expired at equality.
+
+    The resolver treats the override as absent from `until` on, and it
+    stays on disk, listed as expired, until explicitly reset.
+    """
+    if not isinstance(override, Override):
+        raise ProfileError(f"is_expired: want an Override, not {override!r}")
+    return _check_until(now, "is_expired") >= override.until
+
+
 def _check_pin_key(key, where: str) -> None:
     """A pins-table key as a `pin_key`: `repo#number`, else exit 4."""
     if not isinstance(key, str) or not key:
@@ -667,10 +709,10 @@ def explain(
         )
         if not _override_in_scope(override.scope, repo, role):
             values.append((3, "temp", source, override.profile, "out-of-scope"))
-        elif moment < override.until:
-            values.append((3, "temp", source, override.profile, "value"))
-        else:
+        elif is_expired(override, moment):
             values.append((3, "temp", source, override.profile, "expired"))
+        else:
+            values.append((3, "temp", source, override.profile, "value"))
     local_project = selections.projects.get(repo)
     if local_project is not None:
         values.append(
@@ -784,3 +826,148 @@ def resolve(
         profile=found.name,
         until=until,
     )
+
+
+#: The session file holding the profile a session was launched on, next to
+#: the runtime record. Absent for sessions launched before profiles recorded.
+PROFILE_FILE = "profile"
+
+
+@dataclass(frozen=True)
+class RecordedProfile:
+    """The profile a session was launched on: its name, runtime and model head.
+
+    `layer`, `layer_name` and `source` are the resolution provenance, and
+    `until` the override expiry for a layer-3 launch. A resume reads this
+    back instead of resolving again, so an agent started under an override
+    keeps its setup after the override expires.
+    """
+
+    name: str
+    runtime: str
+    model: str | None
+    layer: int
+    layer_name: str
+    source: str
+    until: float | None = None
+
+
+def _check_recorded(raw: object, where: str) -> RecordedProfile:
+    """`raw` as a RecordedProfile: a full record, else exit 4.
+
+    Every shape a hand edit can produce (a missing key, an empty name, an
+    unknown runtime, a layer outside 1 to 6, a bad `until`) fails closed:
+    guessing would bill the wrong setup.
+    """
+    if not isinstance(raw, dict):
+        raise ProfileError(
+            f"{where}: the profile record must be an object, not {type(raw).__name__}"
+        )
+    for key in raw:
+        if key not in ("profile", "runtime", "model", "layer", "layer_name", "source", "until"):
+            raise ProfileError(f"{where}: the profile record has no key {key!r}")
+    for key in ("profile", "runtime", "layer", "layer_name", "source"):
+        if key not in raw:
+            raise ProfileError(f"{where}: the profile record needs {key!r}")
+    name = _check_name(raw["profile"], where)
+    runtime = raw["runtime"]
+    if not isinstance(runtime, str) or runtime not in runtimes.NAMES:
+        raise ProfileError(
+            f"{where}: the profile record names unknown runtime {runtime!r}: "
+            f"want one of {', '.join(runtimes.NAMES)}"
+        )
+    model = raw.get("model")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ProfileError(
+            f"{where}: the profile record model must be a model id or null, not {model!r}"
+        )
+    layer = raw.get("layer")
+    if isinstance(layer, bool) or not isinstance(layer, int) or not 1 <= layer <= 6:
+        raise ProfileError(f"{where}: the profile record layer must be 1 to 6, not {layer!r}")
+    for key in ("layer_name", "source"):
+        if not isinstance(raw[key], str) or not raw[key]:
+            raise ProfileError(f"{where}: the profile record {key} must be a non-empty string")
+    until = raw.get("until")
+    if until is not None:
+        until = _check_until(until, where)
+    return RecordedProfile(
+        name=name,
+        runtime=runtime,
+        model=model,
+        layer=layer,
+        layer_name=raw["layer_name"],
+        source=raw["source"],
+        until=until,
+    )
+
+
+def record_profile(
+    session_dir: str, profile: Profile, provenance: Provenance, model: str | None = None
+) -> None:
+    """Write the resolved profile into `session_dir`, next to the runtime record.
+
+    Records the name, runtime, model head and provenance, so a resume reuses
+    the launch setup even after an override expires. Validates before writing:
+    a bad value raises and nothing is written.
+    """
+    if not isinstance(profile, Profile):
+        raise ProfileError(f"profile record: want a Profile, not {type(profile).__name__}")
+    if not isinstance(provenance, Provenance):
+        raise ProfileError(f"profile record: want a Provenance, not {type(provenance).__name__}")
+    if model is not None and (not isinstance(model, str) or not model):
+        raise ProfileError(f"profile record: model must be a model id or null, not {model!r}")
+    target = os.path.join(session_dir, PROFILE_FILE)
+    stored = _check_recorded(
+        {
+            "profile": profile.name,
+            "runtime": profile.runtime,
+            "model": model,
+            "layer": provenance.layer,
+            "layer_name": provenance.layer_name,
+            "source": provenance.source,
+            "until": provenance.until,
+        },
+        target,
+    )
+    os.makedirs(session_dir, exist_ok=True)
+    paths.atomic_write_text(
+        target,
+        json.dumps(
+            {
+                "profile": stored.name,
+                "runtime": stored.runtime,
+                "model": stored.model,
+                "layer": stored.layer,
+                "layer_name": stored.layer_name,
+                "source": stored.source,
+                "until": stored.until,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def recorded_profile(session_dir: str) -> RecordedProfile | None:
+    """The profile the session was launched on; None when none was recorded.
+
+    Sessions launched before profiles recorded read as None, so the caller
+    falls back to its own rule. A corrupt record fails closed (exit 4),
+    exactly like an unknown runtime at launch.
+    """
+    target = os.path.join(session_dir, PROFILE_FILE)
+    try:
+        with open(target, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise ProfileError(f"{target}: {err}") from None
+    if not text.strip():
+        raise ProfileError(f"{target}: the profile record is empty")
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as err:
+        raise ProfileError(f"{target}: {err}") from None
+    return _check_recorded(raw, target)
