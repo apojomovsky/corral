@@ -198,6 +198,12 @@ class TicketAssignment(unittest.TestCase):
                 labels=[], extra={"profile": ["fast"]}, repo=REPO, number=NUMBER
             )
 
+    def test_a_non_string_label_element_refuses_closed(self):
+        for labels in (["profile:fast", 7], [None], [b"profile:fast"], [True]):
+            with self.subTest(labels=labels):
+                with self.assertRaises(settings.SettingsError):
+                    profiles.ticket_assignment(labels=labels, extra={}, repo=REPO, number=NUMBER)
+
     def test_a_string_labels_value_is_refused_not_read_as_characters(self):
         for labels in ("profile:fast", None, 7, {"profile:fast": True}):
             with self.subTest(labels=labels):

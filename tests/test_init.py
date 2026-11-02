@@ -57,6 +57,11 @@ class FakeGit:
             if self.origin_url is None:
                 return proc(1, "")
             return proc(0, self.origin_url + "\n")
+        if args[:3] == ["remote", "add", "origin"] and len(args) == 4:
+            if self.origin_url is not None:
+                return proc(1, "error: remote origin already exists")
+            self.origin_url = args[3]
+            return proc(0, "")
         if args == ["symbolic-ref", "refs/remotes/origin/HEAD"]:
             if self.head is None:
                 return proc(1, "")
