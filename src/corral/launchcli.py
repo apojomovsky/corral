@@ -85,6 +85,10 @@ class Seams(NamedTuple):
     #: trust the cached row (the CLI builds the production tracker only
     #: when a profile may resolve). Tests pass a fake.
     tracker: object | None = None
+    #: `controllers_read(path)` for the delegated controllers, or None
+    #: to read the real file. Only `production_seams` leaves it unset;
+    #: tests pass a fake whenever a host budget is set.
+    controllers_read: Callable | None = None
 
 
 def production_seams() -> Seams:
@@ -301,6 +305,7 @@ def cmd_launch(args, seams: Seams) -> int:
         pressure_fn=seams.pressure_fn,
         store=seams.store,
         tracker=tracker,
+        controllers_read=seams.controllers_read,
     )
     print(f"launched {unit} in {workdir}")
     return OK
@@ -342,6 +347,7 @@ def cmd_resume(args, seams: Seams) -> int:
         pressure_fn=seams.pressure_fn,
         store=seams.store,
         tracker=_profile_tracker(seams, args, tgt),
+        controllers_read=seams.controllers_read,
     )
     print(f"resumed as {unit} in {workdir}")
     return OK
