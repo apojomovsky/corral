@@ -2170,7 +2170,6 @@ def _release_reviewer_claim(store, repo, number, agent, *, now) -> str:
     it again. Anything else is kept with a suffix saying so: a failed
     release never raises, fail-closed.
     """
-    ref = f"{repo}#{number}"
     try:
         current = store.claim_of(repo, number)
     except (board.StoreError, sqlite3.Error) as err:

@@ -12,6 +12,7 @@ stub policies, injected registry states and a recording launcher. No
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -980,6 +981,96 @@ class ReviewFixDayCapTest(unittest.TestCase):
         self.assertEqual(len(launcher.calls), 1)
         self.assertEqual(launcher.calls[0][3], "resume")
         self.assertEqual(self.day_starts(), 1)
+
+
+class ReviewerReleaseTest(unittest.TestCase):
+    """Direct pins for `drive._release_reviewer_claim`.
+
+    Each test drives the helper directly against a temporary board
+    store, one per fail-closed branch: an unreadable release read, an
+    already gone claim, a claim changed under the pass, and a refused
+    release. The success and re-claim branches already have pass-level
+    pins in `ReviewPassTest`. Fakes only: no `gh`, no systemd, no
+    network, no real state dir.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-reviewer-release-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+
+    def test_an_unreadable_release_read_keeps_the_claim(self):
+        for problem in (
+            board.StoreError("unusable item app#7"),
+            sqlite3.OperationalError("database is locked"),
+        ):
+            store = stored(self.db, [("app", 7, "open")])
+            self.addCleanup(store.close)
+            made = claimed(store, "app", 7)
+            original_claim_of = store.claim_of
+
+            def flaky_claim_of(repo, number, problem=problem):
+                raise problem
+
+            store.claim_of = flaky_claim_of
+            try:
+                suffix = drive._release_reviewer_claim(store, "app", 7, made.agent, now=NOW)
+            finally:
+                store.claim_of = original_claim_of
+            self.assertIn("reviewer release unreadable", suffix)
+            self.assertIn("claim kept", suffix)
+            found = store.claim_of("app", 7)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_an_already_gone_claim_reopens_the_row(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        store.release("app", 7, made.agent, made.epoch, now=NOW)
+        suffix = drive._release_reviewer_claim(store, "app", 7, made.agent, now=NOW)
+        self.assertIn("reviewer claim already gone", suffix)
+        self.assertIn("row open for a later pass", suffix)
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_changed_claim_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        suffix = drive._release_reviewer_claim(store, "app", 7, RIVAL, now=NOW)
+        self.assertIn("reviewer claim changed under the pass", suffix)
+        self.assertIn("left held", suffix)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_refused_release_keeps_the_claim(self):
+        for problem in (
+            board.ExternalItem("item app#7 is external: read-only"),
+            board.StoreError("cannot write the store"),
+            sqlite3.OperationalError("database is locked"),
+        ):
+            store = stored(self.db, [("app", 7, "open")])
+            self.addCleanup(store.close)
+            made = claimed(store, "app", 7)
+            original_release = store.release
+
+            def refused(repo, number, agent, epoch, *, now, problem=problem):
+                raise problem
+
+            store.release = refused
+            try:
+                suffix = drive._release_reviewer_claim(store, "app", 7, made.agent, now=NOW)
+            finally:
+                store.release = original_release
+            self.assertIn("reviewer release refused", suffix)
+            self.assertIn("claim kept", suffix)
+            found = store.claim_of("app", 7)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
 
 class ClaimRaceTest(unittest.TestCase):

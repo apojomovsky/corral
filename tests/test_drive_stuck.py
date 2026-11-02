@@ -1392,6 +1392,29 @@ class StuckErrorBranchTest(unittest.TestCase):
         assert found is not None
         self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
+    def test_a_corrupt_row_listing_raises_at_once_without_a_retry(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def corrupt(*args, **kwargs):
+            calls.append(1)
+            raise board.StoreError("unusable row app#7")
+
+        store.items = corrupt
+        try:
+            with self.assertRaises(board.StoreError):
+                self.sweep(store)
+        finally:
+            store.items = original_items
+        self.assertEqual(len(calls), 1)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
     def test_an_unreadable_claim_leaves_that_row_held_and_restarts_the_rest(self):
         for index, problem in enumerate(
             (
