@@ -475,9 +475,20 @@ class FailClosed(unittest.TestCase):
 
 class DriveRows(unittest.TestCase):
     def test_no_reading_means_no_drive_rows(self):
-        self.assertEqual(names(doctor.run_checks(env())), names(doctor.run_checks(env())))
-        found = [check for check in doctor.run_checks(env()) if check.name.startswith("drive")]
-        self.assertEqual(found, [])
+        self.assertEqual(
+            names(doctor.run_checks(env())),
+            [
+                "deps",
+                "accounts",
+                "settings",
+                "state-dir",
+                "linger",
+                "user-manager",
+                "quota-readers",
+                "registry",
+                "prompts",
+            ],
+        )
 
     def test_an_enabled_timer_is_ok(self):
         checks = doctor.run_checks(env(timer_state="enabled"))

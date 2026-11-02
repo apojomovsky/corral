@@ -17,7 +17,7 @@ import unittest
 
 from corral import board, drive, registry
 from corral import tracker as iface
-from corral.github.tracker import NEEDS_DECISION
+from corral.tracker import NEEDS_DECISION
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_tracker import FakeTracker, reading
