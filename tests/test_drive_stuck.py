@@ -1757,6 +1757,50 @@ class DropStaleTest(unittest.TestCase):
         self.assertEqual(stop.calls, [("app", 7)])
         self.assertIn("left held", out.getvalue())
 
+    def test_a_store_error_on_release_is_left_held(self):
+        from unittest import mock
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        stop = FakeStop()
+
+        def broken(repo, number, agent, epoch, *, now):
+            raise board.StoreError("unknown item app#7")
+
+        out = io.StringIO()
+        with mock.patch.object(store, "release", side_effect=broken):
+            self.assertFalse(
+                drive.drop_stale_claim(store, "app", 7, stop_unit=stop, out=out, now=NOW)
+            )
+        self.assertEqual(stop.calls, [("app", 7)])
+        found = store.claim_of("app", 7)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+        self.assertIn("left held", out.getvalue())
+
+    def test_a_write_error_on_release_is_left_held(self):
+        from unittest import mock
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        stop = FakeStop()
+
+        def broken(repo, number, agent, epoch, *, now):
+            raise sqlite3.Error("disk write failed")
+
+        out = io.StringIO()
+        with mock.patch.object(store, "release", side_effect=broken):
+            self.assertFalse(
+                drive.drop_stale_claim(store, "app", 7, stop_unit=stop, out=out, now=NOW)
+            )
+        self.assertEqual(stop.calls, [("app", 7)])
+        found = store.claim_of("app", 7)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+        self.assertIn("left held", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

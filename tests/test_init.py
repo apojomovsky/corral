@@ -261,6 +261,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
+# hub.host_id = ""  # this host's operator-assigned hub id (empty means unregistered, hub mode refused)
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
@@ -369,6 +370,7 @@ commits.conventional = false
 #
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
+# hub.host_id = ""  # this host's operator-assigned hub id (empty means unregistered, hub mode refused)
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
