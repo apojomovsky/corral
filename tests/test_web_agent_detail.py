@@ -251,5 +251,47 @@ class DetailDiscipline(unittest.TestCase):
         self.assertIn("#tail", web_text("app.css"))
 
 
+class DetailHashGrammarAgreement(unittest.TestCase):
+    """Item 2: detailHash builds and routeFromHash parses the same keys."""
+
+    def detail_keys(self):
+        api = web_text("api.js")
+        at = api.find("export function detailHash(")
+        self.assertGreater(at, -1)
+        body = api[at : api.find("\n}\n", at)]
+        return set(re.findall(r"[?&](id|repo|number|role)=", body))
+
+    def parsed_keys(self):
+        app = web_text("app.js")
+        at = app.find("function routeFromHash(")
+        self.assertGreater(at, -1)
+        end = app.find("\n}\n", at)
+        body = app[at:end]
+        agent_at = body.find('"#/agent"')
+        self.assertGreater(agent_at, -1)
+        branch = body[agent_at:]
+        return set(re.findall(r'params\.get\("([^"]+)"\)', branch))
+
+    def test_both_sides_name_the_same_query_keys(self):
+        self.assertEqual(self.detail_keys(), {"id", "repo", "number", "role"})
+        self.assertEqual(self.parsed_keys(), {"id", "repo", "number", "role"})
+        self.assertEqual(self.detail_keys(), self.parsed_keys())
+
+
+class TailResumeRearmsTail(unittest.TestCase):
+    """Item 3: resuming from pause re-arms the tail poll itself."""
+
+    def test_resume_calls_tick_tail(self):
+        app = web_text("app.js")
+        at = app.find("function bindTailButtons(")
+        self.assertGreater(at, -1)
+        end = app.find("\n}\n", at)
+        body = app[at:end]
+        resume_at = body.find("renderTailPaused(false)")
+        self.assertGreater(resume_at, -1)
+        window = body[resume_at : resume_at + 400]
+        self.assertIn("tickTail(", window)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -381,7 +381,29 @@ export async function loadJournalLast(project, kind, token) {
     return first;
   }
   const start = Math.max(0, total - LOG_JOURNAL_PAGE);
-  return fetchJson(path + "&limit=" + String(LOG_JOURNAL_PAGE) + "&cursor=" + String(start), token);
+  const windowReply = await fetchJson(
+    path + "&limit=" + String(LOG_JOURNAL_PAGE) + "&cursor=" + String(start),
+    token,
+  );
+  if (
+    windowReply.status !== 200 ||
+    !windowReply.data ||
+    typeof windowReply.data.total !== "number"
+  ) {
+    return windowReply;
+  }
+  // Entries arriving between the probe and the window shift the
+  // index; recompute start from the window reply's own total and
+  // refetch once when it moved.
+  const latest = windowReply.data.total;
+  const corrected = Math.max(0, latest - LOG_JOURNAL_PAGE);
+  if (corrected === start) {
+    return windowReply;
+  }
+  return fetchJson(
+    path + "&limit=" + String(LOG_JOURNAL_PAGE) + "&cursor=" + String(corrected),
+    token,
+  );
 }
 
 // The previous journal window above `start`: the "load older" page.
