@@ -175,11 +175,11 @@ class OptionKeys(unittest.TestCase):
     def test_an_unknown_option_key_is_exit_4_naming_runtime_and_key(self):
         with self.assertRaises(settings.SettingsError) as ctx:
             profiles.validate(
-                {"default": raw_profile("muse", options={"reasoning_effort": "high"})},
+                {"default": raw_profile("muse", options={"bogus_key": "high"})},
                 ["provider-a"],
             )
         self.assertIn("muse", str(ctx.exception))
-        self.assertIn("reasoning_effort", str(ctx.exception))
+        self.assertIn("bogus_key", str(ctx.exception))
 
     def test_a_non_table_options_value_is_refused(self):
         for options in ("high", [("reasoning_effort", "high")], None):
@@ -244,9 +244,56 @@ class BuiltinDefault(unittest.TestCase):
 
 
 class AdapterSchemas(unittest.TestCase):
-    def test_every_runtime_adapter_declares_a_stub_options_schema(self):
+    def test_every_runtime_adapter_declares_a_read_only_options_schema(self):
         for name in runtimes.NAMES:
             with self.subTest(runtime=name):
                 adapter = runtimes.get(name)
                 self.assertTrue(callable(adapter.options_schema))
-                self.assertEqual(adapter.options_schema(), {})
+                schema = adapter.options_schema()
+                self.assertIsInstance(schema, dict)
+                self.assertTrue(schema, f"{name} options schema must not be a stub")
+                for key, entry in schema.items():
+                    self.assertIsInstance(key, str)
+                    self.assertTrue(key)
+                    want = entry[0] if isinstance(entry, tuple) else entry
+                    self.assertIn(want, (str, int, float, bool))
+                    if isinstance(entry, tuple):
+                        self.assertEqual(len(entry), 2)
+                        self.assertIsInstance(entry[1], str)
+                        self.assertTrue(entry[1])
+
+    def test_an_unknown_option_key_fails_for_every_real_runtime(self):
+        for name in runtimes.NAMES:
+            with self.subTest(runtime=name):
+                with self.assertRaises(settings.SettingsError) as ctx:
+                    profiles.validate(
+                        {name: raw_profile(name, options={"bogus_key": "x"})},
+                        ["provider-a"],
+                    )
+                self.assertIn(name, str(ctx.exception))
+                self.assertIn("bogus_key", str(ctx.exception))
+
+    def test_each_real_schema_accepts_its_own_keys_with_the_right_types(self):
+        good = {
+            "omp": {"auto_approve": False},
+            "opencode": {"bash_timeout_ms": 60000},
+            "muse": {"reasoning_effort": "high", "parallel_tool_calls": True},
+        }
+        for name, options in good.items():
+            with self.subTest(runtime=name):
+                parsed = profiles.validate(
+                    {name: raw_profile(name, options=options)}, ["provider-a"]
+                )
+                self.assertEqual(parsed[name].options, options)
+
+    def test_each_real_schema_refuses_a_wrong_option_type(self):
+        bad = {
+            "omp": {"auto_approve": "yes"},
+            "opencode": {"bash_timeout_ms": True},
+            "muse": {"reasoning_effort": 2},
+        }
+        for name, options in bad.items():
+            with self.subTest(runtime=name):
+                with self.assertRaises(settings.SettingsError) as ctx:
+                    profiles.validate({name: raw_profile(name, options=options)}, ["provider-a"])
+                self.assertIn(next(iter(options)), str(ctx.exception))

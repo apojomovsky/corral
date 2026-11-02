@@ -131,6 +131,50 @@ class MuseTripwire(unittest.TestCase):
         self.assertIn("Muse Code installation instructions", entry.install or "")
 
 
+class OmpTripwire(unittest.TestCase):
+    """The shipped omp entry pins major 18: canned 18.x passes, 19.x fails."""
+
+    def entry(self):
+        return next(d for d in deps.load() if d.name == "omp")
+
+    def test_corral_deps_reports_omp(self):
+        self.assertEqual(self.entry().probe, ("omp", "--version"))
+
+    def test_canned_18x_output_passes(self):
+        r = deps.check(self.entry(), fake({"omp": "omp 18.12.6\n"}))
+        self.assertTrue(r.ok)
+
+    def test_canned_19x_output_fails_with_the_cutover_hint(self):
+        entry = self.entry()
+        self.assertEqual(entry.below, "19")
+        self.assertIn("cutover", entry.why)
+        r = deps.check(entry, fake({"omp": "omp 19.0.1\n"}))
+        self.assertFalse(r.ok)
+        self.assertIn("below 19", r.problem or "")
+
+
+class OpencodeTripwire(unittest.TestCase):
+    """The shipped opencode entry pins major 1: canned 1.x passes, 2.x fails."""
+
+    def entry(self):
+        return next(d for d in deps.load() if d.name == "opencode")
+
+    def test_corral_deps_reports_opencode(self):
+        self.assertEqual(self.entry().probe, ("opencode", "--version"))
+
+    def test_canned_1x_output_passes(self):
+        r = deps.check(self.entry(), fake({"opencode": "opencode 1.18.32\n"}))
+        self.assertTrue(r.ok)
+
+    def test_canned_2x_output_fails_with_the_cutover_hint(self):
+        entry = self.entry()
+        self.assertEqual(entry.below, "2")
+        self.assertIn("cutover", entry.why)
+        r = deps.check(entry, fake({"opencode": "opencode 2.0.1\n"}))
+        self.assertFalse(r.ok)
+        self.assertIn("below 2", r.problem or "")
+
+
 class ShippedList(unittest.TestCase):
     def test_it_parses_and_every_entry_says_how_to_get_it(self):
         listed = deps.load()

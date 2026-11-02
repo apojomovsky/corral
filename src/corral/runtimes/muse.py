@@ -31,6 +31,12 @@ FALLBACK = "~/.local/bin/muse"
 BINARY_PREFIX = "muse-bin-"
 #: The per-launch config in the session dir; `argv` reads its model from here.
 CONFIG_NAME = "muse.json"
+#: Profile options `argv` consumes as flags; they never render as `-c` pairs.
+EFFORT_KEY = "reasoning_effort"
+PARALLEL_KEY = "parallel_tool_calls"
+#: The flag values without a recorded option: today's fixed run shape.
+DEFAULT_EFFORT = "high"
+DEFAULT_PARALLEL = True
 #: The launch prompt the session setup writes; the worker run reads it back.
 PROMPT_NAME = "prompt.md"
 #: The resume message file; the resume run reads the message from here.
@@ -104,10 +110,14 @@ def _encode_value(value):
 
 
 def _config_flags(config):
-    """Every non-model config entry as `-c KEY=<value>` pairs, sorted by key."""
+    """Every non-model config entry as `-c KEY=<value>` pairs, sorted by key.
+
+    The profile options `argv` consumes as flags never render here: they
+    would read as a second setting for the same fact.
+    """
     flags = []
     for key in sorted(config, key=str):
-        if key == "model":
+        if key in ("model", EFFORT_KEY, PARALLEL_KEY):
             continue
         flags += ["-c", f"{key}={_encode_value(config[key])}"]
     return flags
@@ -134,6 +144,8 @@ def argv(
 
     check_prompt(prompt)
     config = _read_config(session_dir)
+    effort = _effort_of(config, session_dir)
+    parallel = _parallel_of(config, session_dir)
     if resume:
         run_id = resume
         prompt_file = os.path.join(session_dir, MESSAGE_NAME)
@@ -157,9 +169,10 @@ def argv(
         "--no-foreign-personal-context",
         "--disable-request-user-input",
         "--reasoning-effort",
-        "high",
-        "--parallel-tool-calls",
+        effort,
     ]
+    if parallel:
+        command += ["--parallel-tool-calls"]
     if reviewer:
         command += ["--disable-write"]
     return command
@@ -185,8 +198,33 @@ def with_models(config, chains):
 
 
 def options_schema():
-    """The profile options muse accepts: none yet; a later ticket owns the schema."""
-    return {}
+    """The profile options muse accepts: the effort tier and tool-call shape."""
+    return {
+        EFFORT_KEY: (str, "the --reasoning-effort tier for the run"),
+        PARALLEL_KEY: (bool, "whether to pass --parallel-tool-calls"),
+    }
+
+
+def _effort_of(config, session_dir):
+    """The `--reasoning-effort` value: the recorded option, else the default."""
+    if EFFORT_KEY not in config:
+        return DEFAULT_EFFORT
+    effort = config[EFFORT_KEY]
+    if not isinstance(effort, str):
+        path = os.path.join(session_dir, CONFIG_NAME)
+        raise ValueError(f"cannot parse {path}: want reasoning_effort to be a string")
+    return effort
+
+
+def _parallel_of(config, session_dir):
+    """Whether to pass `--parallel-tool-calls`: the recorded option, else on."""
+    if PARALLEL_KEY not in config:
+        return DEFAULT_PARALLEL
+    parallel = config[PARALLEL_KEY]
+    if not isinstance(parallel, bool):
+        path = os.path.join(session_dir, CONFIG_NAME)
+        raise ValueError(f"cannot parse {path}: want parallel_tool_calls to be a boolean")
+    return parallel
 
 
 def sessions_root():

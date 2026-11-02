@@ -51,13 +51,33 @@ def argv(
     return command + [prompt]
 
 
+def _timeout_of(session_dir):
+    """The bash timeout for the run: the recorded option, else the default.
+
+    Anything but an integer stays on the default: `env` reports the run's
+    environment and never refuses it. Profile validation gates the type at
+    launch; a hand-edited config cannot wedge a resume here.
+    """
+    try:
+        with open(os.path.join(session_dir, CONFIG_NAME), encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return BASH_TIMEOUT_MS
+    if not isinstance(config, dict):
+        return BASH_TIMEOUT_MS
+    value = config.get("bash_timeout_ms", BASH_TIMEOUT_MS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return BASH_TIMEOUT_MS
+    return value
+
+
 def env(session_dir):
     return {
         "OPENCODE_CONFIG": os.path.join(session_dir, CONFIG_NAME),
         "OPENCODE_DISABLE_AUTOUPDATE": "1",
         "OPENCODE_DISABLE_SHARE": "1",
         "OPENCODE_DISABLE_CLAUDE_CODE": "1",
-        "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": str(BASH_TIMEOUT_MS),
+        "OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS": str(_timeout_of(session_dir)),
     }
 
 
@@ -76,8 +96,8 @@ def with_models(config, chains):
 
 
 def options_schema():
-    """The profile options opencode accepts: none yet; a later ticket owns the schema."""
-    return {}
+    """The profile options opencode accepts: the bash tool timeout."""
+    return {"bash_timeout_ms": (int, "the bash tool timeout in milliseconds")}
 
 
 def resume_handle(session_dir):
