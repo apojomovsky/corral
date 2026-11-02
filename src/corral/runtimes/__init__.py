@@ -83,6 +83,10 @@ class Runtime(Protocol):
         """The file tail reads for this session's activity, or None."""
         ...
 
+    def options_schema(self) -> dict:
+        """Allowed profile option key to its type and one-line meaning."""
+        ...
+
 
 def get(name: str) -> Runtime:
     """The adapter for `name`; UnknownRuntime for anything else."""
