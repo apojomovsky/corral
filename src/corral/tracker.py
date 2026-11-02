@@ -33,6 +33,20 @@ class TrackerRateLimited(TrackerError):
         self.retry_after = retry_after
 
 
+class TrackerRejected(TrackerError):
+    """The tracker answered with a validation rejection: the write itself
+    is refused, not the connection.
+
+    A subclass of ``TrackerError`` so callers that do not distinguish it
+    still fail closed. Its exit code is 1, not 3: the tracker answered,
+    so nothing is unreachable. Callers that report (the mirror pass)
+    keep the write queued with the real reason and say rejected, never
+    unreachable.
+    """
+
+    exit_code = 1
+
+
 #: Priority names, highest first. The shared vocabulary every adapter
 #: derives the plain priority string from, and the order the dispatch
 #: pass ranks by. A second adapter reuses this order; it never forks it.
@@ -147,7 +161,8 @@ class Tracker(Protocol):
         ``value == ""`` clears the field. Anything outside the corral-owned
         fields is refused with ``ValueError``. A failed call raises
         ``TrackerError``; a rate-limit answer raises ``TrackerRateLimited``
-        with the seconds to wait. A board-backed tracker raises
+        with the seconds to wait, and a validation rejection raises
+        ``TrackerRejected`` with the tracker's reason. A board-backed tracker raises
         ``UnknownOption`` for a concept the board config never mapped (the
         mirror drops it), and a plain ``TrackerError`` when the mapped
         field is absent from the live board (the rows stay queued).

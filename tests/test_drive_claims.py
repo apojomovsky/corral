@@ -105,27 +105,37 @@ def drive_pass(
 
 
 class MintTest(unittest.TestCase):
-    def test_minted_id_carries_host_seconds_repo_and_number(self):
-        self.assertEqual(
-            drive.mint_agent("acme/app", 7, host="host-1", now=2000.0),
-            "drive-host-1-2000-acme--app-7",
-        )
-
-    def test_minted_id_has_the_managed_prefix_and_no_slash(self):
+    def test_minted_id_is_a_short_hash_plus_the_ticket_number(self):
         minted = drive.mint_agent("acme/app", 7, host="host-1", now=2000.0)
-        self.assertTrue(minted.startswith(drive.MANAGED_PREFIX))
-        self.assertNotIn("/", minted)
+        self.assertRegex(minted, r"^drive-[0-9a-f]{8}-7$")
         self.assertTrue(drive.is_managed_agent(minted))
 
-    def test_minted_id_sanitizes_a_host_slash(self):
-        minted = drive.mint_agent("app", 1, host="a/b", now=1.0)
+    def test_minted_id_covers_host_repo_and_seconds(self):
+        base = drive.mint_agent("acme/app", 7, host="host-1", now=2000.0)
+        self.assertEqual(drive.mint_agent("acme/app", 7, host="host-1", now=2000.0), base)
+        self.assertNotEqual(drive.mint_agent("acme/app", 7, host="host-2", now=2000.0), base)
+        self.assertNotEqual(drive.mint_agent("acme/other", 7, host="host-1", now=2000.0), base)
+        self.assertNotEqual(drive.mint_agent("acme/app", 7, host="host-1", now=2001.0), base)
+
+    def test_minted_id_carries_no_path_or_name(self):
+        minted = drive.mint_agent("acme/app", 7, host="host-1", now=2000.0)
         self.assertNotIn("/", minted)
-        self.assertTrue(minted.startswith("drive-"))
+        self.assertNotIn("acme", minted)
+        self.assertNotIn("host-1", minted)
 
     def test_minted_ids_differ_per_ticket(self):
         first = drive.mint_agent("app", 7, host="host-1", now=2000.0)
         second = drive.mint_agent("app", 9, host="host-1", now=2000.0)
         self.assertNotEqual(first, second)
+
+    def test_minted_id_stays_label_safe_at_realistic_maximums(self):
+        owner = "o" * 20
+        repo = f"{owner}/{'r' * 40}"
+        minted = drive.mint_agent(repo, 1234567, host="h" * 20, now=1234567890.0)
+        self.assertLessEqual(len("agent:" + minted), 32)
+        self.assertNotIn("/", minted)
+        self.assertNotIn(owner, minted)
+        self.assertTrue(drive.is_managed_agent(minted))
 
 
 class ClaimLaunchTest(unittest.TestCase):
@@ -402,6 +412,70 @@ class LaunchFailureTest(unittest.TestCase):
         )
         self.assertEqual(code, 3)
         self.assertIn("no bus", out.getvalue())
+
+    def test_an_admission_refusal_releases_the_fresh_claim(self):
+        from corral import launch
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = launch.CapFull("blue at 1 of 1 ceiling")
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("ceiling", out.getvalue())
+        self.assertIn("released", out.getvalue())
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_released_claim_fences_the_next_claim(self):
+        from corral import launch
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        refused = FakeLauncher()
+        refused.errors[("app", 7)] = launch.CapFull("blue at 1 of 1 ceiling")
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=refused,
+        )
+        self.assertEqual(code, 0)
+        self.assertIsNone(store.claim_of("app", 7))
+        second = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=second,
+            now=2100.0,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(second.calls), 1)
+        held = store.claim_of("app", 7)
+        self.assertIsNotNone(held)
+        self.assertEqual(held.epoch, 2)
 
 
 class ProductionLauncherTest(unittest.TestCase):
@@ -1158,13 +1232,16 @@ class AgentHostTest(unittest.TestCase):
 
     def test_pass_with_no_host_uses_the_hashed_hostname(self):
         agent = self.run_pass_without_host("")
-        hashed = hashlib.sha256(b"raw-host-9").hexdigest()[:8]
-        self.assertEqual(agent, f"drive-{hashed}-2000-app-7")
+        segment = hashlib.sha256(b"raw-host-9").hexdigest()[:8]
+        digest = hashlib.sha256(f"{segment}\0app\0{2000}".encode("utf-8")).hexdigest()[:8]
+        self.assertEqual(agent, f"drive-{digest}-7")
         self.assertNotIn("raw-host-9", agent)
 
     def test_pass_with_no_host_uses_the_configured_display_name(self):
         agent = self.run_pass_without_host("fleet/a")
-        self.assertEqual(agent, "drive-fleet-a-2000-app-7")
+        digest = hashlib.sha256(f"fleet-a\0app\0{2000}".encode("utf-8")).hexdigest()[:8]
+        self.assertEqual(agent, f"drive-{digest}-7")
+        self.assertNotIn("fleet-a", agent)
 
 
 if __name__ == "__main__":

@@ -458,7 +458,7 @@ class OrphanPassTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(len(launcher.calls), 1)
         row, _ = store.item("app", 7, now=NOW)
-        self.assertTrue(row.agent.startswith("drive-host-1-"))
+        self.assertEqual(row.agent, drive.mint_agent("app", 7, host="host-1", now=NOW))
         self.assertNotIn("drive-host-9-", row.agent)
 
 
