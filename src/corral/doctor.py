@@ -36,6 +36,7 @@ from corral import (
     projects,
     prompts,
     registry,
+    repodoctor,
     resourcedoctor,
     resources,
     settings,
@@ -145,6 +146,9 @@ class Env(NamedTuple):
     board_open_store: Callable[[], store.Store] | None = None
     #: The board assembly itself failed: one failing `board` row.
     board_error: str | None = None
+    #: Projects whose remote-dependent rows are checked. Empty means the
+    #: caller has no reading, and then the report carries no remote row.
+    repo_sites: Sequence[repodoctor.RepoSite] = ()
     #: Problems with the project registry (bad registration files and
     #: policy entries that do not resolve): None means the caller has
     #: no reading, and then the report carries no `drive-projects` row.
@@ -463,6 +467,16 @@ def _check_boards(env: Env) -> list[Check]:
     ]
 
 
+def _check_repos(sites: Sequence[repodoctor.RepoSite]) -> list[Check]:
+    """The remote-dependent rows: warn without a remote, strict with one.
+
+    No site, no row. `repodoctor` decides each row; this only renders.
+    """
+    return [
+        Check(row.name, row.status, row.detail, row.fix) for row in repodoctor.check_sites(sites)
+    ]
+
+
 def _check_hub_auth(url: str | None, auth: HubAuth | None) -> list[Check]:
     """The hub-token row: no row without a configured hub or a reading."""
     if not url or auth is None:
@@ -736,6 +750,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_registry(env.registry_rows, env.registry_error),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
+        *_check_repos(env.repo_sites),
         *_check_disk(env.disk),
         *_check_resources(env),
         *_check_hub_auth(env.hub_url, env.hub_auth),

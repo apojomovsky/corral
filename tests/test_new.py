@@ -146,7 +146,8 @@ def run_new(
     *,
     name=FIXTURE,
     path=None,
-    template="blank",
+    template=None,
+    template_dir=None,
     plan=False,
     force=False,
     git=None,
@@ -169,6 +170,7 @@ def run_new(
         name=name,
         path=path,
         template=template,
+        template_dir=template_dir,
         plan=plan,
         force=force,
         default_branch=default_branch,
@@ -1325,6 +1327,158 @@ class CliWiring(unittest.TestCase):
         for rel in ("README.md", "Makefile", "AGENTS.md", "corral.toml", "agents.overlay.md"):
             self.assertTrue(os.path.isfile(os.path.join(self.target(), rel)), rel)
         self.assertFalse(os.path.exists(os.path.join(self.target(), ".githooks")))
+
+
+class TemplateDir(unittest.TestCase):
+    """Ticket 5: `--template-dir` copies a user directory like a packaged one."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+        self.source = os.path.join(self.parent, "my-template")
+        os.makedirs(os.path.join(self.source, "docs"))
+        with open(os.path.join(self.source, "README.md"), "w", encoding="utf-8") as handle:
+            handle.write("# {{name}}\n\nA project called {{name}}.\n")
+        with open(os.path.join(self.source, "docs", "NOTES.md"), "w", encoding="utf-8") as handle:
+            handle.write("notes for {{name}}\n")
+        with open(os.path.join(self.source, "Makefile"), "w", encoding="utf-8") as handle:
+            handle.write(".PHONY: test\n\ntest:\n\t@echo ok\n")
+
+    def target(self, name=FIXTURE):
+        return os.path.join(self.parent, name)
+
+    def snapshot(self, root):
+        """`relpath -> bytes` of every file under `root`."""
+        found = {}
+        for here, _, names in os.walk(root):
+            for entry in names:
+                if ".git" in here.split(os.sep):
+                    continue
+                full = os.path.join(here, entry)
+                with open(full, "rb") as handle:
+                    found[os.path.relpath(full, root)] = handle.read()
+        return found
+
+    def test_user_directory_is_copied_with_name_substitution(self):
+        fake = FakeGit(root=self.parent)
+        code, out, err = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual((code, err), (0, ""))
+        got = self.snapshot(self.target())
+        self.assertEqual(got["README.md"], b"# demo\n\nA project called demo.\n")
+        self.assertEqual(got[os.path.join("docs", "NOTES.md")], b"notes for demo\n")
+        self.assertIn("README.md", out)
+
+    def test_unknown_placeholder_is_exit_4_naming_file_and_placeholder(self):
+        with open(os.path.join(self.source, "BAD.md"), "w", encoding="utf-8") as handle:
+            handle.write("a {{oops}} b\n")
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual(code, 4)
+        self.assertIn("BAD.md", err)
+        self.assertIn("{{oops}}", err)
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_template_and_template_dir_together_are_exit_4_before_any_write(self):
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(
+            path=self.parent, template="blank", template_dir=self.source, git=fake
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("mutually exclusive", err)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_missing_directory_is_exit_4_and_writes_nothing(self):
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(
+            path=self.parent,
+            template_dir=os.path.join(self.parent, "no-such-dir"),
+            git=fake,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_file_as_template_dir_is_exit_4(self):
+        other = os.path.join(self.parent, "not-a-dir")
+        with open(other, "w", encoding="utf-8") as handle:
+            handle.write("x\n")
+        fake = FakeGit(root=self.parent)
+        code, _, _ = run_new(path=self.parent, template_dir=other, git=fake)
+        self.assertEqual(code, 4)
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_unreadable_directory_is_exit_4(self):
+        fake = FakeGit(root=self.parent)
+        with mock.patch("pathlib.Path.iterdir", side_effect=OSError("boom")):
+            code, _, _ = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual(code, 4)
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_binary_files_are_copied_byte_identical(self):
+        blob = b"\xff\xfe\x00{{name}}"
+        with open(os.path.join(self.source, "blob.bin"), "wb") as handle:
+            handle.write(blob)
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.snapshot(self.target())["blob.bin"], blob)
+
+    def test_rerun_converges_and_plan_writes_nothing(self):
+        fake = FakeGit(root=self.parent)
+        self.assertEqual(run_new(path=self.parent, template_dir=self.source, git=fake)[0], 0)
+        before = self.snapshot(self.target())
+        rerun = FakeGit(root=self.target(), hooks=".githooks")
+        code, out, _ = run_new(path=self.parent, template_dir=self.source, git=rerun)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.snapshot(self.target()), before)
+        self.assertIn("is up to date", out)
+        planned = FakeGit(root=self.target(), hooks=".githooks")
+        code, _, _ = run_new(path=self.parent, template_dir=self.source, plan=True, git=planned)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.snapshot(self.target()), before)
+
+    def test_foreign_tree_is_exit_4_naming_the_file_and_untouched(self):
+        target = self.target()
+        os.makedirs(target)
+        with open(os.path.join(target, "README.md"), "w", encoding="utf-8") as handle:
+            handle.write("someone else was here\n")
+        before = self.snapshot(target)
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual(code, 4)
+        self.assertIn("README.md", err)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(self.snapshot(target), before)
+
+    def test_force_leaves_a_differing_scaffold_file_alone(self):
+        target = self.target()
+        os.makedirs(target)
+        edited = b"my own readme\n"
+        with open(os.path.join(target, "README.md"), "wb") as handle:
+            handle.write(edited)
+        fake = FakeGit(root=self.parent)
+        code, _, _ = run_new(path=self.parent, template_dir=self.source, force=True, git=fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.snapshot(target)["README.md"], edited)
+
+    def test_cli_accepts_template_dir(self):
+        xdg = tempfile.mkdtemp(prefix="corral-xdg-")
+        self.addCleanup(shutil.rmtree, xdg, True)
+        os.makedirs(os.path.join(xdg, "git"))
+        with open(os.path.join(xdg, "git", "config"), "w", encoding="utf-8") as handle:
+            handle.write("[user]\n\tname = Suite\n\temail = suite@corral.invalid\n")
+        patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(["new", "demo", "--path", self.parent, "--template-dir", self.source])
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        with open(os.path.join(self.target(), "README.md"), encoding="utf-8") as handle:
+            self.assertIn("# demo", handle.read())
 
 
 if __name__ == "__main__":

@@ -1,20 +1,21 @@
 """`corral new`: scaffold a minimal project, then onboard it through `init`.
 
-Tickets 1 to 4 of `docs/06-corral-new.md`, section 8: templates plus
+Tickets 1 to 5 of `docs/06-corral-new.md`, section 8: templates plus
 `--plan`, then the `init` writer, then `--create-remote` through the
 forge interface, then the label bootstrap through the tracker
-interface. `new` creates the target directory, runs `git init -b`
-with the effective branch, copies the packaged template files, then
-onboards the tree through `init.collect` and `init.apply` with the same
-flags `init` takes, commits the result, and reports the next step. Every
-scaffold write is create-only: missing files are written, identical files
-are kept, and a file that differs from the render refuses (exit 4) unless
-`--force` leaves it alone and converges the rest. With `--create-remote`,
-`new` pre-checks the intended remote through the forge, creates it after
-the commit, sets it as origin, and bootstraps the board labels through
-the tracker (the same operation `corral github setup` performs);
-without it, `new` prints the planned create command and runs nothing
-outward. A later ticket covers `--template-dir`.
+interface, then user template directories. `new` creates the target
+directory, runs `git init -b` with the effective branch, copies the
+template files (packaged, or a user directory with `--template-dir`),
+then onboards the tree through `init.collect` and `init.apply` with the
+same flags `init` takes, commits the result, and reports the next step.
+Every scaffold write is create-only: missing files are written,
+identical files are kept, and a file that differs from the render
+refuses (exit 4) unless `--force` leaves it alone and converges the
+rest. With `--create-remote`, `new` pre-checks the intended remote
+through the forge, creates it after the commit, sets it as origin, and
+bootstraps the board labels through the tracker (the same operation
+`corral github setup` performs); without it, `new` prints the planned
+create command and runs nothing outward.
 """
 
 import argparse
@@ -23,6 +24,7 @@ import re
 import stat
 import sys
 from importlib import resources
+from pathlib import Path
 from typing import NamedTuple
 
 from corral import forge as iface
@@ -38,6 +40,10 @@ class NewError(ValueError):
 
 #: The only placeholder templates may hold: `{{name}}`, the project name.
 PLACEHOLDER_RE = re.compile(r"\{\{([^{}]*)\}\}")
+
+#: The packaged template used when neither `--template` nor
+#: `--template-dir` names a source.
+DEFAULT_TEMPLATE = "blank"
 
 
 def _template_root():
@@ -58,11 +64,37 @@ def names():
     return sorted(entry.name for entry in entries if entry.name != "__pycache__")
 
 
+def _collect(node, rel, found, label):
+    """Every file under `node` into `found`, keyed by path relative to it.
+
+    `label` names the source in failures. `__pycache__` directories are
+    skipped: interpreter residue, never author content.
+    """
+    try:
+        entries = sorted(node.iterdir(), key=lambda entry: entry.name)
+    except OSError as err:
+        raise NewError(f"corral: cannot read {label}: {err}") from None
+    for entry in entries:
+        if entry.name == "__pycache__":
+            continue
+        child = f"{rel}/{entry.name}" if rel else entry.name
+        try:
+            is_dir = entry.is_dir()
+        except OSError as err:
+            raise NewError(f"corral: cannot read {label}: {err}") from None
+        if is_dir:
+            _collect(entry, child, found, label)
+        else:
+            try:
+                found[child] = entry.read_bytes()
+            except OSError as err:
+                raise NewError(f"corral: cannot read {label}: {err}") from None
+
+
 def files(template):
     """The template's raw files: `relpath -> bytes`, sorted by path.
 
-    The file set is the template directory recursively, minus the
-    `__pycache__` directories the interpreter may leave behind: what the
+    The file set is the template directory recursively: what the
     author puts there is what lands. An unknown name is exit 4 listing
     the known names.
     """
@@ -70,35 +102,28 @@ def files(template):
     if template not in known:
         listing = ", ".join(known) if known else "(none)"
         raise NewError(f"unknown template {template!r}: want one of {listing}")
-    root = _template_root().joinpath(template)
+    label = f"packaged template {template!r}"
     found: dict[str, bytes] = {}
+    _collect(_template_root().joinpath(template), "", found, label)
+    return found
 
-    def visit(node, rel):
-        try:
-            entries = sorted(node.iterdir(), key=lambda entry: entry.name)
-        except OSError as err:
-            raise NewError(f"corral: cannot read packaged template {template!r}: {err}") from None
-        for entry in entries:
-            if entry.name == "__pycache__":
-                continue
-            child = f"{rel}/{entry.name}" if rel else entry.name
-            try:
-                is_dir = entry.is_dir()
-            except OSError as err:
-                raise NewError(
-                    f"corral: cannot read packaged template {template!r}: {err}"
-                ) from None
-            if is_dir:
-                visit(entry, child)
-            else:
-                try:
-                    found[child] = entry.read_bytes()
-                except OSError as err:
-                    raise NewError(
-                        f"corral: cannot read packaged template {template!r}: {err}"
-                    ) from None
 
-    visit(root, "")
+def user_files(directory):
+    """A user template directory's raw files: `relpath -> bytes`.
+
+    Copied like a packaged template, with the same file set rules and
+    the same strict `{{name}}` substitution. A missing path, a
+    non-directory, or an unreadable entry is exit 4.
+    """
+    try:
+        is_dir = Path(directory).is_dir()
+    except OSError as err:
+        raise NewError(f"corral: cannot read user template {directory!r}: {err}") from None
+    if not is_dir:
+        raise NewError(f"unknown template directory {directory!r}: not a directory")
+    label = f"user template {directory!r}"
+    found: dict[str, bytes] = {}
+    _collect(Path(directory), "", found, label)
     return found
 
 
@@ -119,14 +144,14 @@ def substitute(relpath, text, name):
     return "".join(parts)
 
 
-def render(template, name):
-    """The template's files rendered for `name`: `relpath -> bytes`.
+def _render_blobs(blobs, name):
+    """`relpath -> bytes` with strict `{{name}}` substitution applied.
 
-    UTF-8-decodable files go through strict `{{name}}` substitution;
-    anything else is copied byte-identical.
+    UTF-8-decodable files go through `substitute`; anything else is
+    copied byte-identical.
     """
     out: dict[str, bytes] = {}
-    for rel, blob in files(template).items():
+    for rel, blob in blobs.items():
         try:
             text = blob.decode("utf-8")
         except UnicodeDecodeError:
@@ -136,12 +161,41 @@ def render(template, name):
     return out
 
 
+def render(template, name):
+    """The template's files rendered for `name`: `relpath -> bytes`."""
+    return _render_blobs(files(template), name)
+
+
+def render_dir(directory, name):
+    """A user template directory's files rendered for `name`.
+
+    Same `{{name}}` rule and strictness as a packaged template.
+    """
+    return _render_blobs(user_files(directory), name)
+
+
+def _source(opts):
+    """`(label, rendered)`: the scaffold source and its files for `name`.
+
+    `--template-dir` copies a user directory with the packaged rules;
+    otherwise `--template` picks a packaged template (`blank` when the
+    flag is absent). Both flags together are exit 4.
+    """
+    if opts.template_dir is not None:
+        if opts.template is not None:
+            raise NewError("--template and --template-dir are mutually exclusive")
+        return opts.template_dir, render_dir(opts.template_dir, opts.name)
+    template = DEFAULT_TEMPLATE if opts.template is None else opts.template
+    return template, render(template, opts.name)
+
+
 class Options(NamedTuple):
     """Parsed `corral new` flags."""
 
     name: str
     path: str | None = None
-    template: str = "blank"
+    template: str | None = None
+    template_dir: str | None = None
     plan: bool = False
     force: bool = False
     default_branch: str | None = None
@@ -477,7 +531,7 @@ def _apply(opts, git, forge, tracker):
         raise NewError("--resume needs --create-remote: it would mean nothing")
     if not paths.plain_repo_name(opts.name):
         raise NewError(f"bad project name {opts.name!r}: want one path part without a .git suffix")
-    rendered = render(opts.template, opts.name)
+    label, rendered = _source(opts)
     branch = init.resolve_branch(None, flag=opts.default_branch, sets=opts.sets)
     if opts.create_remote:
         owner = _resolve_owner(opts, forge)
@@ -489,7 +543,7 @@ def _apply(opts, git, forge, tracker):
     target = os.path.join(parent, opts.name)
     _refuse_non_directory(target)
     if opts.plan:
-        return _plan(target, rendered, branch, opts, git, plan_text, repo, adopted)
+        return _plan(target, rendered, label, branch, opts, git, plan_text, repo, adopted)
     try:
         os.makedirs(target, exist_ok=True)
     except OSError as err:
@@ -499,7 +553,7 @@ def _apply(opts, git, forge, tracker):
         first = os.path.join(target, differs[0])
         if not opts.force:
             raise NewError(
-                f"{first} differs from the {opts.template} template render:"
+                f"{first} differs from the {label} template render:"
                 " re-run with --force to leave it alone and converge the rest"
             )
         kept = differs
@@ -523,7 +577,7 @@ def _apply(opts, git, forge, tracker):
         _write_file(target, rel, rendered[rel])
         sys.stdout.write(f"wrote {full}\n")
     for rel in kept:
-        sys.stdout.write(_kept_line(target, rel, opts.template))
+        sys.stdout.write(_kept_line(target, rel, label))
     if not opts.create_remote:
         sys.stdout.write(plan_text + "\n")
     ops_root, inputs, split, ops_created, ops_fresh = _onboard_inputs(target, opts, git)
@@ -598,7 +652,7 @@ def _apply(opts, git, forge, tracker):
     return NOTHING
 
 
-def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
+def _plan(target, rendered, label, branch, opts, git, plan_text, repo, adopted):
     """Print the full diff of every file `new` would write, and write nothing.
 
     `plan_text` is the planned create command: printed verbatim without
@@ -613,7 +667,7 @@ def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
         if differs and not opts.force:
             first = os.path.join(target, differs[0])
             raise NewError(
-                f"{first} differs from the {opts.template} template render:"
+                f"{first} differs from the {label} template render:"
                 " re-run with --force to leave it alone and converge the rest"
             )
         kept = differs if opts.force else []
@@ -633,7 +687,7 @@ def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
         else:
             sys.stdout.write(init.plan_diff(None, text, rel))
     for rel in kept:
-        sys.stdout.write(_kept_line(target, rel, opts.template).replace("kept ", "would keep ", 1))
+        sys.stdout.write(_kept_line(target, rel, label).replace("kept ", "would keep ", 1))
     if opts.create_remote:
         if adopted:
             sys.stdout.write(f"would adopt {repo} when empty, then set it as origin\n")
@@ -682,6 +736,7 @@ def cmd_new(args):
             name=args.name,
             path=args.path,
             template=args.template,
+            template_dir=args.template_dir,
             plan=args.plan,
             force=args.force,
             default_branch=args.default_branch,
@@ -710,8 +765,15 @@ def add_parser(sub) -> None:
     )
     parser.add_argument(
         "--template",
-        default="blank",
-        help="the packaged template to scaffold from (default: blank)",
+        default=None,
+        help=f"the packaged template to scaffold from (default: {DEFAULT_TEMPLATE})",
+    )
+    parser.add_argument(
+        "--template-dir",
+        default=None,
+        metavar="DIR",
+        help="scaffold from a user template directory instead of a packaged"
+        " template (mutually exclusive with --template)",
     )
     parser.add_argument("--plan", action="store_true", help="print the diff and write nothing")
     parser.add_argument(
