@@ -78,6 +78,14 @@ def _remote_row(site: RepoSite) -> RepoRow:
             f"{site.name}: the default branch was not checked: {site.cause}",
             _CAUSE_FIX,
         )
+    if site.labels in ("ok", "missing", "refused"):
+        return RepoRow(
+            name,
+            "ok",
+            f"the default branch for {site.name} was not checked"
+            " (the board labels read proved the remote reachable)",
+            "",
+        )
     return RepoRow(
         name,
         "warn",

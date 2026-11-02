@@ -16,8 +16,8 @@ from corral import cli, detect, init, projects, settings
 from corral.gitenv import clean_env
 
 
-def proc(returncode=0, stdout=""):
-    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+def proc(returncode=0, stdout="", stderr=""):
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
 class FakeGit:
@@ -55,7 +55,7 @@ class FakeGit:
             return proc(0, self.root + "\n")
         if args == ["remote", "get-url", "origin"]:
             if self.origin_url is None:
-                return proc(1, "")
+                return proc(1, "", stderr="error: No such remote 'origin'\n")
             return proc(0, self.origin_url + "\n")
         if args[:3] == ["remote", "add", "origin"] and len(args) == 4:
             if self.origin_url is not None:

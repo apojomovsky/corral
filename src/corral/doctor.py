@@ -993,7 +993,16 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
     if proc is None:
         return repodoctor.RepoSite(name, None, cause=f"cannot run git in {path}")
     if getattr(proc, "returncode", 1) != 0:
-        return repodoctor.RepoSite(name, None)
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+        if "No such remote" in stderr:
+            return repodoctor.RepoSite(name, None)
+        cause = stderr or f"git exited {getattr(proc, 'returncode', 1)}"
+        return repodoctor.RepoSite(
+            name,
+            None,
+            cause=f"cannot read the origin remote of {path}: {cause}:"
+            " the clone needs a re-init here, not a new remote on the forge",
+        )
     origin = (getattr(proc, "stdout", "") or "").strip()
     if not origin:
         return repodoctor.RepoSite(name, None)

@@ -12,11 +12,13 @@ import os
 import shutil
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from corral import doctor, repodoctor, settings
 from corral import tracker as iface
 from tests.test_doctor import env
+from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
 from tests.test_new import FIXTURE, isolated_config, run_new
 from tests.test_tracker import FakeTracker
@@ -109,6 +111,31 @@ class StrictRemote(unittest.TestCase):
         self.assertEqual(doctor.exit_code(checks), 0)
 
 
+class UnknownBranchNote(unittest.TestCase):
+    def test_labels_ok_makes_the_remote_row_an_ok_note(self):
+        checks = rows(site(origin="https://example.com/o/demo.git", labels="ok"))
+        found = by_name(checks)
+        self.assertEqual(found["remote:demo"].status, "ok")
+        self.assertIn("was not checked", found["remote:demo"].detail)
+        self.assertEqual(found["labels:demo"].status, "ok")
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_labels_missing_keeps_the_remote_quiet_while_the_labels_fail(self):
+        checks = rows(site(origin="https://example.com/o/demo.git", labels="missing"))
+        found = by_name(checks)
+        self.assertEqual(found["remote:demo"].status, "ok")
+        self.assertIn("was not checked", found["remote:demo"].detail)
+        self.assertEqual(found["labels:demo"].status, "fail")
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_labels_unknown_keeps_the_unreachable_warning(self):
+        checks = rows(site(origin="https://example.com/o/demo.git"))
+        found = by_name(checks)
+        self.assertEqual(found["remote:demo"].status, "warn")
+        self.assertIn("could not be reached", found["remote:demo"].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+
 class RowOrder(unittest.TestCase):
     def test_each_site_reads_remote_then_labels(self):
         self.assertEqual(
@@ -189,7 +216,42 @@ class LoadRepoSites(unittest.TestCase):
         self.assertEqual(sites, (repodoctor.RepoSite("demo", url, labels="ok"),))
         found = by_name(rows(*sites))
         self.assertEqual(found["labels:demo"].status, "ok")
+        self.assertEqual(found["remote:demo"].status, "ok")
+        self.assertIn("was not checked", found["remote:demo"].detail)
+        self.assertEqual(doctor.exit_code(rows(*sites)), 0)
+
+    def test_no_such_remote_reads_as_no_remote(self):
+        def git(args, cwd):
+            self.assertEqual(args, ["remote", "get-url", "origin"])
+            return SimpleNamespace(
+                returncode=1, stdout="", stderr="error: No such remote 'origin'\n"
+            )
+
+        sites = self.load(git=git)
+        self.assertEqual(sites, (repodoctor.RepoSite("demo", None),))
+        found = by_name(rows(*sites))
         self.assertEqual(found["remote:demo"].status, "warn")
+        self.assertIn("--create-remote", found["remote:demo"].fix)
+        self.assertEqual(doctor.exit_code(rows(*sites)), 0)
+
+    def test_not_a_repository_warns_with_the_stderr_and_the_reinit_hint(self):
+        def git(args, cwd):
+            self.assertEqual(args, ["remote", "get-url", "origin"])
+            return SimpleNamespace(
+                returncode=128,
+                stdout="",
+                stderr="fatal: not a git repository (or any of the parent directories): .git\n",
+            )
+
+        sites = self.load(git=git)
+        self.assertEqual(len(sites), 1)
+        self.assertIsNone(sites[0].origin)
+        self.assertIsNotNone(sites[0].cause)
+        found = by_name(rows(*sites))
+        self.assertEqual(found["remote:demo"].status, "warn")
+        self.assertIn("demo", found["remote:demo"].detail)
+        self.assertIn("not a git repository", found["remote:demo"].detail)
+        self.assertIn("re-init", found["remote:demo"].detail)
         self.assertEqual(doctor.exit_code(rows(*sites)), 0)
 
     def test_origin_set_with_a_missing_label_fails_with_the_setup_fix(self):
@@ -283,6 +345,37 @@ class FreshScaffoldEndToEnd(unittest.TestCase):
         self.assertEqual(found[f"remote:{FIXTURE}"].status, "warn")
         self.assertEqual(found[f"labels:{FIXTURE}"].status, "warn")
         self.assertIn("corral github setup", found[f"labels:{FIXTURE}"].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_after_create_remote_and_setup_doctor_shows_no_warning(self):
+        parent = tempfile.mkdtemp(prefix="corral-repodoctor-setup-")
+        self.addCleanup(shutil.rmtree, parent, True)
+        isolated_config(self)
+        forge = FakeForge(user="operator")
+        code, _, err = run_new(
+            name=FIXTURE,
+            path=parent,
+            git=FakeGit(root=parent),
+            forge=forge,
+            tracker=FakeTracker(),
+            create_remote=True,
+            owner="acme",
+        )
+        self.assertEqual((code, err), (0, ""))
+        target = os.path.join(parent, FIXTURE)
+        chdir(self, target)
+        url = "https://github.com/acme/demo.git"
+        fake = FakeTracker(labels=[("acme/demo", NAMES)])
+        sites = doctor.load_repo_sites(
+            None,
+            git=FakeGit(root=target, origin_url=url),
+            tracker_factory={"acme/demo": fake}.__getitem__,
+        )
+        self.assertEqual(sites, (repodoctor.RepoSite(FIXTURE, url, labels="ok"),))
+        checks = doctor.run_checks(env(repo_sites=sites))
+        found = by_name(checks)
+        self.assertEqual(found[f"remote:{FIXTURE}"].status, "ok")
+        self.assertEqual(found[f"labels:{FIXTURE}"].status, "ok")
         self.assertEqual(doctor.exit_code(checks), 0)
 
 
