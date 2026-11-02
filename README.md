@@ -121,6 +121,9 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | **Hub** | |
 | `corral hub serve [--bind ADDR] [--port N]` | run the hub claim service on loopback (a public bind warns on stderr and keeps serving); prints the listening address; hosts name it with `hub.url` (empty means single-host); exit 2 when the port is held |
 | `corral hub add-host --id ID` | mint a host id and its bearer token in the hub database (prints the token once); exit 4 when the id is taken or badly shaped |
+| `corral hub remove-host --id ID` | drop a host: bump the membership epoch, release its claims with epochs kept, revoke its token; a removed host that rejoins waits to be added again; exit 4 when the id is unknown |
+| `corral hub release REPO NUMBER [--reason TEXT]` | force-release one ticket's claim as an operator override (the epoch is kept so the next grant fences); the reason is logged; exit 4 when the ticket holds no claim |
+| `corral hub rotate-token --id ID` | revoke one host's token and mint its replacement (prints the token once; the old token dies on its next request); exit 4 when the id is unknown |
 | `corral hub export [--file PATH]` | write the hub's movable state as JSON (hosts, claims with epochs, no token material); snapshots excluded, hosts re-push |
 | `corral hub import --file PATH` | load an export into a fresh hub, keeping every epoch; refuses a hub that already holds state; re-add each host afterwards |
 | `corral hub backup --to PATH` | copy the hub database to PATH (refuses to clobber); restore by replacing the file while the hub is stopped |

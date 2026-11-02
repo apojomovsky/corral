@@ -170,13 +170,35 @@ def drop_in_claims(directory: str | None = None) -> list[dict]:
     return found
 
 
+def ignored_drop_ins(directory: str | None = None) -> list[str]:
+    """The drop-in dir entry names no claim file holds, sorted.
+
+    A typo such as ``desk.jsnm`` never counts as a claim; the doctor
+    names these entries so the miss is visible. A missing directory reads
+    as none. Anything else unreadable is a LedgerError naming it: like a
+    malformed claim, an unlistable dir must refuse, never read as empty.
+    """
+    target = directory or claims_dir()
+    try:
+        names = sorted(os.listdir(target))
+    except FileNotFoundError:
+        return []
+    except OSError as err:
+        raise LedgerError(f"cannot list the foreign-claim dir at {target}: {err}") from None
+    return [name for name in names if not name.endswith(".json")]
+
+
 def _with_drop_ins(ledger: dict, target: str) -> dict:
     """`ledger` with the drop-in claims merged after its own entries.
 
     A duplicate name across the ledger and the drop-ins refuses: two
     entries would charge the pool twice for one declarer.
     """
-    drops = drop_in_claims(claims_dir(target))
+    return _merge_drop_ins(ledger, drop_in_claims(claims_dir(target)), target)
+
+
+def _merge_drop_ins(ledger: dict, drops: list[dict], target: str) -> dict:
+    """`ledger` with `drops` merged after its own entries, duplicates refused."""
     names = {entry["name"] for entry in ledger["foreign"]}
     for entry in drops:
         if entry["name"] in names:
@@ -190,16 +212,23 @@ def _with_drop_ins(ledger: dict, target: str) -> dict:
     return merged
 
 
-def _without_drop_ins(ledger: dict, target: str) -> dict:
+def _without_drop_ins(ledger: dict, drops: list[dict]) -> dict:
     """`ledger` with only the entries the ledger file itself owns.
 
     The file never stores drop-in claims: merging happens at read, so a
-    read-modify-write must strip the merged names before persisting.
+    read-modify-write strips the entries merged at read, by identity and
+    by value. Value matters because a change may return copies built by
+    value: a copy of a drop-in is still a drop-in. A drop-in that appears
+    after the read is not stripped: stripping by a fresh name listing
+    would mistake a ledger-owned claim of the same name for a drop-in
+    and lose it from the persisted file.
     """
-    drops = {entry["name"] for entry in drop_in_claims(claims_dir(target))}
+    merged = {id(entry) for entry in drops}
     stripped = dict(ledger)
     stripped["foreign"] = [
-        entry for entry in ledger.get("foreign", []) if entry["name"] not in drops
+        entry
+        for entry in ledger.get("foreign", [])
+        if id(entry) not in merged and entry not in drops
     ]
     return stripped
 
@@ -330,15 +359,15 @@ def _load_file(target: str) -> dict:
     return _check_ledger(raw, target)
 
 
-def _prepare(target: str, state_dir: str) -> dict:
-    """The merged ledger at `target` under the lock, created with its marker when missing.
+def _prepare(target: str, state_dir: str) -> tuple[dict, list[dict]]:
+    """The merged ledger at `target` under the lock, with its drop-ins.
 
-    A missing file starts empty and is written back by the caller; a
-    corrupt one raises and is never reset. A missing marker adopts the
-    caller's state dir; a marker naming another dir raises
-    ``StateDirError`` naming both dirs and the marker. The returned
-    ledger merges the drop-in claims; only the file's own entries are
-    ever written back.
+    Created with its marker when missing: a missing file starts empty
+    and is written back by the caller; a corrupt one raises and is never
+    reset. A missing marker adopts the caller's state dir; a marker
+    naming another dir raises ``StateDirError`` naming both dirs and the
+    marker. The returned drops are the entries merged into the ledger;
+    only the file's own entries are ever written back.
     """
     try:
         stored = _load_file(target)
@@ -356,7 +385,8 @@ def _prepare(target: str, state_dir: str) -> dict:
         )
     if created:
         _write(target, stored)
-    return _with_drop_ins(stored, target)
+    drops = drop_in_claims(claims_dir(target))
+    return _merge_drop_ins(stored, drops, target), drops
 
 
 def load(path: str | None = None) -> dict:
@@ -384,7 +414,8 @@ def ensure(
     target = path or ledger_path()
     want = os.path.normpath(state_dir) if state_dir else paths.state_dir()
     with _locked(target, timeout):
-        return _prepare(target, want)
+        merged, _drops = _prepare(target, want)
+        return merged
 
 
 def update(
@@ -409,8 +440,8 @@ def update(
     target = path or ledger_path()
     want = os.path.normpath(state_dir) if state_dir else paths.state_dir()
     with _locked(target, timeout):
-        ledger = _prepare(target, want)
+        ledger, drops = _prepare(target, want)
         result = change(ledger)
         if result is None:
             return ledger
-        return _write(target, _without_drop_ins(result, target))
+        return _write(target, _without_drop_ins(result, drops))

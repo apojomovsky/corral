@@ -1148,6 +1148,10 @@ def load_resource_readings(
     else:
         ledger_error = None
     try:
+        foreign_ignored = tuple(host_ledger.ignored_drop_ins(host_ledger.claims_dir(ledger_path)))
+    except (host_ledger.LedgerError, OSError):
+        foreign_ignored = ()
+    try:
         state = paths.state_dir()
     except paths.PathError as err:
         state, marker, marker_error = "", None, str(err)
@@ -1223,7 +1227,7 @@ def load_resource_readings(
         host=limits.host if limits is not None else None,
         shares=dict(limits.projects) if limits is not None else {},
         foreign=list(limits.foreign) if limits is not None else [],
-        gone_s=limits.gone_s if limits is not None else 0.0,
+        gone_s=limits.gone_s if limits is not None else resources.DEFAULT_GONE_S,
         now=moment,
         limits_error=limits_error,
         priced_roles=priced,
@@ -1242,6 +1246,7 @@ def load_resource_readings(
         config_path=where,
         pressure=pressure_values,
         pressure_caps=pressure_caps,
+        foreign_ignored=foreign_ignored,
     )
 
 
