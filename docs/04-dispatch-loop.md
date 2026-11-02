@@ -105,6 +105,16 @@ drive skips it with a logbook line. Loading failures are configuration
 errors (exit 4) naming the project and entry point, reported once per
 pass, and they block only that project.
 
+Ready-made policy: most projects need no policy code. The
+`corral.policies` module ships `basic(rows, *, now)`, which a
+registration names as `eligibility = "corral.policies:basic"`. It
+returns one `start` request per ticket that is open, not external,
+unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
+standalone `HOLD` word in the title), unclaimed, unblocked (empty
+`blocked_by` and no `blocked` label), and with no open linked pull
+request. Weight is the board priority rank, highest first, with unknown
+priorities lowest; ties keep row order for the drive loop to break.
+
 ## 3. Ordering and fairness; caps, quota and hold; what exit 75 does
 
 Each pass builds one candidate list: every project's requests,
