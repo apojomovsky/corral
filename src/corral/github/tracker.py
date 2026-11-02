@@ -424,6 +424,15 @@ class GithubTracker:
             raise _fail(f"bad label {payload!r} on {repo}")
         return name
 
+    def missing_labels(self, repo: str) -> tuple[str, ...]:
+        """Names of the bootstrap labels absent on ``repo``, in bootstrap order.
+
+        Read-only: one paged label listing, never a create. Shares the
+        listing (and its fail-closed shape checks) with `ensure_labels`.
+        """
+        have = self._list_label_names(repo)
+        return tuple(label.name for label in iface.BOOTSTRAP_LABELS if label.name not in have)
+
     def ensure_labels(self, repo: str) -> iface.LabelReport:
         """Create the missing bootstrap labels on ``repo``, leave the rest alone.
 

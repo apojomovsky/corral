@@ -187,6 +187,16 @@ class Tracker(Protocol):
         """
         ...
 
+    def missing_labels(self, repo: str) -> tuple[str, ...]:
+        """Names of the bootstrap labels absent on ``repo``, in bootstrap order.
+
+        Read-only: one label listing, never a create, so `doctor` can
+        check the board labels without changing them. A failed call
+        raises ``TrackerError``; a rate-limit answer raises
+        ``TrackerRateLimited`` with the seconds to wait.
+        """
+        ...
+
 
 #: Cursor wire shape: the UTC second an item was last updated. ISO by
 #: the clock, lexicographic by accident; compare as epochs, never as text.

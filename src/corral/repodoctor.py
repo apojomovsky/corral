@@ -17,12 +17,16 @@ class RepoSite(NamedTuple):
     and `labels` are each "ok", "missing", "refused" (labels only) or
     "unknown" (the check could not run: the remote is unreachable).
     Both are meaningless without an origin and are ignored then.
+    `cause` names the gather failure behind an "unknown" reading (the
+    tracker unreachable, no access, an unreadable clone), and is None
+    for a cleanly gathered site.
     """
 
     name: str
     origin: str | None
     branch: str = "unknown"
     labels: str = "unknown"
+    cause: str | None = None
 
 
 class RepoRow(NamedTuple):
@@ -34,10 +38,15 @@ class RepoRow(NamedTuple):
     fix: str
 
 
+#: The fix for a gather failure: the row names the repo and the cause,
+#: the operator resolves it and re-runs.
+_CAUSE_FIX = "resolve the cause above, then run `corral doctor` again"
+
+
 def _remote_row(site: RepoSite) -> RepoRow:
     """The default-branch-on-the-remote row: warn without a remote."""
     name = f"remote:{site.name}"
-    if site.origin is None:
+    if site.origin is None and site.cause is None:
         return RepoRow(
             name,
             "warn",
@@ -46,6 +55,8 @@ def _remote_row(site: RepoSite) -> RepoRow:
             "create the remote on the forge, then run `corral github setup`"
             " (a fresh `corral new` tree: re-run with `--create-remote`)",
         )
+    if site.origin is None:
+        return RepoRow(name, "warn", f"{site.name}: {site.cause}", _CAUSE_FIX)
     if site.branch == "missing":
         return RepoRow(
             name,
@@ -60,6 +71,13 @@ def _remote_row(site: RepoSite) -> RepoRow:
             f"the default branch for {site.name} exists on the remote",
             "",
         )
+    if site.cause is not None:
+        return RepoRow(
+            name,
+            "warn",
+            f"{site.name}: the default branch was not checked: {site.cause}",
+            _CAUSE_FIX,
+        )
     return RepoRow(
         name,
         "warn",
@@ -71,13 +89,15 @@ def _remote_row(site: RepoSite) -> RepoRow:
 def _labels_row(site: RepoSite) -> RepoRow:
     """The labels-exist row: warn without a remote, strict with one."""
     name = f"labels:{site.name}"
-    if site.origin is None:
+    if site.origin is None and site.cause is None:
         return RepoRow(
             name,
             "warn",
             f"no remote is set for {site.name}, so the board labels cannot be checked",
             "run `corral github setup` once the remote exists",
         )
+    if site.origin is None:
+        return RepoRow(name, "warn", f"{site.name}: {site.cause}", _CAUSE_FIX)
     if site.labels == "missing":
         return RepoRow(
             name,
@@ -99,6 +119,13 @@ def _labels_row(site: RepoSite) -> RepoRow:
             "ok",
             f"the board labels for {site.name} exist on the remote",
             "",
+        )
+    if site.cause is not None:
+        return RepoRow(
+            name,
+            "warn",
+            f"{site.name}: the board labels were not checked: {site.cause}",
+            _CAUSE_FIX,
         )
     return RepoRow(
         name,
