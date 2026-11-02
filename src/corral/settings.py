@@ -79,6 +79,7 @@ PROVIDERS = (
     "corral.disk",
     "corral.drive",
     "corral.hold",
+    "corral.hub",
     "corral.launch",
     "corral.prompts",
     "corral.quota",
