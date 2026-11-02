@@ -580,13 +580,25 @@ class LaunchGateTest(DiskCase):
     def test_admit_refuses_at_critical(self):
         with self.dirs():
             with self.assertRaises(launch.CapFull) as ctx:
-                launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=usage_free(1))
+                launch.admit(
+                    self.target(),
+                    5,
+                    list_fn=lambda prefix: [],
+                    usage=usage_free(1),
+                    host_ledger_fn=lambda: {},
+                )
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertIn("disk critically low", str(ctx.exception))
 
     def test_admit_passes_at_low(self):
         with self.dirs():
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=usage_free(9))
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=lambda prefix: [],
+                usage=usage_free(9),
+                host_ledger_fn=lambda: {},
+            )
 
     def test_launch_and_resume_require_the_usage_seam(self):
         for func in (launch.admit, launch.launch, launch.resume):

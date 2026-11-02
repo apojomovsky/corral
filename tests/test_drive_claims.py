@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 from corral import admission, board, disk, drive, sync, tracker
+from corral import host_ledger
 from corral import projects as projects_mod
 from corral import registry, units
 from corral.runtimes import omp, opencode
@@ -512,6 +513,13 @@ class ProductionLauncherStartTest(unittest.TestCase):
         self.enterContext(
             mock.patch.object(
                 disk, "production_usage", return_value=(100 * 1024**3, 10 * 1024**3, 90 * 1024**3)
+            )
+        )
+        self.enterContext(
+            mock.patch.object(
+                host_ledger,
+                "ensure",
+                return_value={"version": 1, "host_budget": None, "projects": {}, "foreign": []},
             )
         )
 

@@ -447,6 +447,7 @@ class LaunchGate(OpsCase):
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 pool_fn=self.pool,
                 ledger_fn=lambda: seen,
                 now_fn=lambda: T0,
