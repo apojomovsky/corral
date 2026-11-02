@@ -22,10 +22,13 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 from corral import paths
 from corral.trackers import VARIANTS
+
+if TYPE_CHECKING:
+    from corral.resources import Tables
 
 DEFAULT = "default"
 HOST = "host"
@@ -81,6 +84,7 @@ PROVIDERS = (
     "corral.prompts",
     "corral.quota",
     "corral.registry",
+    "corral.resources",
     "corral.runtimes",
     "corral.sync",
     "corral.takeoff",
@@ -156,6 +160,11 @@ class Resolved:
     #: The selected repo's ``[board]`` table, or None when the entry has
     #: none. The board slice reads this; it never re-reads corral.toml.
     board: BoardConfig | None = None
+    #: The ``[resources]`` tables from the host config, or None when it
+    #: sets none. The budget code reads this; it never re-reads the host
+    #: config. Project files and repo entries cannot set it: the host
+    #: budget is one machine fact, and it reads as unknown there.
+    resources: "Tables | None" = None
 
     def __getitem__(self, key):
         return self.values[key].value
@@ -498,10 +507,24 @@ def resolve(
     result = {key: Value(s.default, DEFAULT) for key, s in REGISTRY.items()}
 
     limits = host.pop("limits", {})
+    resource_tables = host.pop("resources", None)
     if not isinstance(limits, dict):
         raise SettingsError(f"{host_name}: [limits] must be a table")
-    for key, value in _flatten(host, host_name).items():
+    nested_gone = None
+    has_nested_gone = isinstance(resource_tables, dict) and "gone_s" in resource_tables
+    if has_nested_gone:
+        assert isinstance(resource_tables, dict)
+        resource_tables = dict(resource_tables)
+        nested_gone = resource_tables.pop("gone_s")
+        if not resource_tables:
+            resource_tables = None
+    flat_host = _flatten(host, host_name)
+    if has_nested_gone and "resources.gone_s" in flat_host:
+        raise SettingsError(f"{host_name}: resources.gone_s is set twice")
+    for key, value in flat_host.items():
         result[key] = Value(_check(key, value, host_name), HOST)
+    if has_nested_gone:
+        result["resources.gone_s"] = Value(_check("resources.gone_s", nested_gone, host_name), HOST)
 
     repos = project.pop("repo", [])
     chains = _check_models(project.pop("models", {}), project_name)
@@ -534,8 +557,14 @@ def resolve(
         current = result[key]
         if isinstance(current.value, int) and current.value > ceiling:
             result[key] = Value(ceiling, current.origin, clamped_from=current.value)
+    from corral import (
+        resources,
+    )  # Lazy: providers load above; resources registers its settings there.
+
     board = boards[repo] if repo is not None else None
-    return Resolved(result, chains, private, board)
+    return Resolved(
+        result, chains, private, board, resources.check_tables(resource_tables, host_name)
+    )
 
 
 def load(root=None, repo=None, env=None, flags=None):

@@ -75,6 +75,11 @@ def with_models(config, chains):
     return {**(config or {}), "model": models.primary(chains)}
 
 
+def options_schema():
+    """The profile options opencode accepts: none yet; a later ticket owns the schema."""
+    return {}
+
+
 def resume_handle(session_dir):
     """The last `sessionID` in out.log, or None."""
     found = None
@@ -105,6 +110,7 @@ class Opencode:
     with_models = staticmethod(with_models)
     resume_handle = staticmethod(resume_handle)
     activity_file = staticmethod(activity_file)
+    options_schema = staticmethod(options_schema)
 
 
 RUNTIME = Opencode()
