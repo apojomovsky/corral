@@ -8,10 +8,12 @@ state dirs.
 
 import hashlib
 import http.client
+import io
 import json
 import re
 import threading
 import unittest
+from contextlib import redirect_stderr
 from importlib import resources
 
 from corral import serve
@@ -245,10 +247,16 @@ class JsonHardening(WebCase):
 class DegradedUi(WebCase):
     def test_empty_asset_table_is_500_on_ui_routes_only(self):
         server = self.start_server(trivial_doc, web_files={})
-        for target in ("/", "/ui/app.js", "/ui/config.json"):
-            status, _, body = self.fetch(server, "GET", target)
-            self.assertEqual(status, 500, target)
-            self.assertEqual(json.loads(body), {"error": "snapshot unavailable"})
+        err = io.StringIO()
+        with redirect_stderr(err):
+            for target in ("/", "/ui/app.js", "/ui/config.json"):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 500, target)
+                self.assertEqual(json.loads(body), {"error": serve.UI_UNAVAILABLE})
+        # A missing dashboard must not send the operator to snapshot
+        # debugging: the two generic bodies stay distinct.
+        self.assertNotEqual(serve.UI_UNAVAILABLE, serve.UNAVAILABLE)
+        self.assertIn("dashboard", err.getvalue())
         status, _, _ = self.fetch(server, "GET", "/v1/snapshot")
         self.assertEqual(status, 200)
 
@@ -270,8 +278,20 @@ class SourceDiscipline(unittest.TestCase):
             self.assertNotIn("innerHTML", text, name)
             self.assertNotIn("eval(", text, name)
             self.assertNotIn("document.write", text, name)
+            if name == "views.js":
+                # The one allowed URL-shaped literal: the SVG element
+                # namespace for the quota bars, an identifier that is
+                # never fetched. Exactly one site may name it.
+                self.assertEqual(text.count('"http://www.w3.org/2000/svg"'), 1)
+                text = text.replace('"http://www.w3.org/2000/svg"', "")
             self.assertNotIn("http://", text, name)
             self.assertNotIn("https://", text, name)
+
+    def test_no_inline_style_vector_in_js(self):
+        for name in ("app.js", "api.js", "fmt.js", "views.js"):
+            text = web_bytes(name).decode("utf-8")
+            self.assertNotIn(".style", text, name)
+            self.assertNotIn("style=", text, name)
 
     def test_no_external_references_in_html_or_css(self):
         for name in ("index.html", "app.css"):
@@ -297,7 +317,12 @@ class SourceDiscipline(unittest.TestCase):
 
     def test_volatile_keys_match_the_server(self):
         text = web_bytes("fmt.js").decode("utf-8")
-        names = set(re.findall(r'"(now|read_at)"', text))
+        # Parse the Set literal itself: collecting only the known
+        # names would pass with an extra member sitting beside them.
+        found = re.search(r"VOLATILE_KEYS = new Set\(\[([^\]]*)\]\)", text)
+        self.assertIsNotNone(found)
+        assert found is not None
+        names = set(re.findall(r'"([^"]+)"', found.group(1)))
         self.assertEqual(names, set(serve.VOLATILE_KEYS))
 
     def test_bundle_stays_small(self):
@@ -317,7 +342,7 @@ class SourceDiscipline(unittest.TestCase):
 
     def test_every_poll_await_sits_inside_a_try(self):
         text = web_bytes("app.js").decode("utf-8")
-        for name in ("fetchJson", "loadConfig", "loadVersion"):
+        for name in ("loadSnapshot", "loadConfig", "loadVersion"):
             sites = list(re.finditer(r"await\s+" + name + r"\s*\(", text))
             self.assertTrue(sites, name)
             for site in sites:
@@ -331,6 +356,64 @@ class SourceDiscipline(unittest.TestCase):
         self.assertIn("nextDelay(failures)", app)
         self.assertNotIn("POLL_MS", app)
         self.assertNotIn("BACKOFF_MS", app)
+
+    def test_schedule_runs_only_from_a_finally(self):
+        # The poll loop is structurally unable to die: the single
+        # reschedule sits in tick's finally, so any throw above it
+        # still rearms the loop.
+        app = web_bytes("app.js").decode("utf-8")
+        sites = list(re.finditer(r"schedule\(config, token\);", app))
+        self.assertEqual(len(sites), 1)
+        start = sites[0].start()
+        self.assertGreater(app.rfind("finally {", 0, start), app.rfind("catch", 0, start))
+
+    def test_draw_failure_is_visible_and_counts_a_failure(self):
+        # A render throw (a new server shape) must read as a failure
+        # with a visible notice, never as a live page over stale data.
+        app = web_bytes("app.js").decode("utf-8")
+        at = app.find("Could not draw this update")
+        self.assertGreater(at, -1)
+        window = app[max(0, at - 400) : at]
+        self.assertIn("failures += 1", window)
+        self.assertIn("renderConnection({ live: false, seenMs })", window)
+
+    def test_stopped_state_drops_the_compare_cache(self):
+        # Entering the stopped gate must clear the fingerprint, or the
+        # compare-and-skip path redraws nothing when the version
+        # matches again and an empty page claims to be live.
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertEqual(app.count("renderStopped("), 1)
+        at = app.find("renderStopped(")
+        start = app.rfind("function enterStopped", 0, at)
+        self.assertGreater(start, -1)
+        block = app[start:at]
+        self.assertIn("lastFingerprint = null", block)
+        self.assertIn("lastDoc = null", block)
+
+    def test_usage_triple_tolerates_a_null_share(self):
+        # A null by_project share on a new server shape must read as
+        # unknown, not throw inside the poll loop.
+        text = web_bytes("views.js").decode("utf-8")
+        start = text.find("function usageTriple(")
+        self.assertGreater(start, -1)
+        body = text[start : text.find("\n}\n", start)]
+        self.assertIn("typeof triple", body)
+
+    def test_pressure_degrades_to_verbatim(self):
+        # A non-numeric pressure reading must read as its raw value,
+        # the timestamp formatters' rule, not NaN.
+        text = web_bytes("views.js").decode("utf-8")
+        start = text.find("function pressureValue(")
+        self.assertGreater(start, -1)
+        body = text[start : text.find("\n}\n", start)]
+        self.assertIn("Number.isFinite", body)
+        self.assertIn("String(value)", body)
+        view = web_bytes("views.js").decode("utf-8")
+        at = view.find("function pressureText(")
+        self.assertGreater(at, -1)
+        section = view[at : view.find("\n}\n", at)]
+        self.assertIn("pressureValue(info.load_per_cpu, 2)", section)
+        self.assertIn("pressureValue(info.mem_available_pct, 1)", section)
 
     def test_fetch_maps_network_failure_to_the_failure_branch(self):
         text = web_bytes("api.js").decode("utf-8")
@@ -351,10 +434,79 @@ class SourceDiscipline(unittest.TestCase):
         app = web_bytes("app.js").decode("utf-8")
         self.assertIn("cannot keep this token", app)
 
+    def test_forget_failure_keeps_the_token_instead_of_reloading(self):
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertIsNotNone(re.search(r"if\s*\(\s*forgetToken\(\)", app))
+        self.assertIn("cannot forget this token", app)
+
     def test_el_warns_about_unchecked_hrefs(self):
         text = web_bytes("views.js").decode("utf-8")
         self.assertIn("W6", text)
         self.assertIn("scheme", text)
+
+    def test_overview_entry_points_exist(self):
+        api = web_bytes("api.js").decode("utf-8")
+        for name in (
+            "export function loadSnapshot(",
+            "export function snapshotProjects(",
+            "export function isErrorSection(",
+            "export function isSupportedDocument(",
+            "export function isSupportedApi(",
+            "export const VERSION_CHECK_MS = 60000;",
+        ):
+            self.assertIn(name, api)
+        views = web_bytes("views.js").decode("utf-8")
+        for name in (
+            "export function renderOverview(",
+            "export function renderChips(",
+            "export function renderStopped(",
+        ):
+            self.assertIn(name, views)
+        fmt = web_bytes("fmt.js").decode("utf-8")
+        self.assertIn("export function canonicalJson(", fmt)
+        self.assertIn("export function formatClock(", fmt)
+
+    def test_compare_and_skip_has_one_stable_path(self):
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertIn("canonicalJson(stripVolatile(reply.data))", app)
+        # Two render sites: the poll compare path and the hashchange
+        # filter re-render over the last good payload, never a third.
+        self.assertEqual(app.count("renderOverview("), 2)
+
+    def test_shell_schema_expectation_matches_the_server(self):
+        from corral import snapshot
+
+        app = web_bytes("app.js").decode("utf-8")
+        found = re.search(r"const EXPECTED_SCHEMA_VERSION = (\d+);", app)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(int(found.group(1)), snapshot.SCHEMA_VERSION)
+
+    def test_version_gate_says_out_of_date(self):
+        api = web_bytes("api.js").decode("utf-8")
+        self.assertIn("export const VERSION_CHECK_MS = 60000;", api)
+        app = web_bytes("app.js").decode("utf-8")
+        self.assertIn("VERSION_CHECK_MS", app)
+        self.assertIn("out of date for this server", app)
+        self.assertIn("Unsupported document schema", app)
+
+    def test_error_sections_render_as_error_cards(self):
+        views = web_bytes("views.js").decode("utf-8")
+        self.assertIn("isErrorSection", views)
+        self.assertIn('"card error"', views)
+
+    def test_chips_are_encoded_hash_links(self):
+        views = web_bytes("views.js").decode("utf-8")
+        self.assertIn('"All"', views)
+        self.assertIn('"#/?project=" + encodeURIComponent(name)', views)
+        html = web_bytes("index.html").decode("utf-8")
+        for anchor in ('id="chips"', 'id="notice"', 'id="cards"', 'id="agents"'):
+            self.assertIn(anchor, html)
+
+    def test_quota_bars_are_svg_attributes(self):
+        views = web_bytes("views.js").decode("utf-8")
+        self.assertIn("createElementNS", views)
+        self.assertIn('setAttribute("width"', views)
 
 
 if __name__ == "__main__":

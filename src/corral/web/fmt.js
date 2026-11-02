@@ -97,6 +97,44 @@ export function formatPct(value) {
   return Math.round(value) + "%";
 }
 
+// Canonical JSON: the same object graph always stringifies to the
+// same text, so idle polls compare stable state instead of key
+// order. Used with stripVolatile above for the compare-and-skip
+// path; undefined reads as null the way JSON.stringify renders it
+// inside arrays, and stays absent inside objects the same way.
+export function canonicalJson(value) {
+  if (Array.isArray(value)) {
+    return "[" + value.map(canonicalJson).join(",") + "]";
+  }
+  if (value !== null && typeof value === "object") {
+    const parts = [];
+    for (const key of Object.keys(value).sort()) {
+      if (value[key] !== undefined) {
+        parts.push(JSON.stringify(key) + ":" + canonicalJson(value[key]));
+      }
+    }
+    return "{" + parts.join(",") + "}";
+  }
+  const text = JSON.stringify(value);
+  return text === undefined ? "null" : text;
+}
+
+// A reset epoch as wall-clock hours and minutes for the quota bars.
+// Null reads as not reported; anything unparseable is shown verbatim,
+// the same degradation rule as the timestamp parsers above.
+export function formatClock(value) {
+  const ms = parseEpoch(value);
+  if (ms === null || ms === undefined) {
+    return "not reported";
+  }
+  if (typeof ms !== "number") {
+    return String(ms);
+  }
+  const at = new Date(ms);
+  const pad = (n) => String(n).padStart(2, "0");
+  return pad(at.getHours()) + ":" + pad(at.getMinutes());
+}
+
 // Presentation hygiene, not a sanitizer: the text-node rule is the
 // actual boundary. Drops control characters other than newline and
 // tab, plus the bidirectional override range, so stray terminal
