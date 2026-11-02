@@ -102,6 +102,11 @@ Everything a project might reasonably do differently is a named setting with a d
 | `checks.timeout_s` | `1800` | seconds before a takeoff command is killed |
 | `checks.suite_lock_timeout_s` | `3600` | seconds a second takeoff waits for the full-suite lock before giving up (exit 75) |
 | `agents.cap` | 1 | this project's ceiling on the host |
+| `review.budget.base_minutes` | `15` | reviewer minutes before the diff size matters |
+| `review.budget.seconds_per_line` | `6` | reviewer seconds per changed line |
+| `review.budget.limit_multiple` | `3` | hard limit as a multiple of the expected duration |
+| `review.budget.floor_minutes` | `30` | hard limit floor, however small the diff |
+| `review.budget.ceiling_minutes` | `120` | agent runtime ceiling for one dispatched reviewer |
 | `agents.runtime` | `omp` | or `opencode` or `muse` |
 | `models.*` | roles and fallback chains | must name providers from the host's accounts |
 | `prompts.<role>` | built-in templates | override with a file (see 4) |
