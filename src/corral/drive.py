@@ -1463,6 +1463,8 @@ def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_a
         return None, f"{ref}: no tracker for this repo, claim refused"
     try:
         live = tracker.item(repo, number)
+    except iface.TrackerRejected as err:
+        return None, f"{ref}: tracker rejected the read, row stale, claim refused ({err})"
     except iface.TrackerError as err:
         return None, f"{ref}: tracker unreachable, row stale, claim refused ({err})"
     try:
@@ -2968,7 +2970,7 @@ def _claim_and_launch(
                     )
                 )
                 continue
-            unit, note, code, unreachable, _ = _start_unit(
+            unit, note, code, unreachable, race = _start_unit(
                 launcher,
                 project=gated.project,
                 repo=gated.repo,
@@ -2980,8 +2982,20 @@ def _claim_and_launch(
             )
             blocked = blocked or unreachable
             if unit is None:
+                suffix = ""
                 if unrecord is not None:
+                    # A fix round minted a fresh claim above: a refusal
+                    # after it (admission, quota, a launch error)
+                    # releases the fresh claim in the same pass, like a
+                    # fresh start claim, so the ticket is pickable again
+                    # with the epoch kept. A lost race keeps it: a live
+                    # unit may own the ticket. A resume failure mints
+                    # nothing, so its claim stays held.
                     unrecord()
+                    if not race:
+                        suffix = _release_own_claim(
+                            store, gated.repo, gated.number, agent, now=now, role="fresh"
+                        )
                 rows.append(
                     Gated(
                         project=gated.project,
@@ -2989,7 +3003,7 @@ def _claim_and_launch(
                         number=gated.number,
                         kind=effective,
                         verdict="skip",
-                        reason=f"{gated.reason}; {note}",
+                        reason=f"{gated.reason}; {note}{suffix}",
                         code=code,
                     )
                 )

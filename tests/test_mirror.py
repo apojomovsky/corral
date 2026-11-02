@@ -210,6 +210,28 @@ class LabelDerivationTest(unittest.TestCase):
         self.assertEqual(found.agent, "alpha")
         self.assertEqual(found.status, "a")
 
+    def test_a_422_on_a_read_is_a_rejection(self):
+        self.gh.fail(
+            "repos/acme/app/issues/7",
+            RuntimeError(
+                'gh: Validation Failed: {"resource": "Label", "code": "custom"} (HTTP 422)'
+            ),
+        )
+        with self.assertRaises(tracker.TrackerRejected) as ctx:
+            self.adapter.item("acme/app", 7)
+        self.assertIn("rejected", str(ctx.exception))
+        self.assertNotIn("unreachable", str(ctx.exception))
+        self.assertNotEqual(ctx.exception.exit_code, 3)
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
+
+    def test_a_timeout_on_a_read_stays_unreachable(self):
+        self.gh.fail("repos/acme/app/issues/7", TimeoutError("gh: request timed out after 30s"))
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.item("acme/app", 7)
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRejected)
+        self.assertIn("unreachable", str(ctx.exception))
+        self.assertEqual(ctx.exception.exit_code, 3)
+
 
 class LabelRun:
     """A `gh` seam double for the issues-labels endpoint: answers the GET

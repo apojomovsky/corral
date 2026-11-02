@@ -661,6 +661,93 @@ class FixPassTest(unittest.TestCase):
         self.assertEqual(launcher.calls, [])
         self.assertIn("fix already landed", out)
 
+    def test_a_refused_fix_launch_releases_the_fresh_claim(self):
+        from corral import launch
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = launch.CapFull("blue at 1 of 1 ceiling")
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+            live_units=frozenset(),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "fix")
+        self.assertIn("ceiling", out)
+        self.assertIn("released", out)
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_live_unit_race_on_a_fix_launch_keeps_the_fresh_claim(self):
+        from corral import units
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = units.UnitExists("app-7 already live")
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={},
+            live_units=frozenset(),
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("already live", out)
+        held = store.claim_of("app", 7)
+        self.assertIsNotNone(held)
+        assert held is not None
+        self.assertTrue(held.agent.startswith(drive.MANAGED_PREFIX))
+
+    def test_a_released_fix_claim_fences_the_next_claim(self):
+        from corral import launch
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        refused = FakeLauncher()
+        refused.errors[("app", 7)] = launch.CapFull("blue at 1 of 1 ceiling")
+        code, _, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            refused,
+            agent_states={},
+            live_units=frozenset(),
+        )
+        self.assertEqual(code, 0)
+        self.assertIsNone(store.claim_of("app", 7))
+        second = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=second,
+            now=2100.0,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(second.calls), 1)
+        held = store.claim_of("app", 7)
+        self.assertIsNotNone(held)
+        assert held is not None
+        self.assertEqual(held.epoch, before.epoch + 2)
+
 
 class FixBudgetTest(unittest.TestCase):
     def setUp(self):

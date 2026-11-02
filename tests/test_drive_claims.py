@@ -706,6 +706,37 @@ class OutageTest(unittest.TestCase):
         row, _ = store.item("app", 7, now=2000.0)
         self.assertEqual(row.agent, "")
 
+    def test_rejected_freshness_reread_says_rejected_not_unreachable(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.set_cursor("app", sync.CURSOR_NAME, tracker.format_cursor(1950.0))
+
+        class RejectingTracker(FakeTracker):
+            def item(self, repo, number):
+                raise tracker.TrackerRejected("tracker rejected: gh: Validation Failed (HTTP 422)")
+
+        fake = RejectingTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+            stale_after=300.0,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("rejected", out.getvalue())
+        self.assertNotIn("unreachable", out.getvalue())
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.agent, "")
+
     def test_an_unreadable_store_row_fails_the_claim_closed(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
