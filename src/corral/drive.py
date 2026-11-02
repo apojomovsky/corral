@@ -2233,7 +2233,8 @@ def _mint_claim(store, gated, *, host, now, kind=None, hub=None):
     names itself. When the hub granted first and the local claim then
     loses the race, the just-granted hub row is released best-effort
     with the receipt's agent and epoch, so the next pass cannot fence
-    the innocent local holder. `kind` overrides the reported kind for
+    the innocent local holder; a local refusal after a grant releases
+    the same way. `kind` overrides the reported kind for
     effective-kind rows.
     """
     title_kind = kind if kind is not None else gated.kind
@@ -2276,6 +2277,11 @@ def _mint_claim(store, gated, *, host, now, kind=None, hub=None):
             gated, title_kind, f"{ref}: race lost to `{seen}`, the pass moves on", "claim"
         )
     except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
+        if hub is not None and adopted is not None:
+            try:
+                hub.release(gated.repo, gated.number, agent, adopted)
+            except (HubGone, HubConflict, HubConfigError):
+                pass
         return None, _skip_as(gated, title_kind, f"{ref}: claim refused ({err})", "claim")
     return agent, None
 
@@ -3209,7 +3215,9 @@ def _launching_pass(
     set, at most the remaining starts launch and the pass ends with exit
     1 once the cap stops a start. `hub` is the injected hub facade
     (built CLI-side: `drive` never names the hub module); None means
-    single-host, zero hub calls.
+    single-host, zero hub calls. A facade with an empty host id is
+    refused with the usage error (exit 4): a host that cannot name
+    itself must never reconcile.
     """
     events: list[dict] = []
     released = 0
@@ -3258,6 +3266,9 @@ def _launching_pass(
     for line in sync_errors + sync_store_errors:
         print(f"corral drive: {line}", file=err)
     if hub is not None:
+        if not getattr(hub, "host_id", ""):
+            print("corral drive: hub host id is empty: register this host first", file=err)
+            return finish(USAGE)
         try:
             hub.reconcile(store, stop_unit=stop_unit, out=out, err=err, now=now)
         except HubGone as gone:

@@ -343,6 +343,67 @@ class HubComposeTest(unittest.TestCase):
         self.assertEqual(hub_fake.calls, [])
         self.assertIsNone(store.claim_of("app", 7))
 
+    def test_empty_hub_host_id_is_a_usage_error_that_keeps_claims(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        fake_hub = FakeHub(host_id="")
+        fake_hub.rows = [hub_row("app", 7, made.agent, epoch=made.epoch + 1)]
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+            hub_client=fake_hub,
+            hub_host_id="",
+            now=NOW,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(fake_hub.calls, [])
+        self.assertIn("host", err.getvalue())
+        kept = store.claim_of("app", 7)
+        assert kept is not None
+        self.assertEqual((kept.agent, kept.epoch), (made.agent, made.epoch))
+
+    def test_local_store_error_after_a_hub_grant_releases_the_hub_row(self):
+        for failure in (
+            board.StoreError("disk locked"),
+            board.ExternalItem("app#7 is external"),
+            sqlite3.Error("database is locked"),
+        ):
+            with self.subTest(failure=type(failure).__name__):
+                store = stored(self.db, [("app", 7, "open")])
+                self.addCleanup(store.close)
+                hub_fake = FakeHub()
+                hub_fake.receipts[("app", 7)] = 4
+                mode = drivehub.HubMode(hub_fake, HOST)
+                gated = drive.Gated(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="app#7: unclaimed, start slot",
+                    code="",
+                )
+                with mock.patch.object(store, "claim", side_effect=failure):
+                    agent, skipped = drive._mint_claim(store, gated, host=HOST, now=NOW, hub=mode)
+                self.assertIsNone(agent)
+                assert skipped is not None
+                self.assertEqual(skipped.code, "claim")
+                self.assertIn("claim refused", skipped.reason)
+                proposes = [call for call in hub_fake.calls if call[0] == "propose"]
+                self.assertEqual(len(proposes), 1)
+                self.assertEqual(hub_fake.releases, [("app", 7, proposes[0][3], 4)])
+                self.assertIsNone(store.claim_of("app", 7))
+
     def test_hub_error_is_a_usage_error(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -695,6 +756,22 @@ class HubClientForTest(unittest.TestCase):
             (client.url, client.host_id, client.token_path),
             ("http://host-1:8000", "host-1", "/t/hub-token"),
         )
+
+
+class HubVersionMappingTest(unittest.TestCase):
+    def test_a_newer_hub_major_on_the_claim_path_is_a_config_error(self):
+        class OldHost(FakeHub):
+            def propose(self, repo, number, agent):
+                raise hub.HubVersionError(
+                    f"hub speaks api {hub.HUB_API + 1}, this host speaks api {hub.HUB_API}:"
+                    " upgrade the hub and the hosts in lockstep"
+                )
+
+        mode = drivehub.HubMode(OldHost(), HOST)
+        with self.assertRaises(drive.HubConfigError) as caught:
+            mode.propose("app", 7, "drive-aaa")
+        self.assertIn(str(hub.HUB_API + 1), str(caught.exception))
+        self.assertIn(str(hub.HUB_API), str(caught.exception))
 
 
 if __name__ == "__main__":
