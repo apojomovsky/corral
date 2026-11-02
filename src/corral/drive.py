@@ -1285,9 +1285,7 @@ def _pass(
         quota_for,
         pool,
     ) = ctx
-    released = (
-        finished_holders(store, agent_states=agent_states) if agent_states is not None else {}
-    )
+    released = _capture_finished_holders(store, agent_states=agent_states, err=err)
     finished = resolve_finished(finished_for, released)
     gated_rows, problems = _gate_all(
         items,
@@ -1854,6 +1852,25 @@ def finished_holders(store, *, agent_states) -> dict:
     return {
         (claim.repo, claim.number): claim.agent for claim in _finished_claims(store, agent_states)
     }
+
+
+def _capture_finished_holders(store, *, agent_states, err) -> dict:
+    """The pre-release worker ids for this pass, never raising.
+
+    Both passes read this capture: the launching pass before it
+    releases finished claims, the plan pass to show the verdicts the
+    real pass would print. A missing state map reads as nothing
+    finished. A persistent store failure skips the capture with one
+    log line and reads as nothing finished, so the pass continues
+    with every claim kept instead of failing the pass.
+    """
+    if agent_states is None:
+        return {}
+    try:
+        return finished_holders(store, agent_states=agent_states)
+    except (board.StoreError, sqlite3.Error) as problem:
+        print(f"corral drive: finished holder capture skipped ({problem})", file=err)
+        return {}
 
 
 def resolve_finished(finished_for, released) -> dict:
@@ -3424,14 +3441,7 @@ def _launching_pass(
     else:
         present_agents = frozenset(present_agents or ())
         live_units = frozenset(live_units or ())
-    if agent_states is not None:
-        try:
-            authors = finished_holders(store, agent_states=agent_states)
-        except (board.StoreError, sqlite3.Error) as problem:
-            print(f"corral drive: finished holder capture skipped ({problem})", file=err)
-            authors = {}
-    else:
-        authors = {}
+    authors = _capture_finished_holders(store, agent_states=agent_states, err=err)
     finished = resolve_finished(finished_for, authors)
     if agent_states is not None:
         try:

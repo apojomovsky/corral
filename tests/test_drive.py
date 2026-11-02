@@ -272,6 +272,23 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(err, "")
         self.assertIn("app#7: start", out)
 
+    def test_plan_with_a_persistent_holder_lock_skips_the_capture(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        with mock.patch.object(
+            drive,
+            "finished_holders",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            code, out, err = self.run_pass(
+                store,
+                found=[("blue", [("app", 7, "start")])],
+                agent_states={},
+            )
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: start", out)
+        self.assertIn("finished holder capture skipped", err)
+
     def test_non_plan_pass_takes_and_releases_the_lock(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -441,6 +458,7 @@ class StatePathsTest(unittest.TestCase):
             from corral import paths
 
             state = paths.state_dir()
+            self.assertEqual(drive.lock_path(), os.path.join(state, "drive.lock"))
             self.assertEqual(drive.drive_dir(), os.path.join(state, "drive"))
             self.assertEqual(drive.journal_path(), os.path.join(state, "drive", "journal.jsonl"))
             self.assertEqual(drive.pause_path(), os.path.join(state, "drive.pause"))
