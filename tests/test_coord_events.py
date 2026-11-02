@@ -223,6 +223,30 @@ class QueueApiTest(unittest.TestCase):
         self.assertEqual(open_rows[0]["evidence"], "new")
 
 
+class ResolvedAtEpochTest(unittest.TestCase):
+    def test_aware_stamp_reads_as_epoch(self):
+        import datetime
+
+        self.assertEqual(
+            events.resolved_at_epoch("2026-01-10T00:00:00+00:00"),
+            datetime.datetime(2026, 1, 10, tzinfo=datetime.timezone.utc).timestamp(),
+        )
+
+    def test_naive_stamp_reads_as_utc(self):
+        import datetime
+
+        self.assertEqual(
+            events.resolved_at_epoch("2026-01-10T00:00:00"),
+            datetime.datetime(2026, 1, 10, tzinfo=datetime.timezone.utc).timestamp(),
+        )
+
+    def test_absent_or_unparseable_reads_as_none(self):
+        self.assertIsNone(events.resolved_at_epoch(None))
+        self.assertIsNone(events.resolved_at_epoch(""))
+        self.assertIsNone(events.resolved_at_epoch("not a stamp"))
+        self.assertIsNone(events.resolved_at_epoch(object()))
+
+
 class StateDedupeTest(unittest.TestCase):
     """One event per distinct cause state.
 
