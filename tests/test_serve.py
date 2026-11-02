@@ -25,7 +25,18 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from corral import board, cli, coord, coordevents, hub, launch, paths, serve, settings, snapshot
-from tests.test_snapshot import HOST, T0, config, entry, quota_view, usage, view
+from tests.test_snapshot import (
+    HOST,
+    T0,
+    config,
+    doc_limits,
+    doc_pressure,
+    entry,
+    quota_view,
+    resolved_settings,
+    usage,
+    view,
+)
 
 DRIVE = {
     "last_pass_at": T0,
@@ -45,8 +56,26 @@ DRIVE = {
 
 def healthy_doc():
     """A fully readable snapshot document from canned views."""
+    rows = view((entry("a1"), "live"))
+    resources_view = snapshot.resources_section(
+        rows,
+        HOST,
+        doc_limits(),
+        doc_pressure(),
+        [],
+        lambda *args: None,
+        live_by_owner={"proj-a": ["a1"]},
+        project_names={"proj-a"},
+    )
     return snapshot.build(
-        T0, HOST, view((entry("a1"), "live")), quota_view(), config(), usage, DRIVE
+        T0,
+        HOST,
+        rows,
+        quota_view(),
+        config(),
+        usage,
+        DRIVE,
+        resources_view=resources_view,
     )
 
 
@@ -215,6 +244,15 @@ class HealthRoute(ServeCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["degraded"], ["disk", "quota"])
 
+    def test_health_lists_a_resources_error_as_degraded(self):
+        doc = healthy_doc()
+        doc["resources"] = {"error": "budget unreadable"}
+        server, _ = self.start_server(FakeBuilder(doc))
+        _, _, body = self.fetch(server, "GET", "/v1/health")
+        payload = json.loads(body)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["degraded"], ["resources"])
+
     def test_health_clock_moves_now_and_uptime(self):
         server, now = self.start_server(FakeBuilder(healthy_doc()))
         now[0] = T0 + 30
@@ -290,6 +328,14 @@ class ServerBinding(ServeCase):
         self.assertEqual(server.server_address[0], "127.0.0.1")
 
 
+class ServerFamilyDedup(unittest.TestCase):
+    def test_serve_and_hub_share_one_family_helper(self):
+        from corral import netbind
+
+        self.assertIs(serve.server_family, netbind.server_family)
+        self.assertIs(hub.server_family, netbind.server_family)
+
+
 class ServerFamilyBehavior(unittest.TestCase):
     def test_serve_binds_an_ipv6_literal_as_v6(self):
         server = serve.make_server(build=FakeBuilder(healthy_doc()), bind="::1")
@@ -362,25 +408,28 @@ class ImportClosure(unittest.TestCase):
 
 class CollectDivergence(unittest.TestCase):
     def test_collect_and_helper_cannot_diverge(self):
+        from corral import resources as R
         from corral import snapshot as snap
 
         registry_view = view((entry("a1"), "live"))
         quota = quota_view()
-        resolved = {
-            "admission.total_cap": 4,
-            "admission.repo_cap": 1,
-            "quota.low_pct": 90,
-            "drive.max_starts_per_day": 4,
-        }
+        resolved = resolved_settings(**{"quota.low_pct": 90, "drive.max_starts_per_day": 4})
         with (
             mock.patch("corral.snapshot._settings_root", return_value=None),
             mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
             mock.patch("corral.registry.visible", return_value=registry_view),
             mock.patch("corral.accounts.providers", return_value=["prov-a"]),
             mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
             mock.patch("corral.quotacli.snapshot", return_value=quota),
             mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(load_per_cpu=0.25), []),
+            ),
+            mock.patch("corral.snapshot.default_measured", return_value=None),
             mock.patch("shutil.disk_usage", return_value=(1000, 400, 600)),
             mock.patch("time.time", return_value=T0),
             mock.patch("socket.gethostname", return_value=HOST),
@@ -866,23 +915,26 @@ class ServeCommandTest(unittest.TestCase):
 
 class CollectWiring(unittest.TestCase):
     def test_collect_uses_snapshot_build_with_local_readers(self):
+        from corral import resources as R
+
         registry_view = view((entry("a1"), "live"))
         quota = quota_view()
-        resolved = {
-            "admission.total_cap": 4,
-            "admission.repo_cap": 1,
-            "quota.low_pct": 90,
-            "drive.max_starts_per_day": 4,
-        }
+        resolved = resolved_settings(**{"quota.low_pct": 90, "drive.max_starts_per_day": 4})
         with (
             mock.patch("corral.snapshot._settings_root", return_value=None),
             mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
             mock.patch("corral.registry.visible", return_value=registry_view),
             mock.patch("corral.accounts.providers", return_value=["prov-a"]),
             mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
             mock.patch("corral.quotacli.snapshot", return_value=quota),
             mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(load_per_cpu=0.25), []),
+            ),
             mock.patch("corral.snapshot.build", return_value={"ok": True}) as build,
         ):
             self.assertEqual(serve.collect(), {"ok": True})
@@ -900,6 +952,10 @@ class CollectWiring(unittest.TestCase):
         self.assertEqual(kwargs["drive_view"], DRIVE)
         self.assertIsInstance(kwargs["now"], float)
         self.assertIsInstance(kwargs["host"], str)
+        self.assertEqual(kwargs["resources_view"]["pressure"]["load_per_cpu"], 0.25)
+        self.assertEqual(
+            kwargs["resources_view"]["charged"], {"cpu_m": 0, "memory_mb": 0, "pids": 0}
+        )
 
 
 class SharedSections(unittest.TestCase):
