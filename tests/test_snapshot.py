@@ -296,6 +296,20 @@ class SectionErrors(unittest.TestCase):
         self.assertEqual(doc["capacity"]["by_project"], {})
 
 
+class ErrorHelpers(unittest.TestCase):
+    def test_error_text_prefers_the_message(self):
+        self.assertEqual(snapshot.error_text(ValueError("ledger gone")), "ledger gone")
+
+    def test_error_text_falls_back_to_repr(self):
+        self.assertEqual(snapshot.error_text(ValueError()), "ValueError()")
+
+    def test_is_error_section_matches_exactly(self):
+        self.assertTrue(snapshot.is_error_section({"error": "gone"}))
+        for other in ({"error": "gone", "extra": 1}, {}, [], None, "gone", 0):
+            with self.subTest(other=other):
+                self.assertFalse(snapshot.is_error_section(other))
+
+
 class CapacityAgreesWithRegistry(unittest.TestCase):
     def test_capacity_ignores_other_hosts(self):
         foreign = entry("a9", repo="repo-b", number=9)

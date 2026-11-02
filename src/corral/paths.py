@@ -124,6 +124,16 @@ def hub_token_path(env=None):
     return os.path.join(config_dir(env), "hub-token")
 
 
+def api_token_path(env=None):
+    """The dashboard API token: `<config>/token`, resolved here only.
+
+    The file holds the Bearer [REDACTED] `corral serve --new-token` mints and
+    a non-loopback `corral serve` bind requires. Read at call time, never
+    a setting.
+    """
+    return os.path.join(config_dir(env), "token")
+
+
 REPO_NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
 
 

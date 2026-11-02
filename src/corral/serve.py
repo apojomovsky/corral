@@ -2,12 +2,21 @@
 
 S1 covers the request router, `GET /v1/snapshot` from `snapshot.build`,
 `/v1/version`, `/v1/health`, the JSON error shape and the 405/404 rules.
-Every endpoint reads local files through one injected builder, so the
-API can never disagree with the CLI. No `gh`, no network, no service
-control in this module.
+S2 adds the `serve.*` settings, the token file, the bind rules, CORS and
+the `serve` verb. Every endpoint reads local files through one injected
+builder, so the API can never disagree with the CLI. No `gh`, no network,
+no service control in this module.
 """
 
+import argparse
+import errno
+import hmac
+import ipaddress
 import json
+import os
+import secrets
+import signal
+import socket
 import sys
 import threading
 import time
@@ -15,7 +24,36 @@ from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
-from corral import snapshot
+from corral import settings, snapshot
+
+OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
+
+settings.register("serve.bind", str, "127.0.0.1", "address to bind (default 127.0.0.1, loopback)")
+settings.register("serve.port", int, 0, "port to bind (default 0, an ephemeral port)")
+settings.register(
+    "serve.origins",
+    list,
+    [],
+    "dashboard origins allowed cross-origin (exact match, never *)",
+)
+settings.register(
+    "serve.snapshot_ttl_s",
+    int,
+    2,
+    "seconds one built snapshot is shared between requests",
+)
+settings.register("serve.tail_max", int, 200, "maximum activity lines one tail read returns")
+settings.register(
+    "serve.max_streams",
+    int,
+    20,
+    "concurrent stream connections before the server sheds with 503",
+)
+
+
+class ServeError(Exception):
+    """A serve option or token file is unusable (exit 4)."""
+
 
 #: The API major version, carried in the path (`/v1/`) and `/v1/version`.
 API_VERSION = 1
@@ -26,15 +64,133 @@ ERROR_SECTIONS = ("agents", "quota", "capacity", "disk", "drive")
 #: The generic 500 body: the detail goes to stderr, never the wire.
 UNAVAILABLE = "snapshot unavailable"
 
+#: The generic 401 body: the presented value is never logged.
+UNAUTHORIZED = "unauthorized"
+
+
+def _err(text: str) -> None:
+    print(f"corral serve: {text}", file=sys.stderr)
+
+
+def is_loopback(bind: str) -> bool:
+    """Whether `bind` stays on this host: a loopback literal or `localhost`.
+
+    Any other name reads as remote: without resolving it (no DNS from this
+    check) privacy cannot be proved, so it takes the token rules.
+    """
+    if str(bind or "") == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(str(bind or "")).is_loopback
+    except ValueError:
+        return False
+
+
+def server_family(bind: str) -> socket.AddressFamily:
+    """The socket family for a bind: IPv6 for IPv6 literals, else IPv4.
+
+    Names stay on IPv4: they resolve at bind time, and the default family
+    keeps today's behavior for them.
+    """
+    try:
+        address = ipaddress.ip_address(str(bind or ""))
+    except ValueError:
+        return socket.AF_INET
+    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
+
+
+def check_bind(bind: str, port: int, *, allow_remote: bool, has_token: bool) -> str | None:
+    """Why the server must refuse to start, or None when it may listen.
+
+    Section 3 refusal order: a bad port, then a non-loopback bind without
+    `--allow-remote`, then a non-loopback bind without a token file.
+    """
+    if isinstance(port, bool) or not isinstance(port, int) or port < 0 or port > 65535:
+        return f"serve port {port!r} must be 0-65535"
+    if not is_loopback(bind) and not allow_remote:
+        return f"non-loopback bind {bind!r} needs --allow-remote and a token file"
+    if not is_loopback(bind) and not has_token:
+        return f"non-loopback bind {bind!r} needs a readable token file (mint one with --new-token)"
+    return None
+
+
+def check_origins(origins) -> str | None:
+    """Why the configured origins must refuse startup, or None.
+
+    Exact matches only: a wildcard entry could be echoed back as `*`,
+    so any entry holding one refuses instead.
+    """
+    for origin in origins or ():
+        if not isinstance(origin, str) or not origin or "*" in origin:
+            return f"serve origin {origin!r} is not an exact match (no wildcards)"
+    return None
+
+
+def read_token(path: str) -> str | None:
+    """The bearer token in `path`, stripped; None when there is no file.
+
+    Read at call time, so a minted or replaced file applies without a
+    restart. An unreadable file raises: the caller fails closed.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    except OSError as err:
+        raise ServeError(f"cannot read token file {path}: {err}") from None
+    return text.strip() or None
+
+
+def mint_token(path: str) -> None:
+    """Write a fresh bearer token to `path`, owner-only.
+
+    The only write the verb ever does, to its own file. Refuses when the
+    file already exists: replacing a live credential must be explicit.
+    The token is returned to no one; the caller never prints it.
+    """
+    parent = os.path.dirname(path)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as err:
+            raise ServeError(f"cannot create token dir {parent}: {err}") from None
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        raise ServeError(f"token file {path} already exists") from None
+    except OSError as err:
+        raise ServeError(f"cannot mint token file {path}: {err}") from None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(secrets.token_hex(32) + "\n")
+        os.chmod(path, 0o600)
+    except OSError as err:
+        raise ServeError(f"cannot mint token file {path}: {err}") from None
+
+
+def token_file_warning(path: str) -> str | None:
+    """Why `path` warns on stderr, or None when it is private or missing."""
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return None
+    if mode & 0o077:
+        return f"token file {path} is readable beyond its owner (chmod 600)"
+    return None
+
 
 class _State:
-    """One server's injected builder, clock, and counters."""
+    """One server's injected builder, clock, auth, CORS, and counters."""
 
     def __init__(
         self,
         build: Callable[[], dict],
         clock: Callable[[], float],
         quiet: bool,
+        allowed_origins: tuple[str, ...] = (),
+        token_required: bool = False,
+        token_reader: Callable[[], str | None] | None = None,
     ) -> None:
         self.build = build
         self.clock = clock
@@ -43,6 +199,9 @@ class _State:
         self.total = 0
         self.not_modified = 0
         self.quiet = quiet
+        self.allowed_origins = tuple(allowed_origins)
+        self.token_required = token_required
+        self.token_reader = token_reader
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -62,28 +221,72 @@ class _Handler(BaseHTTPRequestHandler):
             state.total += 1
             return state.total
 
+    def _echo_origin(self) -> str | None:
+        """The request origin when it is configured, else None, never `*`."""
+        origin = self.headers.get("Origin")
+        if origin and origin != "*" and origin in self.server_state.allowed_origins:
+            return origin
+        return None
+
     def _send_json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        echo = self._echo_origin()
+        if echo is not None:
+            self.send_header("Access-Control-Allow-Origin", echo)
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_empty(self, code: int, headers: tuple = ()) -> None:
+        self.send_response(code)
+        for name, value in headers:
+            self.send_header(name, value)
+        self.end_headers()
+
+    def _authorized(self) -> bool:
+        state = self.server_state
+        if not state.token_required:
+            return True
+        expected = None
+        try:
+            if state.token_reader is not None:
+                expected = state.token_reader()
+        except Exception:  # noqa: BLE001 - an unreadable token denies, never breaks the request
+            expected = None
+        presented = self.headers.get("Authorization")
+        ok = False
+        if expected and presented and presented.startswith("Bearer "):
+            try:
+                ok = hmac.compare_digest(presented[len("Bearer ") :], expected)
+            except TypeError:
+                ok = False
+        if not ok:
+            print("corral serve: rejected unauthorized request", file=sys.stderr)
+            self._send_json(401, {"error": UNAUTHORIZED})
+        return ok
+
     def _read_doc(self) -> tuple[dict | None, str | None]:
         try:
-            return self.server_state.build(), None
+            doc = self.server_state.build()
         except Exception as exc:  # noqa: BLE001 - a request never drops the connection
-            text = str(exc) if str(exc) else repr(exc)
-            print(f"corral serve: {text}", file=sys.stderr)
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
             return None, UNAVAILABLE
+        if not isinstance(doc, dict):
+            print(
+                "corral serve: snapshot builder returned a non-dict document",
+                file=sys.stderr,
+            )
+            return None, UNAVAILABLE
+        return doc, None
 
     def _serve_snapshot(self) -> None:
         doc, error = self._read_doc()
         if error is not None:
             self._send_json(500, {"error": error})
         else:
-            assert doc is not None
+            assert doc is not None  # _read_doc pairs a missing doc with an error
             self._send_json(200, doc)
 
     def _serve_health(self) -> None:
@@ -93,11 +296,9 @@ class _Handler(BaseHTTPRequestHandler):
         if error is not None:
             self._send_json(500, {"error": error})
             return
-        assert doc is not None
+        assert doc is not None  # _read_doc pairs a missing doc with an error
         degraded = sorted(
-            name
-            for name in ERROR_SECTIONS
-            if isinstance(doc.get(name), dict) and set(doc[name]) == {"error"}
+            name for name in ERROR_SECTIONS if snapshot.is_error_section(doc.get(name))
         )
         header = doc.get("fleet_header")
         host = header.get("host") if isinstance(header, dict) else None
@@ -119,6 +320,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._count()
+        if not self._authorized():
+            return
         path = urlsplit(self.path).path
         if path == "/v1/snapshot":
             self._serve_snapshot()
@@ -129,8 +332,28 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send_json(404, {"error": "not found"})
 
+    def do_OPTIONS(self) -> None:
+        self._count()
+        origin = self.headers.get("Origin")
+        wanted = self.headers.get("Access-Control-Request-Method")
+        if origin is not None and wanted is not None and self._echo_origin() is not None:
+            self._send_empty(
+                204,
+                (
+                    ("Access-Control-Allow-Origin", origin),
+                    ("Access-Control-Allow-Methods", "GET"),
+                    ("Access-Control-Allow-Headers", "Authorization"),
+                ),
+            )
+            return
+        if not self._authorized():
+            return
+        self._send_json(405, {"error": f"method {self.command} not allowed"})
+
     def _method_not_allowed(self) -> None:
         self._count()
+        if not self._authorized():
+            return
         self._send_json(405, {"error": f"method {self.command} not allowed"})
 
     do_POST = _method_not_allowed
@@ -138,7 +361,6 @@ class _Handler(BaseHTTPRequestHandler):
     do_DELETE = _method_not_allowed
     do_PATCH = _method_not_allowed
     do_HEAD = _method_not_allowed
-    do_OPTIONS = _method_not_allowed
 
     def __getattr__(self, name: str):
         # Any other `do_*` method answers 405: v1 registers GET only.
@@ -153,24 +375,36 @@ def make_server(
     port: int = 0,
     clock: Callable[[], float] | None = None,
     quiet: bool = False,
+    bind: str = "127.0.0.1",
+    allowed_origins: tuple[str, ...] = (),
+    token_required: bool = False,
+    token_reader: Callable[[], str | None] | None = None,
 ) -> ThreadingHTTPServer:
-    """A loopback-only `ThreadingHTTPServer` answering the v1 routes.
+    """An HTTP server answering the v1 routes.
 
     `build` returns the snapshot document (`collect` by default, the
     same readers the `snapshot` verb uses). Health reports the host the
-    built document names. `port` defaults to an ephemeral one; the
-    bound port reads as `server.server_address[1]`.
+    built document names. `bind` defaults to loopback and `port` to an
+    ephemeral one; the bound address reads as `server.server_address`.
+    The caller enforces the bind rules; `token_required` with a
+    `token_reader` enforces the bearer token per request.
     """
     state = _State(
         build=build if build is not None else collect,
         clock=clock if clock is not None else time.time,
         quiet=quiet,
+        allowed_origins=allowed_origins,
+        token_required=token_required,
+        token_reader=token_reader,
     )
 
     class _BoundHandler(_Handler):
         server_state = state
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), _BoundHandler)
+    class _BoundServer(ThreadingHTTPServer):
+        address_family = server_family(bind)
+
+    server = _BoundServer((bind, port), _BoundHandler)
     server.daemon_threads = True
     return server
 
@@ -183,3 +417,117 @@ def collect() -> dict:
     only: no `gh`, no network, no service control.
     """
     return snapshot.build(**snapshot.collect_kwargs())
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Run the `serve` verb."""
+    from corral import paths
+
+    try:
+        resolved = settings.load()
+    except (settings.SettingsError, paths.PathError) as err:
+        _err(str(err))
+        return USAGE
+    try:
+        token_path = paths.api_token_path()
+    except paths.PathError as err:
+        _err(str(err))
+        return USAGE
+    bind = args.bind or resolved["serve.bind"]
+    port = args.port if args.port is not None else resolved["serve.port"]
+    origins = list(resolved["serve.origins"]) + list(args.allow_origin or ())
+    remote = not is_loopback(bind)
+    if args.new_token:
+        try:
+            mint_token(token_path)
+        except ServeError as err:
+            _err(str(err))
+            return USAGE
+    try:
+        have_token = read_token(token_path) is not None
+    except ServeError as err:
+        if remote:
+            _err(str(err))
+            return USAGE
+        have_token = False
+    problem = check_origins(origins)
+    if problem is None:
+        problem = check_bind(bind, port, allow_remote=args.allow_remote, has_token=have_token)
+    if problem is not None:
+        _err(problem)
+        return USAGE
+    warning = token_file_warning(token_path)
+    if warning is not None:
+        _err(warning)
+        if remote:
+            return USAGE
+    try:
+        state_dir = paths.state_dir()
+    except paths.PathError as err:
+        _err(str(err))
+        return USAGE
+    try:
+        os.listdir(state_dir)
+    except OSError as err:
+        _err(f"cannot read state dir {state_dir}: {err}")
+        return UNREACHABLE
+    try:
+        server = make_server(
+            bind=bind,
+            port=port,
+            allowed_origins=tuple(origins),
+            token_required=remote,
+            token_reader=lambda: read_token(token_path),
+        )
+    except OSError as err:
+        if err.errno == errno.EADDRINUSE:
+            _err(f"serve bind {bind}:{port} is already in use")
+            return RACE
+        _err(f"cannot bind serve to {bind}:{port}: {err.strerror or err}")
+        return USAGE
+    host, bound, *_ = server.server_address
+    print(f"listening on {host}:{bound}")
+
+    def _stop(signum: int, frame: object) -> None:
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, _stop)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return OK
+
+
+def add_parser(sub) -> None:
+    """Register `serve` on the top-level subparsers."""
+    p = sub.add_parser(
+        "serve",
+        help="run the read-only dashboard API on loopback (a wider bind needs --allow-remote and a token)",
+    )
+    p.add_argument("--bind", default=None, help="address to bind (default serve.bind, 127.0.0.1)")
+    p.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="port to bind (default serve.port, 0 for an ephemeral port)",
+    )
+    p.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="allow a non-loopback bind (needs a token file)",
+    )
+    p.add_argument(
+        "--allow-origin",
+        action="append",
+        default=None,
+        help="dashboard origin allowed cross-origin (repeatable, exact match, no wildcards)",
+    )
+    p.add_argument(
+        "--new-token",
+        action="store_true",
+        help="mint the API token file, then serve",
+    )
+    p.set_defaults(func=cmd_serve)
