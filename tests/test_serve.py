@@ -18,11 +18,12 @@ import shutil
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import board, cli, hub, launch, paths, serve, settings, snapshot
+from corral import board, cli, coord, coordevents, hub, launch, paths, serve, settings, snapshot
 from tests.test_snapshot import HOST, T0, config, entry, quota_view, usage, view
 
 DRIVE = {
@@ -1267,6 +1268,811 @@ class ProductionTailWiring(unittest.TestCase):
             tail.side_effect = fake
             self.assertEqual(serve.read_tail("app", 7, 3), "line one\n")
         target.assert_called_once()
+
+
+class TailCapSingleSource(unittest.TestCase):
+    def test_tail_cap_default_defined_once(self):
+        import inspect
+
+        self.assertEqual(serve.TAIL_MAX_DEFAULT, 200)
+        self.assertEqual(settings.REGISTRY["serve.tail_max"].default, serve.TAIL_MAX_DEFAULT)
+        state_default = inspect.signature(serve._State.__init__).parameters["tail_max"].default
+        self.assertEqual(state_default, serve.TAIL_MAX_DEFAULT)
+        server_default = inspect.signature(serve.make_server).parameters["tail_max"].default
+        self.assertEqual(server_default, serve.TAIL_MAX_DEFAULT)
+
+
+class BlankNumericsAreInvalid(ServeCase):
+    def test_board_blank_paging_is_a_400(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            store = BoardView()
+            opener = store.open_store(tmp, {"number": 1, "fetched_at": T0})
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            for target in (
+                "/v1/board?limit=",
+                "/v1/board?offset=",
+                "/v1/board?max_age=",
+            ):
+                with self.subTest(target=target):
+                    status, _, body = self.fetch(server, "GET", target)
+                    self.assertEqual(status, 400, target)
+                    self.assertIn("error", json.loads(body))
+
+    def test_tail_blank_numerics_are_a_400(self):
+        tail = FakeTail()
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), tail_fn=tail, tail_max=5)
+        for target in (
+            "/v1/tail?repo=app&number=",
+            "/v1/tail?repo=app&number=7&last=",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+        self.assertEqual(tail.calls, [])
+
+
+def transitive_corral_modules(start):
+    """Module names reachable from `start` through `corral` imports.
+
+    Follows `import corral.x` and `from corral[.x] import ...` edges at
+    every level of each visited file (a lazy import still binds the
+    seam when the handler runs), cycle-safe. Only `corral.*` edges
+    are followed; anything else is a leaf.
+    """
+    import importlib.util
+
+    seen = set()
+    stack = [start]
+    while stack:
+        name = stack.pop()
+        if name in seen or not name.startswith("corral"):
+            continue
+        seen.add(name)
+        spec = importlib.util.find_spec(name)
+        if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
+            continue
+        package = name if spec.submodule_search_locations else name.rsplit(".", 1)[0]
+        with open(spec.origin, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name == "corral" or alias.name.startswith("corral."):
+                        stack.append(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                if node.level:
+                    for alias in node.names:
+                        if node.module:
+                            stack.append(f"{package}.{node.module}")
+                        else:
+                            stack.append(f"{package}.{alias.name}")
+                elif node.module == "corral":
+                    for alias in node.names:
+                        stack.append(f"corral.{alias.name}")
+                elif (node.module or "").startswith("corral"):
+                    stack.append(node.module)
+    return seen
+
+
+class TransitiveImportClosure(unittest.TestCase):
+    def test_transitive_closure_has_no_hub_or_forge(self):
+        closed = transitive_corral_modules("corral.serve")
+        self.assertIn("corral.serve", closed)
+        self.assertIn("corral.board", closed)
+        self.assertNotIn("corral.hub", closed)
+        self.assertNotIn("corral.forge", closed)
+
+    def test_serve_file_uses_no_process_or_network_seam(self):
+        with open(serve.__file__, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        top = set()
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                top.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                top.add(node.module.split(".")[0])
+        # http.server and urllib.parse are the blessed transport (doc 05,
+        # section 2); subprocess and socket would be a live seam.
+        self.assertNotIn("subprocess", top)
+        self.assertNotIn("socket", top)
+
+
+EVENT_ROWS = [
+    {
+        "id": "a1b2c3d4",
+        "kind": "held-merge",
+        "ref": "app#7",
+        "evidence": "waiting on checks",
+        "state": "9:abcdef123 checks-failing",
+        "first_seen": "2026-01-01T00:00:00+00:00",
+        "resolved_at": None,
+    },
+    {
+        "id": "e5f6a7b8",
+        "kind": "coordinator-review",
+        "ref": "app#9",
+        "evidence": "a question",
+        "state": "what now?",
+        "first_seen": "2026-01-01T01:00:00+00:00",
+        "resolved_at": "2026-01-02T00:00:00+00:00",
+    },
+    {
+        "id": "c9d0e1f2",
+        "kind": "held-merge",
+        "ref": "app#11",
+        "evidence": "held again",
+        "state": "4:beef done",
+        "first_seen": "2026-01-03T00:00:00+00:00",
+        "resolved_at": "2026-01-10T00:00:00+00:00",
+    },
+]
+
+
+class EventsView(ServeCase):
+    def start(self, rows, **kwargs):
+        seen = []
+        kwargs.setdefault("events_fn", lambda project: (seen.append(project), list(rows))[1])
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), **kwargs)
+        return server, seen
+
+    def get_json(self, server, target):
+        status, headers, body = self.fetch(server, "GET", target)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "application/json")
+        return json.loads(body)
+
+    def test_events_lists_unresolved_oldest_first(self):
+        server, seen = self.start(EVENT_ROWS)
+        payload = self.get_json(server, "/v1/events?project=demo")
+        self.assertEqual(seen, ["demo"])
+        self.assertEqual(payload["now"], T0)
+        self.assertEqual(payload["project"], "demo")
+        self.assertIsNone(payload["resolved_since"])
+        self.assertEqual(payload["events"], [EVENT_ROWS[0]])
+
+    def test_events_resolved_since_includes_recently_resolved(self):
+        import datetime
+
+        since = datetime.datetime(2026, 1, 5, tzinfo=datetime.timezone.utc).timestamp()
+        server, _ = self.start(EVENT_ROWS)
+        payload = self.get_json(server, f"/v1/events?project=demo&resolved_since={since}")
+        self.assertEqual(payload["resolved_since"], since)
+        self.assertEqual(payload["events"], [EVENT_ROWS[0], EVENT_ROWS[2]])
+
+    def test_events_needs_a_project(self):
+        server, _ = self.start(EVENT_ROWS)
+        for target in ("/v1/events", "/v1/events?project="):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+
+    def test_events_bad_project_is_a_400(self):
+        def boom(project):
+            raise coord.UsageError("bad project name")
+
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), events_fn=boom)
+        status, _, body = self.fetch(server, "GET", "/v1/events?project=../..")
+        self.assertEqual(status, 400)
+        self.assertIn("error", json.loads(body))
+
+    def test_events_bad_since_is_a_400(self):
+        server, seen = self.start(EVENT_ROWS)
+        for target in (
+            "/v1/events?project=demo&resolved_since=many",
+            "/v1/events?project=demo&resolved_since=",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+        self.assertEqual(seen, [])
+
+    def test_events_failure_is_a_generic_500(self):
+        def boom(project):
+            raise OSError("gone")
+
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), events_fn=boom)
+        status, _, body = self.fetch(server, "GET", "/v1/events?project=demo")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "events unavailable"})
+
+
+def journal_entry(index, kind="note"):
+    """One canned logbook entry with the production shape."""
+    return {
+        "at": f"2026-01-01T00:{index:02d}:00+00:00",
+        "holder": "agent-1",
+        "generation": 1,
+        "kind": kind,
+        "refs": [],
+        "text": f"entry {index}",
+    }
+
+
+class JournalView(ServeCase):
+    def start(self, entries, **kwargs):
+        seen = []
+        kwargs.setdefault("journal_fn", lambda project: (seen.append(project), list(entries))[1])
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), **kwargs)
+        return server, seen
+
+    def get_json(self, server, target):
+        status, headers, body = self.fetch(server, "GET", target)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get("Content-Type"), "application/json")
+        return json.loads(body)
+
+    def test_journal_pages_oldest_first_with_an_opaque_cursor(self):
+        entries = [journal_entry(n) for n in range(5)]
+        server, seen = self.start(entries)
+        payload = self.get_json(server, "/v1/journal?project=demo")
+        self.assertEqual(seen, ["demo"])
+        self.assertEqual(payload["now"], T0)
+        self.assertEqual(payload["project"], "demo")
+        self.assertEqual(payload["entries"], entries)
+        self.assertEqual(payload["total"], 5)
+        self.assertEqual(payload["limit"], 100)
+        self.assertEqual(payload["cursor"], "5")
+
+    def test_journal_cursor_pages_cover_every_entry_exactly_once(self):
+        entries = [journal_entry(n) for n in range(7)]
+        server, _ = self.start(entries)
+        seen = []
+        cursor = "0"
+        while True:
+            payload = self.get_json(server, f"/v1/journal?project=demo&limit=3&cursor={cursor}")
+            self.assertEqual(payload["total"], 7)
+            self.assertEqual(payload["limit"], 3)
+            seen.extend(payload["entries"])
+            if len(payload["entries"]) < 3:
+                break
+            cursor = payload["cursor"]
+        self.assertEqual(seen, entries)
+
+    def test_journal_cursor_past_the_end_is_empty_at_the_end(self):
+        entries = [journal_entry(n) for n in range(3)]
+        server, _ = self.start(entries)
+        payload = self.get_json(server, "/v1/journal?project=demo&cursor=99")
+        self.assertEqual(payload["entries"], [])
+        self.assertEqual(payload["cursor"], "3")
+        self.assertEqual(payload["total"], 3)
+
+    def test_journal_filters_by_kind(self):
+        entries = [journal_entry(0, "note"), journal_entry(1, "action"), journal_entry(2, "note")]
+        server, _ = self.start(entries)
+        payload = self.get_json(server, "/v1/journal?project=demo&kind=action")
+        self.assertEqual(payload["entries"], [entries[1]])
+        self.assertEqual(payload["total"], 1)
+        self.assertEqual(payload["cursor"], "1")
+
+    def test_journal_unknown_kind_is_a_400(self):
+        server, seen = self.start([journal_entry(0)])
+        status, _, body = self.fetch(server, "GET", "/v1/journal?project=demo&kind=snooze")
+        self.assertEqual(status, 400)
+        self.assertIn("error", json.loads(body))
+        self.assertEqual(seen, [])
+
+    def test_journal_limit_defaults_and_clamps(self):
+        entries = [journal_entry(n) for n in range(250)]
+        server, _ = self.start(entries)
+        payload = self.get_json(server, "/v1/journal?project=demo")
+        self.assertEqual(payload["limit"], 100)
+        self.assertEqual(len(payload["entries"]), 100)
+        payload = self.get_json(server, "/v1/journal?project=demo&limit=5000")
+        self.assertEqual(payload["limit"], 1000)
+        self.assertEqual(len(payload["entries"]), 250)
+
+    def test_journal_bad_paging_is_a_400(self):
+        server, seen = self.start([journal_entry(0)])
+        for target in (
+            "/v1/journal?project=demo&limit=many",
+            "/v1/journal?project=demo&limit=-1",
+            "/v1/journal?project=demo&limit=",
+            "/v1/journal?project=demo&cursor=many",
+            "/v1/journal?project=demo&cursor=-2",
+            "/v1/journal?project=demo&cursor=",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+        self.assertEqual(seen, [])
+
+    def test_journal_needs_a_project(self):
+        server, _ = self.start([journal_entry(0)])
+        for target in ("/v1/journal", "/v1/journal?project="):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+
+    def test_journal_bad_project_is_a_400(self):
+        def boom(project):
+            raise coord.UsageError("bad project name")
+
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), journal_fn=boom)
+        status, _, body = self.fetch(server, "GET", "/v1/journal?project=../..")
+        self.assertEqual(status, 400)
+        self.assertIn("error", json.loads(body))
+
+    def test_journal_failure_is_a_generic_500(self):
+        def boom(project):
+            raise OSError("gone")
+
+        server, _ = self.start_server(FakeBuilder(healthy_doc()), journal_fn=boom)
+        status, _, body = self.fetch(server, "GET", "/v1/journal?project=demo")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "journal unavailable"})
+
+
+class ProductionProjectReaders(unittest.TestCase):
+    def test_events_reader_returns_the_projects_queue_oldest_first(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-events-") as tmp:
+            root = os.path.join(tmp, "projects", "demo")
+            written = coordevents.record(
+                [
+                    {"kind": "held-merge", "ref": "app#7", "evidence": "e1", "state": "s1"},
+                    {"kind": "coordinator-review", "ref": "app#9", "evidence": "e2"},
+                ],
+                root=root,
+                now=T0,
+                event_id_fn=iter(["a1b2c3d4", "e5f6a7b8"]).__next__,
+            )
+            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+                self.assertEqual(serve.read_project_events("demo"), written)
+                self.assertEqual(serve.read_project_events("demo"), coordevents.read_events(root))
+            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+                with self.assertRaises(coord.UsageError):
+                    serve.read_project_events("../..")
+
+    def test_journal_reader_returns_archives_then_live(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-journal-") as tmp:
+            root = os.path.join(tmp, "projects", "demo")
+            directory = os.path.join(root, coord.LEASE_DIRNAME)
+            os.makedirs(directory)
+            archived_old = {
+                "at": "2026-01-01T00:00:00+00:00",
+                "holder": "",
+                "generation": 1,
+                "kind": "note",
+                "refs": [],
+                "text": "archived old",
+            }
+            archived_new = dict(archived_old, at="2026-01-03T00:00:00+00:00", text="archived new")
+            live = dict(archived_old, at="2026-01-05T00:00:00+00:00", text="live")
+            with open(
+                os.path.join(directory, f"{coord.JOURNAL_ARCHIVE_PREFIX}2026-01-03.jsonl"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(archived_new) + "\n")
+                handle.write("not json\n")
+                handle.write("\n")
+            with open(
+                os.path.join(directory, f"{coord.JOURNAL_ARCHIVE_PREFIX}2026-01-01.jsonl"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(archived_old) + "\n")
+            with open(os.path.join(directory, coord.JOURNAL_NAME), "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(live) + "\n")
+            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+                self.assertEqual(
+                    serve.read_project_journal("demo"), [archived_old, archived_new, live]
+                )
+                self.assertEqual(serve.read_project_journal("quiet"), [])
+            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+                with self.assertRaises(coord.UsageError):
+                    serve.read_project_journal("../..")
+
+
+def sse_field(line, prefix):
+    """The value of one `prefix: value` SSE line (one space stripped)."""
+    rest = line[len(prefix) :]
+    return rest[1:] if rest.startswith(" ") else rest
+
+
+class StreamConn:
+    """An open SSE request: the connection, its response, and the live socket.
+
+    `getresponse` moves the socket into the response, so each frame
+    read sets its timeout through this handle instead of `conn.sock`.
+    `close` hangs up like a browser tab closing: the response owns
+    the socket, so closing the connection alone releases nothing.
+    """
+
+    def __init__(
+        self,
+        conn: http.client.HTTPConnection,
+        resp: http.client.HTTPResponse,
+        sock: socket.socket,
+    ) -> None:
+        self.conn = conn
+        self.resp = resp
+        self.sock = sock
+
+    def close(self) -> None:
+        try:
+            self.resp.close()
+        finally:
+            self.conn.close()
+
+
+class StreamCase(ServeCase):
+    """A live loopback server plus an incremental SSE reader per test."""
+
+    def start_stream_server(self, build=None, **kwargs):
+        kwargs.setdefault("clock", lambda: T0)
+        kwargs.setdefault("quiet", True)
+        kwargs.setdefault("stream_poll_s", 0.02)
+        kwargs.setdefault("stream_heartbeat_s", 60.0)
+        server = serve.make_server(build=build or FakeBuilder(healthy_doc()), **kwargs)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(self._stop, server, thread)
+        return server
+
+    def open_stream(self, server, target, last_id=None):
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        headers = {}
+        if last_id is not None:
+            headers["Last-Event-ID"] = last_id
+        conn.request("GET", target, headers=headers)
+        # Read the socket before getresponse moves it into the response.
+        sock = conn.sock
+        assert sock is not None  # requested and unanswered: the socket is live
+        stream = StreamConn(conn, conn.getresponse(), sock)
+        self.addCleanup(stream.close)
+        return stream
+
+    def read_frame(self, stream, timeout=10):
+        """One SSE frame: the lines up to the blank terminator."""
+        stream.sock.settimeout(timeout)
+        lines = []
+        try:
+            while True:
+                raw = stream.resp.fp.readline()
+                if not raw:
+                    raise AssertionError("stream closed before a full frame")
+                text = raw.decode("utf-8")
+                text = text[:-1] if text.endswith("\n") else text
+                text = text[:-1] if text.endswith("\r") else text
+                if not text:
+                    return lines
+                lines.append(text)
+        except socket.timeout:
+            raise AssertionError(f"no stream frame within {timeout}s (got {lines!r})")
+
+    def frame_fields(self, lines):
+        fields = {}
+        for line in lines:
+            if line.startswith(":"):
+                fields.setdefault("comments", []).append(line)
+            elif line.startswith("data:"):
+                fields.setdefault("data", []).append(sse_field(line, "data:"))
+            else:
+                name, _, value = line.partition(":")
+                fields[name.strip()] = value.strip()
+        return fields
+
+    def wait_for_streams(self, server, count, timeout=10):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with server.state.lock:
+                if server.state.live_streams == count:
+                    return
+            time.sleep(0.02)
+        self.fail(f"live streams did not reach {count}")
+
+
+class StreamHandshake(StreamCase):
+    def test_stream_is_an_event_stream_with_ids(self):
+        server = self.start_stream_server(events_fn=lambda project: [], journal_fn=lambda p: [])
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot&project=demo")
+        self.assertEqual(stream.resp.status, 200)
+        self.assertEqual(stream.resp.getheader("Content-Type"), "text/event-stream")
+        fields = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(fields["event"], "snapshot")
+        self.assertTrue(fields["id"].startswith("snapshot:"))
+        self.assertIn("digest", json.loads(fields["data"][0]))
+
+    def test_stream_topics_subset_suppresses_the_rest(self):
+        entries = [journal_entry(0)]
+        server = self.start_stream_server(
+            events_fn=lambda project: list(EVENT_ROWS),
+            journal_fn=lambda project: list(entries),
+        )
+        stream = self.open_stream(server, "/v1/stream?topics=journal&project=demo")
+        self.assertEqual(stream.resp.status, 200)
+        entries.append(journal_entry(1))
+        fields = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(fields["event"], "journal")
+        self.assertEqual(fields["id"], "journal:2")
+        self.assertEqual([e["text"] for e in json.loads(fields["data"][0])["entries"]], ["entry 1"])
+
+    def test_stream_unknown_topic_is_a_400(self):
+        server = self.start_stream_server()
+        status, _, body = self.fetch(server, "GET", "/v1/stream?topics=snapshot,bogus")
+        self.assertEqual(status, 400)
+        self.assertIn("error", json.loads(body))
+
+    def test_stream_events_and_journal_need_a_project(self):
+        server = self.start_stream_server()
+        for target in ("/v1/stream", "/v1/stream?topics=events,journal"):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.assertEqual(stream.resp.status, 200)
+        self.read_frame(stream)
+
+    def test_stream_bad_cursor_is_a_400(self):
+        server = self.start_stream_server(journal_fn=lambda project: [journal_entry(0)])
+        for target in (
+            "/v1/stream?topics=journal&project=demo&cursor=bogus",
+            "/v1/stream?topics=journal&project=demo&cursor=journal:-1",
+            "/v1/stream?topics=journal&project=demo&cursor=journal:",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+
+    def test_stream_stray_last_event_id_restarts_at_the_end(self):
+        entries = [journal_entry(0)]
+        server = self.start_stream_server(journal_fn=lambda project: list(entries))
+        stream = self.open_stream(server, "/v1/stream?topics=journal&project=demo", last_id="bogus")
+        self.assertEqual(stream.resp.status, 200)
+        entries.append(journal_entry(1))
+        fields = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(fields["id"], "journal:2")
+        self.assertEqual([e["text"] for e in json.loads(fields["data"][0])["entries"]], ["entry 1"])
+
+    def test_stream_builder_failure_is_a_500(self):
+        def boom():
+            raise OSError("gone")
+
+        server = self.start_stream_server(build=boom)
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.assertEqual(stream.resp.status, 500)
+        self.assertEqual(json.loads(stream.resp.read()), {"error": "stream unavailable"})
+
+    def test_stream_bad_project_is_a_400(self):
+        def boom(project):
+            raise coord.UsageError("bad project name")
+
+        server = self.start_stream_server(events_fn=boom)
+        stream = self.open_stream(server, "/v1/stream?topics=events&project=../..")
+        self.assertEqual(stream.resp.status, 400)
+        self.assertIn("error", json.loads(stream.resp.read()))
+
+
+class StreamLiveUpdates(StreamCase):
+    def test_snapshot_digest_moves_on_rebuild(self):
+        builder = FakeBuilder(healthy_doc())
+        server = self.start_stream_server(build=builder)
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot")
+        first = self.frame_fields(self.read_frame(stream))
+        builder.doc = dict(healthy_doc(), drive={"error": "changed"})
+        second = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(first["event"], "snapshot")
+        self.assertEqual(second["event"], "snapshot")
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_events_emit_on_change_with_unresolved_only(self):
+        rows = [dict(EVENT_ROWS[0])]
+        server = self.start_stream_server(events_fn=lambda project: list(rows))
+        stream = self.open_stream(server, "/v1/stream?topics=events&project=demo")
+        first = self.frame_fields(self.read_frame(stream))
+        self.assertEqual([e["id"] for e in json.loads(first["data"][0])["events"]], ["a1b2c3d4"])
+        rows.append(dict(EVENT_ROWS[2], resolved_at=None))
+        second = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(
+            [e["id"] for e in json.loads(second["data"][0])["events"]],
+            ["a1b2c3d4", "c9d0e1f2"],
+        )
+        self.assertNotEqual(first["id"], second["id"])
+
+    def test_journal_resumes_from_last_event_id_without_gaps(self):
+        entries = [journal_entry(n) for n in range(5)]
+        server = self.start_stream_server(journal_fn=lambda project: list(entries))
+        stream = self.open_stream(server, "/v1/stream?topics=journal&project=demo")
+        entries.extend([journal_entry(5), journal_entry(6)])
+        first = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(first["id"], "journal:7")
+        stream.close()
+        entries.append(journal_entry(7))
+        stream2 = self.open_stream(
+            server, "/v1/stream?topics=journal&project=demo", last_id=first["id"]
+        )
+        second = self.frame_fields(self.read_frame(stream2))
+        self.assertEqual(second["id"], "journal:8")
+        got = json.loads(first["data"][0])["entries"] + json.loads(second["data"][0])["entries"]
+        self.assertEqual([e["text"] for e in got], ["entry 5", "entry 6", "entry 7"])
+        stream2.close()
+
+    def test_journal_cursor_param_replays_the_backlog(self):
+        entries = [journal_entry(n) for n in range(5)]
+        server = self.start_stream_server(journal_fn=lambda project: list(entries))
+        stream = self.open_stream(server, "/v1/stream?topics=journal&project=demo&cursor=journal:3")
+        fields = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(fields["id"], "journal:5")
+        self.assertEqual(
+            [e["text"] for e in json.loads(fields["data"][0])["entries"]],
+            ["entry 3", "entry 4"],
+        )
+
+    def test_mixed_topics_resume_from_any_frame_without_gaps(self):
+        entries = [journal_entry(n) for n in range(5)]
+        server = self.start_stream_server(
+            journal_fn=lambda project: list(entries), events_fn=lambda project: []
+        )
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot,journal&project=demo")
+        snap = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(snap["event"], "snapshot")
+        self.assertTrue(snap["id"].startswith("5:snapshot:"))
+        entries.extend([journal_entry(5), journal_entry(6)])
+        first = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(first["id"], "journal:7")
+        stream.close()
+        entries.append(journal_entry(7))
+        # Reconnect from the snapshot frame, not the journal one: the
+        # prefixed cursor still resumes the log where it was.
+        stream2 = self.open_stream(
+            server, "/v1/stream?topics=snapshot,journal&project=demo", last_id=snap["id"]
+        )
+        self.frame_fields(self.read_frame(stream2))
+        second = self.frame_fields(self.read_frame(stream2))
+        self.assertEqual(second["id"], "journal:8")
+        # At-least-once replay from the resume point: 5 and 6 repeat,
+        # 7 is new, and nothing in between is missing.
+        self.assertEqual(
+            [e["text"] for e in json.loads(second["data"][0])["entries"]],
+            ["entry 5", "entry 6", "entry 7"],
+        )
+        stream2.close()
+
+    def test_prefixed_cursor_param_replays_from_its_index(self):
+        entries = [journal_entry(n) for n in range(5)]
+        server = self.start_stream_server(journal_fn=lambda project: list(entries))
+        stream = self.open_stream(
+            server, "/v1/stream?topics=journal&project=demo&cursor=2:journal:3"
+        )
+        fields = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(fields["id"], "journal:5")
+        self.assertEqual(
+            [e["text"] for e in json.loads(fields["data"][0])["entries"]],
+            ["entry 2", "entry 3", "entry 4"],
+        )
+
+    def test_journal_matches_polling(self):
+        entries = [journal_entry(n) for n in range(4)]
+        server = self.start_stream_server(
+            journal_fn=lambda project: list(entries),
+            events_fn=lambda project: [],
+        )
+        stream = self.open_stream(server, "/v1/stream?topics=journal&project=demo&cursor=journal:1")
+        fields = self.frame_fields(self.read_frame(stream))
+        status, _, body = self.fetch(server, "GET", "/v1/journal?project=demo&cursor=1")
+        self.assertEqual(status, 200)
+        polled = json.loads(body)
+        self.assertEqual(json.loads(fields["data"][0])["entries"], polled["entries"])
+        self.assertEqual(json.loads(fields["data"][0])["cursor"], polled["cursor"])
+
+    def test_heartbeat_arrives_when_idle(self):
+        server = self.start_stream_server(
+            clock=time.time,
+            stream_heartbeat_s=0.05,
+            events_fn=lambda project: [],
+            journal_fn=lambda p: [],
+        )
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.frame_fields(self.read_frame(stream))
+        deadline = time.time() + 5
+        while True:
+            fields = self.frame_fields(self.read_frame(stream, timeout=5))
+            if "comments" in fields:
+                self.assertIn(": heartbeat", fields["comments"])
+                return
+            if time.time() > deadline:
+                self.fail("no heartbeat arrived while idle")
+
+
+class StreamShedding(StreamCase):
+    def test_past_max_streams_sheds_with_retry_after(self):
+        server = self.start_stream_server(
+            max_streams=2,
+            stream_heartbeat_s=3600.0,
+            events_fn=lambda project: [],
+            journal_fn=lambda p: [],
+        )
+        stream1 = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.assertEqual(stream1.resp.status, 200)
+        self.read_frame(stream1)
+        stream2 = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.assertEqual(stream2.resp.status, 200)
+        self.read_frame(stream2)
+        status, headers, body = self.fetch(server, "GET", "/v1/stream?topics=snapshot")
+        self.assertEqual(status, 503)
+        self.assertIn("Retry-After", headers)
+        self.assertEqual(json.loads(body), {"error": "too many streams"})
+        stream1.close()
+        stream2.close()
+        self.wait_for_streams(server, 0)
+
+    def test_closed_stream_releases_its_slot(self):
+        server = self.start_stream_server(
+            max_streams=1,
+            stream_heartbeat_s=3600.0,
+            events_fn=lambda project: [],
+            journal_fn=lambda p: [],
+        )
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.assertEqual(stream.resp.status, 200)
+        self.read_frame(stream)
+        status, _, _ = self.fetch(server, "GET", "/v1/stream?topics=snapshot")
+        self.assertEqual(status, 503)
+        stream.close()
+        self.wait_for_streams(server, 0)
+        stream2 = self.open_stream(server, "/v1/stream?topics=snapshot")
+        self.assertEqual(stream2.resp.status, 200)
+        self.read_frame(stream2)
+        stream2.close()
+        self.wait_for_streams(server, 0)
+
+
+class StreamSettings(unittest.TestCase):
+    def test_max_streams_default_defined_once(self):
+        import inspect
+
+        self.assertEqual(serve.MAX_STREAMS_DEFAULT, 20)
+        self.assertEqual(settings.REGISTRY["serve.max_streams"].default, serve.MAX_STREAMS_DEFAULT)
+        params = inspect.signature(serve.make_server).parameters
+        self.assertEqual(params["max_streams"].default, serve.MAX_STREAMS_DEFAULT)
+
+    def test_journal_and_stream_bounds(self):
+        self.assertEqual(serve.JOURNAL_LIMIT_DEFAULT, 100)
+        self.assertEqual(serve.JOURNAL_LIMIT_MAX, 1000)
+        self.assertEqual(serve.STREAM_TOPICS, ("snapshot", "events", "journal"))
+        self.assertEqual(serve.STREAM_POLL_S, 0.2)
+        self.assertEqual(serve.STREAM_HEARTBEAT_S, 15.0)
+
+    def test_settings_max_streams_reaches_the_server(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-stream-") as tmp:
+            config_dir = os.path.join(tmp, "config")
+            state_dir = os.path.join(tmp, "state")
+            os.makedirs(config_dir)
+            os.makedirs(state_dir)
+            with open(os.path.join(config_dir, "config.toml"), "w", encoding="utf-8") as handle:
+                handle.write("[serve]\nmax_streams = 3\n")
+            args = cli.build_parser().parse_args(["serve"])
+            seen = {}
+
+            class FakeServer:
+                server_address = ("127.0.0.1", 4321)
+
+                def serve_forever(self):
+                    pass
+
+                def server_close(self):
+                    pass
+
+            def fake_make(**kwargs):
+                seen.update(kwargs)
+                return FakeServer()
+
+            with mock.patch.dict(
+                os.environ, {"CORRAL_CONFIG": config_dir, "CORRAL_STATE": state_dir}
+            ):
+                with mock.patch.object(serve, "make_server", side_effect=fake_make):
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(args.func(args), 0)
+            self.assertEqual(seen.get("max_streams"), 3)
 
 
 if __name__ == "__main__":
