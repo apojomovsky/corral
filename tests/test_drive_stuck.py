@@ -1329,6 +1329,101 @@ class StuckErrorBranchTest(unittest.TestCase):
         assert found is not None
         self.assertEqual(found.agent, "drive-host-1-19999-acme--app-7")
 
+    def sweep(self, store, **over):
+        values = {
+            "agent_states": {},
+            "stale_s": STALE_S,
+            "gone_s": GONE_S,
+            "live_units": frozenset(),
+            "now": NOW,
+            "host": HOST,
+            "stuck_project": lambda repo, number: "blue",
+            "stop_unit": FakeStop(),
+            "restarter": FakeLauncher(),
+            "tracker_factory": None,
+            "restarts_path": self.budget,
+        }
+        values.update(over)
+        stop, launcher = values["stop_unit"], values["restarter"]
+        out, err = io.StringIO(), io.StringIO()
+        result = drive.handle_stuck(store, out=out, err=err, **values)
+        return result, out.getvalue(), err.getvalue(), stop, launcher
+
+    def test_a_transient_lock_on_the_row_listing_retries_the_sweep(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        original_items = store.items
+        calls = []
+
+        def flaky_items(*args, **kwargs):
+            calls.append(1)
+            if len(calls) < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return original_items(*args, **kwargs)
+
+        store.items = flaky_items
+        try:
+            (restarted, capped), text, _, stop, launcher = self.sweep(store)
+        finally:
+            store.items = original_items
+        self.assertEqual((restarted, capped), (1, False))
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertIn("restarted", text)
+
+    def test_a_persistent_lock_on_the_row_listing_skips_the_sweep_with_claims_kept(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        original_items = store.items
+
+        def locked(*args, **kwargs):
+            raise sqlite3.OperationalError("database is locked")
+
+        store.items = locked
+        try:
+            with self.assertRaises(sqlite3.Error):
+                self.sweep(store)
+        finally:
+            store.items = original_items
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_an_unreadable_claim_leaves_that_row_held_and_restarts_the_rest(self):
+        for index, problem in enumerate(
+            (
+                sqlite3.OperationalError("database is locked"),
+                board.StoreError("unusable item app#7"),
+            )
+        ):
+            db = os.path.join(self.tmp.name, f"board-unreadable-{index}.sqlite")
+            store = stored(db, [("app", 7, "open"), ("app", 9, "open")])
+            self.addCleanup(store.close)
+            claimed(store, "app", 7)
+            claimed(store, "app", 9, agent="drive-host-1-16000-acme--app-9")
+            original_claim_of = store.claim_of
+
+            def flaky_claim_of(repo, number, problem=problem):
+                if (repo, number) == ("app", 7):
+                    raise problem
+                return original_claim_of(repo, number)
+
+            store.claim_of = flaky_claim_of
+            try:
+                (restarted, capped), text, _, stop, launcher = self.sweep(store)
+            finally:
+                store.claim_of = original_claim_of
+            self.assertEqual((restarted, capped), (1, False))
+            self.assertIn("app#7", text)
+            self.assertIn("left held", text)
+            self.assertEqual(stop.calls, [("app", 9)])
+            self.assertEqual(len(launcher.calls), 1)
+            row, _ = store.item("app", 7, now=NOW)
+            self.assertEqual(row.agent, AGENT)
+
 
 class StuckJournalTest(unittest.TestCase):
     def setUp(self):
