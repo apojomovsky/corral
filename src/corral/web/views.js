@@ -541,4 +541,156 @@ export function renderStopped(message) {
   note.appendChild(document.createTextNode(cleanText(message)));
   document.getElementById("cards").textContent = "";
   document.getElementById("agents").textContent = "";
+  document.getElementById("board").textContent = "";
+}
+
+// A tracker reference, or the raw value as text. Only absolute http
+// and https URLs become links (with rel, never a new window: the
+// operator chose to leave); anything else renders as text, never
+// markup, per the text-node rule at the top of this module.
+export function trackerLink(url) {
+  let link = null;
+  if (typeof url === "string" && url !== "") {
+    let scheme = null;
+    try {
+      scheme = new URL(url).protocol;
+    } catch {
+      scheme = null;
+    }
+    if (scheme === "http:" || scheme === "https:") {
+      link = document.createElement("a");
+      link.setAttribute("href", url);
+      link.setAttribute("rel", "noopener noreferrer");
+      link.textContent = "tracker";
+    }
+  }
+  if (link !== null) {
+    return link;
+  }
+  return el("span", typeof url === "string" && url !== "" ? url : "no tracker link");
+}
+
+// The board shell: filter controls and empty containers. Built once
+// per mount (not per poll) so typed filters survive the 15s poll;
+// rows and the pager fill in through renderBoardRows below.
+export function renderBoardShell({ repo, state, label }) {
+  const board = document.getElementById("board");
+  board.textContent = "";
+  const form = document.createElement("form");
+  form.setAttribute("id", "board-filters");
+  const fields = [
+    ["board-repo", "repo", repo],
+    ["board-state", "state", state],
+    ["board-label", "label", label],
+  ];
+  for (const [id, name, value] of fields) {
+    const caption = document.createElement("label");
+    caption.setAttribute("for", id);
+    caption.textContent = name;
+    const input = document.createElement("input");
+    input.setAttribute("id", id);
+    input.setAttribute("name", name);
+    input.setAttribute("type", "text");
+    input.setAttribute("autocomplete", "off");
+    input.value = value === null || value === undefined ? "" : String(value);
+    form.appendChild(caption);
+    form.appendChild(input);
+  }
+  const apply = document.createElement("button");
+  apply.setAttribute("type", "submit");
+  apply.textContent = "apply";
+  form.appendChild(apply);
+  board.appendChild(form);
+  const list = document.createElement("ul");
+  list.setAttribute("id", "board-rows");
+  board.appendChild(list);
+  const pager = document.createElement("div");
+  pager.setAttribute("id", "board-pager");
+  const prev = document.createElement("button");
+  prev.setAttribute("id", "board-prev");
+  prev.setAttribute("type", "button");
+  prev.textContent = "prev";
+  const count = document.createElement("span");
+  count.setAttribute("id", "board-count");
+  const next = document.createElement("button");
+  next.setAttribute("id", "board-next");
+  next.setAttribute("type", "button");
+  next.textContent = "next";
+  pager.appendChild(prev);
+  pager.appendChild(count);
+  pager.appendChild(next);
+  board.appendChild(pager);
+}
+
+// The board rows and pager for one poll reply. Only the list and the
+// pager rebuild, so the filter controls stand. Row lines come from
+// the boardRow helper below (holder, trackerLink, fetched age with
+// fresh, confidence), and the pager counts against total.
+export function renderBoardRows(payload, { limit, offset, nowMs }) {
+  const info = payload !== null && typeof payload === "object" ? payload : {};
+  const rows = Array.isArray(info.board) ? info.board : [];
+  const total = typeof info.total === "number" ? info.total : rows.length;
+  const page = typeof info.limit === "number" ? info.limit : limit;
+  const list = document.getElementById("board-rows");
+  list.textContent = "";
+  if (rows.length === 0) {
+    list.appendChild(el("li", "no rows"));
+  }
+  for (const row of rows) {
+    if (row !== null && typeof row === "object") {
+      list.appendChild(boardRow(row, nowMs));
+    }
+  }
+  const first = total === 0 ? 0 : offset + 1;
+  const last = Math.min(offset + rows.length, total);
+  const count = document.getElementById("board-count");
+  count.textContent = "";
+  count.appendChild(document.createTextNode(first + "-" + last + " of " + total));
+  document.getElementById("board-prev").disabled = offset <= 0;
+  document.getElementById("board-next").disabled = offset + page >= total;
+}
+
+function claimText(claim) {
+  // A missing or foreign holder shape reads as unheld instead of
+  // throwing inside the poll loop.
+  if (claim === null || claim === undefined || typeof claim !== "object") {
+    return "unheld";
+  }
+  const agent = claim.agent === null || claim.agent === undefined ? "?" : String(claim.agent);
+  const host = claim.host === null || claim.host === undefined ? "?" : String(claim.host);
+  const epoch = claim.epoch === null || claim.epoch === undefined ? "?" : String(claim.epoch);
+  return agent + " on " + host + " (" + epoch + ")";
+}
+
+function boardRow(row, nowMs) {
+  const item = document.createElement("li");
+  item.setAttribute("class", "card");
+  const head = document.createElement("div");
+  head.appendChild(
+    el("strong", String(row.repo) + "#" + String(row.number) + "  " + String(row.title)),
+  );
+  head.appendChild(document.createTextNode("  "));
+  head.appendChild(trackerLink(row.url));
+  item.appendChild(head);
+  const bits = [String(row.state)];
+  if (row.priority !== null && row.priority !== undefined && String(row.priority) !== "") {
+    bits.push("priority:" + String(row.priority));
+  }
+  if (Array.isArray(row.labels) && row.labels.length > 0) {
+    bits.push(row.labels.map((name) => String(name)).join(", "));
+  }
+  bits.push(claimText(row.claim));
+  item.appendChild(el("div", bits.join(", ")));
+  item.appendChild(
+    el(
+      "div",
+      "fetched " +
+        formatAge(parseEpoch(row.fetched_at), nowMs) +
+        ", " +
+        String(row.confidence) +
+        ", " +
+        (row.fresh ? "fresh" : "stale"),
+    ),
+  );
+  return item;
 }

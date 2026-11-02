@@ -52,7 +52,7 @@ the snapshot only summarizes:
 - `GET /v1/quota`: the `quota` section plus `now`.
 - `GET /v1/capacity`: the `capacity` section plus `now`.
 - `GET /v1/disks`: the `disk` section plus `now`.
-- `GET /v1/board?repo=&state=&label=&max_age=&limit=&offset=`: board store rows
+- `GET /v1/board?repo=&state=&label=&max_age=&limit=&offset=&body=`: board store rows
   oldest first, each with its confidence (`confirmed`, `pending`,
   `dirty`), `fetched_at`, claim holder (agent, host, epoch,
   claimed_at) when held, and queued agent/status overlays. Listing
@@ -70,7 +70,10 @@ the snapshot only summarizes:
   `limit` and `offset`, so a poller knows whether it is complete. A
   non-integer or negative `limit` or `offset` is a `400`. The bounds
   live as module constants in `serve.py` (`BOARD_LIMIT_DEFAULT`,
-  `BOARD_LIMIT_MAX`), not as settings.
+  `BOARD_LIMIT_MAX`), not as settings. `body=0` slims rows for the
+  list view the browser polls: those rows drop exactly `body` and
+  `extra` while every other key stays identical; missing or `body=1`
+  reads full rows, and anything else is a `400`.
 - `GET /v1/events?project=`: one project's unresolved coordinator
   events oldest first (`coordevents.unresolved`), each with id, kind,
   ref, evidence, state, first_seen. A `resolved_since` parameter

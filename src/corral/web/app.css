@@ -94,8 +94,39 @@ main {
 
 main.stale #status-card,
 main.stale #cards,
-main.stale #agents {
+main.stale #agents,
+main.stale #board {
   background: var(--stale-bg);
+}
+
+#tabs {
+  display: flex;
+  gap: 0.5rem;
+  overflow-x: auto;
+  padding: 0.5rem 1rem 0;
+}
+
+#tabs a {
+  flex: none;
+  padding: 0.5rem 1rem;
+  min-height: 44px;
+  line-height: 2;
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  text-decoration: none;
+}
+
+#tabs a[aria-current="true"] {
+  border-color: var(--accent);
+  border-width: 2px;
+  border-bottom: none;
+}
+
+#tabs a:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 
 #chips {
@@ -196,6 +227,46 @@ main.stale #agents {
   color: var(--fg);
   border: 1px solid var(--line);
   border-radius: 6px;
+}
+
+#board-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  align-items: end;
+  margin: 1rem 0;
+}
+
+#board-filters label {
+  margin-right: 0.25rem;
+}
+
+#board-filters input {
+  min-height: 44px;
+  padding: 0.5rem;
+  font: inherit;
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+#board-rows {
+  list-style: none;
+  margin: 1rem 0;
+  padding: 0;
+}
+
+#board-pager {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+
+#board-count {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
 }
 
 @media (prefers-reduced-motion: reduce) {
