@@ -76,7 +76,9 @@ Steps, in order (each is re-runnable; section 5):
    template's name substitution), containing the scaffold plus everything
    `init` wrote. Agents require clean trees and `takeoff` refuses dirty ones,
    so the first agent must start from a committed base. The commit goes
-   through the installed `commit-msg` hook like any other commit.
+   through the installed `commit-msg` hook like any other commit. In the
+   split layout the commit covers only the clone. The ops root is a
+   separate working tree with its own history, so the operator commits it.
 5. **Remote and labels, only when asked.** Without `--create-remote`, `new`
    prints the outward commands (the planned create command as rendered by
    the forge, then `corral github setup`) and stops, exactly like `init`
