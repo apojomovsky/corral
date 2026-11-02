@@ -1,0 +1,6 @@
+[project]
+name = "{{name}}"
+version = "0.1.0"
+description = "One line: what this project is and who it is for."
+requires-python = ">=3.11"
+dependencies = []

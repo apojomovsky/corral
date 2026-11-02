@@ -49,6 +49,8 @@ class FakeGit:
             if not self.hooks:
                 return proc(1, "")
             return proc(0, self.hooks + "\n")
+        if args[:1] == ["init"]:
+            return proc(0, "")
         raise AssertionError(f"unexpected git call {args}")
 
 
