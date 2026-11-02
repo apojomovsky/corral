@@ -75,19 +75,22 @@ class OpenDbTest(StoreCase):
             hub.open_db(self.db)
 
     def test_preexisting_file_from_a_lost_create_race_opens(self):
-        from unittest import mock
-
         self.store.close()
         with open(self.db, "wb") as handle:
             handle.write(b"")
-        real_exists = os.path.exists
-        with mock.patch.object(
-            hub.os.path, "exists", side_effect=lambda p: False if p == self.db else real_exists(p)
-        ):
-            reopened = hub.open_db(self.db)
+        reopened = hub.open_db(self.db)
         self.addCleanup(reopened.close)
         epoch = reopened.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
         self.assertEqual(tuple(epoch), (0,))
+
+    def test_unwritable_state_parent_is_hub_error(self):
+        self.store.close()
+        parent = os.path.join(self.tmp.name, "noperm")
+        os.mkdir(parent)
+        os.chmod(parent, 0o555)
+        self.addCleanup(os.chmod, parent, 0o755)
+        with self.assertRaises(hub.HubError):
+            hub.open_db(os.path.join(parent, "nested", "hub.sqlite"))
 
 
 class AddHostTest(StoreCase):
@@ -371,6 +374,55 @@ class BindWarningTest(unittest.TestCase):
         self.assertIn("hub-1.example.com", str(warning))
 
 
+class ServerFamilyTest(unittest.TestCase):
+    def test_ipv6_literals_select_the_ipv6_family(self):
+        import socket as socket_module
+
+        for bind in ("::1", "::"):
+            with self.subTest(bind=bind):
+                self.assertEqual(hub.server_family(bind), socket_module.AF_INET6)
+
+    def test_ipv4_literals_and_names_stay_on_ipv4(self):
+        import socket as socket_module
+
+        for bind in ("127.0.0.1", "0.0.0.0", "10.0.0.5", "localhost", "hub-1.example.com"):
+            with self.subTest(bind=bind):
+                self.assertEqual(hub.server_family(bind), socket_module.AF_INET)
+
+
+class IPv6LoopbackTest(unittest.TestCase):
+    def test_ipv6_loopback_serves_the_version_route(self):
+        import socket as socket_module
+
+        if not socket_module.has_ipv6:
+            self.skipTest("this host has no IPv6")
+        tmp = tempfile.TemporaryDirectory(prefix="corral-hub-ipv6-")
+        self.addCleanup(tmp.cleanup)
+        db = os.path.join(tmp.name, "hub.sqlite")
+        store = hub.open_db(db)
+        hub.add_host(store, "host-1")
+        store.close()
+        try:
+            server = hub.make_server("::1", 0, db)
+        except OSError as err:
+            self.skipTest(f"this host cannot bind ::1: {err}")
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(server.server_close)
+        conn = http.client.HTTPConnection("::1", port, timeout=10)
+        try:
+            conn.request("GET", "/v1/version")
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload, {"api": hub.HUB_API, "schema_version": hub.SCHEMA_VERSION})
+
+
 class HubPathsTest(unittest.TestCase):
     def test_defaults_follow_the_state_and_config_dirs(self):
         env = {}
@@ -539,6 +591,28 @@ class ServeCommandTest(unittest.TestCase):
         self.assertIn("0.0.0.0", err.getvalue())
         self.assertIn("listening on 0.0.0.0:4321", out.getvalue())
         self.assertTrue(fake.served)
+
+    def test_corrupt_store_is_a_usage_error_without_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import paths
+        from corral import settings
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+            db_path = paths.hub_db_path({"CORRAL_HUB_STATE": state})
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            with open(db_path, "wb") as handle:
+                handle.write(b"this is not a database")
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with mock.patch.object(settings, "load", return_value={"hub.lease_ttl_s": 90}):
+                    args = self.parse("--bind", "127.0.0.1", "--port", "0")
+                    err = io.StringIO()
+                    with redirect_stderr(err):
+                        self.assertEqual(args.func(args), 4)
+        self.assertIn("corral:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
 
     def test_nonpositive_lease_ttl_is_a_usage_error_naming_the_setting(self):
         import io

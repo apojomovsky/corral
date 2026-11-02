@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import sqlite3
 import time
 from collections.abc import Callable
@@ -152,14 +153,20 @@ def open_db(path: str | None = None) -> sqlite3.Connection:
     target = path if path is not None else paths.hub_db_path()
     parent = os.path.dirname(target)
     if parent:
-        os.makedirs(parent, exist_ok=True)
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as err:
+            raise HubError(f"cannot create hub state dir {parent}: {err}") from None
     try:
         fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         pass
     else:
         os.close(fd)
-    os.chmod(target, 0o600)
+    try:
+        os.chmod(target, 0o600)
+    except OSError as err:
+        raise HubError(f"cannot secure hub store {target}: {err}") from None
     try:
         conn = sqlite3.connect(target, timeout=_BUSY_TIMEOUT_MS / 1000)
     except sqlite3.Error as err:
@@ -315,6 +322,19 @@ def bind_warning(bind: str) -> str | None:
     return None
 
 
+def server_family(bind: str) -> socket.AddressFamily:
+    """The socket family for a hub bind: IPv6 for IPv6 literals, else IPv4.
+
+    Names stay on IPv4: they resolve at bind time, and the default
+    family keeps today's behavior for them.
+    """
+    try:
+        address = ipaddress.ip_address(str(bind or ""))
+    except ValueError:
+        return socket.AF_INET
+    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
+
+
 class HubServer(http.server.ThreadingHTTPServer):
     """The hub service: one thread per connection, one transaction per write."""
 
@@ -332,6 +352,7 @@ class HubServer(http.server.ThreadingHTTPServer):
         self.db_path = db_path
         self.clock = clock or time.time
         self.lease_ttl_s = lease_ttl_s
+        self.address_family = server_family(address[0])
         super().__init__(address, HubHandler)
 
 

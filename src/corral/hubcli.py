@@ -65,6 +65,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
         return USAGE
     try:
         server = hub.make_server(args.bind, args.port, db_path, lease_ttl_s=lease_ttl_s)
+    except hub.HubError as err:
+        _err(str(err))
+        return USAGE
     except OSError as err:
         if err.errno == errno.EADDRINUSE:
             _err(f"hub bind {args.bind}:{args.port} is already in use")
