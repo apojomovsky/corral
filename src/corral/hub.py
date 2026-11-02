@@ -1,11 +1,11 @@
 """The hub: one SQLite database behind a small loopback HTTP service.
 
-Tickets H1 and H6 of docs/08-hub-multihost.md section 10: the hub
-skeleton, the host registry and the claims table (H1), plus hub
-operations (H6): backup, export and import with fencing epochs
-preserved, and the version exchange hosts check on every call. Later
-tickets add leases and renewal (H2), drive composition (H3), operator
-verbs (H4) and the merged dashboard (H5).
+Tickets H1, H2 and H6 of docs/08-hub-multihost.md section 10: the
+hub skeleton, the host registry and the claims table (H1), the lease
+cycle with renew and release (H2), and hub operations (H6): backup,
+export and import with fencing epochs preserved, and the version
+exchange hosts check on every call. Later tickets add drive
+composition (H3), operator verbs (H4) and the merged dashboard (H5).
 
 Every grant is decided by one SQLite transaction: the row is
 unclaimed, or its lease has lapsed, and the new owner takes a strictly
@@ -234,15 +234,24 @@ def verify_token(conn: sqlite3.Connection, presented: str | None) -> str | None:
     return None
 
 
-def _check_shape(repo: object, number: object, agent: object, host_id: object) -> None:
+def _check_identity(repo: object, number: object, agent: object) -> None:
     if not isinstance(repo, str) or not repo:
         raise HubError(f"claim repo {repo!r} must be a non-empty string")
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise HubError(f"claim number {number!r} must be a positive integer")
     if not isinstance(agent, str) or not agent:
         raise HubError(f"claim agent {agent!r} must be a non-empty string")
+
+
+def _check_shape(repo: object, number: object, agent: object, host_id: object) -> None:
+    _check_identity(repo, number, agent)
     if not isinstance(host_id, str) or not host_id:
         raise HubError(f"claim host_id {host_id!r} must be a non-empty string")
+
+
+def _check_epoch(epoch: object) -> None:
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1:
+        raise HubError(f"claim epoch {epoch!r} must be a positive integer")
 
 
 def grant(
@@ -515,6 +524,99 @@ def backup_hub(source: str, dest: str) -> str:
     return dest
 
 
+def renew(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    agent: str,
+    epoch: int,
+    *,
+    now: float,
+    lease_ttl_s: int,
+) -> Receipt:
+    """Extend a live lease without changing the fencing epoch.
+
+    Only the holder with the matching agent plus epoch renews, and
+    only before the lease lapses: anything else raises ``Conflict``
+    naming the current holder (empty when no live holder exists), so
+    a partitioned holder re-grants with a bumped epoch instead of
+    reviving a stale one. A renew can never fence, because the epoch
+    never changes here. One transaction, like the grant.
+    """
+    _check_identity(repo, number, agent)
+    _check_epoch(epoch)
+    if lease_ttl_s <= 0:
+        raise HubError(f"lease_ttl_s {lease_ttl_s!r} must be positive")
+    with _txn(conn):
+        row = conn.execute(
+            "SELECT agent, host_id, epoch, lease_expires FROM claims WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        if row is None or not row[0]:
+            raise Conflict(repo, number, "", "", 0)
+        if row[0] != agent or row[2] != epoch:
+            raise Conflict(repo, number, row[0], row[1], row[2])
+        if row[3] <= now:
+            raise Conflict(repo, number, row[0], row[1], row[2])
+        expires = now + lease_ttl_s
+        conn.execute(
+            "UPDATE claims SET lease_expires=?, updated_at=? WHERE repo=? AND number=?",
+            (expires, now, repo, number),
+        )
+        return Receipt(repo, number, row[0], row[1], row[2], expires)
+
+
+def release(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    agent: str,
+    epoch: int,
+    *,
+    now: float,
+) -> int:
+    """Release a held claim, keeping the epoch for the next grant.
+
+    Only the holder with the matching agent plus epoch releases;
+    anyone else gets ``Conflict`` naming the holder. The row is
+    cleared but the epoch is kept, so the next grant mints
+    ``epoch+1`` and fences a stale holder still acting on the old
+    epoch. Returns the kept epoch. One transaction, like the grant.
+    """
+    _check_identity(repo, number, agent)
+    _check_epoch(epoch)
+    with _txn(conn):
+        row = conn.execute(
+            "SELECT agent, host_id, epoch FROM claims WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        if row is None or not row[0]:
+            raise Conflict(repo, number, "", "", 0)
+        if row[0] != agent or row[2] != epoch:
+            raise Conflict(repo, number, row[0], row[1], row[2])
+        kept = row[2]
+        conn.execute(
+            "UPDATE claims SET agent='', host_id='', lease_expires=0, updated_at=?"
+            " WHERE repo=? AND number=?",
+            (now, repo, number),
+        )
+        return kept
+
+
+def renewal_entry(repo: str, number: int, agent: str, epoch: int) -> dict[str, Any]:
+    """One entry of the heartbeat ``renewals`` list.
+
+    The heartbeat carries one entry per held claim beside the
+    snapshot document, so one call renews every lease; the reply
+    answers each entry with granted or ``409``. The entry shape is
+    fixed here so the heartbeat client and the hub read one fact in
+    one place.
+    """
+    _check_identity(repo, number, agent)
+    _check_epoch(epoch)
+    return {"repo": repo, "number": number, "agent": agent, "epoch": epoch}
+
+
 def bind_warning(bind: str) -> str | None:
     """Why a hub bind address is unsafe to serve on, or None when quiet.
 
@@ -592,6 +694,9 @@ def _server(handler: http.server.BaseHTTPRequestHandler) -> HubServer:
 #: A versioned hub path: `/v<major>` plus the rest, or None.
 _VERSIONED_PATH_RE = re.compile(r"^/v(\d+)(?:/|$)")
 
+#: Authed claim routes: propose, renew a live lease, release a hold.
+CLAIM_PATHS = ("/v1/claims", "/v1/claims/renew", "/v1/claims/release")
+
 
 def _path_major(path: str) -> int | None:
     """The API major a request path asks for, or None when unversioned."""
@@ -600,7 +705,7 @@ def _path_major(path: str) -> int | None:
 
 
 class HubHandler(http.server.BaseHTTPRequestHandler):
-    """Routes: `GET /v1/version` (open), `POST /v1/claims` (authed).
+    """Routes: `GET /v1/version` (open), the claim routes (authed).
 
     Anything else is 404 (unknown path) or 405 (wrong method), with no
     side effects. A path naming another API major gets a typed 404
@@ -668,10 +773,96 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/v1/version":
             self._send(200, {"api": HUB_API, "schema_version": SCHEMA_VERSION})
             return
-        if self.path == "/v1/claims":
+        if self.path in CLAIM_PATHS:
             self._send(405, {"error": "hub v1 takes GET and POST only"})
             return
         self._send(404, {"error": f"unknown hub route {self.path}"})
+
+    def _valid_claim_body(self, body: dict[str, Any], *, want_epoch: bool) -> bool:
+        repo, number, agent, claim_host, epoch = (
+            body.get("repo"),
+            body.get("number"),
+            body.get("agent"),
+            body.get("host_id"),
+            body.get("epoch"),
+        )
+        if (
+            not isinstance(repo, str)
+            or not isinstance(number, int)
+            or isinstance(number, bool)
+            or not isinstance(agent, str)
+            or not isinstance(claim_host, str)
+        ):
+            return False
+        if want_epoch and (not isinstance(epoch, int) or isinstance(epoch, bool)):
+            return False
+        return True
+
+    def _post_claim(
+        self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any]
+    ) -> None:
+        if not self._valid_claim_body(body, want_epoch=False):
+            self._send(400, {"error": "claim needs repo, number, agent and host_id"})
+            return
+        try:
+            receipt = grant(
+                conn,
+                str(body["repo"]),
+                int(body["number"]),
+                str(body["agent"]),
+                str(body["host_id"]),
+                now=server.clock(),
+                lease_ttl_s=server.lease_ttl_s,
+            )
+        except Conflict as err:
+            self._send(409, {"error": str(err), "holder": err.holder})
+        except HubError as err:
+            self._send(400, {"error": str(err)})
+        else:
+            self._send(200, receipt.as_dict())
+
+    def _post_renew(
+        self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any]
+    ) -> None:
+        if not self._valid_claim_body(body, want_epoch=True):
+            self._send(400, {"error": "renew needs repo, number, agent, epoch and host_id"})
+            return
+        try:
+            receipt = renew(
+                conn,
+                str(body["repo"]),
+                int(body["number"]),
+                str(body["agent"]),
+                int(body["epoch"]),
+                now=server.clock(),
+                lease_ttl_s=server.lease_ttl_s,
+            )
+        except Conflict as err:
+            self._send(409, {"error": str(err), "holder": err.holder})
+        except HubError as err:
+            self._send(400, {"error": str(err)})
+        else:
+            self._send(200, receipt.as_dict())
+
+    def _post_release(self, conn: sqlite3.Connection, body: dict[str, Any]) -> None:
+        if not self._valid_claim_body(body, want_epoch=True):
+            self._send(400, {"error": "release needs repo, number, agent, epoch and host_id"})
+            return
+        try:
+            kept = release(
+                conn,
+                str(body["repo"]),
+                int(body["number"]),
+                str(body["agent"]),
+                int(body["epoch"]),
+                now=_server(self).clock(),
+            )
+        except Conflict as err:
+            self._send(409, {"error": str(err), "holder": err.holder})
+        except HubError as err:
+            self._send(400, {"error": str(err)})
+        else:
+            self._send(200, {"repo": body["repo"], "number": body["number"], "epoch": kept})
 
     def do_POST(self) -> None:
         if self._refuse_old_major():
@@ -679,7 +870,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         if self.path == "/v1/version":
             self._send(405, {"error": "hub v1 takes GET and POST only"})
             return
-        if self.path != "/v1/claims":
+        if self.path not in CLAIM_PATHS:
             self._send(404, {"error": f"unknown hub route {self.path}"})
             return
         server = _server(self)
@@ -698,37 +889,12 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             if host is None or host != body.get("host_id"):
                 self._reject("unknown hub host")
                 return
-            repo, number, agent, claim_host = (
-                body.get("repo"),
-                body.get("number"),
-                body.get("agent"),
-                body.get("host_id"),
-            )
-            if (
-                not isinstance(repo, str)
-                or not isinstance(number, int)
-                or isinstance(number, bool)
-                or not isinstance(agent, str)
-                or not isinstance(claim_host, str)
-            ):
-                self._send(400, {"error": "claim needs repo, number, agent and host_id"})
-                return
-            try:
-                receipt = grant(
-                    conn,
-                    repo,
-                    number,
-                    agent,
-                    claim_host,
-                    now=server.clock(),
-                    lease_ttl_s=server.lease_ttl_s,
-                )
-            except Conflict as err:
-                self._send(409, {"error": str(err), "holder": err.holder})
-            except HubError as err:
-                self._send(400, {"error": str(err)})
+            if self.path == "/v1/claims/renew":
+                self._post_renew(server, conn, body)
+            elif self.path == "/v1/claims/release":
+                self._post_release(conn, body)
             else:
-                self._send(200, receipt.as_dict())
+                self._post_claim(server, conn, body)
         finally:
             conn.close()
 

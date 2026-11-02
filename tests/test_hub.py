@@ -638,6 +638,267 @@ class ServeCommandTest(unittest.TestCase):
                 made.assert_not_called()
 
 
+class RenewTest(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.add_host()
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+
+    def test_renew_moves_the_lease_and_keeps_the_epoch(self):
+        renewed = hub.renew(self.store, "app", 7, "drive-aaa", 1, now=1030.0, lease_ttl_s=90)
+        self.assertEqual(
+            (renewed.agent, renewed.host_id, renewed.epoch), ("drive-aaa", "host-1", 1)
+        )
+        self.assertEqual(renewed.lease_expires, 1120.0)
+        row = self.store.execute(
+            "SELECT epoch, lease_expires FROM claims WHERE repo=? AND number=?", ("app", 7)
+        ).fetchone()
+        self.assertEqual((row[0], row[1]), (1, 1120.0))
+
+    def test_renew_with_a_wrong_epoch_conflicts_naming_the_holder(self):
+        with self.assertRaises(hub.Conflict) as caught:
+            hub.renew(self.store, "app", 7, "drive-aaa", 2, now=1030.0, lease_ttl_s=90)
+        self.assertEqual(caught.exception.holder["agent"], "drive-aaa")
+        self.assertEqual(caught.exception.holder["epoch"], 1)
+
+    def test_renew_with_a_wrong_agent_conflicts(self):
+        with self.assertRaises(hub.Conflict) as caught:
+            hub.renew(self.store, "app", 7, "drive-bbb", 1, now=1030.0, lease_ttl_s=90)
+        self.assertIn("drive-aaa", str(caught.exception))
+
+    def test_renew_after_the_lease_lapsed_conflicts_then_regrant_bumps(self):
+        with self.assertRaises(hub.Conflict):
+            hub.renew(self.store, "app", 7, "drive-aaa", 1, now=1091.0, lease_ttl_s=90)
+        receipt = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1091.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 2)
+
+    def test_renew_at_exact_expiry_conflicts(self):
+        with self.assertRaises(hub.Conflict):
+            hub.renew(self.store, "app", 7, "drive-aaa", 1, now=1090.0, lease_ttl_s=90)
+
+    def test_renew_of_an_unclaimed_ticket_conflicts(self):
+        with self.assertRaises(hub.Conflict):
+            hub.renew(self.store, "other", 9, "drive-aaa", 1, now=1001.0, lease_ttl_s=90)
+
+    def test_renew_of_a_released_ticket_conflicts(self):
+        hub.release(self.store, "app", 7, "drive-aaa", 1, now=1030.0)
+        with self.assertRaises(hub.Conflict):
+            hub.renew(self.store, "app", 7, "drive-aaa", 1, now=1031.0, lease_ttl_s=90)
+
+    def test_renew_leaves_a_conflicting_row_untouched(self):
+        with self.assertRaises(hub.Conflict):
+            hub.renew(self.store, "app", 7, "drive-bbb", 1, now=1030.0, lease_ttl_s=90)
+        row = self.store.execute(
+            "SELECT agent, epoch, lease_expires FROM claims WHERE repo=? AND number=?",
+            ("app", 7),
+        ).fetchone()
+        self.assertEqual((row[0], row[1], row[2]), ("drive-aaa", 1, 1090.0))
+
+    def test_bad_shapes_are_refused(self):
+        with self.assertRaises(hub.HubError):
+            hub.renew(self.store, "", 7, "drive-aaa", 1, now=1030.0, lease_ttl_s=90)
+        with self.assertRaises(hub.HubError):
+            hub.renew(self.store, "app", 0, "drive-aaa", 1, now=1030.0, lease_ttl_s=90)
+        with self.assertRaises(hub.HubError):
+            hub.renew(self.store, "app", 7, "", 1, now=1030.0, lease_ttl_s=90)
+        for bad_epoch in (0, -1, True):
+            with self.subTest(bad_epoch=bad_epoch), self.assertRaises(hub.HubError):
+                hub.renew(self.store, "app", 7, "drive-aaa", bad_epoch, now=1030.0, lease_ttl_s=90)
+        with self.assertRaises(hub.HubError):
+            hub.renew(self.store, "app", 7, "drive-aaa", 1, now=1030.0, lease_ttl_s=0)
+
+
+class ReleaseTest(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.add_host()
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+
+    def test_release_clears_the_holder_and_keeps_the_epoch(self):
+        kept = hub.release(self.store, "app", 7, "drive-aaa", 1, now=1030.0)
+        self.assertEqual(kept, 1)
+        row = self.store.execute(
+            "SELECT agent, host_id, epoch, lease_expires FROM claims WHERE repo=? AND number=?",
+            ("app", 7),
+        ).fetchone()
+        self.assertEqual(row[0], "")
+        self.assertEqual(row[1], "")
+        self.assertEqual(row[2], 1)
+        self.assertLessEqual(row[3], 1030.0)
+
+    def test_next_grant_after_release_fences_with_epoch_plus_one(self):
+        hub.release(self.store, "app", 7, "drive-aaa", 1, now=1030.0)
+        receipt = hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1031.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 2)
+        with self.assertRaises(hub.Conflict) as caught:
+            hub.renew(self.store, "app", 7, "drive-aaa", 1, now=1032.0, lease_ttl_s=90)
+        self.assertEqual(caught.exception.holder["agent"], "drive-bbb")
+
+    def test_release_with_a_wrong_agent_or_epoch_conflicts(self):
+        with self.assertRaises(hub.Conflict):
+            hub.release(self.store, "app", 7, "drive-bbb", 1, now=1030.0)
+        with self.assertRaises(hub.Conflict):
+            hub.release(self.store, "app", 7, "drive-aaa", 2, now=1030.0)
+        row = self.store.execute(
+            "SELECT agent, epoch FROM claims WHERE repo=? AND number=?", ("app", 7)
+        ).fetchone()
+        self.assertEqual((row[0], row[1]), ("drive-aaa", 1))
+
+    def test_release_twice_conflicts_the_second_time(self):
+        hub.release(self.store, "app", 7, "drive-aaa", 1, now=1030.0)
+        with self.assertRaises(hub.Conflict):
+            hub.release(self.store, "app", 7, "drive-aaa", 1, now=1031.0)
+
+    def test_release_of_an_unclaimed_ticket_conflicts(self):
+        with self.assertRaises(hub.Conflict):
+            hub.release(self.store, "other", 9, "drive-aaa", 1, now=1030.0)
+
+    def test_bad_shapes_are_refused(self):
+        with self.assertRaises(hub.HubError):
+            hub.release(self.store, "", 7, "drive-aaa", 1, now=1030.0)
+        with self.assertRaises(hub.HubError):
+            hub.release(self.store, "app", 7, "drive-aaa", 0, now=1030.0)
+
+
+class RenewalEntryTest(unittest.TestCase):
+    def test_entry_carries_repo_number_agent_and_epoch(self):
+        self.assertEqual(
+            hub.renewal_entry("app", 7, "drive-aaa", 3),
+            {"repo": "app", "number": 7, "agent": "drive-aaa", "epoch": 3},
+        )
+
+    def test_bad_shapes_are_refused(self):
+        with self.assertRaises(hub.HubError):
+            hub.renewal_entry("", 7, "drive-aaa", 3)
+        with self.assertRaises(hub.HubError):
+            hub.renewal_entry("app", 0, "drive-aaa", 3)
+        with self.assertRaises(hub.HubError):
+            hub.renewal_entry("app", 7, "", 3)
+        with self.assertRaises(hub.HubError):
+            hub.renewal_entry("app", 7, "drive-aaa", 0)
+
+
+class RenewReleaseRouteTest(ServerCase):
+    def renew(self, agent="drive-aaa", host="host-1", epoch=1, token=None, **over):
+        body = {"repo": "app", "number": 7, "agent": agent, "host_id": host, "epoch": epoch}
+        body.update(over)
+        return self.call(
+            "POST",
+            "/v1/claims/renew",
+            body,
+            token=self.token_a if token is None else token,
+        )
+
+    def release(self, agent="drive-aaa", host="host-1", epoch=1, token=None, **over):
+        body = {"repo": "app", "number": 7, "agent": agent, "host_id": host, "epoch": epoch}
+        body.update(over)
+        return self.call(
+            "POST",
+            "/v1/claims/release",
+            body,
+            token=self.token_a if token is None else token,
+        )
+
+    def test_renew_keeps_the_epoch_and_moves_the_lease(self):
+        self.propose()
+        status, payload = self.renew()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            (payload["agent"], payload["host_id"], payload["epoch"]), ("drive-aaa", "host-1", 1)
+        )
+        self.assertEqual(payload["lease_expires"], 1090.0)
+        self.clock[0] = 1030.0
+        status, payload = self.renew()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["epoch"], 1)
+        self.assertEqual(payload["lease_expires"], 1120.0)
+
+    def test_renew_with_a_wrong_epoch_is_409_naming_the_holder(self):
+        self.propose()
+        status, payload = self.renew(epoch=2)
+        self.assertEqual(status, 409)
+        self.assertIn("drive-aaa", payload["error"])
+        self.assertEqual(payload["holder"]["epoch"], 1)
+
+    def test_renew_after_release_is_409(self):
+        self.propose()
+        status, _ = self.release()
+        self.assertEqual(status, 200)
+        status, _ = self.renew()
+        self.assertEqual(status, 409)
+
+    def test_release_returns_the_kept_epoch_and_fences_the_next_grant(self):
+        self.propose()
+        status, payload = self.release()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"repo": "app", "number": 7, "epoch": 1})
+        status, granted = self.propose(agent="drive-bbb", host="host-2", token=self.token_b)
+        self.assertEqual(status, 200)
+        self.assertEqual(granted["epoch"], 2)
+        status, payload = self.renew()
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["holder"]["agent"], "drive-bbb")
+
+    def test_release_twice_conflicts_the_second_time(self):
+        self.propose()
+        status, _ = self.release()
+        self.assertEqual(status, 200)
+        status, payload = self.release()
+        self.assertEqual(status, 409)
+        self.assertTrue(payload["error"])
+
+    def test_release_by_another_holder_is_409(self):
+        self.propose()
+        status, payload = self.release(agent="drive-bbb", host="host-2", token=self.token_b)
+        self.assertEqual(status, 409)
+        self.assertIn("drive-aaa", payload["error"])
+
+    def test_missing_or_wrong_token_is_401_without_a_leak(self):
+        self.propose()
+        status, _ = self.call("POST", "/v1/claims/renew", {"repo": "app"}, token=None)
+        self.assertEqual(status, 401)
+        status, _ = self.call("POST", "/v1/claims/release", {"repo": "app"}, token="wrong")
+        self.assertEqual(status, 401)
+        with self.assertLogs("corral.hub", level="WARNING") as logs:
+            self.call("POST", "/v1/claims/renew", {"repo": "app"}, token="s3cret-token")
+        self.assertFalse(any("s3cret-token" in line for line in logs.output))
+
+    def test_token_for_another_host_is_refused(self):
+        self.propose()
+        status, _ = self.renew(host="host-2", token=self.token_a)
+        self.assertEqual(status, 401)
+        status, _ = self.release(host="host-2", token=self.token_a)
+        self.assertEqual(status, 401)
+
+    def test_bad_bodies_are_400(self):
+        self.propose()
+        for path, make in (
+            ("/v1/claims/renew", self.renew),
+            ("/v1/claims/release", self.release),
+        ):
+            with self.subTest(path=path):
+                status, payload = make(number=0)
+                self.assertEqual(status, 400)
+                status, payload = make(epoch=True)
+                self.assertEqual(status, 400)
+                status, payload = make(epoch="1")
+                self.assertEqual(status, 400)
+                status, payload = self.call(
+                    "POST",
+                    path,
+                    {"repo": "app", "number": 7, "agent": "drive-aaa", "host_id": "host-1"},
+                    token=self.token_a,
+                )
+                self.assertEqual(status, 400)
+                self.assertTrue(payload["error"])
+
+    def test_wrong_method_on_renew_and_release_is_405(self):
+        for path in ("/v1/claims/renew", "/v1/claims/release"):
+            with self.subTest(path=path):
+                status, _ = self.call("GET", path, token=self.token_a)
+                self.assertEqual(status, 405)
+
+
 class ImportClosureTest(unittest.TestCase):
     def test_hub_reaches_no_live_seam(self):
         with open(hub.__file__, encoding="utf-8") as handle:
