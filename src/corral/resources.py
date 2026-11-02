@@ -904,12 +904,6 @@ MEMINFO_PATH = "/proc/meminfo"
 PRESSURE_CPU_PATH = "/proc/pressure/cpu"
 PRESSURE_MEMORY_PATH = "/proc/pressure/memory"
 
-#: Saturation thresholds over load per CPU and MemAvailable percent.
-#: Conservative defaults; promoting them to settings belongs to the
-#: pressure-backoff ticket, which owns the saturation refusal.
-DEFAULT_MAX_LOAD_PER_CPU = 2.0
-DEFAULT_MIN_MEM_AVAILABLE_PCT = 10.0
-
 #: Leaf files read for per-slice use, for the snapshot only.
 MEMORY_CURRENT = "memory.current"
 PIDS_CURRENT = "pids.current"
@@ -992,8 +986,8 @@ def parse_pressure(
     *,
     cpu_stall=None,
     memory_stall=None,
-    max_load_per_cpu=DEFAULT_MAX_LOAD_PER_CPU,
-    min_mem_available_pct=DEFAULT_MIN_MEM_AVAILABLE_PCT,
+    max_load_per_cpu=pressure.DEFAULT_MAX_LOAD_PER_CPU,
+    min_mem_available_pct=pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
 ):
     """A Pressure from file texts and a CPU count (pure, total).
 
