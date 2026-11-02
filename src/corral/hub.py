@@ -1,10 +1,11 @@
 """The hub: one SQLite database behind a small loopback HTTP service.
 
 Ticket H1 of docs/08-hub-multihost.md section 10: the hub skeleton,
-the host registry and the claims table. Later tickets add leases and
-renewal (H2), drive composition (H3), operator verbs (H4), the merged
-dashboard (H5) and hub operations (H6); this module grows no further
-than H1 needs.
+the host registry and the claims table. Ticket H4 adds the operator
+verbs: `remove-host` (membership epoch, claim release), per-ticket
+`release`, and `rotate-token`. Later tickets add leases and renewal
+(H2), drive composition (H3), the merged dashboard (H5) and hub
+operations (H6).
 
 Every grant is decided by one SQLite transaction: the row is
 unclaimed, or its lease has lapsed, and the new owner takes a strictly
@@ -231,6 +232,94 @@ def verify_token(conn: sqlite3.Connection, presented: str | None) -> str | None:
         if hmac.compare_digest(_hash(salt, presented), digest):
             return str(host_id)
     return None
+
+
+def membership_epoch(conn: sqlite3.Connection) -> int:
+    """The hub's membership counter, bumped by every `remove-host`."""
+    row = conn.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
+    return int(row[0])
+
+
+def remove_host(conn: sqlite3.Connection, host_id: str, *, now: float) -> int:
+    """Remove a host: bump the epoch, release its claims, drop its token.
+
+    The host's claim rows are cleared but their epochs are kept, so the
+    next grant mints ``epoch + 1`` and fences a stale holder still acting
+    on the old epoch. The returned epoch rides every register and
+    heartbeat reply; a host that reads a newer epoch than the one it
+    stored stops its agents and waits to be added again. An unknown id
+    is ``HubError`` (exit 4).
+    """
+    name = str(host_id or "")
+    with _txn(conn):
+        row = conn.execute("SELECT host_id FROM hosts WHERE host_id=?", (name,)).fetchone()
+        if row is None:
+            raise HubError(f"hub host {name!r} is not registered")
+        conn.execute("UPDATE meta SET value=value+1 WHERE key='membership_epoch'")
+        conn.execute(
+            "UPDATE claims SET agent='', host_id='', lease_expires=0, updated_at=? WHERE host_id=?",
+            (now, name),
+        )
+        conn.execute("DELETE FROM hosts WHERE host_id=?", (name,))
+        epoch = membership_epoch(conn)
+    log.info("hub: removed host %s (membership epoch %d)", name, epoch)
+    return epoch
+
+
+def release_claim(
+    conn: sqlite3.Connection,
+    repo: str,
+    number: int,
+    *,
+    now: float,
+    reason: str = "",
+) -> int:
+    """Force-release one claim, keeping its epoch for the next mint.
+
+    An operator override: the row is cleared but the epoch stays, so the
+    next grant fences. An unclaimed or unknown ticket is ``HubError``
+    (exit 4). The reason is logged; it never carries a secret.
+    """
+    if not isinstance(repo, str) or not repo:
+        raise HubError(f"claim repo {repo!r} must be a non-empty string")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise HubError(f"claim number {number!r} must be a positive integer")
+    with _txn(conn):
+        row = conn.execute(
+            "SELECT agent, epoch FROM claims WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        if row is None or not row[0]:
+            raise HubError(f"ticket {repo}#{number} holds no hub claim to release")
+        epoch = row[1]
+        conn.execute(
+            "UPDATE claims SET agent='', host_id='', lease_expires=0,"
+            " updated_at=? WHERE repo=? AND number=?",
+            (now, repo, number),
+        )
+    log.info("hub: released %s#%d (epoch %d): %s", repo, number, epoch, reason)
+    return int(epoch)
+
+
+def rotate_token(conn: sqlite3.Connection, host_id: str) -> str:
+    """Revoke one host's token and mint its replacement.
+
+    The old hash is replaced at once, so the leaked token dies on its
+    next request; no other host's token changes. Returns the new token
+    for the caller to print once. An unknown id is ``HubError``.
+    """
+    name = str(host_id or "")
+    token = secrets.token_hex(32)
+    salt = secrets.token_hex(16)
+    with _txn(conn):
+        cursor = conn.execute(
+            "UPDATE hosts SET token_salt=?, token_hash=? WHERE host_id=?",
+            (salt, _hash(salt, token), name),
+        )
+        if cursor.rowcount == 0:
+            raise HubError(f"hub host {name!r} is not registered")
+    log.info("hub: rotated token for host %s", name)
+    return token
 
 
 def _check_shape(repo: object, number: object, agent: object, host_id: object) -> None:

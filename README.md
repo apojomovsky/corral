@@ -115,6 +115,9 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | **Hub** | |
 | `corral hub serve [--bind ADDR] [--port N]` | run the hub claim service on loopback (a public bind warns on stderr and keeps serving); prints the listening address; hosts name it with `hub.url` (empty means single-host); exit 2 when the port is held |
 | `corral hub add-host --id ID` | mint a host id and its bearer token in the hub database (prints the token once); exit 4 when the id is taken or badly shaped |
+| `corral hub remove-host --id ID` | drop a host: bump the membership epoch, release its claims with epochs kept, revoke its token; a removed host that rejoins waits to be added again; exit 4 when the id is unknown |
+| `corral hub release REPO NUMBER [--reason TEXT]` | force-release one ticket's claim as an operator override (the epoch is kept so the next grant fences); the reason is logged; exit 4 when the ticket holds no claim |
+| `corral hub rotate-token --id ID` | revoke one host's token and mint its replacement (prints the token once; the old token dies on its next request); exit 4 when the id is unknown |
 | **Hygiene** | |
 | `corral gc [--repo PATH] [--apply] [--json]` | plan-only hygiene audit: landed, superseded and merged branches print as `git branch -d`; worktree cleanup and prune need `--apply`, branches are never deleted. `merged-pr` comes from the forge's PR index for the clone's origin repo, empty with a note when the forge is unreachable |
 | `corral disk [--apply] [--json]` | disk pressure and the reclaim plan, largest first: stale `pr-*.md` drafts, finished tickets' session dirs, the `corral gc` worktree rows, and other large dirs (plan only; `--apply` removes only safe `pr-body` and `session` rows). Pressure is `low` under 10% or 5 GiB free and `critical` under half of either (`disk.min_free_pct`, `disk.min_free_gb`); a critical disk refuses launches with exit 75. `corral doctor` carries the same reading |

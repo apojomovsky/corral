@@ -1,7 +1,8 @@
 """`corral hub`: the multi-host hub service and its operator verbs.
 
 H1 ships two verbs: `add-host` mints a host id and its bearer token
-(printed once), and `serve` runs the claim service. Every verb acts on
+(printed once), and `serve` runs the claim service. H4 adds
+`remove-host`, `release` and `rotate-token`. Every verb acts on
 the hub database from `paths.hub_db_path`, never on a worker host's
 state. Exit codes follow the public table: 0 ok, 2 a held port, 4 a
 usage or configuration error.
@@ -11,6 +12,7 @@ import argparse
 import errno
 import signal
 import sys
+import time
 
 OK, RACE, USAGE = 0, 2, 4
 
@@ -93,11 +95,86 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return OK
 
 
+def _open_store():
+    from corral import hub, paths
+
+    try:
+        db_path = paths.hub_db_path()
+    except paths.PathError as err:
+        return None, str(err)
+    try:
+        return hub.open_db(db_path), ""
+    except hub.HubError as err:
+        return None, str(err)
+
+
+def cmd_remove_host(args: argparse.Namespace) -> int:
+    from corral import hub
+
+    store, err = _open_store()
+    if store is None:
+        _err(err)
+        return USAGE
+    try:
+        epoch = hub.remove_host(store, args.id, now=time.time())
+    except hub.HubError as exc:
+        _err(str(exc))
+        return USAGE
+    finally:
+        store.close()
+    print(f"removed {args.id} (membership epoch {epoch})")
+    return OK
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    from corral import hub
+
+    store, err = _open_store()
+    if store is None:
+        _err(err)
+        return USAGE
+    try:
+        epoch = hub.release_claim(
+            store, args.repo, args.number, now=time.time(), reason=args.reason
+        )
+    except hub.HubError as exc:
+        _err(str(exc))
+        return USAGE
+    finally:
+        store.close()
+    print(f"released {args.repo}#{args.number} (epoch {epoch} kept for the next mint)")
+    return OK
+
+
+def cmd_rotate_token(args: argparse.Namespace) -> int:
+    from corral import hub
+
+    store, err = _open_store()
+    if store is None:
+        _err(err)
+        return USAGE
+    try:
+        token = hub.rotate_token(store, args.id)
+    except hub.HubError as exc:
+        _err(str(exc))
+        return USAGE
+    finally:
+        store.close()
+    print(token)
+    return OK
+
+
 def cmd_hub(args: argparse.Namespace) -> int:
     if args.hub_verb == "add-host":
         return cmd_add_host(args)
     if args.hub_verb == "serve":
         return cmd_serve(args)
+    if args.hub_verb == "remove-host":
+        return cmd_remove_host(args)
+    if args.hub_verb == "release":
+        return cmd_release(args)
+    if args.hub_verb == "rotate-token":
+        return cmd_rotate_token(args)
     _err(f"unknown hub verb {args.hub_verb!r}")
     return USAGE
 
@@ -111,6 +188,16 @@ def add_parser(sub) -> None:
     p = verbs.add_parser(
         "add-host", help="mint a host id and its bearer token (prints the token once)"
     )
+    p.add_argument("--id", required=True, help="stable operator-assigned host id")
+    p = verbs.add_parser(
+        "remove-host", help="drop a host: bump the membership epoch and release its claims"
+    )
+    p.add_argument("--id", required=True, help="stable operator-assigned host id")
+    p = verbs.add_parser("release", help="force-release one ticket's claim (operator override)")
+    p.add_argument("repo", help="repository holding the ticket")
+    p.add_argument("number", type=int, help="ticket number")
+    p.add_argument("--reason", default="", help="why the claim is released (logged)")
+    p = verbs.add_parser("rotate-token", help="revoke one host's token and mint its replacement")
     p.add_argument("--id", required=True, help="stable operator-assigned host id")
     p = verbs.add_parser("serve", help="run the hub claim service")
     p.add_argument("--bind", default="127.0.0.1", help="address to bind (default 127.0.0.1)")
