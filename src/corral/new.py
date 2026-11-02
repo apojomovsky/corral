@@ -1,15 +1,18 @@
 """`corral new`: scaffold a minimal project, then onboard it through `init`.
 
-Tickets 1 and 2 of `docs/06-corral-new.md`, section 8: templates plus
-`--plan`, then the `init` writer. `new` creates the target directory,
-runs `git init -b` with the effective branch, copies the packaged
-template files, then onboards the tree through `init.collect` and
-`init.apply` with the same flags `init` takes, commits the result, and
-reports the next step. Every scaffold write is create-only: missing
-files are written, identical files are kept, and a file that differs
-from the render refuses (exit 4) unless `--force` leaves it alone and
-converges the rest. Later tickets wire the forge side
-(`--create-remote`), the label bootstrap, and `--template-dir`.
+Tickets 1 to 3 of `docs/06-corral-new.md`, section 8: templates plus
+`--plan`, then the `init` writer, then `--create-remote` through the
+forge interface. `new` creates the target directory, runs `git init -b`
+with the effective branch, copies the packaged template files, then
+onboards the tree through `init.collect` and `init.apply` with the same
+flags `init` takes, commits the result, and reports the next step. Every
+scaffold write is create-only: missing files are written, identical files
+are kept, and a file that differs from the render refuses (exit 4) unless
+`--force` leaves it alone and converges the rest. With `--create-remote`,
+`new` pre-checks the intended remote through the forge, creates it after
+the commit, and sets it as origin; without it, `new` prints the planned
+create command and runs nothing outward. Later tickets cover the label
+bootstrap and `--template-dir`.
 """
 
 import argparse
@@ -20,9 +23,10 @@ import sys
 from importlib import resources
 from typing import NamedTuple
 
+from corral import forge as iface
 from corral import gc, init, paths
 
-OK, NOTHING, USAGE = 0, 1, 4
+OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
 
 class NewError(ValueError):
@@ -144,6 +148,10 @@ class Options(NamedTuple):
     cap: int | None = None
     ops: str | None = None
     ops_name: str | None = None
+    create_remote: bool = False
+    public: bool = False
+    owner: str | None = None
+    resume: bool = False
 
 
 def _refuse_non_directory(target):
@@ -228,12 +236,14 @@ def _check_writable(target, rel):
 def _write_file(target, rel, blob):
     """One scaffold file, created exclusively. Failures are exit 4.
 
-    Parent directories are created, the path is re-checked (a file
-    appearing after the pre-check still fails), and `O_CREAT | O_EXCL`
-    opens the file, so nothing already there is ever clobbered and no
-    write ever lands outside the target.
+    The path is checked, parent directories are created, the path is
+    checked again, then `O_CREAT | O_EXCL` opens the file. A symlinked
+    parent is refused by the first check, before anything is created
+    outside the target; a file appearing between the checks still fails
+    instead of being clobbered.
     """
     full = os.path.join(target, rel)
+    _check_writable(target, rel)
     parent = os.path.dirname(full)
     if parent:
         try:
@@ -320,26 +330,126 @@ def _kept_line(target, rel, template):
     )
 
 
-def run(opts, git=gc.git):
-    """Run `new` with an injectable git seam. Returns the exit code."""
+def _production_forge():
+    """The live forge over the production `gh` runner."""
+    from corral.github import forge as ghforge
+    from corral.github.gh import paced_run
+
+    return ghforge.GithubForge(paced_run)
+
+
+def _check_owner_shape(owner):
+    """The remote owner as given: no slash, no whitespace, else exit 4."""
+    if not isinstance(owner, str) or not owner or "/" in owner or any(ch.isspace() for ch in owner):
+        raise NewError(f"unresolvable owner {owner!r}: pass --owner OWNER")
+    return owner
+
+
+def _resolve_owner(opts, forge):
+    """The remote owner: `--owner` when given, else the forge current user.
+
+    A failed current-user call propagates as `ForgeError` (exit 3); an
+    empty answer reads as exit 4, never as a guess.
+    """
+    if opts.owner is not None:
+        return _check_owner_shape(opts.owner)
+    return _check_owner_shape(forge.current_user())
+
+
+def _plan_text(forge, name, owner, private):
+    """The planned create command; provider shape errors read as exit 4.
+
+    Pure: `describe_create` never calls the runner, so this runs before
+    any local write and (without `--owner`) without any network read.
+    """
+    target = f"{owner}/{name}" if owner else name
     try:
-        return _apply(opts, git)
+        return forge.describe_create(name, owner, private=private)
+    except iface.ForgeError as err:
+        raise NewError(f"bad remote {target}: {err}") from None
+
+
+def _remote_precheck(opts, forge, owner):
+    """`(repo, plan_text, adopted)`: the remote gate before any local write.
+
+    A present repo refuses (exit 4) unless `--resume` adopts it, and only
+    on positive proof that it is empty. Every forge failure propagates
+    as `ForgeError` (exit 3); nothing is written in any of these paths.
+    """
+    plan_text = _plan_text(forge, opts.name, owner, not opts.public)
+    repo = f"{owner}/{opts.name}"
+    if not forge.repo_exists(repo):
+        return repo, plan_text, False
+    if not opts.resume:
+        raise NewError(f"remote {repo} already exists: refusing to adopt it")
+    if not forge.repo_empty(repo):
+        raise NewError(f"remote {repo} is not empty: refusing to adopt it")
+    return repo, plan_text, True
+
+
+def _ensure_origin(target, url, git):
+    """Set `origin` to `url` in `target`, unless it already points there.
+
+    An origin pointing elsewhere is refused (exit 4): overwriting it
+    could repoint a foreign checkout. Returns whether anything changed.
+    """
+    try:
+        proc = git(["remote", "get-url", "origin"], target)
+    except OSError as err:
+        raise NewError(f"cannot run git in {target}: {err}") from None
+    if proc is not None and getattr(proc, "returncode", 1) == 0:
+        current = (getattr(proc, "stdout", "") or "").strip()
+        if current == url:
+            return False
+        raise NewError(f"origin in {target} already points at {current}: refusing to overwrite it")
+    try:
+        added = git(["remote", "add", "origin", url], target)
+    except OSError as err:
+        raise NewError(f"cannot run git in {target}: {err}") from None
+    if added is None or getattr(added, "returncode", 1) != 0:
+        raise NewError(f"cannot set origin in {target} to {url}")
+    sys.stdout.write(f"set origin to {url} in {target}\n")
+    return True
+
+
+def run(opts, git=gc.git, forge=None):
+    """Run `new` with injectable seams. Returns the exit code."""
+    try:
+        return _apply(opts, git, forge if forge is not None else _production_forge())
+    except iface.ForgeExists as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return RACE
+    except iface.ForgeError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return UNREACHABLE
     except (NewError, init.InitError) as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
 
 
-def _apply(opts, git):
+def _apply(opts, git, forge):
     """Create the tree, init the repo, write the scaffold, onboard, commit."""
+    if opts.public and not opts.create_remote:
+        raise NewError("--public needs --create-remote: it would mean nothing")
+    if opts.resume and not opts.create_remote:
+        raise NewError("--resume needs --create-remote: it would mean nothing")
     if not paths.plain_repo_name(opts.name):
         raise NewError(f"bad project name {opts.name!r}: want one path part without a .git suffix")
     rendered = render(opts.template, opts.name)
     branch = init.resolve_branch(None, flag=opts.default_branch, sets=opts.sets)
+    if opts.create_remote:
+        owner = _resolve_owner(opts, forge)
+        repo, plan_text, adopted = _remote_precheck(opts, forge, owner)
+    else:
+        if opts.owner is not None:
+            _check_owner_shape(opts.owner)
+        owner, repo, adopted = None, None, False
+        plan_text = _plan_text(forge, opts.name, opts.owner, True)
     parent = os.path.abspath(opts.path) if opts.path else os.getcwd()
     target = os.path.join(parent, opts.name)
     _refuse_non_directory(target)
     if opts.plan:
-        return _plan(target, rendered, branch, opts, git)
+        return _plan(target, rendered, branch, opts, git, plan_text, repo, adopted)
     try:
         os.makedirs(target, exist_ok=True)
     except OSError as err:
@@ -374,6 +484,8 @@ def _apply(opts, git):
         sys.stdout.write(f"wrote {full}\n")
     for rel in kept:
         sys.stdout.write(_kept_line(target, rel, opts.template))
+    if not opts.create_remote:
+        sys.stdout.write(plan_text + "\n")
     ops_root, inputs, split, ops_created, ops_fresh = _onboard_inputs(target, opts, git)
     init_code = init.apply(
         ops_root,
@@ -391,14 +503,42 @@ def _apply(opts, git):
     if _dirty(target, git):
         _commit(target, opts.name, git)
         committed = True
-    sys.stdout.write("next: corral doctor\n")
-    if scaffold_changed or init_code == OK or committed:
+    remote_changed = False
+    origin_changed = False
+    if opts.create_remote:
+        if adopted:
+            url = forge.clone_url(repo)
+            sys.stdout.write(f"adopted empty remote {repo}\n")
+        else:
+            try:
+                url = forge.create_repo(owner, opts.name, private=not opts.public)
+            except iface.ForgeExists as err:
+                print(
+                    f"corral: remote {repo} appeared during setup (race lost): {err}",
+                    file=sys.stderr,
+                )
+                return RACE
+            except iface.ForgeError as err:
+                sys.stdout.write(f"remote {repo} not created: {err}\n")
+                sys.stdout.write(f"next: {plan_text}\n")
+                return UNREACHABLE
+            remote_changed = True
+            sys.stdout.write(f"created remote {repo}\n")
+        origin_changed = _ensure_origin(target, url, git)
+    if scaffold_changed or init_code == OK or committed or remote_changed or origin_changed:
+        sys.stdout.write("next: corral doctor\n")
         return OK
     return NOTHING
 
 
-def _plan(target, rendered, branch, opts, git):
-    """Print the full diff of every file `new` would write, and write nothing."""
+def _plan(target, rendered, branch, opts, git, plan_text, repo, adopted):
+    """Print the full diff of every file `new` would write, and write nothing.
+
+    `plan_text` is the planned create command: printed verbatim without
+    `--create-remote`, `would run` with it. The remote pre-check already
+    ran in `_apply`, so `--plan` never promises a create the real run
+    would refuse.
+    """
     _refuse_non_directory(target)
     if os.path.isdir(target):
         differs = [rel for rel, want in rendered.items() if _present_differs(target, rel, want)]
@@ -426,6 +566,12 @@ def _plan(target, rendered, branch, opts, git):
             sys.stdout.write(init.plan_diff(None, text, rel))
     for rel in kept:
         sys.stdout.write(_kept_line(target, rel, opts.template).replace("kept ", "would keep ", 1))
+    if opts.create_remote:
+        if adopted:
+            sys.stdout.write(f"would adopt {repo} when empty, then set it as origin\n")
+        sys.stdout.write(f"would run {plan_text}\n")
+    else:
+        sys.stdout.write(plan_text + "\n")
     if os.path.isdir(target) and not needs_init:
         ops_root, inputs, split, ops_created, ops_fresh = _onboard_inputs(target, opts, git)
         init_code = init.apply(
@@ -451,11 +597,11 @@ def _plan(target, rendered, branch, opts, git):
         would_commit, changed = True, True
     if would_commit:
         sys.stdout.write(f"would commit chore: scaffold the {opts.name} project in {target}\n")
-    sys.stdout.write("next: corral doctor\n")
     if not changed:
         if not kept:
             sys.stdout.write(f"{target} is up to date\n")
         return NOTHING
+    sys.stdout.write("next: corral doctor\n")
     return OK
 
 
@@ -475,6 +621,10 @@ def cmd_new(args):
             cap=args.cap,
             ops=args.ops,
             ops_name=args.ops_name,
+            create_remote=args.create_remote,
+            public=args.public,
+            owner=args.owner,
+            resume=args.resume,
         )
     )
 
@@ -528,5 +678,27 @@ def add_parser(sub) -> None:
         default=None,
         metavar="NAME",
         help="write the agent side to the NAME sibling of the clone (--ops wins)",
+    )
+    parser.add_argument(
+        "--create-remote",
+        action="store_true",
+        help="create the repository on the forge and set it as origin"
+        " (default: print the create command and run nothing outward)",
+    )
+    parser.add_argument(
+        "--public",
+        action="store_true",
+        help="create a public repository (needs --create-remote; private by default)",
+    )
+    parser.add_argument(
+        "--owner",
+        default=None,
+        metavar="OWNER",
+        help="the remote owner (default: the forge current user)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="adopt an existing empty remote instead of refusing (needs --create-remote)",
     )
     parser.set_defaults(func=cmd_new)

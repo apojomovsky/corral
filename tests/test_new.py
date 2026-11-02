@@ -12,12 +12,14 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from corral import cli, init, new, settings
+from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
 
 FIXTURE = "demo"
@@ -146,6 +148,7 @@ def run_new(
     plan=False,
     force=False,
     git=None,
+    forge=None,
     default_branch=None,
     sets=(),
     test_cmd=None,
@@ -153,6 +156,10 @@ def run_new(
     cap=None,
     ops=None,
     ops_name=None,
+    create_remote=False,
+    public=False,
+    owner=None,
+    resume=False,
 ):
     """`new.run` with captured output: `(code, stdout, stderr)`."""
     opts = new.Options(
@@ -168,13 +175,17 @@ def run_new(
         cap=cap,
         ops=ops,
         ops_name=ops_name,
+        create_remote=create_remote,
+        public=public,
+        owner=owner,
+        resume=resume,
     )
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        if git is None:
+        if git is None and forge is None:
             code = new.run(opts)
         else:
-            code = new.run(opts, git=git)
+            code = new.run(opts, git=git or FakeGit(root=path), forge=forge)
     return code, out.getvalue(), err.getvalue()
 
 
@@ -678,6 +689,368 @@ class GenericTemplates(unittest.TestCase):
             )
             for secret in secrets:
                 self.assertNotIn(secret, text, template)
+
+
+class ProviderLoading(unittest.TestCase):
+    """Follow-up fix: the branch lookup loads its own providers.
+
+    `new.run` in a process that never imported the CLI (or `launch`)
+    failed with "clone.default_branch is not registered" (exit 4 on a
+    valid request); the suite masked it because `cli` imports the
+    providers. `init.resolve_branch` loads them itself now, so the run
+    succeeds and the key is registered afterwards.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def _evict_launch(self):
+        saved_module = sys.modules.pop("corral.launch", None)
+        saved = {}
+        for key in ("clone.path", "clone.default_branch"):
+            if key in settings.REGISTRY:
+                saved[key] = settings.REGISTRY.pop(key)
+        self.addCleanup(self._restore_launch, saved_module, saved)
+
+    def _restore_launch(self, saved_module, saved):
+        sys.modules.pop("corral.launch", None)
+        if saved_module is not None:
+            sys.modules["corral.launch"] = saved_module
+        settings.REGISTRY.update(saved)
+
+    def test_new_run_registers_the_branch_setting_without_launch(self):
+        self._evict_launch()
+        self.assertNotIn("clone.default_branch", settings.REGISTRY)
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(path=self.parent, git=fake, forge=FakeForge())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("clone.default_branch", settings.REGISTRY)
+        self.assertIn((["init", "-b", "main"], os.path.join(self.parent, FIXTURE)), fake.calls)
+
+
+class ConvergedOutput(unittest.TestCase):
+    """Follow-up fix: the next-step line prints on the OK path only."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def test_converged_rerun_prints_no_action_line(self):
+        first = FakeGit(root=self.parent, status="?? README.md\n")
+        self.assertEqual(run_new(path=self.parent, git=first)[0], 0)
+        rerun = FakeGit(root=self.target(), hooks=".githooks", status="")
+        code, out, _ = run_new(path=self.parent, git=rerun)
+        self.assertEqual(code, 1)
+        self.assertIn("is up to date", out)
+        self.assertNotIn("next:", out)
+
+    def test_converged_plan_prints_no_action_line(self):
+        first = FakeGit(root=self.parent, status="?? README.md\n")
+        self.assertEqual(run_new(path=self.parent, git=first)[0], 0)
+        rerun = FakeGit(root=self.target(), hooks=".githooks", status="")
+        code, out, _ = run_new(path=self.parent, git=rerun, plan=True, forge=FakeForge())
+        self.assertEqual(code, 1)
+        self.assertIn("is up to date", out)
+        self.assertNotIn("next:", out)
+
+
+class SymlinkedParentWrite(unittest.TestCase):
+    """Follow-up fix: `_write_file` checks before creating parents."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+
+    def test_write_through_a_symlinked_parent_creates_nothing_outside(self):
+        target = os.path.join(self.parent, "demo")
+        os.makedirs(target)
+        outside = os.path.join(self.parent, "elsewhere")
+        os.makedirs(outside)
+        os.symlink(outside, os.path.join(target, ".github"))
+        with self.assertRaises(new.NewError):
+            new._write_file(target, ".github/workflows/check.yml", b"data\n")
+        self.assertEqual(os.listdir(outside), [])
+        self.assertFalse(os.path.exists(os.path.join(target, ".github", "workflows")))
+
+
+class SplitCommitScope(unittest.TestCase):
+    """Follow-up: the initial commit covers only the clone.
+
+    The ops root is a separate working tree with its own history, so
+    the operator commits it; `new` leaves it alone.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def test_the_initial_commit_leaves_the_ops_root_alone(self):
+        fake = FakeGit(root=self.parent, status="?? README.md\n")
+        code, _, err = run_new(path=self.parent, git=fake, ops="")
+        self.assertEqual((code, err), (0, ""))
+        ops_root = os.path.join(self.parent, f"{FIXTURE}_ops")
+        self.assertTrue(os.path.isfile(os.path.join(ops_root, "corral.toml")))
+        self.assertTrue(fake.commits)
+        self.assertTrue(all(cwd == self.target() for _, cwd in fake.commits))
+
+
+class RemoteFlagValidation(unittest.TestCase):
+    """`--public` and `--resume` need `--create-remote` (exit 4, no writes)."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def test_public_without_create_remote_is_exit_4_before_any_write(self):
+        fake = FakeGit(root=self.parent)
+        forge = FakeForge()
+        code, _, err = run_new(path=self.parent, git=fake, forge=forge, public=True)
+        self.assertEqual(code, 4)
+        self.assertIn("--public", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(forge.calls, [])
+
+    def test_resume_without_create_remote_is_exit_4_before_any_write(self):
+        fake = FakeGit(root=self.parent)
+        forge = FakeForge()
+        code, _, err = run_new(path=self.parent, git=fake, forge=forge, resume=True)
+        self.assertEqual(code, 4)
+        self.assertIn("--resume", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(forge.calls, [])
+
+
+class CreateRemote(unittest.TestCase):
+    """Ticket 3: `--create-remote` through the forge interface."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def repo(self, owner="operator", name=FIXTURE, empty=True, private=True):
+        full = f"{owner}/{name}"
+        return {
+            full: {
+                "private": private,
+                "empty": empty,
+                "url": f"https://example.com/{full}.git",
+            }
+        }
+
+    def test_create_remote_creates_private_by_default_and_sets_origin(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        code, out, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(forge.created, [("operator", FIXTURE, True)])
+        self.assertEqual(git.origin_url, f"https://example.com/operator/{FIXTURE}.git")
+        self.assertIn(f"created remote operator/{FIXTURE}", out)
+        self.assertIn("set origin to", out)
+        self.assertIn("next: corral doctor", out)
+        self.assertLess(out.index("committed"), out.index("created remote"))
+
+    def test_public_flag_creates_a_public_repo(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator")
+        code, _, err = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, public=True
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(forge.created, [("operator", FIXTURE, False)])
+
+    def test_owner_flag_wins_over_current_user(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="someone-else")
+        code, _, err = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, owner="acme"
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(forge.created, [("acme", FIXTURE, True)])
+        self.assertNotIn(("current_user",), forge.calls)
+        self.assertIn(("repo_exists", f"acme/{FIXTURE}"), forge.calls)
+
+    def test_owner_defaults_to_current_user(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator")
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(("current_user",), forge.calls)
+        self.assertEqual(forge.created, [("operator", FIXTURE, True)])
+
+    def test_precheck_refuses_an_existing_remote_before_any_write(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", repos=self.repo())
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 4)
+        self.assertIn(f"operator/{FIXTURE}", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(git.calls, [])
+        self.assertEqual(forge.created, [])
+
+    def test_bad_owner_flag_is_exit_4_before_any_write(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator")
+        code, _, err = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, owner="not an owner"
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("owner", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(forge.created, [])
+
+    def test_unresolvable_owner_is_exit_4_before_any_write(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="")
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 4)
+        self.assertIn("owner", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(forge.created, [])
+
+    def test_unreachable_precheck_is_exit_3_and_writes_nothing(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", fail={"repo_exists"})
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 3)
+        self.assertIn("forge unreachable", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(forge.created, [])
+
+    def test_race_between_precheck_and_create_is_exit_2(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", race={f"operator/{FIXTURE}"})
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 2)
+        self.assertIn("race", err)
+        self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
+        self.assertEqual(forge.created, [])
+
+    def test_unreachable_create_is_exit_3_with_the_manual_command(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", fail={"create_repo"})
+        code, out, _ = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 3)
+        self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
+        self.assertIn("not created", out)
+        self.assertIn(f"gh repo create operator/{FIXTURE} --private", out)
+
+    def test_resume_adopts_an_empty_remote(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", repos=self.repo(empty=True))
+        code, out, err = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, resume=True
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(forge.created, [])
+        self.assertIn(("repo_empty", f"operator/{FIXTURE}"), forge.calls)
+        self.assertEqual(git.origin_url, f"https://example.com/operator/{FIXTURE}.git")
+        self.assertIn("adopted", out)
+
+    def test_resume_refuses_a_nonempty_remote(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", repos=self.repo(empty=False))
+        code, _, err = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, resume=True
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("not empty", err)
+        self.assertIsNone(git.origin_url)
+        self.assertEqual(forge.created, [])
+
+    def test_failed_emptiness_check_is_exit_3_and_never_adopts(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", repos=self.repo(), fail={"repo_empty"})
+        code, _, err = run_new(
+            path=self.parent, git=git, forge=forge, create_remote=True, resume=True
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("forge unreachable", err)
+        self.assertIsNone(git.origin_url)
+        self.assertEqual(forge.created, [])
+
+
+class RemotePlan(unittest.TestCase):
+    """`--plan` prints the outward command and writes nothing."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def test_plain_run_prints_the_planned_create_command(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge()
+        code, out, err = run_new(path=self.parent, git=git, forge=forge)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"gh repo create {FIXTURE} --private", out)
+        self.assertNotIn(("current_user",), forge.calls)
+
+    def test_plan_with_owner_names_the_owner(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge()
+        code, out, _ = run_new(path=self.parent, git=git, forge=forge, plan=True, owner="acme")
+        self.assertEqual(code, 0)
+        self.assertIn(f"gh repo create acme/{FIXTURE} --private", out)
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_plan_with_create_remote_prints_would_run(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator")
+        code, out, _ = run_new(
+            path=self.parent, git=git, forge=forge, plan=True, create_remote=True
+        )
+        self.assertEqual(code, 0)
+        self.assertIn(f"would run gh repo create operator/{FIXTURE} --private", out)
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_plan_with_resume_notes_adoption(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(
+            user="operator",
+            repos={
+                f"operator/{FIXTURE}": {
+                    "private": True,
+                    "empty": True,
+                    "url": f"https://example.com/operator/{FIXTURE}.git",
+                }
+            },
+        )
+        code, out, _ = run_new(
+            path=self.parent, git=git, forge=forge, plan=True, create_remote=True, resume=True
+        )
+        self.assertEqual(code, 0)
+        self.assertIn(f"would adopt operator/{FIXTURE} when empty", out)
+        self.assertFalse(os.path.exists(self.target()))
 
 
 class CliWiring(unittest.TestCase):

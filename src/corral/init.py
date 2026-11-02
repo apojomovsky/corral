@@ -169,8 +169,10 @@ def resolve_branch(detected, *, flag=None, sets=()):
     entry wins over detection; detection wins over the settings registry
     default, so the two verbs agree when the default changes. A flag
     conflicting with a differing `--set` entry is exit 4: two answers
-    for one fact.
+    for one fact. The providers load here, so a caller that never imported
+    the CLI still sees the registered `clone.default_branch` default.
     """
+    settings._load_providers()
     from_sets = None
     for raw in sets:
         key, sep, value = raw.partition("=")
