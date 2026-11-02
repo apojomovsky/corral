@@ -357,16 +357,14 @@ def _resolve_owner(opts, forge):
 
 
 def _plan_text(forge, name, owner, private):
-    """The planned create command; provider shape errors read as exit 4.
+    """The planned create command, printed verbatim.
 
     Pure: `describe_create` never calls the runner, so this runs before
     any local write and (without `--owner`) without any network read.
+    Shape errors are impossible here: the name and the owner are
+    validated before this runs, so a `ForgeError` propagates as exit 3.
     """
-    target = f"{owner}/{name}" if owner else name
-    try:
-        return forge.describe_create(name, owner, private=private)
-    except iface.ForgeError as err:
-        raise NewError(f"bad remote {target}: {err}") from None
+    return forge.describe_create(name, owner, private=private)
 
 
 def _remote_precheck(opts, forge, owner):
@@ -524,8 +522,8 @@ def _apply(opts, git, forge):
             try:
                 url = forge.clone_url(repo)
             except iface.ForgeError as err:
-                sys.stdout.write(f"remote {repo} not wired: {err}\n")
-                sys.stdout.write(f"next: {plan_text}\n")
+                sys.stdout.write(f"remote {repo} adopted but not wired: {err}\n")
+                sys.stdout.write("next: re-run with --resume to adopt it\n")
                 return UNREACHABLE
             sys.stdout.write(f"adopted empty remote {repo}\n")
         else:
@@ -533,7 +531,9 @@ def _apply(opts, git, forge):
                 url = forge.create_repo(owner, opts.name, private=not opts.public)
             except iface.ForgeExists as err:
                 print(
-                    f"corral: remote {repo} appeared during setup (race lost): {err}",
+                    f"corral: remote {repo} appeared during setup (race lost): {err}."
+                    " The repository may exist but be invisible to this account:"
+                    " check `gh auth status`",
                     file=sys.stderr,
                 )
                 return RACE

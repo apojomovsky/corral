@@ -18,7 +18,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, init, new, settings
+from corral import cli, forge as iface, init, new, settings
 from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
 
@@ -942,12 +942,24 @@ class CreateRemote(unittest.TestCase):
         self.assertFalse(os.path.exists(self.target()))
         self.assertEqual(forge.created, [])
 
+    def test_unreachable_current_user_is_exit_3_before_any_probe_or_write(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", fail={"current_user"})
+        code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 3)
+        self.assertIn("forge unreachable", err)
+        self.assertFalse(os.path.exists(self.target()))
+        self.assertEqual(forge.created, [])
+        self.assertNotIn("repo_exists", [call[0] for call in forge.calls])
+
     def test_race_between_precheck_and_create_is_exit_2(self):
         git = FakeGit(root=self.parent)
         forge = FakeForge(user="operator", race={f"operator/{FIXTURE}"})
         code, _, err = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
         self.assertEqual(code, 2)
         self.assertIn("race", err)
+        self.assertIn("may exist but be invisible to this account", err)
+        self.assertIn("gh auth status", err)
         self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
         self.assertEqual(forge.created, [])
 
@@ -959,6 +971,25 @@ class CreateRemote(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
         self.assertIn("not created", out)
         self.assertIn(f"gh repo create operator/{FIXTURE} --private", out)
+
+    def test_create_and_probe_both_failing_stays_fail_closed(self):
+        # The create may have succeeded before its read-back failed; with
+        # the existence probe down too there is no proof either way, so
+        # the report stays "not created". Deliberate: claiming a remote
+        # exists that nobody can see would be worse than a redundant retry.
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", fail={"create_repo"})
+        probe = mock.Mock(
+            side_effect=[False, iface.ForgeError("forge unreachable during repo_exists")]
+        )
+        with mock.patch.object(forge, "repo_exists", probe):
+            code, out, _ = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 3)
+        self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
+        self.assertIn("not created", out)
+        self.assertNotIn("but not wired", out)
+        self.assertIn(f"gh repo create operator/{FIXTURE} --private", out)
+        self.assertIsNone(git.origin_url)
 
     def test_post_create_clone_url_failure_reports_created_but_unwired(self):
         git = FakeGit(root=self.parent)
@@ -1006,7 +1037,7 @@ class CreateRemote(unittest.TestCase):
         self.assertIsNone(git.origin_url)
         self.assertEqual(forge.created, [])
 
-    def test_adopted_clone_url_failure_is_exit_3_with_the_manual_command(self):
+    def test_adopted_clone_url_failure_suggests_resume(self):
         git = FakeGit(root=self.parent)
         forge = FakeForge(user="operator", repos=self.repo(empty=True), fail={"clone_url"})
         code, out, _ = run_new(
@@ -1015,7 +1046,8 @@ class CreateRemote(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
         self.assertIn("not wired", out)
-        self.assertIn(f"next: gh repo create operator/{FIXTURE} --private", out)
+        self.assertIn("next: re-run with --resume to adopt it", out)
+        self.assertNotIn("gh repo create", out)
         self.assertIsNone(git.origin_url)
         self.assertEqual(forge.created, [])
 

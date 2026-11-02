@@ -180,6 +180,11 @@ class GithubForge:
         return login
 
     def repo_exists(self, repo: str) -> bool:
+        """Whether `owner/name` exists, with one blind spot: the API answers
+        a private repository the token cannot see with 404, the same as a
+        missing one, so such a repo reads as `False` and the pre-check
+        passes. Behavior is unchanged (the adapter cannot tell the two
+        apart); the create then reports the already-exists failure."""
         if not _REPO.fullmatch(repo or ""):
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
         try:
