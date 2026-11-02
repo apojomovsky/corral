@@ -10,6 +10,7 @@ import argparse
 import ast
 import copy
 import http.client
+import inspect
 import io
 import json
 import os
@@ -1413,6 +1414,90 @@ class SnapshotCache(ServeCase):
         self.assertEqual(payload["requests_304"], 1)
         self.assertTrue(payload["ok"])
 
+    def test_health_matching_etag_is_a_304_counted(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/health")
+        etag = headers.get("ETag")
+        self.assertTrue(etag)
+        status, again, body = self.get(server, "/v1/health", etag=etag)
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertEqual(builder.calls, 1)
+        _, _, fresh = self.get(server, "/v1/health")
+        payload = json.loads(fresh)
+        self.assertEqual(payload["requests_total"], 3)
+        self.assertEqual(payload["requests_304"], 1)
+
+    def get_with_origin(self, server, target, etag=None, origin=None):
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            headers = {}
+            if etag is not None:
+                headers["If-None-Match"] = etag
+            if origin is not None:
+                headers["Origin"] = origin
+            conn.request("GET", target, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, dict(resp.getheaders()), resp.read()
+        finally:
+            conn.close()
+
+    def test_304_echoes_matching_origin(self):
+        origin = "https://dash.example.com"
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder, allowed_origins=(origin,))
+        _, headers, _ = self.get_with_origin(server, "/v1/snapshot", origin=origin)
+        etag = headers.get("ETag")
+        self.assertTrue(etag)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), origin)
+        status, again, body = self.get_with_origin(server, "/v1/snapshot", etag=etag, origin=origin)
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertEqual(again.get("Access-Control-Allow-Origin"), origin)
+
+    def test_304_without_matching_origin_has_no_echo(self):
+        origin = "https://dash.example.com"
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder, allowed_origins=(origin,))
+        _, headers, _ = self.get_with_origin(server, "/v1/snapshot")
+        etag = headers.get("ETag")
+        status, again, body = self.get_with_origin(
+            server, "/v1/snapshot", etag=etag, origin="https://other.example.com"
+        )
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertNotIn("Access-Control-Allow-Origin", again)
+
+    def test_preflight_emits_origin_exactly_once(self):
+        origin = "https://dash.example.com"
+        server, _ = self.start_cached(FakeBuilder(healthy_doc()), allowed_origins=(origin,))
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request(
+                "OPTIONS",
+                "/v1/snapshot",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            resp = conn.getresponse()
+            raw = resp.getheaders()
+            body = resp.read()
+            status = resp.status
+        finally:
+            conn.close()
+        self.assertEqual(status, 204)
+        self.assertEqual(body, b"")
+        echoed = [v for k, v in raw if k.lower() == "access-control-allow-origin"]
+        self.assertEqual(echoed, [origin])
+
 
 class SnapshotTtlWiring(ServeCommandTest):
     def test_snapshot_ttl_defaults_to_two_seconds(self):
@@ -1437,6 +1522,18 @@ class SnapshotTtlWiring(ServeCommandTest):
                     with redirect_stdout(out):
                         self.assertEqual(args.func(args), 0)
         self.assertEqual(made.call_args.kwargs["snapshot_ttl_s"], 2)
+
+    def test_snapshot_ttl_default_is_one_fact(self):
+        self.assertEqual(
+            settings.REGISTRY["serve.snapshot_ttl_s"].default,
+            serve.SNAPSHOT_TTL_S_DEFAULT,
+        )
+        state_default = (
+            inspect.signature(serve._State.__init__).parameters["snapshot_ttl_s"].default
+        )
+        make_default = inspect.signature(serve.make_server).parameters["snapshot_ttl_s"].default
+        self.assertEqual(state_default, serve.SNAPSHOT_TTL_S_DEFAULT)
+        self.assertEqual(make_default, serve.SNAPSHOT_TTL_S_DEFAULT)
 
     def test_snapshot_ttl_setting_reaches_make_server(self):
         class FakeServer:

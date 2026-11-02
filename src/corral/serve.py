@@ -35,6 +35,10 @@ from corral.netbind import server_family
 
 OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
 
+#: Seconds one built snapshot is shared between requests. The one owner
+#: for the default used by the setting, `_State`, and `make_server`.
+SNAPSHOT_TTL_S_DEFAULT = 2
+
 settings.register("serve.bind", str, "127.0.0.1", "address to bind (default 127.0.0.1, loopback)")
 settings.register("serve.port", int, 0, "port to bind (default 0, an ephemeral port)")
 settings.register(
@@ -46,7 +50,7 @@ settings.register(
 settings.register(
     "serve.snapshot_ttl_s",
     int,
-    2,
+    SNAPSHOT_TTL_S_DEFAULT,
     "seconds one built snapshot is shared between requests",
 )
 settings.register("serve.tail_max", int, 200, "maximum activity lines one tail read returns")
@@ -258,7 +262,7 @@ class _State:
         board_open: Callable[[], board.Store] | None = None,
         tail_fn: Callable[[str, int, int], str] | None = None,
         tail_max: int = 200,
-        snapshot_ttl_s: float = 2,
+        snapshot_ttl_s: float = SNAPSHOT_TTL_S_DEFAULT,
     ) -> None:
         self.build = build
         self.clock = clock
@@ -395,11 +399,20 @@ class _Handler(BaseHTTPRequestHandler):
         return any(tag.strip() in (etag, "*") for tag in presented.split(","))
 
     def _send_not_modified(self, etag: str) -> None:
-        """Answer 304 and count it; the client reuses its cached copy."""
+        """Answer 304 and count it; the client reuses its cached copy.
+
+        Echoes the exact-match origin like `_send_json` does, passed
+        through here (not inside `_send_empty`): the 204 preflight path
+        supplies its own header, and a blanket echo would emit it twice.
+        """
         state = self.server_state
         with state.lock:
             state.not_modified += 1
-        self._send_empty(304, (("ETag", etag),))
+        echo = self._echo_origin()
+        if echo is None:
+            self._send_empty(304, (("ETag", etag),))
+        else:
+            self._send_empty(304, (("ETag", etag), ("Access-Control-Allow-Origin", echo)))
 
     def _serve_snapshot(self) -> None:
         doc, generation, now, error = self._cached_doc()
@@ -637,7 +650,7 @@ def make_server(
     board_open: Callable[[], board.Store] | None = None,
     tail_fn: Callable[[str, int, int], str] | None = None,
     tail_max: int = 200,
-    snapshot_ttl_s: float = 2,
+    snapshot_ttl_s: float = SNAPSHOT_TTL_S_DEFAULT,
 ) -> ThreadingHTTPServer:
     """An HTTP server answering the v1 routes.
 
