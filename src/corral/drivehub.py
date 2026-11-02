@@ -208,7 +208,7 @@ class HubMode:
         return table
 
 
-def hub_client_for(resolved, *, token_path):
+def hub_client_for(resolved: settings.Resolved, *, token_path):
     """The hub client for this pass, or None in single-host mode.
 
     Pure except for storing the token path: with no `hub.url` there
@@ -217,10 +217,10 @@ def hub_client_for(resolved, *, token_path):
     4): a host that cannot name itself must never propose. The client
     reads the token at call time, so construction touches no file.
     """
-    url = str(resolved.get("hub.url", "") or "").strip()
+    url = str(resolved["hub.url"] or "").strip()
     if not url:
         return None
-    host_id = str(resolved.get("hub.host_id", "") or "").strip()
+    host_id = str(resolved["hub.host_id"] or "").strip()
     if not host_id:
         raise drive.HubConfigError(
             "hub.url is set but hub.host_id is empty: register this host first"
@@ -228,7 +228,7 @@ def hub_client_for(resolved, *, token_path):
     return hubmod.HubClient(url, host_id, token_path)
 
 
-def hub_mode_for(resolved, *, token_path):
+def hub_mode_for(resolved: settings.Resolved, *, token_path):
     """The pass's hub conversation, or None in single-host mode.
 
     One place for the CLI entry: builds the client and wraps it in a
@@ -239,7 +239,7 @@ def hub_mode_for(resolved, *, token_path):
     client = hub_client_for(resolved, token_path=token_path)
     if client is None:
         return None
-    return HubMode(client, str(resolved.get("hub.host_id", "") or "").strip())
+    return HubMode(client, str(resolved["hub.host_id"] or "").strip())
 
 
 def cmd_drive(args: argparse.Namespace) -> int:
@@ -261,18 +261,14 @@ def cmd_drive(args: argparse.Namespace) -> int:
         host_settings = settings.load(root=None)
         max_starts = host_settings["drive.max_starts_per_day"]
         hold_label = host_settings["board.hold_label"]
-        hub_url = host_settings.get("hub.url", "")
-        hub_host_id = host_settings.get("hub.host_id", "")
+        hub_url = host_settings["hub.url"]
     except settings.SettingsError as problem:
         print(f"corral drive: {problem}", file=sys.stderr)
         return drive.USAGE
     hub = None
     if not args.plan and str(hub_url or "").strip():
         try:
-            hub = hub_mode_for(
-                {"hub.url": hub_url, "hub.host_id": hub_host_id},
-                token_path=paths.hub_token_path(),
-            )
+            hub = hub_mode_for(host_settings, token_path=paths.hub_token_path())
         except (drive.HubConfigError, paths.PathError) as problem:
             print(f"corral drive: {problem}", file=sys.stderr)
             return drive.USAGE
