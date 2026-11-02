@@ -206,14 +206,17 @@ class GithubForge:
         if not _REPO.fullmatch(repo or ""):
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
         try:
-            payload = json.loads(self._get(f"repos/{repo}/branches"))
+            branches = json.loads(self._get(f"repos/{repo}/branches"))
+            tags = json.loads(self._get(f"repos/{repo}/tags"))
         except forge.ForgeError:
             raise
         except Exception as err:
             raise forge.ForgeError(f"unusable empty check for {repo}: {err}") from err
-        if not isinstance(payload, list):
-            raise _shape(f"bad branches for {repo}: {payload!r}")
-        return not payload
+        if not isinstance(branches, list):
+            raise _shape(f"bad branches for {repo}: {branches!r}")
+        if not isinstance(tags, list):
+            raise _shape(f"bad tags for {repo}: {tags!r}")
+        return not branches and not tags
 
     def clone_url(self, repo: str) -> str:
         if not _REPO.fullmatch(repo or ""):

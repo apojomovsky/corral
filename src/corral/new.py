@@ -387,6 +387,20 @@ def _remote_precheck(opts, forge, owner):
     return repo, plan_text, True
 
 
+def _remote_created(repo, forge):
+    """Whether the remote exists after a failed create.
+
+    A create that succeeded but whose clone-URL read failed leaves the
+    repository behind; a create that never happened leaves nothing. A
+    probe that errors reads as not created: without positive proof the
+    report stays fail-closed.
+    """
+    try:
+        return bool(forge.repo_exists(repo))
+    except iface.ForgeError:
+        return False
+
+
 def _ensure_origin(target, url, git):
     """Set `origin` to `url` in `target`, unless it already points there.
 
@@ -524,8 +538,12 @@ def _apply(opts, git, forge):
                 )
                 return RACE
             except iface.ForgeError as err:
-                sys.stdout.write(f"remote {repo} not created: {err}\n")
-                sys.stdout.write(f"next: {plan_text}\n")
+                if _remote_created(repo, forge):
+                    sys.stdout.write(f"remote {repo} created but not wired: {err}\n")
+                    sys.stdout.write("next: re-run with --resume to adopt it\n")
+                else:
+                    sys.stdout.write(f"remote {repo} not created: {err}\n")
+                    sys.stdout.write(f"next: {plan_text}\n")
                 return UNREACHABLE
             remote_changed = True
             sys.stdout.write(f"created remote {repo}\n")

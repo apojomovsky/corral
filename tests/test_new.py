@@ -960,6 +960,18 @@ class CreateRemote(unittest.TestCase):
         self.assertIn("not created", out)
         self.assertIn(f"gh repo create operator/{FIXTURE} --private", out)
 
+    def test_post_create_clone_url_failure_reports_created_but_unwired(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge(user="operator", fail={"clone_url"})
+        code, out, _ = run_new(path=self.parent, git=git, forge=forge, create_remote=True)
+        self.assertEqual(code, 3)
+        self.assertTrue(os.path.isfile(os.path.join(self.target(), "README.md")))
+        self.assertIn("created but not wired", out)
+        self.assertIn("--resume", out)
+        self.assertNotIn("gh repo create", out)
+        self.assertIsNone(git.origin_url)
+        self.assertEqual(len(forge.created), 1)
+
     def test_resume_adopts_an_empty_remote(self):
         git = FakeGit(root=self.parent)
         forge = FakeForge(user="operator", repos=self.repo(empty=True))

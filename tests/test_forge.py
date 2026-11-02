@@ -92,7 +92,7 @@ class FakeForge:
         url = f"https://example.com/{repo}.git"
         self.repos[repo] = {"private": private, "empty": True, "url": url}
         self.created.append((owner, name, private))
-        return url
+        return self.clone_url(repo)
 
     def repo_empty(self, repo):
         self.calls.append(("repo_empty", repo))
@@ -448,15 +448,39 @@ class CreateRepoTest(unittest.TestCase):
 
 class RepoEmptyTest(unittest.TestCase):
     def test_no_branches_is_empty(self):
-        run = CmdRun({("api", "repos/acme/lib/branches"): []})
+        run = CmdRun(
+            {
+                ("api", "repos/acme/lib/branches"): [],
+                ("api", "repos/acme/lib/tags"): [],
+            }
+        )
         self.assertTrue(ghforge.GithubForge(run).repo_empty("acme/lib"))
 
     def test_a_branch_is_not_empty(self):
-        run = CmdRun({("api", "repos/acme/lib/branches"): [{"name": "main"}]})
+        run = CmdRun(
+            {
+                ("api", "repos/acme/lib/branches"): [{"name": "main"}],
+                ("api", "repos/acme/lib/tags"): [],
+            }
+        )
+        self.assertFalse(ghforge.GithubForge(run).repo_empty("acme/lib"))
+
+    def test_a_surviving_tag_is_not_empty(self):
+        run = CmdRun(
+            {
+                ("api", "repos/acme/lib/branches"): [],
+                ("api", "repos/acme/lib/tags"): [{"name": "v0.1"}],
+            }
+        )
         self.assertFalse(ghforge.GithubForge(run).repo_empty("acme/lib"))
 
     def test_malformed_answer_is_forge_error(self):
-        run = CmdRun({("api", "repos/acme/lib/branches"): {"name": "main"}})
+        run = CmdRun(
+            {
+                ("api", "repos/acme/lib/branches"): {"name": "main"},
+                ("api", "repos/acme/lib/tags"): [],
+            }
+        )
         with self.assertRaises(forge.ForgeError):
             ghforge.GithubForge(run).repo_empty("acme/lib")
 
