@@ -453,6 +453,10 @@ class DropIns(LedgerCase):
         self.drop("note.txt", "not a claim")
         self.assertEqual(hl.drop_in_claims(self.claims_dir()), [])
 
+    def test_a_subdirectory_counts_as_an_ignored_entry(self):
+        os.makedirs(os.path.join(self.claims_dir(), "stale.d"), exist_ok=True)
+        self.assertEqual(hl.ignored_drop_ins(self.claims_dir()), ["stale.d"])
+
     def test_a_claim_without_a_name_refuses_naming_the_file(self):
         self.drop("bad.json", {"cpu_m": 1})
         with self.assertRaisesRegex(hl.LedgerError, r"bad\.json"):
@@ -506,6 +510,33 @@ class DropIns(LedgerCase):
         self.assertEqual(out["host_budget"], {"cpu_m": 1})
         self.assertEqual(out["foreign"], [])
         self.assertEqual(hl.load(self.path)["foreign"][0]["name"], "desk")
+
+    def test_a_drop_in_added_mid_update_keeps_the_ledger_owned_claim(self):
+        self.write(json.dumps({**hl.empty(), "foreign": [{"name": "desk", "cpu_m": 1}]}))
+
+        def change(ledger):
+            self.drop("desk.json", {"name": "desk", "cpu_m": 999, "claimed_at": 1.0})
+            return {**ledger, "host_budget": {"cpu_m": 1}}
+
+        out = hl.update(change, path=self.path, state_dir=self.state)
+        self.assertEqual(out["foreign"], [{"name": "desk", "cpu_m": 1}])
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["foreign"], [{"name": "desk", "cpu_m": 1}])
+
+    def test_a_change_returning_copies_persists_only_ledger_owned_claims(self):
+        self.write(json.dumps({**hl.empty(), "foreign": [{"name": "desk", "cpu_m": 1}]}))
+        self.drop("away.json", {"name": "away", "cpu_m": 999, "claimed_at": 1.0})
+
+        def change(ledger):
+            return {**ledger, "foreign": [dict(entry) for entry in ledger["foreign"]]}
+
+        out = hl.update(change, path=self.path, state_dir=self.state)
+        self.assertEqual(out["foreign"], [{"name": "desk", "cpu_m": 1}])
+        with open(self.path, encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["foreign"], [{"name": "desk", "cpu_m": 1}])
+        self.assertEqual(
+            [entry["name"] for entry in hl.load(self.path)["foreign"]], ["desk", "away"]
+        )
 
     def test_an_unlistable_claims_dir_refuses(self):
         with open(os.path.join(self.dir, "file-not-dir"), "w", encoding="utf-8") as handle:

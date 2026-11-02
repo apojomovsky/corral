@@ -28,6 +28,7 @@ from corral import (
     accounts,
     boarddoctor,
     deps,
+    detect,
     drive,
     host_ledger,
     hub,
@@ -37,6 +38,7 @@ from corral import (
     projects,
     prompts,
     registry,
+    repodoctor,
     resourcedoctor,
     resources,
     settings,
@@ -146,6 +148,9 @@ class Env(NamedTuple):
     board_open_store: Callable[[], store.Store] | None = None
     #: The board assembly itself failed: one failing `board` row.
     board_error: str | None = None
+    #: Projects whose remote-dependent rows are checked. Empty means the
+    #: caller has no reading, and then the report carries no remote row.
+    repo_sites: Sequence[repodoctor.RepoSite] = ()
     #: Problems with the project registry (bad registration files and
     #: policy entries that do not resolve): None means the caller has
     #: no reading, and then the report carries no `drive-projects` row.
@@ -464,6 +469,16 @@ def _check_boards(env: Env) -> list[Check]:
     ]
 
 
+def _check_repos(sites: Sequence[repodoctor.RepoSite]) -> list[Check]:
+    """The remote-dependent rows: warn without a remote, strict with one.
+
+    No site, no row. `repodoctor` decides each row; this only renders.
+    """
+    return [
+        Check(row.name, row.status, row.detail, row.fix) for row in repodoctor.check_sites(sites)
+    ]
+
+
 def _check_hub_auth(url: str | None, auth: HubAuth | None) -> list[Check]:
     """The hub-token row: no row without a configured hub or a reading."""
     if not url or auth is None:
@@ -737,6 +752,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_registry(env.registry_rows, env.registry_error),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
+        *_check_repos(env.repo_sites),
         *_check_disk(env.disk),
         *_check_resources(env),
         *_check_hub_auth(env.hub_url, env.hub_auth),
@@ -886,6 +902,41 @@ def production_list_fn(prefix: str) -> list:
     return units.list_units(prefix)
 
 
+def production_git(args: Sequence[str], cwd: str):
+    """A local git seam for the origin lookup. Only the CLI builds it.
+
+    Read-only verbs (`remote get-url`) stay local; anything git cannot
+    run reads as None so the caller degrades to a warn row, never a
+    traceback. Tests inject a fake.
+    """
+    from corral.gitenv import clean_env
+
+    try:
+        return subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            env=clean_env(),
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def production_tracker_factory(tracker_repo: str):
+    """One labels tracker per tracker repo, through the one factory.
+
+    Labels live on the repository whatever the tracker variant, so
+    every repo reads through the labels construction; the runners stay
+    the factory's production ones. Only the CLI calls this; tests pass
+    a fake. `max_pages` is unused by the labels construction.
+    """
+    from corral import trackers
+
+    return trackers.build_tracker(variant="labels", board=None, max_pages=1)
+
+
 def production_board_fetch(board_config: settings.BoardConfig) -> object:
     """The live board schema fetch. Only the CLI builds it; tests never call this.
 
@@ -915,6 +966,88 @@ def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
         return (), None
     sites, error = boarddoctor.sites_from_settings(root)
     return tuple(sites), error
+
+
+def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.RepoSite:
+    """One repo's remote readings: the origin URL plus label presence.
+
+    Read-only: one local `git remote get-url` per clone (no network)
+    plus one label listing per tracker repo, and only when a remote is
+    set. Every gather failure degrades to an "unknown" reading naming
+    the repo and the cause, never a raise.
+    """
+    try:
+        resolved = settings.load(root, repo=name)
+    except (settings.SettingsError, paths.PathError, OSError) as err:
+        return repodoctor.RepoSite(name, None, cause=str(err))
+    clone = resolved["clone.path"]
+    if not clone:
+        return repodoctor.RepoSite(name, None)
+    path = clone if os.path.isabs(clone) else os.path.join(root, clone)
+    try:
+        proc = git(["remote", "get-url", "origin"], path)
+    except Exception as err:  # noqa: BLE001 - a failed git read is report data
+        return repodoctor.RepoSite(
+            name, None, cause=f"cannot read the origin remote of {path}: {err}"
+        )
+    if proc is None:
+        return repodoctor.RepoSite(name, None, cause=f"cannot run git in {path}")
+    if getattr(proc, "returncode", 1) != 0:
+        stderr = (getattr(proc, "stderr", "") or "").strip()
+        if "No such remote" in stderr:
+            return repodoctor.RepoSite(name, None)
+        cause = stderr or f"git exited {getattr(proc, 'returncode', 1)}"
+        return repodoctor.RepoSite(
+            name,
+            None,
+            cause=f"cannot read the origin remote of {path}: {cause}:"
+            " the clone needs a re-init here, not a new remote on the forge",
+        )
+    origin = (getattr(proc, "stdout", "") or "").strip()
+    if not origin:
+        return repodoctor.RepoSite(name, None)
+    tracker_repo = resolved["tracker.repo"] or detect.remote_slug(origin)
+    if not tracker_repo:
+        return repodoctor.RepoSite(
+            name, origin, cause=f"no owner/name in the origin remote of {path}"
+        )
+    try:
+        repo_tracker = tracker_factory(tracker_repo)
+    except KeyError:
+        return repodoctor.RepoSite(name, origin, cause=f"no tracker for {tracker_repo}")
+    except Exception as err:  # noqa: BLE001 - a failed factory is report data
+        return repodoctor.RepoSite(name, origin, cause=str(err))
+    try:
+        missing = repo_tracker.missing_labels(tracker_repo)
+    except Exception as err:  # noqa: BLE001 - a failed read is report data
+        return repodoctor.RepoSite(name, origin, cause=str(err))
+    return repodoctor.RepoSite(name, origin, labels="missing" if missing else "ok")
+
+
+def load_repo_sites(
+    settings_error: str | None, *, git, tracker_factory
+) -> tuple[repodoctor.RepoSite, ...]:
+    """Remote-dependent sites for the live report. Never raises.
+
+    Read-only like `load_board_sites`: plain file reads, one local git
+    read per clone, one label listing per tracker repo. Without
+    settings there are no sites (the settings row already carries the
+    failure); a repo whose own gathering fails still gets warn rows
+    naming it and the cause.
+    """
+    if settings_error is not None:
+        return ()
+    try:
+        root = settings.find_root(os.getcwd())
+    except OSError:
+        return ()
+    if root is None:
+        return ()
+    try:
+        names = settings.repo_names(root)
+    except (settings.SettingsError, OSError):
+        return ()
+    return tuple(_repo_site(root, name, git=git, tracker_factory=tracker_factory) for name in names)
 
 
 def load_prompts_state() -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
@@ -1015,6 +1148,10 @@ def load_resource_readings(
     else:
         ledger_error = None
     try:
+        foreign_ignored = tuple(host_ledger.ignored_drop_ins(host_ledger.claims_dir(ledger_path)))
+    except (host_ledger.LedgerError, OSError):
+        foreign_ignored = ()
+    try:
         state = paths.state_dir()
     except paths.PathError as err:
         state, marker, marker_error = "", None, str(err)
@@ -1090,7 +1227,7 @@ def load_resource_readings(
         host=limits.host if limits is not None else None,
         shares=dict(limits.projects) if limits is not None else {},
         foreign=list(limits.foreign) if limits is not None else [],
-        gone_s=limits.gone_s if limits is not None else 0.0,
+        gone_s=limits.gone_s if limits is not None else resources.DEFAULT_GONE_S,
         now=moment,
         limits_error=limits_error,
         priced_roles=priced,
@@ -1109,6 +1246,7 @@ def load_resource_readings(
         config_path=where,
         pressure=pressure_values,
         pressure_caps=pressure_caps,
+        foreign_ignored=foreign_ignored,
     )
 
 
@@ -1383,6 +1521,11 @@ def production_env() -> Env:
         resolved, list_fn=production_list_fn, run=production_run
     )
     board_sites, board_error = load_board_sites(settings_error)
+    repo_sites = load_repo_sites(
+        settings_error,
+        git=production_git,
+        tracker_factory=production_tracker_factory,
+    )
     project_problems = load_project_problems()
     timer_state = load_timer_state()
     hub_url = _production_hub_url(resolved)
@@ -1412,6 +1555,7 @@ def production_env() -> Env:
         board_fetch=production_board_fetch,
         board_open_store=store.open_store,
         board_error=board_error,
+        repo_sites=repo_sites,
         project_problems=project_problems,
         timer_state=timer_state,
         hub_url=hub_url or None,
