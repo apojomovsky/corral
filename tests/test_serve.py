@@ -288,6 +288,14 @@ class ServerBinding(ServeCase):
         self.assertEqual(server.server_address[0], "127.0.0.1")
 
 
+class ServerFamilyDedup(unittest.TestCase):
+    def test_serve_and_hub_share_one_family_helper(self):
+        from corral import hub, netbind
+
+        self.assertIs(serve.server_family, netbind.server_family)
+        self.assertIs(hub.server_family, netbind.server_family)
+
+
 class MethodFallback(unittest.TestCase):
     def test_unknown_do_method_answers_405(self):
         handler = object.__new__(serve._Handler)
@@ -309,6 +317,7 @@ class ImportClosure(unittest.TestCase):
             "tracker",
             "trackers",
             "forge",
+            "hub",
             "systemd",
             "docker",
             "omp",
@@ -627,6 +636,30 @@ class CorsTest(ServeCase):
         server, _ = self.start_server(FakeBuilder(healthy_doc()), allowed_origins=(self.ORIGIN,))
         status, _, _ = self.fetch_origin(server, "OPTIONS", "/v1/snapshot")
         self.assertEqual(status, 405)
+
+    def test_preflight_needs_no_token(self):
+        server, _ = self.start_server(
+            FakeBuilder(healthy_doc()),
+            allowed_origins=(self.ORIGIN,),
+            token_required=True,
+            token_reader=lambda: "tok-1",
+        )
+        status, headers, body = self.fetch_origin(
+            server, "OPTIONS", "/v1/snapshot", origin=self.ORIGIN, preflight=True
+        )
+        self.assertEqual(status, 204)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), self.ORIGIN)
+        self.assertEqual(body, b"")
+
+    def test_plain_options_still_needs_token(self):
+        server, _ = self.start_server(
+            FakeBuilder(healthy_doc()),
+            allowed_origins=(self.ORIGIN,),
+            token_required=True,
+            token_reader=lambda: "tok-1",
+        )
+        status, _, _ = self.fetch_origin(server, "OPTIONS", "/v1/snapshot")
+        self.assertEqual(status, 401)
 
 
 class ServeCommandTest(unittest.TestCase):

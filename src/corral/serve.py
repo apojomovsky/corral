@@ -16,7 +16,6 @@ import json
 import os
 import secrets
 import signal
-import socket
 import sys
 import threading
 import time
@@ -25,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
 from corral import settings, snapshot
+from corral.netbind import server_family
 
 OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
 
@@ -84,19 +84,6 @@ def is_loopback(bind: str) -> bool:
         return ipaddress.ip_address(str(bind or "")).is_loopback
     except ValueError:
         return False
-
-
-def server_family(bind: str) -> socket.AddressFamily:
-    """The socket family for a bind: IPv6 for IPv6 literals, else IPv4.
-
-    Names stay on IPv4: they resolve at bind time, and the default family
-    keeps today's behavior for them.
-    """
-    try:
-        address = ipaddress.ip_address(str(bind or ""))
-    except ValueError:
-        return socket.AF_INET
-    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
 
 
 def check_bind(bind: str, port: int, *, allow_remote: bool, has_token: bool) -> str | None:

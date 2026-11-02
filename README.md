@@ -8,7 +8,7 @@ An opinionated core for running fleets of headless coding agents on Linux hosts.
 
 You bring the projects: a board, the rules for which ticket is ready, the prompts. corral keeps the agents in one pen. It launches them as systemd user units, keeps their sessions, routes their models, watches the provider quota every project shares, caps how many run at once, and cleans up after them without losing work.
 
-Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; the hub skeleton (`corral hub serve`, `hub add-host`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: claims across hosts, `corral new`.
+Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; `corral serve` (the read-only dashboard API: the snapshot, version and health routes on loopback); the hub skeleton (`corral hub serve`, `hub add-host`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: the dashboard API's remaining views, events and stream; claims across hosts; `corral new`.
 
 ## Opinions
 
