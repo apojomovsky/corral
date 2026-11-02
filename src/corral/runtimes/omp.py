@@ -104,6 +104,11 @@ def overlay_text(config):
     return "\n".join(_yaml_lines(_merge(config, FORCED))) + "\n"
 
 
+def options_schema():
+    """The profile options omp accepts: none yet; a later ticket owns the schema."""
+    return {}
+
+
 def with_models(config, chains):
     """`config` with each live chain laid over it: head as the role's model,
     tail as its fallback chain. Other keys and roles are kept; an empty
@@ -194,6 +199,7 @@ class Omp:
     with_models = staticmethod(with_models)
     resume_handle = staticmethod(resume_handle)
     activity_file = staticmethod(activity_file)
+    options_schema = staticmethod(options_schema)
 
 
 RUNTIME = Omp()
