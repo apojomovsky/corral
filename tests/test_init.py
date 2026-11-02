@@ -329,6 +329,11 @@ TAIL = """# Defaults: uncomment to override.
 # resources.gone_s = 600  # seconds a foreign claim counts against the pool
 #
 # [review]
+# review.budget.base_minutes = 15  # reviewer minutes before the diff size matters (loading, build, fast gates)
+# review.budget.ceiling_minutes = 120  # agent runtime ceiling in minutes for one dispatched reviewer
+# review.budget.floor_minutes = 30  # hard limit floor in minutes, however small the diff
+# review.budget.limit_multiple = 3  # hard limit as a multiple of the expected duration
+# review.budget.seconds_per_line = 6  # reviewer seconds per changed line in the diff
 # review.required = true  # takeoff needs an approving review record for the head
 #
 # [serve]
@@ -449,6 +454,11 @@ commits.conventional = false
 # resources.gone_s = 600  # seconds a foreign claim counts against the pool
 #
 # [review]
+# review.budget.base_minutes = 15  # reviewer minutes before the diff size matters (loading, build, fast gates)
+# review.budget.ceiling_minutes = 120  # agent runtime ceiling in minutes for one dispatched reviewer
+# review.budget.floor_minutes = 30  # hard limit floor in minutes, however small the diff
+# review.budget.limit_multiple = 3  # hard limit as a multiple of the expected duration
+# review.budget.seconds_per_line = 6  # reviewer seconds per changed line in the diff
 # review.required = true  # takeoff needs an approving review record for the head
 #
 # [serve]
