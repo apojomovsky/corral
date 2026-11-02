@@ -74,6 +74,21 @@ class OpenDbTest(StoreCase):
         with self.assertRaises(hub.HubError):
             hub.open_db(self.db)
 
+    def test_preexisting_file_from_a_lost_create_race_opens(self):
+        from unittest import mock
+
+        self.store.close()
+        with open(self.db, "wb") as handle:
+            handle.write(b"")
+        real_exists = os.path.exists
+        with mock.patch.object(
+            hub.os.path, "exists", side_effect=lambda p: False if p == self.db else real_exists(p)
+        ):
+            reopened = hub.open_db(self.db)
+        self.addCleanup(reopened.close)
+        epoch = reopened.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
+        self.assertEqual(tuple(epoch), (0,))
+
 
 class AddHostTest(StoreCase):
     def test_mint_stores_a_salted_hash_never_the_token(self):
@@ -150,6 +165,13 @@ class GrantTest(StoreCase):
         receipt = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1091.0, lease_ttl_s=90)
         self.assertEqual(receipt.epoch, 2)
 
+    def test_propose_at_exact_expiry_regrants_with_a_bumped_epoch(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        with self.assertRaises(hub.Conflict):
+            hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1089.0, lease_ttl_s=90)
+        receipt = hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1090.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 2)
+
     def test_bad_shapes_are_refused(self):
         with self.assertRaises(hub.HubError):
             hub.grant(self.store, "", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
@@ -203,6 +225,19 @@ class ServerCase(unittest.TestCase):
         body = {"repo": "app", "number": 7, "agent": agent, "host_id": host}
         body.update(over)
         return self.call("POST", "/v1/claims", body, token=self.token_a if token is None else token)
+
+    def raw_call(self, raw, token=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Authorization": f"Bearer {self.token_a if token is None else token}"}
+        conn.request("POST", "/v1/claims", body=raw, headers=headers)
+        response = conn.getresponse()
+        payload = response.read()
+        conn.close()
+        try:
+            body = json.loads(payload.decode("utf-8")) if payload else None
+        except ValueError:
+            body = None
+        return response.status, body
 
 
 class ClaimRouteTest(ServerCase):
@@ -287,6 +322,19 @@ class ClaimRouteTest(ServerCase):
         self.assertEqual(status, 400)
         self.assertTrue(payload["error"])
 
+    def test_malformed_bodies_are_400(self):
+        cases = {
+            "empty": b"",
+            "non-json": b"this is not json",
+            "oversize": b"x" * (hub._MAX_BODY + 1),
+            "non-dict": b"[1, 2]",
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                status, payload = self.raw_call(raw)
+                self.assertEqual(status, 400)
+                self.assertTrue(payload["error"])
+
     def test_unknown_path_is_404_and_wrong_method_is_405(self):
         status, _ = self.call("GET", "/v1/nope", token=self.token_a)
         self.assertEqual(status, 404)
@@ -304,6 +352,13 @@ class BindWarningTest(unittest.TestCase):
         for bind in ("127.0.0.1", "127.0.0.2", "::1", "localhost", "10.0.0.5", "192.168.1.9"):
             with self.subTest(bind=bind):
                 self.assertIsNone(hub.bind_warning(bind))
+
+    def test_wildcard_and_multicast_binds_warn_and_keep_serving(self):
+        for bind in ("0.0.0.0", "::", "224.0.0.1", "ff02::1"):
+            with self.subTest(bind=bind):
+                warning = hub.bind_warning(bind)
+                self.assertTrue(warning)
+                self.assertIn(bind, str(warning))
 
     def test_public_bind_warns(self):
         warning = hub.bind_warning("8.8.8.8")
@@ -334,6 +389,9 @@ class HubPathsTest(unittest.TestCase):
     def test_a_relative_hub_state_is_refused(self):
         with self.assertRaises(paths.PathError):
             paths.hub_db_path({"CORRAL_HUB_STATE": "relative/hub"})
+
+    def test_no_second_resolver_for_the_file_name(self):
+        self.assertFalse(hasattr(hub, "DB_NAME"))
 
 
 class HubSettingsTest(unittest.TestCase):
@@ -415,6 +473,95 @@ class AddHostCommandTest(unittest.TestCase):
                     self.assertEqual(hub.verify_token(store, token), "host-1")
                 finally:
                     store.close()
+
+
+class ServeCommandTest(unittest.TestCase):
+    def parse(self, *argv):
+        from corral import cli
+
+        return cli.build_parser().parse_args(["hub", "serve", *argv])
+
+    def test_bad_port_is_a_usage_error(self):
+        for port in ("-1", "70000"):
+            with self.subTest(port=port):
+                args = self.parse("--port", port)
+                self.assertEqual(args.func(args), 4)
+
+    def test_held_loopback_port_is_a_race(self):
+        import socket
+        from unittest import mock
+
+        from corral import settings
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with mock.patch.object(settings, "load", return_value={"hub.lease_ttl_s": 90}):
+                    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        holder.bind(("127.0.0.1", 0))
+                        holder.listen(1)
+                        port = holder.getsockname()[1]
+                        args = self.parse("--bind", "127.0.0.1", "--port", str(port))
+                        self.assertEqual(args.func(args), 2)
+                    finally:
+                        holder.close()
+
+    def test_bind_warning_goes_to_stderr_and_listening_to_stdout(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest import mock
+
+        from corral import hub as hub_module
+        from corral import settings
+
+        class FakeServer:
+            server_address = ("0.0.0.0", 4321)
+
+            def __init__(self):
+                self.served = False
+
+            def serve_forever(self):
+                self.served = True
+
+            def server_close(self):
+                pass
+
+        fake = FakeServer()
+        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with mock.patch.object(settings, "load", return_value={"hub.lease_ttl_s": 90}):
+                    with mock.patch.object(hub_module, "make_server", return_value=fake) as made:
+                        args = self.parse("--bind", "0.0.0.0", "--port", "4321")
+                        out, err = io.StringIO(), io.StringIO()
+                        with redirect_stdout(out), redirect_stderr(err):
+                            self.assertEqual(args.func(args), 0)
+        made.assert_called_once()
+        self.assertIn("0.0.0.0", err.getvalue())
+        self.assertIn("listening on 0.0.0.0:4321", out.getvalue())
+        self.assertTrue(fake.served)
+
+    def test_nonpositive_lease_ttl_is_a_usage_error_naming_the_setting(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import hub as hub_module
+        from corral import settings
+
+        for ttl in (0, -5):
+            with self.subTest(ttl=ttl):
+                with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+                    with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                        with mock.patch.object(
+                            settings, "load", return_value={"hub.lease_ttl_s": ttl}
+                        ):
+                            with mock.patch.object(hub_module, "make_server") as made:
+                                args = self.parse()
+                                err = io.StringIO()
+                                with redirect_stderr(err):
+                                    self.assertEqual(args.func(args), 4)
+                                self.assertIn("hub.lease_ttl_s", err.getvalue())
+                made.assert_not_called()
 
 
 class ImportClosureTest(unittest.TestCase):

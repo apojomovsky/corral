@@ -55,9 +55,6 @@ settings.register(
     "hub.lease_ttl_s", int, DEFAULT_LEASE_TTL_S, "seconds a hub claim grant stays valid"
 )
 
-#: The hub store file inside the hub state dir.
-DB_NAME = "hub.sqlite"
-
 _BUSY_TIMEOUT_MS = 5000
 _MAX_BODY = 65536
 
@@ -156,8 +153,11 @@ def open_db(path: str | None = None) -> sqlite3.Connection:
     parent = os.path.dirname(target)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    if not os.path.exists(target):
+    try:
         fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    else:
         os.close(fd)
     os.chmod(target, 0o600)
     try:
@@ -284,10 +284,11 @@ def grant(
 def bind_warning(bind: str) -> str | None:
     """Why a hub bind address is unsafe to serve on, or None when quiet.
 
-    Loopback and private addresses stay quiet, including tailnet
-    ranges. A public address warns, and so does a name that is not a
-    literal IP: without resolving it (no DNS from this check) privacy
-    cannot be proved. Warning never refuses: the operator knows best.
+    Loopback and private addresses stay quiet. A wildcard, a
+    non-loopback multicast address, or a public address warns, and so
+    does a name that is not a literal IP: without resolving it (no DNS
+    from this check) privacy cannot be proved. Warning never refuses:
+    the operator knows best, and serving continues.
     """
     host = str(bind or "")
     if host == "localhost":
@@ -299,7 +300,14 @@ def bind_warning(bind: str) -> str | None:
             f"hub bind {host!r} is not a literal IP address: cannot prove it is"
             " private, serving plain HTTP anyway"
         )
-    if address.is_global:
+    if address.is_loopback:
+        return None
+    if address.is_unspecified:
+        return (
+            f"hub bind {host} listens on every interface: the hub speaks plain HTTP,"
+            " serve it only over a private network"
+        )
+    if address.is_multicast or address.is_global:
         return (
             f"hub bind {host} looks public: the hub speaks plain HTTP,"
             " serve it only over a private network"
