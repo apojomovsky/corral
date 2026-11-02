@@ -466,6 +466,22 @@ class NonMappingTables(unittest.TestCase):
                     R.share_cap(self.table(roles=bad), "web", NOW)
         self.assertEqual(R.LimitsError.exit_code, 4)
 
+    def test_direct_limits_with_list_tables_refuse_at_construction(self):
+        host = triple(8000, 16000, 4096)
+        good_projects: Any = {"web": {"weight": 1}}
+        good_roles: Any = {"worker": dict(WORKER)}
+        bad_projects: tuple[Any, ...] = ([], ["web"])
+        bad_roles: tuple[Any, ...] = ([], ["worker"])
+        for bad in bad_projects:
+            with self.subTest(projects=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.Limits(host=host, projects=bad, roles=dict(good_roles))
+        for bad in bad_roles:
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.Limits(host=host, projects=dict(good_projects), roles=bad)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
 
 class Join(unittest.TestCase):
     def base(self, host=(8000, 16000, 4096)):

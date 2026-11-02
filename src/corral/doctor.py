@@ -1069,10 +1069,10 @@ def load_repo_sites(
     """Remote-dependent sites for the live report. Never raises.
 
     Read-only like `load_board_sites`: plain file reads, one local git
-    read per clone, one label listing per tracker repo. Without
-    settings there are no sites (the settings row already carries the
-    failure); a repo whose own gathering fails still gets warn rows
-    naming it and the cause.
+    read per clone, one remote default-branch read, one label listing
+    per tracker repo. Without settings there are no sites (the settings
+    row already carries the failure); a repo whose own gathering fails
+    still gets warn rows naming it and the cause.
     """
     if settings_error is not None:
         return ()

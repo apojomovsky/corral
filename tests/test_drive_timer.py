@@ -215,6 +215,15 @@ class PeriodSetting(unittest.TestCase):
                 with self.assertRaises(drive.settings.SettingsError):
                     drive.settings.resolve(host={"drive.period": period}, project={}, env={})
 
+    def test_timer_text_refuses_non_ascii_controls_and_separators(self):
+        for period in ("hourly\u0085daily", "hourly\u2028daily", "hourly\u200bdaily"):
+            with self.subTest(period=period):
+                with self.assertRaises(drive.TimerError) as ctx:
+                    drive.timer_text(period)
+                self.assertEqual(ctx.exception.exit_code, 4)
+                with self.assertRaises(drive.settings.SettingsError):
+                    drive.settings.resolve(host={"drive.period": period}, project={}, env={})
+
 
 class InstallTimer(unittest.TestCase):
     def test_install_writes_both_units_then_reloads_and_enables(self):

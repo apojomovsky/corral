@@ -33,6 +33,7 @@ import socket
 import sqlite3
 import sys
 import time
+import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
 
@@ -754,11 +755,23 @@ def _nonblank_period(value):
     """
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"must be a non-blank OnCalendar cadence, not {value!r}")
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in value):
+    if any(_is_control_or_separator(ch) for ch in value):
         raise ValueError(
             f"must be a non-blank OnCalendar cadence without control characters, not {value!r}"
         )
     return value
+
+
+def _is_control_or_separator(char):
+    """Whether `char` could break the single `OnCalendar=` line it renders into.
+
+    Every Unicode control or format character (category C) is refused,
+    and so are the line and paragraph separators (U+2028 is Zl, not C,
+    but splits the unit the same way a newline does): the seam fails
+    closed on the whole class instead of an ASCII enumeration.
+    """
+    category = unicodedata.category(char)
+    return category.startswith("C") or category in ("Zl", "Zp")
 
 
 settings.register(
@@ -806,8 +819,9 @@ def timer_text(period=None) -> str:
     """The shipped timer unit: wake the pass, catching up one missed tick. Pure.
 
     `period` is the `OnCalendar=` cadence; None renders the shipped
-    default. A blank period raises `TimerError` (exit 4): the seam fails
-    closed no matter which caller passes it.
+    default. A blank period, or one with control characters, raises
+    `TimerError` (exit 4): the seam fails closed no matter which caller
+    passes it.
     """
     if period is not None:
         try:

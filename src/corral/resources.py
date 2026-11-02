@@ -148,6 +148,21 @@ class Limits:
     gone_s: float = DEFAULT_GONE_S
     pressure: PressureCaps | Mapping[str, object] | None = None
 
+    def __post_init__(self):
+        """Refuse non-mapping project and role tables at construction.
+
+        Every path builds through here (direct construction and the
+        plain-mapping coercions in `validate_limits`, `share_cap` and
+        `admit`), so a list-shaped table raises LimitsError (exit 4)
+        once, at the boundary, never the bare TypeError `dict` or the
+        attribute access further in would raise.
+        """
+        for what in ("projects", "roles"):
+            value = getattr(self, what)
+            if not isinstance(value, Mapping):
+                raise LimitsError(f"limits {what} must be a mapping, not {value!r}")
+            object.__setattr__(self, what, dict(value))
+
 
 @dataclass(frozen=True)
 class Verdict:
@@ -190,18 +205,6 @@ def _moment(value, what):
     if not math.isfinite(value):
         raise LimitsError(f"{what} must be a number of seconds, not {value!r}")
     return value
-
-
-def _table(value, what):
-    """A project or role table: a mapping of names to entries, else LimitsError.
-
-    A missing table reads as empty; any other non-mapping (a list, a
-    string, a number, None) is a configuration error, never the bare
-    TypeError `dict` would raise.
-    """
-    if not isinstance(value, Mapping):
-        raise LimitsError(f"limits {what} must be a mapping, not {value!r}")
-    return dict(value)
 
 
 def _usage(value, what):
@@ -419,8 +422,8 @@ def validate_limits(limits):
         if isinstance(limits, Mapping):
             limits = Limits(
                 host=limits.get("host"),
-                projects=_table(limits.get("projects", {}), "projects"),
-                roles=_table(limits.get("roles", {}), "roles"),
+                projects=limits.get("projects", {}),
+                roles=limits.get("roles", {}),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
@@ -538,8 +541,8 @@ def share_cap(limits, project, now):
         if isinstance(limits, Mapping):
             limits = Limits(
                 host=limits.get("host"),
-                projects=_table(limits.get("projects", {}), "projects"),
-                roles=_table(limits.get("roles", {}), "roles"),
+                projects=limits.get("projects", {}),
+                roles=limits.get("roles", {}),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
@@ -597,8 +600,8 @@ def admit(request, charged, limits, now, pressure=None):
         if isinstance(limits, Mapping):
             limits = Limits(
                 host=limits.get("host"),
-                projects=_table(limits.get("projects", {}), "projects"),
-                roles=_table(limits.get("roles", {}), "roles"),
+                projects=limits.get("projects", {}),
+                roles=limits.get("roles", {}),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
                 pressure=limits.get("pressure"),
