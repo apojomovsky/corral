@@ -543,6 +543,99 @@ class Registration(unittest.TestCase):
         self.assertIn("muse", rt.NAMES)
         self.assertEqual(rt.DEFAULT_RUNTIME, "omp")
 
+    def test_muse_covers_the_section_6_checklist_shape(self):
+        for method in (
+            "argv",
+            "env",
+            "write_config",
+            "with_models",
+            "resume_handle",
+            "activity_file",
+            "options_schema",
+        ):
+            self.assertTrue(callable(getattr(muse.RUNTIME, method)), method)
+
+
+class OptionsSchema(unittest.TestCase):
+    def test_the_schema_is_pinned(self):
+        self.assertEqual(
+            muse.RUNTIME.options_schema(),
+            {
+                "reasoning_effort": (
+                    str,
+                    "the --reasoning-effort tier for the run",
+                    muse.EFFORT_TIERS,
+                ),
+                "parallel_tool_calls": (bool, "whether to pass --parallel-tool-calls"),
+            },
+        )
+
+    def test_the_effort_tiers_are_the_binary_tiers(self):
+        self.assertEqual(
+            set(muse.EFFORT_TIERS),
+            {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"},
+        )
+        self.assertIn(muse.DEFAULT_EFFORT, muse.EFFORT_TIERS)
+
+    def test_a_second_call_returns_the_same_shape(self):
+        first = muse.RUNTIME.options_schema()
+        first["reasoning_effort"] = "mutated"
+        self.assertEqual(
+            muse.RUNTIME.options_schema(),
+            {
+                "reasoning_effort": (
+                    str,
+                    "the --reasoning-effort tier for the run",
+                    muse.EFFORT_TIERS,
+                ),
+                "parallel_tool_calls": (bool, "whether to pass --parallel-tool-calls"),
+            },
+        )
+
+
+class ProfileOptions(SessionCase):
+    def write_options(self, config):
+        with open(os.path.join(self.sdir, "muse.json"), "w", encoding="utf-8") as handle:
+            json.dump(config, handle)
+
+    def test_reasoning_effort_defaults_to_high(self):
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "high")
+
+    def test_setting_reasoning_effort_moves_the_flag(self):
+        self.write_options({"model": "muse/spark-1", "reasoning_effort": "low"})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "low")
+
+    def test_options_never_render_as_dash_c(self):
+        self.write_options({"reasoning_effort": "low", "parallel_tool_calls": False})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+        for entry in argv:
+            self.assertNotIn("reasoning_effort=", entry)
+            self.assertNotIn("parallel_tool_calls=", entry)
+
+    def test_parallel_tool_calls_defaults_on(self):
+        self.assertIn(
+            "--parallel-tool-calls",
+            muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID),
+        )
+
+    def test_clearing_parallel_tool_calls_drops_the_flag(self):
+        self.write_options({"parallel_tool_calls": False})
+        argv = muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+        self.assertNotIn("--parallel-tool-calls", argv)
+        self.assertIn("--reasoning-effort", argv)
+
+    def test_a_non_string_effort_refuses_the_run(self):
+        self.write_options({"reasoning_effort": 2})
+        with self.assertRaisesRegex(ValueError, "muse.json"):
+            muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+
+    def test_a_non_boolean_parallel_flag_refuses_the_run(self):
+        self.write_options({"parallel_tool_calls": "yes"})
+        with self.assertRaisesRegex(ValueError, "muse.json"):
+            muse.RUNTIME.argv(self.sdir, PROMPT, session_id=SESSION_ID)
+
 
 #: (returncode, stderr, stream) cut from the observed exit-2 usage lines
 #: in the design: a bad `--session-id`, an unknown `-c` key, `--prompt-file`

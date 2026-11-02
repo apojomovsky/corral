@@ -5,6 +5,9 @@ S1 covers the request router, `GET /v1/snapshot` from `snapshot.build`,
 S2 adds the `serve.*` settings, the token file, the bind rules, CORS and
 the `serve` verb. S3 adds the filtered views: `/v1/agents`,
 `/v1/quota`, `/v1/capacity`, `/v1/disks`, `/v1/board` and `/v1/tail`.
+S4 adds `/v1/events`, `/v1/journal` (live plus archives, opaque
+cursors), and the `/v1/stream` Server-Sent Events over the snapshot
+digest, the event queue, and the logbook.
 S5 adds the snapshot TTL cache, the generation counter with `ETag`/`304`,
 and the request counters in `/v1/health`.
 Every endpoint reads local files through injected readers, so the API
@@ -14,13 +17,16 @@ control in this module.
 
 import argparse
 import errno
+import hashlib
 import hmac
 import io
 import ipaddress
 import json
 import os
 import secrets
+import select
 import signal
+import socket
 import sys
 import threading
 import time
@@ -30,7 +36,7 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
-from corral import board, launch, settings, snapshot
+from corral import board, coord, coordevents, launch, settings, snapshot
 from corral.netbind import server_family
 
 OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
@@ -53,11 +59,23 @@ settings.register(
     SNAPSHOT_TTL_S_DEFAULT,
     "seconds one built snapshot is shared between requests",
 )
-settings.register("serve.tail_max", int, 200, "maximum activity lines one tail read returns")
+#: Default cap for one tail read. The single source for the setting
+#: default, the `_State` default, and the `make_server` default below:
+#: an agreement test pins all three to this constant.
+TAIL_MAX_DEFAULT = 200
+
+#: Default bound for concurrent streams. The single source, like the
+#: tail cap above: an agreement test pins the setting and the
+#: `make_server` defaults to this constant.
+MAX_STREAMS_DEFAULT = 20
+
+settings.register(
+    "serve.tail_max", int, TAIL_MAX_DEFAULT, "maximum activity lines one tail read returns"
+)
 settings.register(
     "serve.max_streams",
     int,
-    20,
+    MAX_STREAMS_DEFAULT,
     "concurrent stream connections before the server sheds with 503",
 )
 
@@ -78,6 +96,29 @@ BOARD_LIMIT_DEFAULT = 100
 
 #: Board rows one listing never returns more than; a larger `?limit=` clamps.
 BOARD_LIMIT_MAX = 1000
+
+#: Journal entries one page returns unless `?limit=` says otherwise.
+JOURNAL_LIMIT_DEFAULT = 100
+
+#: Journal entries one page never returns more than; a larger `?limit=` clamps.
+JOURNAL_LIMIT_MAX = 1000
+
+#: Stream topics: the snapshot digest, one project's event queue, and
+#: one project's logbook. `?topics=` names a comma-separated subset.
+STREAM_TOPICS = ("snapshot", "events", "journal")
+
+#: Seconds between stream store polls. stdlib has no inotify, so the
+#: short poll is the mechanism (the `coordevents.WAIT_POLL_S` pattern);
+#: this is the stream's own cadence, not that constant's, so tuning
+#: `coord wait` never retunes the stream.
+STREAM_POLL_S = 0.2
+
+#: Seconds between stream heartbeat comments when nothing changed.
+STREAM_HEARTBEAT_S = 15.0
+
+#: Seconds a shed stream asks the client to wait before retrying.
+#: Polling covers every fact, so a shed stream loses nothing.
+STREAM_RETRY_AFTER_S = 1
 
 #: The generic 500 body: the detail goes to stderr, never the wire.
 UNAVAILABLE = "snapshot unavailable"
@@ -195,7 +236,9 @@ def read_tail(repo: str, number: int, last: int) -> str:
     The production tail reader: resolves the repo target and returns the
     same text `corral tail` prints. The quota pool is empty on purpose, so
     a read never touches the quota ledger and the read-only promise holds.
-    Raises `launch.LaunchError` when the ticket has nothing to show.
+    Raises `launch.LaunchError` when the ticket has nothing to show and
+    `settings.SettingsError` when the repo names no known target. The
+    tail handler maps both to a 404.
     """
     root = settings.find_root(os.getcwd())
     tgt = launch.target(root, repo)
@@ -204,12 +247,161 @@ def read_tail(repo: str, number: int, last: int) -> str:
     return out.getvalue()
 
 
+def read_project_events(project: str) -> list:
+    """All event queue rows for one project, oldest first.
+
+    The production events reader: the project root comes from
+    `coord.project_root`, the one owner of project state paths, and
+    the rows from `coordevents.read_events`. Raises
+    `coord.UsageError` when the name is not a project.
+    """
+    return coordevents.read_events(coord.project_root(project))
+
+
+def _read_jsonl_rows(path: str) -> list:
+    """Dict rows from one JSONL file, oldest first.
+
+    The same rule as `coord._read_entries`: blank lines and
+    unparseable or non-dict rows drop out, so a hand edit never
+    breaks a read.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            lines = handle.read().splitlines()
+    except FileNotFoundError:
+        return []
+    rows = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def read_project_journal(project: str) -> list:
+    """One project's logbook entries, oldest first: archives, then live.
+
+    The production journal reader: archive names come from
+    `coord.journal_archive_names`, the one owner of dated archive
+    listing, and the live file from `coord.read_entries`. Rotation
+    moves entries from live to archives but keeps the union, so an
+    index cursor into the combined list stays continuous across a
+    rotation. Raises `coord.UsageError` when the name is not a
+    project.
+    """
+    root = coord.project_root(project)
+    directory = os.path.join(root, coord.LEASE_DIRNAME)
+    entries = []
+    for name in coord.journal_archive_names(directory):
+        entries.extend(_read_jsonl_rows(os.path.join(directory, name)))
+    entries.extend(coord.read_entries(root))
+    return entries
+
+
+def _resolved_at_epoch(row: dict) -> float | None:
+    """Epoch seconds of a row's `resolved_at`, or None when absent or unparseable."""
+    import datetime
+
+    at = row.get("resolved_at")
+    if not at:
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(str(at))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return moment.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _event_row(row: dict) -> dict:
+    """One queue row as the API shows it: identity, cause, and timing."""
+    return {
+        "id": row.get("id"),
+        "kind": row.get("kind"),
+        "ref": row.get("ref"),
+        "evidence": row.get("evidence"),
+        "state": row.get("state"),
+        "first_seen": row.get("first_seen"),
+        "resolved_at": row.get("resolved_at"),
+    }
+
+
+#: Volatile stamps the change token ignores: the serving host stamps a
+#: fresh `now` (and per-reading `read_at`) on every build, which is
+#: staleness data, not a store change. Dropping them keeps an idle
+#: stream idle until real content moves.
+VOLATILE_KEYS = frozenset({"now", "read_at"})
+
+
+def _stable(obj):
+    """A copy of `obj` without the volatile stamps, at every depth."""
+    if isinstance(obj, dict):
+        return {key: _stable(value) for key, value in obj.items() if key not in VOLATILE_KEYS}
+    if isinstance(obj, (list, tuple)):
+        return [_stable(value) for value in obj]
+    return obj
+
+
+def _digest(obj) -> str:
+    """Short stable-content hash: the stream's change token for full-state topics."""
+    return hashlib.sha256(json.dumps(_stable(obj), sort_keys=True).encode("utf-8")).hexdigest()[:12]
+
+
+def _parse_stream_cursor(value: str | None) -> tuple[str | None, str | None, int | None]:
+    """A stream cursor split into (topic, position, journal_start).
+
+    The stream mints `snapshot:<digest>`, `events:<digest>`, and
+    `journal:<index>` ids; when the journal rides along, full-state
+    frames carry its cursor up front (`<index>:snapshot:<digest>`),
+    so reconnecting from any frame resumes the log without gaps.
+    Anything else reads as (None, None, None). The `?cursor=`
+    validator fails fast on one, while a stray `Last-Event-ID` just
+    restarts the log at its end, so an auto-reconnect never wedges on
+    a cursor the stream did not mint.
+    """
+    if not value:
+        return None, None, None
+    parts = value.split(":")
+    journal: str | None = None
+    if len(parts) == 3 and parts[0].isdigit():
+        journal, topic, pos = parts
+    elif len(parts) == 2:
+        topic, pos = parts
+    else:
+        return None, None, None
+    if topic not in STREAM_TOPICS or not pos:
+        return None, None, None
+    if topic == "journal":
+        try:
+            index = int(pos)
+        except ValueError:
+            return None, None, None
+        if index < 0:
+            return None, None, None
+    if journal is not None:
+        return topic, pos, int(journal)
+    if topic == "journal":
+        return topic, pos, int(pos)
+    return topic, pos, None
+
+
 def _page_int(raw: str | None, name: str, default: int) -> tuple[int, str | None]:
     """A validated paging parameter, or the 400 body when it is unusable.
 
     Missing reads as `default`; above any maximum clamps at the call
     site, never here. A non-integer or a negative is an error, never a
     silent default: the poller must know its page is not what it asked.
+    A present-but-blank value is not an integer, so it errors instead
+    of folding to absent.
     """
     if raw is None:
         return default, None
@@ -249,7 +441,7 @@ def _fresh_headers(etag: str, now: float) -> tuple:
 
 
 class _State:
-    """One server's injected builder, board, tail, clock, auth, CORS, cache, and counters."""
+    """One server's injected builders, readers, clock, auth, CORS, cache, stream slots, and counters."""
 
     def __init__(
         self,
@@ -261,7 +453,12 @@ class _State:
         token_reader: Callable[[], str | None] | None = None,
         board_open: Callable[[], board.Store] | None = None,
         tail_fn: Callable[[str, int, int], str] | None = None,
-        tail_max: int = 200,
+        tail_max: int = TAIL_MAX_DEFAULT,
+        events_fn: Callable[[str], list] | None = None,
+        journal_fn: Callable[[str], list] | None = None,
+        max_streams: int = MAX_STREAMS_DEFAULT,
+        stream_poll_s: float = STREAM_POLL_S,
+        stream_heartbeat_s: float = STREAM_HEARTBEAT_S,
         snapshot_ttl_s: float = SNAPSHOT_TTL_S_DEFAULT,
     ) -> None:
         self.build = build
@@ -277,6 +474,12 @@ class _State:
         self.board_open = board_open
         self.tail_fn = tail_fn
         self.tail_max = tail_max
+        self.events_fn = events_fn
+        self.journal_fn = journal_fn
+        self.max_streams = max_streams
+        self.live_streams = 0
+        self.stream_poll_s = stream_poll_s
+        self.stream_heartbeat_s = stream_heartbeat_s
         self.snapshot_ttl_s = snapshot_ttl_s
         self.cached_doc: dict | None = None
         self.cached_at: float | None = None
@@ -496,7 +699,7 @@ class _Handler(BaseHTTPRequestHandler):
         repo = query.get("repo") or None
         state = query.get("state") or None
         label = query.get("label") or None
-        raw_age = query.get("max_age") or None
+        raw_age = query.get("max_age")
         max_age = None
         if raw_age is not None:
             try:
@@ -504,9 +707,9 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send_json(400, {"error": f"max_age {raw_age!r} is not seconds"})
                 return
-        limit, problem = _page_int(query.get("limit") or None, "limit", BOARD_LIMIT_DEFAULT)
+        limit, problem = _page_int(query.get("limit"), "limit", BOARD_LIMIT_DEFAULT)
         if problem is None:
-            offset, problem = _page_int(query.get("offset") or None, "offset", 0)
+            offset, problem = _page_int(query.get("offset"), "offset", 0)
         else:
             offset = 0
         if problem is not None:
@@ -542,7 +745,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _serve_tail(self) -> None:
         query = self._query()
         repo = query.get("repo") or None
-        raw_number = query.get("number") or None
+        raw_number = query.get("number")
         if repo is None or raw_number is None:
             self._send_json(400, {"error": "tail needs ?repo= and ?number="})
             return
@@ -552,7 +755,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(400, {"error": f"number {raw_number!r} is not an integer"})
             return
         limit = self.server_state.tail_max
-        raw_last = query.get("last") or None
+        raw_last = query.get("last")
         if raw_last is not None:
             try:
                 limit = int(raw_last)
@@ -574,6 +777,370 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             self._send_text(200, text)
 
+    def _serve_events(self) -> None:
+        query = self._query()
+        project = query.get("project") or None
+        if project is None:
+            self._send_json(400, {"error": "events needs ?project="})
+            return
+        raw_since = query.get("resolved_since")
+        since = None
+        if raw_since is not None:
+            try:
+                since = float(raw_since)
+            except ValueError:
+                self._send_json(400, {"error": f"resolved_since {raw_since!r} is not seconds"})
+                return
+        now = self.server_state.clock()
+        reader = self.server_state.events_fn or read_project_events
+        try:
+            rows = reader(project)
+        except coord.UsageError:
+            self._send_json(400, {"error": f"bad project {project!r}"})
+            return
+        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "events unavailable"})
+            return
+        shown = []
+        for row in rows or ():
+            if not isinstance(row, dict):
+                continue
+            if row.get("resolved_at"):
+                if since is None:
+                    continue
+                at = _resolved_at_epoch(row)
+                if at is not None and at < since:
+                    continue
+            shown.append(_event_row(row))
+        self._send_json(
+            200,
+            {"now": now, "project": project, "events": shown, "resolved_since": since},
+        )
+
+    def _serve_journal(self) -> None:
+        query = self._query()
+        project = query.get("project") or None
+        if project is None:
+            self._send_json(400, {"error": "journal needs ?project="})
+            return
+        raw_kind = query.get("kind")
+        if raw_kind is None:
+            kind = None
+        elif not raw_kind.strip():
+            self._send_json(400, {"error": f"kind {raw_kind!r} is empty"})
+            return
+        else:
+            kind = raw_kind
+        if kind is not None and kind not in coord.KINDS:
+            self._send_json(400, {"error": f"kind {kind!r} is unknown"})
+            return
+        limit, problem = _page_int(query.get("limit"), "limit", JOURNAL_LIMIT_DEFAULT)
+        if problem is not None:
+            self._send_json(400, {"error": problem})
+            return
+        limit = min(limit, JOURNAL_LIMIT_MAX)
+        raw_cursor = query.get("cursor")
+        start = 0
+        if raw_cursor is not None:
+            try:
+                start = int(raw_cursor)
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": f"cursor {raw_cursor!r} is not an entry index"})
+                return
+            if start < 0:
+                self._send_json(400, {"error": f"cursor {raw_cursor!r} must be 0 or more"})
+                return
+        now = self.server_state.clock()
+        reader = self.server_state.journal_fn or read_project_journal
+        try:
+            entries = reader(project)
+        except coord.UsageError:
+            self._send_json(400, {"error": f"bad project {project!r}"})
+            return
+        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "journal unavailable"})
+            return
+        kept = [
+            entry
+            for entry in entries or ()
+            if isinstance(entry, dict) and (kind is None or entry.get("kind") == kind)
+        ]
+        total = len(kept)
+        pos = min(start, total)
+        page = kept[pos : pos + limit]
+        self._send_json(
+            200,
+            {
+                "now": now,
+                "project": project,
+                "entries": page,
+                "cursor": str(pos + len(page)),
+                "total": total,
+                "limit": limit,
+            },
+        )
+
+    def _serve_stream(self) -> None:
+        state = self.server_state
+        query = self._query()
+        raw_topics = query.get("topics")
+        if raw_topics is None:
+            topics = list(STREAM_TOPICS)
+        else:
+            if not raw_topics.strip():
+                self._send_json(400, {"error": f"topics {raw_topics!r} is empty"})
+                return
+            topics = [part.strip() for part in raw_topics.split(",") if part.strip()]
+            if not topics:
+                self._send_json(400, {"error": f"topics {raw_topics!r} is empty"})
+                return
+            unknown = [part for part in topics if part not in STREAM_TOPICS]
+            if unknown:
+                self._send_json(400, {"error": f"unknown stream topic {unknown[0]!r}"})
+                return
+        project = query.get("project") or None
+        if project is None and {"events", "journal"} & set(topics):
+            self._send_json(400, {"error": "stream topics events and journal need ?project="})
+            return
+        raw_cursor = query.get("cursor")
+        if raw_cursor is not None and _parse_stream_cursor(raw_cursor) == (None, None, None):
+            self._send_json(400, {"error": f"cursor {raw_cursor!r} is not a stream cursor"})
+            return
+        with state.lock:
+            if state.live_streams >= state.max_streams:
+                shed = True
+            else:
+                state.live_streams += 1
+                shed = False
+        if shed:
+            body = json.dumps({"error": "too many streams"}).encode("utf-8")
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Retry-After", str(STREAM_RETRY_AFTER_S))
+            echo = self._echo_origin()
+            if echo is not None:
+                self.send_header("Access-Control-Allow-Origin", echo)
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        try:
+            self._run_stream(topics, project, raw_cursor)
+        finally:
+            with state.lock:
+                state.live_streams -= 1
+
+    def _emit_stream(self, event: str, sid: str, data) -> None:
+        """One SSE frame: id, event, JSON data, flushed at once."""
+        body = json.dumps(data).encode("utf-8")
+        self.wfile.write(f"id: {sid}\nevent: {event}\n".encode("utf-8"))
+        for line in body.split(b"\n"):
+            self.wfile.write(b"data: " + line + b"\n")
+        self.wfile.write(b"\n")
+        self.wfile.flush()
+
+    def _client_gone(self) -> bool:
+        """Whether the stream's client went away: readable means EOF here.
+
+        A GET carries no body on a close-delimited (HTTP/1.0)
+        connection, so any readable byte is the client's FIN, not a
+        request. The peek leaves a pipelined byte in place instead of
+        eating it. Lets a closed stream release its slot without
+        waiting for the next heartbeat write.
+        """
+        try:
+            ready, _, _ = select.select([self.connection], [], [], 0)
+        except (OSError, ValueError):
+            return True
+        if not ready:
+            return False
+        try:
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
+
+    def _run_stream(self, topics: list, project: str | None, param_cursor: str | None) -> None:
+        state = self.server_state
+        # Resume: the reconnect header wins. EventSource re-requests the
+        # frozen URL on every reconnect, so only the header moves; a
+        # stray header restarts the log at its end, while a bad
+        # `?cursor=` already failed fast above.
+        resume = self.headers.get("Last-Event-ID") or param_cursor
+        _, _, journal_wanted = _parse_stream_cursor(resume)
+        if project is None:
+            if {"events", "journal"} & set(topics):
+                raise AssertionError("unreachable: _serve_stream answers 400 without one")
+            # A snapshot-only stream reads no project: "" never reaches a reader.
+            project = ""
+        events_fn = state.events_fn or read_project_events
+        journal_fn = state.journal_fn or read_project_journal
+        if "snapshot" in topics:
+            try:
+                doc = state.build()
+            except Exception as exc:  # noqa: BLE001 - a stillborn stream answers 500, not silence
+                print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+                self._send_json(500, {"error": "stream unavailable"})
+                return
+            if not isinstance(doc, dict):
+                print(
+                    "corral serve: snapshot builder returned a non-dict document",
+                    file=sys.stderr,
+                )
+                self._send_json(500, {"error": "stream unavailable"})
+                return
+            snap_digest = _digest(doc)
+        else:
+            snap_digest = None
+        try:
+            unresolved = (
+                [
+                    _event_row(row)
+                    for row in events_fn(project)
+                    if isinstance(row, dict) and not row.get("resolved_at")
+                ]
+                if "events" in topics
+                else None
+            )
+            entries = (
+                [entry for entry in journal_fn(project) if isinstance(entry, dict)]
+                if "journal" in topics
+                else []
+            )
+        except coord.UsageError:
+            self._send_json(400, {"error": f"bad project {project!r}"})
+            return
+        except Exception as exc:  # noqa: BLE001 - a stillborn stream answers 500, not silence
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "stream unavailable"})
+            return
+        if journal_wanted is None:
+            journal_pos = len(entries)
+        else:
+            journal_pos = min(journal_wanted, len(entries))
+
+        def _sid(topic: str, pos: str) -> str:
+            # Full-state frames in a journal-bearing stream carry the
+            # journal cursor up front, so a reconnect from any frame
+            # resumes the log: journal frames keep their plain index id.
+            if topic != "journal" and "journal" in topics:
+                return f"{journal_pos}:{topic}:{pos}"
+            return f"{topic}:{pos}"
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        echo = self._echo_origin()
+        if echo is not None:
+            self.send_header("Access-Control-Allow-Origin", echo)
+        self.end_headers()
+        try:
+            if snap_digest is not None:
+                self._emit_stream(
+                    "snapshot", _sid("snapshot", snap_digest), {"digest": snap_digest}
+                )
+            last_events = None
+            if unresolved is not None:
+                last_events = _digest(unresolved)
+                self._emit_stream(
+                    "events",
+                    _sid("events", last_events),
+                    {"project": project, "events": unresolved},
+                )
+            if "journal" in topics and journal_pos < len(entries):
+                backlog = entries[journal_pos:]
+                journal_pos = len(entries)
+                self._emit_stream(
+                    "journal",
+                    f"journal:{journal_pos}",
+                    {"project": project, "entries": backlog, "cursor": str(journal_pos)},
+                )
+            last_beat = state.clock()
+            while True:
+                if self._client_gone():
+                    return
+                time.sleep(state.stream_poll_s)
+                if self._client_gone():
+                    return
+                idle = True
+                if snap_digest is not None:
+                    try:
+                        doc = state.build()
+                    except Exception as exc:  # noqa: BLE001 - a failed poll heals on the next one
+                        print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+                    else:
+                        if isinstance(doc, dict):
+                            digest = _digest(doc)
+                            if digest != snap_digest:
+                                snap_digest = digest
+                                self._emit_stream(
+                                    "snapshot", _sid("snapshot", digest), {"digest": digest}
+                                )
+                                idle = False
+                if unresolved is not None:
+                    try:
+                        rows = events_fn(project)
+                    except coord.UsageError:
+                        # The project went away mid-stream: close it instead
+                        # of idling on stale data.
+                        return
+                    except Exception as exc:  # noqa: BLE001 - a failed poll heals on the next one
+                        print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+                    else:
+                        current = [
+                            _event_row(row)
+                            for row in rows or ()
+                            if isinstance(row, dict) and not row.get("resolved_at")
+                        ]
+                        digest = _digest(current)
+                        if digest != last_events:
+                            last_events = digest
+                            self._emit_stream(
+                                "events",
+                                _sid("events", digest),
+                                {"project": project, "events": current},
+                            )
+                            idle = False
+                if "journal" in topics:
+                    try:
+                        entries = [
+                            entry for entry in journal_fn(project) if isinstance(entry, dict)
+                        ]
+                    except coord.UsageError:
+                        # The project went away mid-stream: close it instead
+                        # of idling on stale data.
+                        return
+                    except Exception as exc:  # noqa: BLE001 - a failed poll heals on the next one
+                        print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+                    else:
+                        if len(entries) < journal_pos:
+                            # The log shrank under the cursor (old
+                            # archives pruned): fast-forward to the end,
+                            # the same rule polling uses past the end.
+                            journal_pos = len(entries)
+                        if len(entries) > journal_pos:
+                            fresh = entries[journal_pos:]
+                            journal_pos = len(entries)
+                            self._emit_stream(
+                                "journal",
+                                f"journal:{journal_pos}",
+                                {
+                                    "project": project,
+                                    "entries": fresh,
+                                    "cursor": str(journal_pos),
+                                },
+                            )
+                            idle = False
+                if idle and state.clock() - last_beat >= state.stream_heartbeat_s:
+                    self.wfile.write(b": heartbeat\n\n")
+                    self.wfile.flush()
+                    last_beat = state.clock()
+        except (OSError, ValueError):
+            # The client went away mid-write: the slot releases below.
+            return
+
     def do_GET(self) -> None:
         self._count()
         if not self._authorized():
@@ -593,6 +1160,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_board()
         elif path == "/v1/tail":
             self._serve_tail()
+        elif path == "/v1/events":
+            self._serve_events()
+        elif path == "/v1/journal":
+            self._serve_journal()
+        elif path == "/v1/stream":
+            self._serve_stream()
         elif path == "/v1/version":
             self._send_json(200, {"api": API_VERSION, "schema_version": snapshot.SCHEMA_VERSION})
         elif path == "/v1/health":
@@ -649,7 +1222,12 @@ def make_server(
     token_reader: Callable[[], str | None] | None = None,
     board_open: Callable[[], board.Store] | None = None,
     tail_fn: Callable[[str, int, int], str] | None = None,
-    tail_max: int = 200,
+    tail_max: int = TAIL_MAX_DEFAULT,
+    events_fn: Callable[[str], list] | None = None,
+    journal_fn: Callable[[str], list] | None = None,
+    max_streams: int = MAX_STREAMS_DEFAULT,
+    stream_poll_s: float = STREAM_POLL_S,
+    stream_heartbeat_s: float = STREAM_HEARTBEAT_S,
     snapshot_ttl_s: float = SNAPSHOT_TTL_S_DEFAULT,
 ) -> ThreadingHTTPServer:
     """An HTTP server answering the v1 routes.
@@ -660,9 +1238,15 @@ def make_server(
     ephemeral one; the bound address reads as `server.server_address`.
     `board_open` opens the board store per board request (`board.open_store`
     by default); `tail_fn` renders tail output (`read_tail` by default),
-    capped at `tail_max` lines. Snapshot builds are shared between
+    capped at `tail_max` lines; `events_fn` reads one project's event
+    rows (`read_project_events` by default); `journal_fn` reads one
+    project's logbook (`read_project_journal` by default). Past
+    `max_streams` concurrent streams the next is shed with a 503; the
+    stream polls the stores every `stream_poll_s` and heartbeats every
+    `stream_heartbeat_s`. Snapshot builds are shared between
     requests inside `snapshot_ttl_s` seconds, and each rebuild bumps a
-    generation counter served as the `ETag`.
+    generation counter served as the `ETag`. `server.state` exposes
+    the `_State` for introspection (tests watch `live_streams`).
     The caller enforces the bind rules; `token_required` with a
     `token_reader` enforces the bearer token per request.
     """
@@ -676,6 +1260,11 @@ def make_server(
         board_open=board_open,
         tail_fn=tail_fn,
         tail_max=tail_max,
+        events_fn=events_fn,
+        journal_fn=journal_fn,
+        max_streams=max_streams,
+        stream_poll_s=stream_poll_s,
+        stream_heartbeat_s=stream_heartbeat_s,
         snapshot_ttl_s=snapshot_ttl_s,
     )
 
@@ -684,9 +1273,11 @@ def make_server(
 
     class _BoundServer(ThreadingHTTPServer):
         address_family = server_family(bind)
+        state: _State
 
     server = _BoundServer((bind, port), _BoundHandler)
     server.daemon_threads = True
+    server.state = state
     return server
 
 
@@ -758,6 +1349,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             token_required=remote,
             token_reader=lambda: read_token(token_path),
             tail_max=resolved["serve.tail_max"],
+            max_streams=resolved["serve.max_streams"],
             snapshot_ttl_s=resolved["serve.snapshot_ttl_s"],
         )
     except OSError as err:

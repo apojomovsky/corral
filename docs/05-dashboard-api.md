@@ -87,7 +87,8 @@ the snapshot only summarizes:
   only, the same output `corral tail` prints.
 - `GET /v1/stream?topics=&cursor=`: Server-Sent Events (section 2)
   over the journal, the event queue, and a snapshot generation
-  counter.
+  counter. The `events` and `journal` topics follow one project
+  (`?project=`); without it only `snapshot` streams.
 - `GET /v1/version`: `{api: 1, schema_version: 2}` for change
   detection (section 4).
 - `GET /v1/health`: `{ok, host, now, uptime_s, requests_total,
@@ -268,16 +269,22 @@ design in `08-hub-multihost.md`.
 ## 6. Performance: bounded reads, cached snapshot, honest staleness
 
 - The GitHub budget is never touched by a read. This is structural,
-  not a convention: `serve.py` imports the local readers only
-  (registry, board store, journal, events, quota ledger, disk usage).
+  not a convention: `serve.py` reaches only the local readers
+  (registry, board store, journal, events, quota ledger, disk usage)
+  plus `launch.tail`, the single resolver for rendered activity
+  lines, which the tail endpoint calls with an empty quota pool so a
+  read never touches the quota ledger or any other launch machinery.
   The `gh` seam is unreachable from any request handler, and a test
-  asserts the import closure (section 7). A dashboard that polls
-  forever cannot pace-limit the fleet.
+  asserts the transitive import closure (section 7). A dashboard that
+  polls forever cannot pace-limit the fleet.
 - Cost bounds: a snapshot is local file reads plus one SQLite query
   set; `tail` is capped at a server side maximum (`serve.tail_max`,
   default 200 lines: a larger `last` is clamped, not refused);
   `board` pages with `limit` (default 100 rows, maximum 1000) and
-  `journal` pages with a `limit` default (100 rows) and maximum; the
+  `journal` pages with a `limit` default (100 rows) and maximum; both
+  bounds live as module constants in `serve.py` (`BOARD_LIMIT_DEFAULT`,
+  `BOARD_LIMIT_MAX`, `JOURNAL_LIMIT_DEFAULT`, `JOURNAL_LIMIT_MAX`),
+  not as settings. The
   stream emits at most one event per store change per
   poll interval. Disk usage reuses `shutil.disk_usage` (no tree
   walk): the API reports filesystem free space, never the reclaim
@@ -348,9 +355,16 @@ takes injected views):
   timeout: under `ThreadingHTTPServer` a thread is spawned before the
   handler runs, so the test must never assert the count at the instant
   of refusal).
-- Import closure: a test walks `serve.py` imports and fails on `gh`,
-  tracker, forge, or any subprocess seam, so a later slice cannot
-  smuggle a live call into a read.
+- Import closure: a test walks the transitive closure of `serve.py`
+  through every `corral` import edge and fails on `hub` or `forge`,
+  and asserts the `(module, seam)` bindings to `subprocess` or
+  `socket` across that closure equal an explicit allowlist, one
+  one-line reason per entry (hostname reads, the loopback bind
+  family, the client-close probe, and the subprocess seams other
+  verbs call), so a new edge fails the test. Binding a module at
+  import time is not calling it: the handler tests inject fakes at
+  every reader seam, and `suiteguard.py` refuses any live call the
+  fakes miss.
 - Exit codes: startup failures map through the same validator the
   verb calls: bad flags to 4, bad token perms to 4, unreadable state
   dir to 3, a held loopback port (`EADDRINUSE` via a held loopback

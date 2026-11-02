@@ -1351,6 +1351,30 @@ class ReviewerWiringTest(OpsCase):
         self.assertEqual(found["role"], "reviewer")
 
 
+class EnvRefusalTest(OpsCase):
+    """An adapter environment refusal is a configuration error: exit 4, nothing started."""
+
+    def test_an_env_value_error_refuses_the_launch(self):
+        class RefusingAdapter(FakeAdapter):
+            def env(self, session_dir):
+                raise ValueError("cannot parse /s/options.json: want a JSON object")
+
+        with mock.patch.object(runtimes, "get", return_value=RefusingAdapter()):
+            with self.assertRaises(launch.LaunchError) as ctx:
+                launch.launch(
+                    self.target("lib", "omp"),
+                    5,
+                    "do the thing",
+                    title="feat: add the thing",
+                    list_fn=self.system.list_fn,
+                    run=self.system.run,
+                    usage=roomy,
+                    host_ledger_fn=self.system.host_ledger_fn,
+                )
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertEqual(self.system.started, [])
+
+
 class MuseReviewerLaunchTest(OpsCase):
     """A reviewer muse launch carries `--disable-write`; a worker's does not."""
 

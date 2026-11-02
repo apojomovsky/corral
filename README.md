@@ -8,7 +8,7 @@ An opinionated core for running fleets of headless coding agents on Linux hosts.
 
 You bring the projects: a board, the rules for which ticket is ready, the prompts. corral keeps the agents in one pen. It launches them as systemd user units, keeps their sessions, routes their models, watches the provider quota every project shares, caps how many run at once, and cleans up after them without losing work.
 
-Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; `corral serve` (the read-only dashboard API on loopback: the snapshot, version and health routes plus filtered views of agents, quota, capacity, disks, the board and tail); the hub skeleton (`corral hub serve`, `hub add-host`) with its operations (`hub export`, `hub import`, `hub backup`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: the dashboard API's events and stream; claims across hosts; `corral new`.
+Status: alpha. Working today: launching, resuming, tailing and stopping agents (`corral launch`, `resume`, `tail`, `stop`); the agent registry, admission, quota, models and prompts; `corral init` and `uninit`; the board store with `sync` and `mirror`; `gc` and `disk` hygiene; `doctor` and `snapshot`; `corral serve` (the read-only dashboard API on loopback: the snapshot, version and health routes plus filtered views of agents, quota, capacity, disks, the board, tail, events and journal, and the stream); the hub skeleton (`corral hub serve`, `hub add-host`) with its operations (`hub export`, `hub import`, `hub backup`); the review records and takeoff (`corral takeoff`, `make pre-pr-check`). Not yet: claims across hosts; `corral new`.
 
 ## Opinions
 
@@ -121,6 +121,9 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | **Hub** | |
 | `corral hub serve [--bind ADDR] [--port N]` | run the hub claim service on loopback (a public bind warns on stderr and keeps serving); prints the listening address; hosts name it with `hub.url` (empty means single-host); exit 2 when the port is held |
 | `corral hub add-host --id ID` | mint a host id and its bearer token in the hub database (prints the token once); exit 4 when the id is taken or badly shaped |
+| `corral hub remove-host --id ID` | drop a host: bump the membership epoch, release its claims with epochs kept, revoke its token; a removed host that rejoins waits to be added again; exit 4 when the id is unknown |
+| `corral hub release REPO NUMBER [--reason TEXT]` | force-release one ticket's claim as an operator override (the epoch is kept so the next grant fences); the reason is logged; exit 4 when the ticket holds no claim |
+| `corral hub rotate-token --id ID` | revoke one host's token and mint its replacement (prints the token once; the old token dies on its next request); exit 4 when the id is unknown |
 | `corral hub export [--file PATH]` | write the hub's movable state as JSON (hosts, claims with epochs, no token material); snapshots excluded, hosts re-push |
 | `corral hub import --file PATH` | load an export into a fresh hub, keeping every epoch; refuses a hub that already holds state; re-add each host afterwards |
 | `corral hub backup --to PATH` | copy the hub database to PATH (refuses to clobber); restore by replacing the file while the hub is stopped |
