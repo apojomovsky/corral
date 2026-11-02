@@ -12,6 +12,7 @@ stub policies, injected registry states and a recording launcher. No
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -24,6 +25,7 @@ from tests.test_tracker import FakeTracker, reading
 
 WORKER = AGENT
 REVIEWER = "drive-host-1-17000-acme--app-7"
+RIVAL = "drive-host-1-19999-acme--app-7"
 FINISHED = registry.FINISHED
 
 
@@ -376,6 +378,64 @@ class ReviewPassTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(launcher.calls, [])
         self.assertIn("still holds the claim", out)
+
+    def test_a_failed_reviewer_launch_releases_the_claim_for_a_later_pass(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = RuntimeError(
+            "reviewer prompt override failed: no such template"
+        )
+        code, out, _ = self.run_review(
+            store,
+            [("blue", [("app", 7, "review")])],
+            fake,
+            launcher,
+            agent_states={WORKER: (FINISHED, NOW - 10.0)},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "review")
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertIn("reviewer claim released", out)
+
+    def test_a_failed_reviewer_launch_with_a_release_race_keeps_the_rival_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        launcher.errors[("app", 7)] = RuntimeError(
+            "reviewer prompt override failed: no such template"
+        )
+        original_release = store.release
+
+        def racy_release(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7) and agent != WORKER:
+                original_release(repo, number, agent, epoch, now=now)
+                store.claim(repo, number, REVIEWER, HOST, now=now)
+            return original_release(repo, number, agent, epoch, now=now)
+
+        store.release = racy_release
+        try:
+            code, out, _ = self.run_review(
+                store,
+                [("blue", [("app", 7, "review")])],
+                fake,
+                launcher,
+                agent_states={WORKER: (FINISHED, NOW - 10.0)},
+            )
+        finally:
+            store.release = original_release
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertIn("left held", out)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, REVIEWER)
 
 
 class FixPassTest(unittest.TestCase):
@@ -921,6 +981,333 @@ class ReviewFixDayCapTest(unittest.TestCase):
         self.assertEqual(len(launcher.calls), 1)
         self.assertEqual(launcher.calls[0][3], "resume")
         self.assertEqual(self.day_starts(), 1)
+
+
+class ReviewerReleaseTest(unittest.TestCase):
+    """Direct pins for `drive._release_reviewer_claim`.
+
+    Each test drives the helper directly against a temporary board
+    store, one per fail-closed branch: an unreadable release read, an
+    already gone claim, a claim changed under the pass, and a refused
+    release. The success and re-claim branches already have pass-level
+    pins in `ReviewPassTest`. Fakes only: no `gh`, no systemd, no
+    network, no real state dir.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-reviewer-release-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+
+    def test_an_unreadable_release_read_keeps_the_claim(self):
+        for problem in (
+            board.StoreError("unusable item app#7"),
+            sqlite3.OperationalError("database is locked"),
+        ):
+            store = stored(self.db, [("app", 7, "open")])
+            self.addCleanup(store.close)
+            made = claimed(store, "app", 7)
+            original_claim_of = store.claim_of
+
+            def flaky_claim_of(repo, number, problem=problem):
+                raise problem
+
+            store.claim_of = flaky_claim_of
+            try:
+                suffix = drive._release_reviewer_claim(store, "app", 7, made.agent, now=NOW)
+            finally:
+                store.claim_of = original_claim_of
+            self.assertIn("reviewer release unreadable", suffix)
+            self.assertIn("claim kept", suffix)
+            found = store.claim_of("app", 7)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_an_already_gone_claim_reopens_the_row(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        store.release("app", 7, made.agent, made.epoch, now=NOW)
+        suffix = drive._release_reviewer_claim(store, "app", 7, made.agent, now=NOW)
+        self.assertIn("reviewer claim already gone", suffix)
+        self.assertIn("row open for a later pass", suffix)
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_changed_claim_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        suffix = drive._release_reviewer_claim(store, "app", 7, RIVAL, now=NOW)
+        self.assertIn("reviewer claim changed under the pass", suffix)
+        self.assertIn("left held", suffix)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_refused_release_keeps_the_claim(self):
+        for problem in (
+            board.ExternalItem("item app#7 is external: read-only"),
+            board.StoreError("cannot write the store"),
+            sqlite3.OperationalError("database is locked"),
+        ):
+            store = stored(self.db, [("app", 7, "open")])
+            self.addCleanup(store.close)
+            made = claimed(store, "app", 7)
+            original_release = store.release
+
+            def refused(repo, number, agent, epoch, *, now, problem=problem):
+                raise problem
+
+            store.release = refused
+            try:
+                suffix = drive._release_reviewer_claim(store, "app", 7, made.agent, now=NOW)
+            finally:
+                store.release = original_release
+            self.assertIn("reviewer release refused", suffix)
+            self.assertIn("claim kept", suffix)
+            found = store.claim_of("app", 7)
+            self.assertIsNotNone(found)
+            assert found is not None
+            self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+
+class ClaimRaceTest(unittest.TestCase):
+    """Fail-safe branches over a pre-released or re-claimed store.
+
+    Each test drives `drive._claim_and_launch` directly with one gated
+    row, after moving the real store under it the way a concurrent pass
+    would: releasing the claim first, or re-claiming it for a rival
+    mid-flight. Fakes only: a temporary board store, a temporary
+    restart budget, and a recording launcher. No `gh`, no systemd, no
+    network, no real state dir.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-claim-races-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+
+    def launch(self, store, gated, **over):
+        values = {
+            "tracker_factory": None,
+            "operators": {},
+            "launcher": FakeLauncher(),
+            "host": HOST,
+            "now": NOW,
+            "stale_after": 3600.0,
+            "restarts_path": self.budget,
+        }
+        values.update(over)
+        launcher = values["launcher"]
+        rows, started, blocked, launched = drive._claim_and_launch(store, [gated], **values)
+        return rows, started, blocked, launched, launcher
+
+    def test_a_review_with_a_lost_worker_id_is_skipped_without_claiming(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="review",
+            verdict="review",
+            reason="app#7: unclaimed, review slot",
+            code="",
+        )
+        rows, started, blocked, launched, launcher = self.launch(
+            store, gated, released={}, finished={}
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].verdict, "skip")
+        self.assertEqual(rows[0].code, "claim")
+        self.assertIn("finished worker id lost", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_resume_over_a_released_row_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        store.release("app", 7, made.agent, made.epoch, now=NOW)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="resume",
+            verdict="resume",
+            reason="app#7: resume on managed holder",
+            code="",
+        )
+        rows, started, blocked, launched, launcher = self.launch(
+            store, gated, agent_states={}, live_units=frozenset()
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].verdict, "skip")
+        self.assertEqual(rows[0].code, "claim")
+        self.assertIn("claim changed under the pass, left held", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_resume_raced_reclaim_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="resume",
+            verdict="resume",
+            reason="app#7: resume on managed holder",
+            code="",
+        )
+        original_refresh = store.refresh_claim
+
+        def racy_refresh(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7) and agent == WORKER:
+                store.release(repo, number, agent, epoch, now=now)
+                store.claim(repo, number, RIVAL, HOST, now=now)
+            return original_refresh(repo, number, agent, epoch, now=now)
+
+        store.refresh_claim = racy_refresh
+        try:
+            rows, started, blocked, launched, launcher = self.launch(
+                store,
+                gated,
+                agent_states={WORKER: (registry.LIVE, NOW - 10.0)},
+                live_units=frozenset(),
+            )
+        finally:
+            store.refresh_claim = original_refresh
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].kind, rows[0].verdict), ("resume", "skip"))
+        self.assertIn("resume raced a re-claim, left held", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, RIVAL)
+
+    def test_a_fix_mint_raced_reclaim_names_the_rival(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="fix",
+            verdict="fix",
+            reason="app#7: fix round on managed holder",
+            code="",
+        )
+        original_claim = store.claim
+
+        def racy_claim(repo, number, agent, host, *, now):
+            if (repo, number) == ("app", 7):
+                original_claim(repo, number, RIVAL, host, now=now)
+            return original_claim(repo, number, agent, host, now=now)
+
+        store.claim = racy_claim
+        try:
+            rows, started, blocked, launched, launcher = self.launch(
+                store, gated, agent_states={}, live_units=frozenset()
+            )
+        finally:
+            store.claim = original_claim
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].kind, rows[0].verdict), ("fix", "skip"))
+        self.assertIn("race lost to", rows[0].reason)
+        self.assertIn(RIVAL, rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, RIVAL)
+
+    def test_a_fix_release_raced_reclaim_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="fix",
+            verdict="fix",
+            reason="app#7: fix round on managed holder",
+            code="",
+        )
+        original_release = store.release
+
+        def racy_release(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7) and agent == WORKER:
+                original_release(repo, number, agent, epoch, now=now)
+                store.claim(repo, number, RIVAL, HOST, now=now)
+            return original_release(repo, number, agent, epoch, now=now)
+
+        store.release = racy_release
+        try:
+            rows, started, blocked, launched, launcher = self.launch(
+                store, gated, agent_states={}, live_units=frozenset()
+            )
+        finally:
+            store.release = original_release
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].kind, rows[0].verdict), ("fix", "skip"))
+        self.assertIn("fix release raced a re-claim, left held", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, RIVAL)
+
+    def test_a_fix_release_refusal_keeps_the_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="fix",
+            verdict="fix",
+            reason="app#7: fix round on managed holder",
+            code="",
+        )
+        original_release = store.release
+
+        def refused(repo, number, agent, epoch, *, now):
+            raise board.StoreError("cannot write the store")
+
+        store.release = refused
+        try:
+            rows, started, blocked, launched, launcher = self.launch(
+                store, gated, agent_states={}, live_units=frozenset()
+            )
+        finally:
+            store.release = original_release
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].kind, rows[0].verdict), ("fix", "skip"))
+        self.assertIn("fix release refused", rows[0].reason)
+        self.assertIn("left held", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
 
 if __name__ == "__main__":
