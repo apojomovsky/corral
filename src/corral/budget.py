@@ -179,9 +179,13 @@ def _origin(resolved, key):
 
     A value the host [limits] table clamped reports the host limits,
     not the layer that set it: the clamp is what made it the number
-    the checks below compare.
+    the checks below compare. A plain mapping has no layer record, so
+    it reports the generic input rather than raising AttributeError.
     """
-    item = resolved.values[key]
+    values = getattr(resolved, "values", None)
+    if not isinstance(values, dict):
+        return "input"
+    item = values[key]
     if item.clamped_from is not None:
         return "host limits"
     return item.origin
@@ -196,6 +200,8 @@ def numbers(resolved=None):
     that compare two numbers stay here, and each names the layer behind
     the offending values, which the resolved settings already record. A
     mapping missing a key is a SettingsError naming it, not a KeyError.
+    A plain mapping has no layer record, so cross-key errors there blame
+    the generic input.
     """
     if resolved is None:
         raw = {key: settings.REGISTRY[key].default for key in NUMBERS_KEYS}
@@ -442,7 +448,7 @@ def resolve_root_repo(root, repo):
 
 
 def main_cli(argv):
-    """`python -m corral.budget [--base <ref>]`: print the dispatch block.
+    """`python -m corral.budget [--base <ref>] [--root <dir>] [--repo <name>]`: print the dispatch block.
 
     Built from the same parser and root/repo check as the `corral budget`
     verb, so the two spellings cannot disagree about flags, a missing

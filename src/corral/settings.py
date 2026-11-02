@@ -576,7 +576,13 @@ def resolve(
         setting = REGISTRY.get(key)
         if setting is None or setting.type is not int:
             raise SettingsError(f"{host_name}: [limits] {key!r} is not a numeric setting")
-        if isinstance(ceiling, bool) or not isinstance(ceiling, int) or ceiling < 0:
+        if isinstance(ceiling, bool) or not isinstance(ceiling, int):
+            raise SettingsError(f"{host_name}: [limits] {key} must be an int of 0 or more")
+        # The ceiling is a value too: a checked setting refuses 0 (or less)
+        # here, naming the host limits file and key, instead of clamping a
+        # 0 in unchecked and dividing by it later.
+        ceiling = _apply_check(setting, ceiling, f"{host_name} [limits]")
+        if ceiling < 0:
             raise SettingsError(f"{host_name}: [limits] {key} must be an int of 0 or more")
         current = result[key]
         if isinstance(current.value, int) and current.value > ceiling:

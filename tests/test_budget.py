@@ -370,6 +370,43 @@ class RangeSourceTest(unittest.TestCase):
             resolve_settings(flags={"review.budget.ceiling_minutes": 0})
 
 
+class HostCeilingTest(unittest.TestCase):
+    """A host [limits] ceiling is a value too: it runs the range check.
+
+    The check used to run only where a value was set, so a ceiling of 0
+    for a checked setting was clamped in unchecked: seconds per line 0
+    then dies with ZeroDivisionError in max_reviewable_lines, and a limit
+    multiple of 0 divides by zero inside numbers(). A ceiling of 0 (or
+    below) for a checked setting is a SettingsError naming the host
+    limits file and key instead.
+    """
+
+    def ceiling_host(self, short, ceiling):
+        return {"limits": {"review": {"budget": {short: ceiling}}}}
+
+    def test_a_zero_host_ceiling_is_refused_for_each_checked_setting(self):
+        for key in bu.NUMBERS_KEYS:
+            short = key.removeprefix("review.budget.")
+            pattern = r"host-config\.toml.*\[limits\].*" + key.replace(".", r"\.")
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(S.SettingsError, pattern):
+                    resolve_settings(
+                        host=self.ceiling_host(short, 0),
+                        host_name="host-config.toml",
+                    )
+
+    def test_a_negative_host_ceiling_is_refused_for_each_checked_setting(self):
+        for key in bu.NUMBERS_KEYS:
+            short = key.removeprefix("review.budget.")
+            pattern = r"host-config\.toml.*\[limits\].*" + key.replace(".", r"\.")
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(S.SettingsError, pattern):
+                    resolve_settings(
+                        host=self.ceiling_host(short, -1),
+                        host_name="host-config.toml",
+                    )
+
+
 class NumbersTest(unittest.TestCase):
     def test_no_resolved_settings_reads_as_todays_constants(self):
         cfg = bu.numbers()
@@ -436,6 +473,30 @@ class NumbersTest(unittest.TestCase):
     def test_a_missing_setting_is_a_settings_error(self):
         with self.assertRaisesRegex(S.SettingsError, "review.budget.base_minutes"):
             bu.numbers({})
+
+    def test_a_complete_plain_dict_resolves_verbatim(self):
+        # numbers() takes plain mappings too, not only Resolved: with no
+        # .values layer record there is nothing to blame, so a complete
+        # dict reads verbatim instead of raising TypeError.
+        plain = dict(zip(bu.NUMBERS_KEYS, (10, 10, 2, 20, 60)))
+        self.assertEqual(
+            bu.numbers(plain),
+            bu.Numbers(
+                base_minutes=10,
+                seconds_per_line=10,
+                limit_multiple=2,
+                floor_minutes=20,
+                ceiling_minutes=60,
+            ),
+        )
+
+    def test_a_plain_dict_cross_key_error_names_a_generic_origin(self):
+        plain = dict(zip(bu.NUMBERS_KEYS, (10, 10, 2, 60, 60)))
+        with self.assertRaisesRegex(
+            S.SettingsError,
+            r"review\.budget\.floor_minutes \(60, from input\) must be below",
+        ):
+            bu.numbers(plain)
 
     def test_a_floor_no_limit_can_clear_is_refused(self):
         # base * multiple below the floor: even an empty diff prints a
@@ -664,6 +725,13 @@ class StrictFlagsTest(unittest.TestCase):
             with self.subTest(rc=rc, err=err):
                 self.assertEqual(rc, 4)
                 self.assertIn("review.budget.base_minutes", err)
+
+    def test_the_standalone_docstring_names_all_three_flags(self):
+        doc = bu.main_cli.__doc__
+        assert doc is not None
+        for flag in ("--base", "--root", "--repo"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, doc)
 
 
 if __name__ == "__main__":
