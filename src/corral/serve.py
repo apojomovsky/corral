@@ -38,7 +38,7 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
-from corral import board, coord, coordevents, launch, projects, settings, snapshot
+from corral import board, coord, coordevents, launch, projects, settings, snapshot, webui
 from corral.netbind import server_family
 
 OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
@@ -469,6 +469,7 @@ class _State:
         stream_poll_s: float = STREAM_POLL_S,
         stream_heartbeat_s: float = STREAM_HEARTBEAT_S,
         snapshot_ttl_s: float = SNAPSHOT_TTL_S_DEFAULT,
+        web_assets: dict | None = None,
     ) -> None:
         self.build = build
         self.clock = clock
@@ -494,6 +495,7 @@ class _State:
         self.cached_doc: dict | None = None
         self.cached_at: float | None = None
         self.generation = 0
+        self.web_assets = web_assets or {}
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -525,6 +527,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", webui.NO_SNIFF)
         for name, value in headers:
             self.send_header(name, value)
         echo = self._echo_origin()
@@ -537,13 +540,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         for name, value in headers:
             self.send_header(name, value)
+        self.send_header("X-Content-Type-Options", webui.NO_SNIFF)
         self.end_headers()
+
+    def _send_bytes(self, code: int, data: bytes, headers: tuple = ()) -> None:
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(data)))
+        for name, value in headers:
+            self.send_header(name, value)
+        echo = self._echo_origin()
+        if echo is not None:
+            self.send_header("Access-Control-Allow-Origin", echo)
+        self.end_headers()
+        self.wfile.write(data)
 
     def _send_text(self, code: int, text: str) -> None:
         body = text.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", webui.NO_SNIFF)
         echo = self._echo_origin()
         if echo is not None:
             self.send_header("Access-Control-Allow-Origin", echo)
@@ -626,6 +642,30 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_empty(304, (("ETag", etag),))
         else:
             self._send_empty(304, (("ETag", etag), ("Access-Control-Allow-Origin", echo)))
+
+    def _serve_ui(self) -> None:
+        """The dashboard shell: the asset table, exempt from auth.
+
+        Exact table-key lookup only, so traversal shapes 404. An empty
+        table (the assets failed to load) degrades to the generic 500
+        while the API routes keep serving.
+        """
+        state = self.server_state
+        if not state.web_assets:
+            self._send_json(500, {"error": UNAVAILABLE})
+            return
+        path = urlsplit(self.path).path
+        if path == webui.CONFIG_PATH:
+            self._send_bytes(200, webui.config_body(API_VERSION), webui.config_headers())
+            return
+        asset = state.web_assets.get(path)
+        if asset is None:
+            self._send_json(404, {"error": "not found"})
+            return
+        if self._is_fresh(asset.etag):
+            self._send_not_modified(asset.etag)
+        else:
+            self._send_bytes(200, asset.data, webui.asset_headers(asset))
 
     def _serve_snapshot(self) -> None:
         doc, generation, now, error = self._cached_doc()
@@ -939,6 +979,7 @@ class _Handler(BaseHTTPRequestHandler):
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Content-Type-Options", webui.NO_SNIFF)
             self.send_header("Retry-After", str(STREAM_RETRY_AFTER_S))
             echo = self._echo_origin()
             if echo is not None:
@@ -1051,6 +1092,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Content-Type-Options", webui.NO_SNIFF)
         self.send_header("Connection", "close")
         echo = self._echo_origin()
         if echo is not None:
@@ -1163,6 +1205,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         self._count()
+        if webui.is_ui_path(urlsplit(self.path).path):
+            self._serve_ui()
+            return
         if not self._authorized():
             return
         path = urlsplit(self.path).path
@@ -1197,6 +1242,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self) -> None:
         self._count()
+        if webui.is_ui_path(urlsplit(self.path).path):
+            self._send_json(405, {"error": f"method {self.command} not allowed"})
+            return
         origin = self.headers.get("Origin")
         wanted = self.headers.get("Access-Control-Request-Method")
         if origin is not None and wanted is not None and self._echo_origin() is not None:
@@ -1215,6 +1263,9 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _method_not_allowed(self) -> None:
         self._count()
+        if webui.is_ui_path(urlsplit(self.path).path):
+            self._send_json(405, {"error": f"method {self.command} not allowed"})
+            return
         if not self._authorized():
             return
         self._send_json(405, {"error": f"method {self.command} not allowed"})
@@ -1252,6 +1303,7 @@ def make_server(
     stream_poll_s: float = STREAM_POLL_S,
     stream_heartbeat_s: float = STREAM_HEARTBEAT_S,
     snapshot_ttl_s: float = SNAPSHOT_TTL_S_DEFAULT,
+    web_files: dict[str, bytes] | None = None,
 ) -> ThreadingHTTPServer:
     """An HTTP server answering the v1 routes.
 
@@ -1271,10 +1323,20 @@ def make_server(
     `stream_heartbeat_s`. Snapshot builds are shared between
     requests inside `snapshot_ttl_s` seconds, and each rebuild bumps a
     generation counter served as the `ETag`. `server.state` exposes
-    the `_State` for introspection (tests watch `live_streams`).
+    the `_State` for introspection (tests watch `live_streams`). `web_files`
+    injects raw dashboard bytes; without it the packaged files load once,
+    and a load failure degrades the UI routes instead of refusing startup.
     The caller enforces the bind rules; `token_required` with a
     `token_reader` enforces the bearer token per request.
     """
+    if web_files is None:
+        try:
+            web_assets = webui.load_assets()
+        except Exception as exc:  # noqa: BLE001 - a broken table degrades the UI, never startup
+            print(f"corral serve: dashboard assets unavailable: {exc}", file=sys.stderr)
+            web_assets = {}
+    else:
+        web_assets = webui.build_assets(web_files)
     state = _State(
         build=build if build is not None else collect,
         clock=clock if clock is not None else time.time,
@@ -1292,6 +1354,7 @@ def make_server(
         stream_poll_s=stream_poll_s,
         stream_heartbeat_s=stream_heartbeat_s,
         snapshot_ttl_s=snapshot_ttl_s,
+        web_assets=web_assets,
     )
 
     class _BoundHandler(_Handler):

@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>corral dashboard</title>
+<link rel="stylesheet" href="/ui/app.css">
+</head>
+<body>
+<header id="topbar">
+<span id="brand">corral</span>
+<span id="mode" aria-label="backend mode">starting</span>
+<span id="api" aria-label="api version"></span>
+<span id="conn" role="status">connecting</span>
+<span id="updated" aria-label="last update age"></span>
+<button id="token-btn" type="button">token</button>
+</header>
+<div id="banner" role="alert" hidden></div>
+<main id="view" aria-live="off">
+<section id="status-card" aria-label="server status">
+<h1>dashboard</h1>
+<p id="status-line">loading server details</p>
+</section>
+<section id="token" aria-label="api token" hidden>
+<h2>api token</h2>
+<p id="token-help">Paste the API token for this server, then save.</p>
+<label for="token-input">token</label>
+<input id="token-input" type="password" autocomplete="off" spellcheck="false">
+<p id="token-msg" role="status"></p>
+<div>
+<button id="token-save" type="button">save</button>
+<button id="token-forget" type="button">forget this token</button>
+</div>
+</section>
+</main>
+<script type="module" src="/ui/app.js"></script>
+</body>
+</html>
