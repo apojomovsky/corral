@@ -303,6 +303,7 @@ TAIL = """# Defaults: uncomment to override.
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
+# hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [prompts]
@@ -324,6 +325,14 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [review]
 # review.required = true  # takeoff needs an approving review record for the head
+#
+# [serve]
+# serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
+# serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
+# serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
+# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
+# serve.tail_max = 200  # maximum activity lines one tail read returns
 #
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
@@ -414,6 +423,7 @@ commits.conventional = false
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
+# hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [prompts]
@@ -435,6 +445,14 @@ commits.conventional = false
 #
 # [review]
 # review.required = true  # takeoff needs an approving review record for the head
+#
+# [serve]
+# serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
+# serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
+# serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
+# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
+# serve.tail_max = 200  # maximum activity lines one tail read returns
 #
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
