@@ -356,11 +356,14 @@ takes injected views):
   of refusal).
 - Import closure: a test walks the transitive closure of `serve.py`
   through every `corral` import edge and fails on `hub` or `forge`,
-  and checks `serve.py` itself imports no subprocess or network seam,
-  so a later slice cannot smuggle a live call into a read. Binding a
-  module at import time is not calling it: the handler tests inject
-  fakes at every reader seam, and `suiteguard.py` refuses any live
-  call the fakes miss.
+  and asserts the `(module, seam)` bindings to `subprocess` or
+  `socket` across that closure equal an explicit allowlist, one
+  one-line reason per entry (hostname reads, the loopback bind
+  family, the client-close probe, and the subprocess seams other
+  verbs call), so a new edge fails the test. Binding a module at
+  import time is not calling it: the handler tests inject fakes at
+  every reader seam, and `suiteguard.py` refuses any live call the
+  fakes miss.
 - Exit codes: startup failures map through the same validator the
   verb calls: bad flags to 4, bad token perms to 4, unreadable state
   dir to 3, a held loopback port (`EADDRINUSE` via a held loopback

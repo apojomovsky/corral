@@ -24,6 +24,7 @@ import os
 import secrets
 import select
 import signal
+import socket
 import sys
 import threading
 import time
@@ -279,25 +280,17 @@ def read_project_journal(project: str) -> list:
     """One project's logbook entries, oldest first: archives, then live.
 
     The production journal reader: archive names come from
-    `coord.JOURNAL_ARCHIVE_PREFIX` under `coord.LEASE_DIRNAME`, dated
-    `YYYY-MM-DD` so filename order is time order, and the live file
-    from `coord.read_entries`. Rotation moves entries from live to
-    archives but keeps the union, so an index cursor into the combined
-    list stays continuous across a rotation. Raises
-    `coord.UsageError` when the name is not a project.
+    `coord.journal_archive_names`, the one owner of dated archive
+    listing, and the live file from `coord.read_entries`. Rotation
+    moves entries from live to archives but keeps the union, so an
+    index cursor into the combined list stays continuous across a
+    rotation. Raises `coord.UsageError` when the name is not a
+    project.
     """
     root = coord.project_root(project)
     directory = os.path.join(root, coord.LEASE_DIRNAME)
-    try:
-        names = sorted(
-            name
-            for name in os.listdir(directory)
-            if name.startswith(coord.JOURNAL_ARCHIVE_PREFIX) and name.endswith(".jsonl")
-        )
-    except OSError:
-        names = []
     entries = []
-    for name in names:
+    for name in coord.journal_archive_names(directory):
         entries.extend(_read_jsonl_rows(os.path.join(directory, name)))
     entries.extend(coord.read_entries(root))
     return entries
@@ -335,9 +328,25 @@ def _event_row(row: dict) -> dict:
     }
 
 
+#: Volatile stamps the change token ignores: the serving host stamps a
+#: fresh `now` (and per-reading `read_at`) on every build, which is
+#: staleness data, not a store change. Dropping them keeps an idle
+#: stream idle until real content moves.
+VOLATILE_KEYS = frozenset({"now", "read_at"})
+
+
+def _stable(obj):
+    """A copy of `obj` without the volatile stamps, at every depth."""
+    if isinstance(obj, dict):
+        return {key: _stable(value) for key, value in obj.items() if key not in VOLATILE_KEYS}
+    if isinstance(obj, (list, tuple)):
+        return [_stable(value) for value in obj]
+    return obj
+
+
 def _digest(obj) -> str:
-    """Short content hash: the stream's change token for full-state topics."""
-    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode("utf-8")).hexdigest()[:12]
+    """Short stable-content hash: the stream's change token for full-state topics."""
+    return hashlib.sha256(json.dumps(_stable(obj), sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
 
 def _parse_stream_cursor(value: str | None) -> tuple[str | None, str | None, int | None]:
@@ -732,7 +741,14 @@ class _Handler(BaseHTTPRequestHandler):
         if project is None:
             self._send_json(400, {"error": "journal needs ?project="})
             return
-        kind = query.get("kind") or None
+        raw_kind = query.get("kind")
+        if raw_kind is None:
+            kind = None
+        elif not raw_kind.strip():
+            self._send_json(400, {"error": f"kind {raw_kind!r} is empty"})
+            return
+        else:
+            kind = raw_kind
         if kind is not None and kind not in coord.KINDS:
             self._send_json(400, {"error": f"kind {kind!r} is unknown"})
             return
@@ -787,16 +803,20 @@ class _Handler(BaseHTTPRequestHandler):
         state = self.server_state
         query = self._query()
         raw_topics = query.get("topics")
-        if raw_topics is None or not raw_topics.strip():
+        if raw_topics is None:
             topics = list(STREAM_TOPICS)
         else:
+            if not raw_topics.strip():
+                self._send_json(400, {"error": f"topics {raw_topics!r} is empty"})
+                return
             topics = [part.strip() for part in raw_topics.split(",") if part.strip()]
+            if not topics:
+                self._send_json(400, {"error": f"topics {raw_topics!r} is empty"})
+                return
             unknown = [part for part in topics if part not in STREAM_TOPICS]
             if unknown:
                 self._send_json(400, {"error": f"unknown stream topic {unknown[0]!r}"})
                 return
-            if not topics:
-                topics = list(STREAM_TOPICS)
         project = query.get("project") or None
         if project is None and {"events", "journal"} & set(topics):
             self._send_json(400, {"error": "stream topics events and journal need ?project="})
@@ -843,8 +863,9 @@ class _Handler(BaseHTTPRequestHandler):
 
         A GET carries no body on a close-delimited (HTTP/1.0)
         connection, so any readable byte is the client's FIN, not a
-        pipelined request. Lets a closed stream release its slot
-        without waiting for the next heartbeat write.
+        request. The peek leaves a pipelined byte in place instead of
+        eating it. Lets a closed stream release its slot without
+        waiting for the next heartbeat write.
         """
         try:
             ready, _, _ = select.select([self.connection], [], [], 0)
@@ -853,7 +874,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not ready:
             return False
         try:
-            return self.connection.recv(1) == b""
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
         except (OSError, ValueError):
             return True
 
@@ -978,6 +999,10 @@ class _Handler(BaseHTTPRequestHandler):
                 if unresolved is not None:
                     try:
                         rows = events_fn(project)
+                    except coord.UsageError:
+                        # The project went away mid-stream: close it instead
+                        # of idling on stale data.
+                        return
                     except Exception as exc:  # noqa: BLE001 - a failed poll heals on the next one
                         print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
                     else:
@@ -1000,6 +1025,10 @@ class _Handler(BaseHTTPRequestHandler):
                         entries = [
                             entry for entry in journal_fn(project) if isinstance(entry, dict)
                         ]
+                    except coord.UsageError:
+                        # The project went away mid-stream: close it instead
+                        # of idling on stale data.
+                        return
                     except Exception as exc:  # noqa: BLE001 - a failed poll heals on the next one
                         print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
                     else:

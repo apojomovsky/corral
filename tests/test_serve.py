@@ -1355,29 +1355,6 @@ def transitive_corral_modules(start):
     return seen
 
 
-class TransitiveImportClosure(unittest.TestCase):
-    def test_transitive_closure_has_no_hub_or_forge(self):
-        closed = transitive_corral_modules("corral.serve")
-        self.assertIn("corral.serve", closed)
-        self.assertIn("corral.board", closed)
-        self.assertNotIn("corral.hub", closed)
-        self.assertNotIn("corral.forge", closed)
-
-    def test_serve_file_uses_no_process_or_network_seam(self):
-        with open(serve.__file__, encoding="utf-8") as handle:
-            tree = ast.parse(handle.read())
-        top = set()
-        for node in tree.body:
-            if isinstance(node, ast.Import):
-                top.update(alias.name.split(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                top.add(node.module.split(".")[0])
-        # http.server and urllib.parse are the blessed transport (doc 05,
-        # section 2); subprocess and socket would be a live seam.
-        self.assertNotIn("subprocess", top)
-        self.assertNotIn("socket", top)
-
-
 EVENT_ROWS = [
     {
         "id": "a1b2c3d4",
@@ -2073,6 +2050,257 @@ class StreamSettings(unittest.TestCase):
                     with redirect_stdout(out):
                         self.assertEqual(args.func(args), 0)
             self.assertEqual(seen.get("max_streams"), 3)
+
+
+class DigestVolatility(unittest.TestCase):
+    def test_volatile_keys_constant_names_now_and_read_at(self):
+        self.assertEqual(serve.VOLATILE_KEYS, frozenset({"now", "read_at"}))
+
+    def test_digest_ignores_top_level_volatile_keys(self):
+        self.assertEqual(
+            serve._digest({"now": 1, "agents": []}),
+            serve._digest({"now": 2, "agents": []}),
+        )
+
+    def test_digest_ignores_nested_read_at(self):
+        before = {"quota": {"prov": {"read_at": 1.0, "stale": False}}}
+        after = {"quota": {"prov": {"read_at": 2.0, "stale": False}}}
+        self.assertEqual(serve._digest(before), serve._digest(after))
+
+    def test_digest_moves_on_real_change(self):
+        before = {"now": 1, "agents": []}
+        after = {"now": 1, "agents": [{"id": "a1"}]}
+        self.assertNotEqual(serve._digest(before), serve._digest(after))
+
+
+class TickingBuilder:
+    """A snapshot builder whose volatile stamps tick on every call."""
+
+    def __init__(self):
+        self.n = 0
+
+    def __call__(self):
+        return {
+            "schema_version": 1,
+            "fleet_header": {"host": "host-1", "now": time.time()},
+            "quota": {"prov": {"read_at": time.time(), "stale": False}},
+            "n": self.n,
+        }
+
+
+class StreamDigestStability(StreamCase):
+    def test_ticking_clock_emits_no_repeat_frame(self):
+        builder = TickingBuilder()
+        server = self.start_stream_server(
+            build=builder,
+            clock=time.time,
+            stream_poll_s=0.02,
+            stream_heartbeat_s=0.3,
+            events_fn=lambda project: [],
+            journal_fn=lambda project: [],
+        )
+        stream = self.open_stream(server, "/v1/stream?topics=snapshot")
+        first = self.frame_fields(self.read_frame(stream))
+        self.assertEqual(first["event"], "snapshot")
+        # Nothing changed: the next frame is the heartbeat, not a snapshot.
+        ticking = self.frame_fields(self.read_frame(stream, timeout=5))
+        self.assertNotIn("event", ticking)
+        self.assertIn(": heartbeat", ticking.get("comments", []))
+        # Real content changes: a snapshot frame with a new digest.
+        builder.n = 1
+        changed = self.frame_fields(self.read_frame(stream, timeout=5))
+        self.assertEqual(changed["event"], "snapshot")
+        self.assertNotEqual(first["id"], changed["id"])
+        stream.close()
+        self.wait_for_streams(server, 0)
+
+
+class StreamBlankTopics(StreamCase):
+    def test_blank_topics_is_a_400(self):
+        server = self.start_stream_server(
+            events_fn=lambda project: [], journal_fn=lambda project: []
+        )
+        for target in (
+            "/v1/stream?topics=&project=demo",
+            "/v1/stream?topics=,,,&project=demo",
+            "/v1/stream?topics=%20&project=demo",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+
+
+class JournalBlankKind(ServeCase):
+    def test_blank_kind_is_a_400(self):
+        seen = []
+        server, _ = self.start_server(
+            FakeBuilder(healthy_doc()),
+            journal_fn=lambda project: (seen.append(project), [journal_entry(0)])[1],
+        )
+        for target in (
+            "/v1/journal?project=demo&kind=",
+            "/v1/journal?project=demo&kind=,,,",
+        ):
+            with self.subTest(target=target):
+                status, _, body = self.fetch(server, "GET", target)
+                self.assertEqual(status, 400, target)
+                self.assertIn("error", json.loads(body))
+        self.assertEqual(seen, [])
+
+
+class StreamProjectGone(StreamCase):
+    def test_stream_closes_when_the_project_goes_away(self):
+        for topics in ("journal", "events"):
+            with self.subTest(topics=topics):
+                if topics == "journal":
+                    entries = [journal_entry(0)]
+                    calls = []
+
+                    def journal_fn(project):
+                        calls.append(project)
+                        if len(calls) > 1:
+                            raise coord.UsageError("renamed mid-stream")
+                        return list(entries)
+
+                    kwargs = {"journal_fn": journal_fn, "events_fn": lambda project: []}
+                else:
+                    rows = [dict(EVENT_ROWS[0])]
+                    calls = []
+
+                    def events_fn(project):
+                        calls.append(project)
+                        if len(calls) > 1:
+                            raise coord.UsageError("renamed mid-stream")
+                        return list(rows)
+
+                    kwargs = {"events_fn": events_fn, "journal_fn": lambda project: []}
+                server = self.start_stream_server(**kwargs)
+                stream = self.open_stream(server, f"/v1/stream?topics={topics}&project=demo")
+                if topics == "events":
+                    self.frame_fields(self.read_frame(stream))
+                stream.sock.settimeout(5)
+                self.assertEqual(stream.resp.fp.readline(), b"")
+                stream.close()
+                self.wait_for_streams(server, 0)
+
+
+class ClientGonePeek(unittest.TestCase):
+    def test_client_gone_peeks_instead_of_consuming(self):
+        with open(serve.__file__, encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        func = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_client_gone"
+        )
+        recvs = [
+            node
+            for node in ast.walk(func)
+            if isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "recv"
+        ]
+        self.assertEqual(len(recvs), 1)
+        self.assertEqual(len(recvs[0].args), 2)
+        flag = recvs[0].args[1]
+        self.assertTrue(isinstance(flag, ast.Attribute) and flag.attr == "MSG_PEEK")
+
+
+class TransitiveSeamClosure(unittest.TestCase):
+    def test_transitive_closure_has_no_hub_or_forge(self):
+        closed = transitive_corral_modules("corral.serve")
+        self.assertIn("corral.serve", closed)
+        self.assertIn("corral.board", closed)
+        self.assertNotIn("corral.hub", closed)
+        self.assertNotIn("corral.forge", closed)
+
+    def test_transitive_closure_seams_match_allowlist(self):
+        import importlib.util
+
+        closed = transitive_corral_modules("corral.serve")
+        found = set()
+        for name in sorted(closed):
+            spec = importlib.util.find_spec(name)
+            if spec is None or spec.origin is None or not spec.origin.endswith(".py"):
+                continue
+            with open(spec.origin, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        top = alias.name.split(".")[0]
+                        if top in ("subprocess", "socket"):
+                            found.add((name, top))
+                elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                    top = node.module.split(".")[0]
+                    if top in ("subprocess", "socket"):
+                        found.add((name, top))
+        allowlist = {
+            (
+                "corral.drive",
+                "socket",
+            ): "socket.gethostname names the agent host segment; no packets",
+            (
+                "corral.drive",
+                "subprocess",
+            ): "timer helpers other verbs call; no request handler reaches them",
+            (
+                "corral.github.gh",
+                "subprocess",
+            ): "the gh seam other verbs call; reads inject fakes instead",
+            (
+                "corral.launch",
+                "socket",
+            ): "socket.gethostname names launch records; the tail read never shells out",
+            ("corral.netbind", "socket"): "address-family constants for the loopback bind",
+            ("corral.registry", "socket"): "socket.gethostname tags live-agent rows; local only",
+            ("corral.serve", "socket"): "MSG_PEEK flag for the client-close probe; opens nothing",
+            ("corral.snapshot", "socket"): "socket.gethostname fills the fleet header; local only",
+            (
+                "corral.syncli",
+                "subprocess",
+            ): "sync subprocess seam other verbs call; reads never reach it",
+            (
+                "corral.units",
+                "subprocess",
+            ): "unit control seam other verbs call; reads never reach it",
+            (
+                "corral.worktrees",
+                "subprocess",
+            ): "git worktree seam other verbs call; reads never reach it",
+        }
+        for reason in allowlist.values():
+            self.assertTrue(reason and "\n" not in reason, reason)
+        self.assertEqual(found, set(allowlist))
+
+    def test_journal_reader_skips_undated_archives(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-journal-") as tmp:
+            root = os.path.join(tmp, "projects", "demo")
+            directory = os.path.join(root, coord.LEASE_DIRNAME)
+            os.makedirs(directory)
+            live = {
+                "at": "2026-01-05T00:00:00+00:00",
+                "holder": "",
+                "generation": 1,
+                "kind": "note",
+                "refs": [],
+                "text": "live",
+            }
+            dated = dict(live, at="2026-01-01T00:00:00+00:00", text="dated")
+            stray = dict(live, at="2026-01-02T00:00:00+00:00", text="stray")
+            with open(
+                os.path.join(directory, f"{coord.JOURNAL_ARCHIVE_PREFIX}2026-01-01.jsonl"),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(json.dumps(dated) + "\n")
+            with open(
+                os.path.join(directory, "journal-draft.jsonl"), "w", encoding="utf-8"
+            ) as handle:
+                handle.write(json.dumps(stray) + "\n")
+            with open(os.path.join(directory, coord.JOURNAL_NAME), "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(live) + "\n")
+            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+                self.assertEqual(serve.read_project_journal("demo"), [dated, live])
 
 
 if __name__ == "__main__":
