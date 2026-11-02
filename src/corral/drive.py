@@ -2230,8 +2230,11 @@ def _mint_claim(store, gated, *, host, now, kind=None, hub=None):
     of minting, so there is still one minter; a hub conflict skips as
     a lost race naming the holder, and a dead hub skips as hub
     unreachable. A lost local race names the holder; any other refusal
-    names itself. `kind` overrides the reported kind for effective-kind
-    rows.
+    names itself. When the hub granted first and the local claim then
+    loses the race, the just-granted hub row is released best-effort
+    with the receipt's agent and epoch, so the next pass cannot fence
+    the innocent local holder. `kind` overrides the reported kind for
+    effective-kind rows.
     """
     title_kind = kind if kind is not None else gated.kind
     ref = f"{gated.repo}#{gated.number}"
@@ -2259,6 +2262,11 @@ def _mint_claim(store, gated, *, host, now, kind=None, hub=None):
         else:
             store.claim(gated.repo, gated.number, agent, host, now=now, epoch=adopted)
     except board.Claimed:
+        if hub is not None and adopted is not None:
+            try:
+                hub.release(gated.repo, gated.number, agent, adopted)
+            except (HubGone, HubConflict, HubConfigError):
+                pass
         try:
             current, _ = store.item(gated.repo, gated.number, now=now)
         except (board.StoreError, sqlite3.Error) as err:
