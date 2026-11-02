@@ -380,11 +380,57 @@ class SliceNamesTest(unittest.TestCase):
                 units.project_slice(bad)
 
 
+class SliceCgroupTest(unittest.TestCase):
+    def test_a_project_slice_maps_under_the_user_service(self):
+        path = units.project_cgroup("web", uid=1000)
+        self.assertEqual(
+            path,
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+            "/corral.slice/corral-web.slice",
+        )
+
+    def test_an_agent_leaf_maps_under_its_project_slice(self):
+        path = units.agent_cgroup("web", "corral-agent-lib-5", uid=1000)
+        self.assertEqual(
+            path,
+            "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
+            "/corral.slice/corral-web.slice/corral-agent-lib-5.service",
+        )
+
+    def test_a_bad_project_or_unit_cannot_name_a_cgroup(self):
+        for bad in ("", "a/b"):
+            with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
+                units.project_cgroup(bad, uid=1000)
+        with self.assertRaises(units.UnitsError):
+            units.agent_cgroup("web", "not a unit", uid=1000)
+
+
 class DelegationTest(unittest.TestCase):
     def test_the_controllers_file_names_the_user_slice(self):
         path = units.controllers_path(uid=1000)
         self.assertIn("user-1000.slice", path)
         self.assertTrue(path.endswith("cgroup.controllers"))
+
+    def test_the_controllers_file_builds_from_the_cgroup_root(self):
+        with mock.patch.object(units, "CGROUP_ROOT", "/fake/cgroup"):
+            self.assertEqual(
+                units.controllers_path(uid=1000),
+                "/fake/cgroup/user.slice/user-1000.slice/cgroup.controllers",
+            )
+
+    def test_the_controllers_file_agrees_with_the_service_dir(self):
+        for uid in (0, 1000):
+            with self.subTest(uid=uid):
+                self.assertEqual(
+                    os.path.dirname(units.controllers_path(uid=uid)),
+                    os.path.dirname(units.user_service_dir(uid=uid)),
+                )
+
+    def test_a_non_integer_uid_is_refused(self):
+        for bad in (True, "1000", -1, 1.5):
+            with self.subTest(uid=bad):
+                with self.assertRaises(units.UnitsError):
+                    units.controllers_path(uid=bad)
 
     def test_delegated_controllers_parse_the_file(self):
         available = units.delegated_controllers(read=lambda path: "cpu memory pids\n")

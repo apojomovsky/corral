@@ -15,6 +15,7 @@ import shutil
 import socket
 import sys
 import time
+from collections.abc import Mapping
 
 OK, UNREACHABLE, USAGE = 0, 3, 4
 
@@ -24,7 +25,7 @@ SCHEMA_VERSION = 2
 
 #: Sections whose `{"error"}` body marks the server degraded.
 #: The one owner of the section names; `serve` reads through this.
-ERROR_SECTIONS = ("agents", "quota", "capacity", "disk", "drive")
+ERROR_SECTIONS = ("agents", "quota", "capacity", "resources", "disk", "drive")
 
 
 def _err(text):
@@ -158,7 +159,167 @@ def _disk(usage_fn):
     return {"paths": out}
 
 
-def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_view=None):
+def default_measured(scope, name, project=None):
+    """Measured slice use through the real cgroup files, or None.
+
+    `scope` is `"agent"` (name is the unit id) or `"project"` (name is
+    the project). Anything unreadable or unresolvable reads None: a
+    missing leaf is routine (a foreign agent, a drifted layout), so it
+    stays silent, while host-level misses surface through the pressure
+    notes instead. Never raises.
+    """
+    from corral import resources, units
+
+    try:
+        if scope == "agent":
+            if not project:
+                return None
+            directory = units.agent_cgroup(project, name)
+        elif scope == "project":
+            if not name:
+                return None
+            directory = units.project_cgroup(name)
+        else:
+            return None
+        measured, _notes = resources.read_slice_use(directory)
+        return measured
+    except Exception:  # noqa: BLE001 - a missing leaf reads null, never an error
+        return None
+
+
+def resources_section(
+    registry_view,
+    host,
+    limits,
+    pressure,
+    pressure_notes=(),
+    measured_fn=None,
+    *,
+    live_by_owner,
+    project_names,
+):
+    """The `resources` snapshot section from plain data.
+
+    Charged usage is `resources.charge_live_units` over the registry
+    view and `live_by_owner`, the same sum the launch gate admits
+    from, so totals and per-project attribution are identical: a unit
+    counts for the project its ticket names when registered, else the
+    project whose listing owns it, never an empty name. A registry
+    entry whose unit is gone holds no share and reads zero, as does
+    every entry of another state; only listed units charge. A missing
+    role reads as the default role, and an unpriced role reads as
+    zero. `live_by_owner` maps an owning project to its live unit
+    names as `resources.live_units_by_owner` builds it; `project_names`
+    holds the registered project names, passed explicitly rather than
+    derived from the listing keys. `host` scopes nothing in the sum,
+    the listing already does, and stays for the callers that pass the
+    host they listed on.
+
+    Measured use comes from `measured_fn(scope, name, project)`: one
+    call per charged agent under its owning project, one per charged
+    project; a failing call reads null. `pressure_notes` names the
+    unreadable pressure files and any unreadable units listing. Raises
+    the registry exception when the registry could not be read, so the
+    section errors with it.
+    """
+    from corral import resources
+
+    if isinstance(registry_view, Exception):
+        raise registry_view
+    if limits is None:
+        roles = {}
+        host_budget = None
+    elif isinstance(limits, resources.Limits):
+        roles = limits.roles
+        host_budget = limits.host
+    elif isinstance(limits, Mapping):
+        raw_roles = limits.get("roles")
+        if raw_roles is None:
+            roles = {}
+        elif isinstance(raw_roles, Mapping):
+            roles = raw_roles
+        else:
+            raise resources.LimitsError(
+                f"roles must be a mapping of role names to charges, not {raw_roles!r}"
+            )
+        host_budget = limits.get("host")
+    else:
+        raise resources.LimitsError(f"limits must be a Limits table, not {limits!r}")
+    if not isinstance(live_by_owner, Mapping):
+        raise resources.LimitsError(
+            f"live units must be a mapping of owner to unit names, not {live_by_owner!r}"
+        )
+    names = set(project_names)
+    charged, per_unit = resources.charge_live_units(registry_view, live_by_owner, names, roles)
+    zeros = resources.Usage()
+    rows = []
+    for entry, state in registry_view:
+        row = _agent_row(entry, state)
+        if row["id"] in per_unit:
+            owner, cost = per_unit[row["id"]]
+            measured = None
+            if measured_fn is not None:
+                try:
+                    measured = resources.measured_dict(measured_fn("agent", row["id"], owner))
+                except Exception:  # noqa: BLE001 - a missing leaf reads null
+                    measured = None
+            rows.append(
+                {
+                    "id": row["id"],
+                    "project": row["project"],
+                    "role": row["role"],
+                    "state": state,
+                    "charged": resources.usage_dict(cost),
+                    "measured": measured,
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "id": row["id"],
+                    "project": row["project"],
+                    "role": row["role"],
+                    "state": state,
+                    "charged": resources.usage_dict(zeros),
+                    "measured": None,
+                }
+            )
+    measured_by_project = {}
+    for name in charged.by_project:
+        if measured_fn is None:
+            measured_by_project[name] = None
+            continue
+        try:
+            measured_by_project[name] = resources.measured_dict(measured_fn("project", name))
+        except Exception:  # noqa: BLE001 - a missing slice reads null
+            measured_by_project[name] = None
+    report = resources.capacity_report(
+        host_budget=host_budget,
+        charged=charged,
+        pressure=pressure,
+    )
+    return {
+        "schema_version": report["schema_version"],
+        "host_budget": report["host_budget"],
+        "charged": report["charged"],
+        "by_project": report["by_project"],
+        "measured_by_project": measured_by_project,
+        "agents": rows,
+        "pressure": report["pressure"],
+        "notes": list(pressure_notes or []),
+    }
+
+
+def build(
+    now,
+    host,
+    registry_view,
+    quota_view,
+    settings,
+    usage_fn=None,
+    drive_view=None,
+    resources_view=None,
+):
     """The snapshot document from plain data (pure, except disk paths).
 
     `registry_view` is `[(entry, status)]` as `registry.visible` returns,
@@ -169,8 +330,11 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_v
     raised. `usage_fn(path)` reports `(total, used, free)` and defaults
     to `shutil.disk_usage`. `drive_view` is the dict `drive.drive_status`
     returns, or the exception reading it raised; None reads as a section
-    error, since nothing collected it. Sections fail independently: a
-    broken one reads `{"error": ...}` while the rest still print.
+    error, since nothing collected it. `resources_view` is the dict
+    `resources_section` returns, or the exception reading it raised;
+    None reads as a section error too, and a broken registry errors it
+    like the capacity section. Sections fail independently: a broken
+    one reads `{"error": ...}` while the rest still print.
     """
     if usage_fn is None:
         usage_fn = shutil.disk_usage
@@ -195,6 +359,14 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_v
             capacity = _capacity(registry_view, settings, host)
         except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
             capacity = _section_error(exc)
+    if isinstance(registry_view, Exception):
+        resources = _section_error(registry_view)
+    elif isinstance(resources_view, Exception):
+        resources = _section_error(resources_view)
+    elif resources_view is None:
+        resources = _section_error(ValueError("resources section not collected"))
+    else:
+        resources = resources_view
     try:
         disk = _disk(usage_fn)
     except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
@@ -213,6 +385,7 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_v
         "agents": agents,
         "quota": quota,
         "capacity": capacity,
+        "resources": resources,
         "disk": disk,
         "drive": drive,
     }
@@ -271,6 +444,41 @@ def _show(doc):
     else:
         _err(
             f"capacity: {capacity.get('error', 'unreadable') if isinstance(capacity, dict) else 'unreadable'}"
+        )
+    resources = doc.get("resources")
+    if isinstance(resources, dict) and isinstance(resources.get("charged"), dict):
+        charged = resources["charged"]
+        budget = resources.get("host_budget") or {}
+        parts = []
+        for dim, short, unit in (
+            ("cpu_m", "cpu", "m"),
+            ("memory_mb", "mem", "MB"),
+            ("pids", "pids", ""),
+        ):
+            used = charged.get(dim)
+            whole = budget.get(dim)
+            parts.append(
+                f"{short} {used}/{whole}{unit}" if whole is not None else f"{short} {used}{unit}"
+            )
+        print(f"resources: charged {', '.join(parts)}")
+        pressure = resources.get("pressure") or {}
+        load = pressure.get("load_per_cpu")
+        mem = pressure.get("mem_available_pct")
+        if load is None and mem is None:
+            print("pressure: unknown")
+        else:
+            bits = []
+            if load is not None:
+                bits.append(f"load {load:.2f}/cpu")
+            if mem is not None:
+                bits.append(f"mem {mem:.1f}% avail")
+            bits.append("saturated" if pressure.get("saturated") else "ok")
+            print(f"pressure: {', '.join(bits)}")
+        for note in resources.get("notes") or []:
+            print(f"  note: {note}")
+    else:
+        _err(
+            f"resources: {resources.get('error', 'unreadable') if isinstance(resources, dict) else 'unreadable'}"
         )
     disk = doc.get("disk")
     if isinstance(disk, dict) and "paths" in disk:
@@ -371,11 +579,24 @@ def collect_kwargs() -> dict:
 
     One shared helper so the `snapshot` verb and `serve.collect`
     cannot diverge: settings load, registry config, validated limits,
-    and the registry, quota and drive readers in that order.
-    Settings and limit errors propagate; section readers fail into
-    the returned values, never raise.
+    the host budget, and the registry, quota, drive and pressure
+    readers in that order. Settings and limit errors propagate;
+    section readers fail into the returned values, never raise. The
+    budget, pressure and slice readers never touch the ledger: the
+    hub path built from this report cannot write it.
     """
-    from corral import accounts, admission, drive, quota_ledger, quotacli, registry, settings
+    from corral import (
+        accounts,
+        admission,
+        drive,
+        projects,
+        quota_ledger,
+        quotacli,
+        registry,
+        resources,
+        settings,
+        units,
+    )
 
     resolved = settings.load(root=_settings_root(os.getcwd()))
     cfg = registry.config(resolved)
@@ -387,6 +608,7 @@ def collect_kwargs() -> dict:
     admission.validate_limits(
         admission.Limits(total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"])
     )
+    limits = resources.config(resolved)
     low_pct = resolved["quota.low_pct"]
     now = time.time()
     host = socket.gethostname()
@@ -411,6 +633,41 @@ def collect_kwargs() -> dict:
         )
     except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
         drive_view = exc
+    pressure, pressure_notes = resources.read_pressure()
+    notes = list(pressure_notes)
+    try:
+        registered = projects.load_all()
+    except Exception as exc:  # noqa: BLE001 - without names nothing is attributable
+        resources_view = exc
+    else:
+        own_prefix = resolved["agents.unit_prefix"]
+        local = next(
+            (entry.name for entry in registered if entry.unit_prefix == own_prefix),
+            own_prefix,
+        )
+        try:
+            listing = resources.live_units_by_owner(
+                [(entry.name, entry.unit_prefix) for entry in registered],
+                local,
+                own_prefix,
+                units.list_units,
+            )
+        except Exception as exc:  # noqa: BLE001 - an unread listing charges nothing, noted
+            notes.append(f"units listing unreadable: {error_text(exc)}")
+            listing = {}
+        try:
+            resources_view = resources_section(
+                registry_view,
+                host,
+                limits,
+                pressure,
+                notes,
+                default_measured,
+                live_by_owner=listing,
+                project_names=[entry.name for entry in registered],
+            )
+        except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+            resources_view = exc
     return {
         "now": now,
         "host": host,
@@ -419,6 +676,7 @@ def collect_kwargs() -> dict:
         "settings": plain,
         "usage_fn": shutil.disk_usage,
         "drive_view": drive_view,
+        "resources_view": resources_view,
     }
 
 
