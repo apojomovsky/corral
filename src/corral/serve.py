@@ -5,6 +5,8 @@ S1 covers the request router, `GET /v1/snapshot` from `snapshot.build`,
 S2 adds the `serve.*` settings, the token file, the bind rules, CORS and
 the `serve` verb. S3 adds the filtered views: `/v1/agents`,
 `/v1/quota`, `/v1/capacity`, `/v1/disks`, `/v1/board` and `/v1/tail`.
+S5 adds the snapshot TTL cache, the generation counter with `ETag`/`304`,
+and the request counters in `/v1/health`.
 Every endpoint reads local files through injected readers, so the API
 can never disagree with the CLI. No `gh`, no network, no service
 control in this module.
@@ -24,6 +26,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import asdict
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
@@ -231,8 +234,18 @@ def _board_row(item: board.Item, fresh: bool, claim: board.Claim | None) -> dict
     return row
 
 
+def _etag(generation: int) -> str:
+    """The ETag for a snapshot generation: the counter, quoted."""
+    return f'"{generation}"'
+
+
+def _fresh_headers(etag: str, now: float) -> tuple:
+    """The caching headers for a fresh snapshot-derived reply."""
+    return (("ETag", etag), ("Last-Modified", formatdate(now, usegmt=True)))
+
+
 class _State:
-    """One server's injected builder, board, tail, clock, auth, CORS, and counters."""
+    """One server's injected builder, board, tail, clock, auth, CORS, cache, and counters."""
 
     def __init__(
         self,
@@ -245,6 +258,7 @@ class _State:
         board_open: Callable[[], board.Store] | None = None,
         tail_fn: Callable[[str, int, int], str] | None = None,
         tail_max: int = 200,
+        snapshot_ttl_s: float = 2,
     ) -> None:
         self.build = build
         self.clock = clock
@@ -259,6 +273,10 @@ class _State:
         self.board_open = board_open
         self.tail_fn = tail_fn
         self.tail_max = tail_max
+        self.snapshot_ttl_s = snapshot_ttl_s
+        self.cached_doc: dict | None = None
+        self.cached_at: float | None = None
+        self.generation = 0
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -285,11 +303,13 @@ class _Handler(BaseHTTPRequestHandler):
             return origin
         return None
 
-    def _send_json(self, code: int, obj: dict) -> None:
+    def _send_json(self, code: int, obj: dict, headers: tuple = ()) -> None:
         body = json.dumps(obj).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        for name, value in headers:
+            self.send_header(name, value)
         echo = self._echo_origin()
         if echo is not None:
             self.send_header("Access-Control-Allow-Origin", echo)
@@ -338,36 +358,70 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_json(401, {"error": UNAUTHORIZED})
         return ok
 
-    def _read_doc(self) -> tuple[dict | None, str | None]:
-        try:
-            doc = self.server_state.build()
-        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
-            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
-            return None, UNAVAILABLE
-        if not isinstance(doc, dict):
-            print(
-                "corral serve: snapshot builder returned a non-dict document",
-                file=sys.stderr,
-            )
-            return None, UNAVAILABLE
-        return doc, None
+    def _cached_doc(self) -> tuple[dict | None, int | None, float, str | None]:
+        """The snapshot for this request: a TTL cache hit or a fresh build.
+
+        Returns the document, its generation, the request `now`, or the
+        generic 500 body when the build failed. A failed build never
+        populates the cache, so the next request retries. A TTL of zero
+        or less rebuilds on every request.
+        """
+        state = self.server_state
+        with state.lock:
+            now = state.clock()
+            if state.cached_at is not None and now - state.cached_at < state.snapshot_ttl_s:
+                return state.cached_doc, state.generation, now, None
+            try:
+                doc = state.build()
+            except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+                print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+                return None, None, now, UNAVAILABLE
+            if not isinstance(doc, dict):
+                print(
+                    "corral serve: snapshot builder returned a non-dict document",
+                    file=sys.stderr,
+                )
+                return None, None, now, UNAVAILABLE
+            state.generation += 1
+            state.cached_doc = doc
+            state.cached_at = now
+            return doc, state.generation, now, None
+
+    def _is_fresh(self, etag: str) -> bool:
+        """Whether the client's copy (If-None-Match) is still current."""
+        presented = self.headers.get("If-None-Match")
+        if presented is None:
+            return False
+        return any(tag.strip() in (etag, "*") for tag in presented.split(","))
+
+    def _send_not_modified(self, etag: str) -> None:
+        """Answer 304 and count it; the client reuses its cached copy."""
+        state = self.server_state
+        with state.lock:
+            state.not_modified += 1
+        self._send_empty(304, (("ETag", etag),))
 
     def _serve_snapshot(self) -> None:
-        doc, error = self._read_doc()
-        if error is not None:
-            self._send_json(500, {"error": error})
-        else:
-            assert doc is not None  # _read_doc pairs a missing doc with an error
-            self._send_json(200, doc)
-
-    def _serve_health(self) -> None:
-        state = self.server_state
-        now = state.clock()
-        doc, error = self._read_doc()
+        doc, generation, now, error = self._cached_doc()
         if error is not None:
             self._send_json(500, {"error": error})
             return
-        assert doc is not None  # _read_doc pairs a missing doc with an error
+        assert doc is not None  # _cached_doc pairs a missing doc with an error
+        assert generation is not None  # _cached_doc pairs a missing generation with an error
+        etag = _etag(generation)
+        if self._is_fresh(etag):
+            self._send_not_modified(etag)
+        else:
+            self._send_json(200, doc, _fresh_headers(etag, now))
+
+    def _serve_health(self) -> None:
+        state = self.server_state
+        doc, generation, now, error = self._cached_doc()
+        if error is not None:
+            self._send_json(500, {"error": error})
+            return
+        assert doc is not None  # _cached_doc pairs a missing doc with an error
+        assert generation is not None  # _cached_doc pairs a missing generation with an error
         degraded = sorted(
             name for name in ERROR_SECTIONS if snapshot.is_error_section(doc.get(name))
         )
@@ -376,6 +430,10 @@ class _Handler(BaseHTTPRequestHandler):
         with state.lock:
             total = state.total
             not_modified = state.not_modified
+        etag = _etag(generation)
+        if self._is_fresh(etag):
+            self._send_not_modified(etag)
+            return
         self._send_json(
             200,
             {
@@ -387,26 +445,38 @@ class _Handler(BaseHTTPRequestHandler):
                 "requests_304": not_modified,
                 "degraded": degraded,
             },
+            _fresh_headers(etag, now),
         )
 
     def _serve_agents(self) -> None:
-        doc, error = self._read_doc()
+        doc, generation, now, error = self._cached_doc()
         if error is not None:
             self._send_json(500, {"error": error})
+            return
+        assert doc is not None  # _cached_doc pairs a missing doc with an error
+        assert generation is not None  # _cached_doc pairs a missing generation with an error
+        etag = _etag(generation)
+        if self._is_fresh(etag):
+            self._send_not_modified(etag)
         else:
-            assert doc is not None  # _read_doc pairs a missing doc with an error
             self._send_json(
-                200, {"fleet_header": doc.get("fleet_header"), "agents": doc.get("agents")}
+                200,
+                {"fleet_header": doc.get("fleet_header"), "agents": doc.get("agents")},
+                _fresh_headers(etag, now),
             )
 
     def _serve_section(self, section: str) -> None:
-        now = self.server_state.clock()
-        doc, error = self._read_doc()
+        doc, generation, now, error = self._cached_doc()
         if error is not None:
             self._send_json(500, {"error": error})
+            return
+        assert doc is not None  # _cached_doc pairs a missing doc with an error
+        assert generation is not None  # _cached_doc pairs a missing generation with an error
+        etag = _etag(generation)
+        if self._is_fresh(etag):
+            self._send_not_modified(etag)
         else:
-            assert doc is not None  # _read_doc pairs a missing doc with an error
-            self._send_json(200, {"now": now, section: doc.get(section)})
+            self._send_json(200, {"now": now, section: doc.get(section)}, _fresh_headers(etag, now))
 
     def _serve_board(self) -> None:
         query = self._query()
@@ -567,6 +637,7 @@ def make_server(
     board_open: Callable[[], board.Store] | None = None,
     tail_fn: Callable[[str, int, int], str] | None = None,
     tail_max: int = 200,
+    snapshot_ttl_s: float = 2,
 ) -> ThreadingHTTPServer:
     """An HTTP server answering the v1 routes.
 
@@ -576,7 +647,9 @@ def make_server(
     ephemeral one; the bound address reads as `server.server_address`.
     `board_open` opens the board store per board request (`board.open_store`
     by default); `tail_fn` renders tail output (`read_tail` by default),
-    capped at `tail_max` lines.
+    capped at `tail_max` lines. Snapshot builds are shared between
+    requests inside `snapshot_ttl_s` seconds, and each rebuild bumps a
+    generation counter served as the `ETag`.
     The caller enforces the bind rules; `token_required` with a
     `token_reader` enforces the bearer token per request.
     """
@@ -590,6 +663,7 @@ def make_server(
         board_open=board_open,
         tail_fn=tail_fn,
         tail_max=tail_max,
+        snapshot_ttl_s=snapshot_ttl_s,
     )
 
     class _BoundHandler(_Handler):
@@ -671,6 +745,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
             token_required=remote,
             token_reader=lambda: read_token(token_path),
             tail_max=resolved["serve.tail_max"],
+            snapshot_ttl_s=resolved["serve.snapshot_ttl_s"],
         )
     except OSError as err:
         if err.errno == errno.EADDRINUSE:
