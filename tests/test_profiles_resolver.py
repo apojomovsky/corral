@@ -9,7 +9,8 @@ import os
 import tempfile
 import unittest
 
-from corral import paths, profiles, settings
+from corral import board, paths, profiles, settings, tracker as iface
+from tests.test_tracker import FakeTracker, reading
 
 
 def profile(name, runtime="omp"):
@@ -196,6 +197,18 @@ class TicketAssignment(unittest.TestCase):
             profiles.ticket_assignment(
                 labels=[], extra={"profile": ["fast"]}, repo=REPO, number=NUMBER
             )
+
+    def test_a_string_labels_value_is_refused_not_read_as_characters(self):
+        for labels in ("profile:fast", None, 7, {"profile:fast": True}):
+            with self.subTest(labels=labels):
+                with self.assertRaises(settings.SettingsError):
+                    profiles.ticket_assignment(labels=labels, extra={}, repo=REPO, number=NUMBER)
+
+    def test_a_non_dict_extra_container_is_refused(self):
+        for extra in ("profile:fast", ["profile:fast"], 7):
+            with self.subTest(extra=extra):
+                with self.assertRaises(settings.SettingsError):
+                    profiles.ticket_assignment(labels=[], extra=extra, repo=REPO, number=NUMBER)
 
     def test_agreeing_label_and_field_resolve_together(self):
         name, source = profiles.ticket_assignment(
@@ -423,6 +436,57 @@ class FailClosed(unittest.TestCase):
                 with self.assertRaises(settings.SettingsError):
                     resolve(parsed("fast"), sel(default="fast"), **kw)
 
+    def test_an_unknown_committed_key_is_exit_4(self):
+        with self.assertRaises(settings.SettingsError) as ctx:
+            resolve(parsed("fast"), sel(default="fast"), committed={"bogus": "fast"})
+        self.assertIn("bogus", str(ctx.exception))
+
+    def test_a_committed_default_of_the_wrong_type_is_exit_4(self):
+        for default in (7, "", ["fast"], {"profile": "fast"}):
+            with self.subTest(default=default):
+                with self.assertRaises(settings.SettingsError):
+                    resolve(parsed("fast"), sel(), committed={"default": default})
+
+    def test_a_falsy_mistyped_committed_table_is_refused_not_dropped(self):
+        for committed in (
+            {"repos": []},
+            {"repos": ""},
+            {"repos": 0},
+            {"repos": False},
+            {"roles": []},
+            {"roles": ""},
+            {"roles": 0},
+            {"roles": False},
+        ):
+            with self.subTest(committed=committed):
+                with self.assertRaises(settings.SettingsError):
+                    resolve(parsed("fast"), sel(), committed=committed)
+
+    def test_selections_none_reads_as_empty(self):
+        found, provenance = profiles.resolve(
+            parsed("fast"),
+            None,  # ty: ignore[invalid-argument-type]
+            repo=REPO,
+            role=ROLE,
+            number=NUMBER,
+            now=T0,
+            committed={"default": "fast"},
+        )
+        self.assertEqual((found.name, provenance.layer), ("fast", 6))
+
+    def test_an_empty_flag_string_is_exit_4_naming_the_value(self):
+        with self.assertRaises(settings.SettingsError) as ctx:
+            profiles.resolve(
+                parsed("fast"),
+                sel(),
+                repo=REPO,
+                role=ROLE,
+                number=NUMBER,
+                now=T0,
+                flag="",
+            )
+        self.assertIn("''", str(ctx.exception))
+
 
 class Explain(unittest.TestCase):
     def test_the_chain_names_every_layer_with_its_source(self):
@@ -505,3 +569,147 @@ class Explain(unittest.TestCase):
         self.assertEqual(len(winners), 1)
         self.assertEqual(winners[0].profile, found.name)
         self.assertEqual(winners[0].layer, provenance.layer)
+
+
+def stored_row(directory, *, labels=(), extra=None, fetched_at):
+    """A board store holding one row for the ticket, fetched at `fetched_at`."""
+    store = board.open_store(os.path.join(directory, "board.db"))
+    store.upsert_item(
+        board.Item(
+            repo=REPO,
+            number=NUMBER,
+            kind="issue",
+            title="Title",
+            body="Body",
+            state="open",
+            author="operator",
+            labels=list(labels),
+            priority="",
+            assignees=[],
+            url=f"https://example.com/{REPO}/{NUMBER}",
+            tracker_updated_at=fetched_at,
+            extra=dict(extra or {}),
+        ),
+        operators=["operator"],
+        now=fetched_at,
+    )
+    return store
+
+
+STALE_AFTER = 3600.0
+
+
+def load(store, tracker, **kw):
+    args = {"repo": REPO, "number": NUMBER, "now": T0, "stale_after": STALE_AFTER}
+    args.update(kw)
+    return profiles.load_tracker_assignment(store, tracker, **args)
+
+
+class StoreAssignment(unittest.TestCase):
+    def test_a_fresh_labels_row_resolves_end_to_end(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(directory, labels=["ready", "profile:fast"], fetched_at=T0)
+            fake = FakeTracker([])
+            name, source, skip = load(store, fake)
+        self.assertIsNone(skip)
+        self.assertEqual(name, "fast")
+        self.assertIn("profile:fast", source)
+        self.assertEqual(fake.calls, [])
+        found, provenance = resolve(parsed("fast", "other"), tracker=name, tracker_source=source)
+        self.assertEqual((found.name, provenance.layer), ("fast", 2))
+
+    def test_a_fresh_board_field_row_resolves_end_to_end(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(
+                directory, labels=["ready"], extra={"profile": "fast"}, fetched_at=T0
+            )
+            name, source, skip = load(store, FakeTracker([]))
+        self.assertIsNone(skip)
+        self.assertEqual(name, "fast")
+        self.assertIn("profile", source)
+        found, provenance = resolve(parsed("fast", "other"), tracker=name, tracker_source=source)
+        self.assertEqual((found.name, provenance.layer), ("fast", 2))
+
+    def test_a_row_without_assignment_reads_absent(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(directory, labels=["ready"], fetched_at=T0)
+            fake = FakeTracker([])
+            name, source, skip = load(store, fake)
+        self.assertIsNone(skip)
+        self.assertIsNone(name)
+        self.assertEqual(source, "")
+        self.assertEqual(fake.calls, [])
+        found, provenance = resolve(
+            parsed("other"), sel(default="other"), tracker=name, tracker_source=source
+        )
+        self.assertEqual((found.name, provenance.layer), ("other", 6))
+
+    def test_a_missing_row_skips_as_withdrawn(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = board.open_store(os.path.join(directory, "board.db"))
+            fake = FakeTracker([])
+            name, source, skip = load(store, fake)
+        self.assertIsNone(name)
+        self.assertEqual(source, "")
+        self.assertIn("withdrawn", skip)
+        self.assertEqual(fake.calls, [])
+
+    def test_a_stale_row_is_reread_live_not_trusted(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(directory, labels=["ready"], fetched_at=T0 - 2 * STALE_AFTER)
+            fake = FakeTracker([reading(repo=REPO, number=NUMBER, labels=("profile:live",))])
+            name, source, skip = load(store, fake)
+        self.assertIsNone(skip)
+        self.assertEqual(name, "live")
+        self.assertIn("profile:live", source)
+        self.assertIn(("item", REPO, NUMBER), fake.calls)
+
+    def test_a_fresh_row_never_touches_a_failing_tracker(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(directory, labels=["profile:fast"], fetched_at=T0)
+            fake = FakeTracker([])
+            fake.item_errors[(REPO, NUMBER)] = "down"
+            name, _, skip = load(store, fake)
+        self.assertIsNone(skip)
+        self.assertEqual(name, "fast")
+        self.assertEqual(fake.calls, [])
+
+    def test_a_stale_row_with_an_unreachable_tracker_raises_exit_3(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(directory, labels=["ready"], fetched_at=T0 - 2 * STALE_AFTER)
+            fake = FakeTracker([])
+            fake.item_errors[(REPO, NUMBER)] = "down"
+            with self.assertRaises(iface.TrackerError) as ctx:
+                load(store, fake)
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_a_stale_row_without_a_tracker_uses_the_cached_row(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(
+                directory,
+                labels=["profile:cached"],
+                fetched_at=T0 - 2 * STALE_AFTER,
+            )
+            name, _, skip = load(store, None)
+        self.assertIsNone(skip)
+        self.assertEqual(name, "cached")
+
+    def test_a_corrupt_shared_value_fails_closed_instead_of_skipping(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(
+                directory,
+                labels=["profile:a", "profile:b"],
+                fetched_at=T0,
+            )
+            with self.assertRaises(settings.SettingsError):
+                load(store, FakeTracker([]))
+
+    def test_a_store_pin_disagreement_names_both_sources(self):
+        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+            store = stored_row(directory, labels=["profile:fast"], fetched_at=T0)
+            name, source, _ = load(store, FakeTracker([]))
+            selections = sel(pins={profiles.pin_key(REPO, NUMBER): "other"})
+            with self.assertRaises(settings.SettingsError) as ctx:
+                resolve(parsed("fast", "other"), selections, tracker=name, tracker_source=source)
+        self.assertIn("profile:fast", str(ctx.exception))
+        self.assertIn("pin", str(ctx.exception))
