@@ -66,8 +66,10 @@ own, and no pass touches the timer. The timer wakes one pass every five
 minutes and catches up one missed tick after a reboot (`Persistent`).
 It starts `corral drive` from the `make install` location; when corral
 lives elsewhere, edit the installed `ExecStart` line, which corral
-never rewrites. A different cadence is the same edit, on the installed
-`OnCalendar` line. The timer runs while the user manager runs, so keep
+never rewrites. A different cadence is the `drive.period` setting
+plus a reinstall, which bakes it into the installed `OnCalendar`
+line (a hand edit there also works, until the next reinstall
+overwrites it). The timer runs while the user manager runs, so keep
 linger on (the doctor checks that too). `corral doctor` reports a
 missing or disabled timer, a bad project registration, and a policy
 entry that does not resolve.

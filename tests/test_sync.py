@@ -320,6 +320,26 @@ class ResyncAdoptionTest(StoreCase):
         row, _ = self.store.item(REPO, 1, now=T0)
         self.assertEqual(row.agent, "")
 
+    def test_a_loop_namespaced_label_is_never_adopted(self):
+        fake = FakeTracker([reading(number=1, agent="drive-host-9-0-acme--app-1", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, "")
+        self.assertEqual(len(result.conflicts), 1)
+        self.assertIn("drive-host-9-0-acme--app-1", result.conflicts[0])
+
+    def test_a_matching_loop_namespaced_claim_reports_no_conflict(self):
+        self.stored(1)
+        held = self.store.claim(REPO, 1, "drive-host-1-x", "host-1", now=T0 - 50)
+        fake = FakeTracker([reading(number=1, agent="drive-host-1-x", updated_at=T0)])
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.conflicts, ())
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.agent, held.agent)
+
+    def test_the_reserved_namespaces_agree_with_the_loop(self):
+        self.assertIn(drive.MANAGED_PREFIX, sync.RESERVED_AGENT_PREFIXES)
+
 
 class SyncAllTest(StoreCase):
     OTHER = "acme/api"

@@ -193,7 +193,8 @@ def _runtime_of(comm, argv0):
             names.add(os.path.basename(head[0]))
     if "claude" in names or "muse" in names:
         return _RUNTIME_NAMES["muse"]
-    if any(name.startswith(muse_adapter.BINARY_PREFIX) for name in names):
+    prefix = muse_adapter.BINARY_PREFIX
+    if any(name.startswith(prefix) and len(name) > len(prefix) for name in names):
         return _RUNTIME_NAMES["muse"]
     if "omp" in names:
         return _RUNTIME_NAMES["omp"]

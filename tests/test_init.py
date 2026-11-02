@@ -299,6 +299,7 @@ TAIL = """# Defaults: uncomment to override.
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
+# drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -426,6 +427,7 @@ commits.conventional = false
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
+# drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -1497,6 +1499,51 @@ class UninitCase(Fixture):
             remove(os.path.join(self.root, "..", "outside"))
         with self.assertRaises(init.InitError):
             remove(self.root)
+
+
+class RegistrationConflictsCase(unittest.TestCase):
+    """`_registration_conflicts` compares both sides terminated."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.directory = tmp.name
+        self.root = os.path.realpath(tmp.name)
+
+    def write_registration(self, name, prefix):
+        path = os.path.join(self.directory, f"{name}.toml")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(f"name = {name!r}\nunit_prefix = {prefix!r}\nroot = {self.root!r}\n")
+
+    def test_stored_terminated_prefix_collides_with_unterminated_caller(self):
+        self.write_registration("other", "other-agent-")
+        with self.assertRaises(init.InitError) as ctx:
+            init._registration_conflicts(
+                self.directory, "target", "new", "other-agent", "/elsewhere"
+            )
+        self.assertIn("other-agent-", str(ctx.exception))
+
+    def test_stored_unterminated_prefix_collides_with_unterminated_caller(self):
+        self.write_registration("other", "other-agent")
+        with self.assertRaises(init.InitError):
+            init._registration_conflicts(
+                self.directory, "target", "new", "other-agent", "/elsewhere"
+            )
+
+    def test_stored_terminated_prefix_collides_with_terminated_caller(self):
+        self.write_registration("other", "other-agent-")
+        with self.assertRaises(init.InitError):
+            init._registration_conflicts(
+                self.directory, "target", "new", "other-agent-", "/elsewhere"
+            )
+
+    def test_own_file_is_skipped(self):
+        self.write_registration("new", "other-agent-")
+        init._registration_conflicts(self.directory, "target", "new", "other-agent-", "/elsewhere")
+
+    def test_distinct_prefixes_do_not_collide(self):
+        self.write_registration("other", "other-agent-")
+        init._registration_conflicts(self.directory, "target", "new", "new-agent-", "/elsewhere")
 
 
 if __name__ == "__main__":

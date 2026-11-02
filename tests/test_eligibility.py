@@ -204,6 +204,19 @@ class LoaderTest(unittest.TestCase):
         self.assertIn("blue", str(ctx.exception))
         self.assertIn(entry, str(ctx.exception))
 
+    def test_a_spec_creation_failure_names_the_project_and_entry(self):
+        entry = self.path_entry
+        with mock.patch.object(
+            eligibility.importlib.util,
+            "spec_from_file_location",
+            side_effect=ValueError("no loader for this suffix"),
+        ):
+            with self.assertRaises(eligibility.EligibilityError) as ctx:
+                eligibility.load_policy(entry, project="blue")
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertIn("blue", str(ctx.exception))
+        self.assertIn(entry, str(ctx.exception))
+
     def test_relative_path_entry_resolves_against_base_not_cwd(self):
         ops_root = os.path.join(self.tmp, "ops")
         os.makedirs(os.path.join(ops_root, "policies"))

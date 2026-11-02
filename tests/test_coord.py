@@ -252,6 +252,11 @@ class CoordApiTest(unittest.TestCase):
         self.assertIsNone(coord._runtime_of("x", "muse-helper run"))
         self.assertIsNone(coord._runtime_of("musex", None))
 
+    def test_runtime_of_ignores_the_bare_versioned_prefix(self):
+        self.assertIsNone(coord._runtime_of("muse-bin-", None))
+        self.assertIsNone(coord._runtime_of("x", "muse-bin-"))
+        self.assertEqual(coord._runtime_of("muse-bin-1", None), "muse")
+
 
 class CoordCliTest(unittest.TestCase):
     def setUp(self):
