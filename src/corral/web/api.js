@@ -98,6 +98,128 @@ export function loadSnapshot(token) {
   return fetchJson("/v1/snapshot", token);
 }
 
+// The agent-detail tail cadence, in milliseconds. Failures back off
+// on the shared table; successes stay on this cadence.
+export const TAIL_POLL_MS = 3000;
+
+async function readText(resp) {
+  try {
+    return await resp.text();
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchText(path, token, { timeoutMs = 10000 } = {}) {
+  const ctrl = new AbortController();
+  const timer = window.setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const headers = {};
+    if (token) {
+      headers["Authorization"] = "Bearer " + token;
+    }
+    const resp = await window.fetch(path, {
+      cache: "no-store",
+      headers,
+      signal: ctrl.signal,
+    });
+    return { status: resp.status, text: await readText(resp) };
+  } catch {
+    // Same contract as fetchJson: a status the HTTP layer can never
+    // send, so the caller takes the failure branch without its own
+    // throw and the poll loop survives.
+    return { status: 0, text: null };
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+// One ticket's activity lines for the detail tail pane.
+export function loadTail(token, repo, number) {
+  return fetchText(
+    "/v1/tail?repo=" + encodeURIComponent(repo) + "&number=" + encodeURIComponent(String(number)),
+    token,
+  );
+}
+
+// Whether a row names a ticket. Ticket-less rows (null repo or
+// number, which the server allows) get a fields-only detail.
+export function hasTicket(row) {
+  return (
+    !!row &&
+    row.repo !== null &&
+    row.repo !== undefined &&
+    row.number !== null &&
+    row.number !== undefined
+  );
+}
+
+// The detail key for a row: its id when it has one, else its ticket
+// plus role, so rows sharing one ticket still get their own detail.
+export function agentKey(row) {
+  if (!row || typeof row !== "object") {
+    return null;
+  }
+  if (row.id !== null && row.id !== undefined && row.id !== "") {
+    return { kind: "id", id: String(row.id) };
+  }
+  if (hasTicket(row)) {
+    return {
+      kind: "ticket",
+      repo: String(row.repo),
+      number: String(row.number),
+      role: row.role === null || row.role === undefined ? null : String(row.role),
+    };
+  }
+  return null;
+}
+
+export function detailHash(key) {
+  if (key.kind === "id") {
+    return "#/agent?id=" + encodeURIComponent(key.id);
+  }
+  let hash =
+    "#/agent?repo=" + encodeURIComponent(key.repo) + "&number=" + encodeURIComponent(key.number);
+  if (key.role !== null) {
+    hash += "&role=" + encodeURIComponent(key.role);
+  }
+  return hash;
+}
+
+// The row a detail key names in a fresh document, or null when
+// nothing matches. Never a guessed neighbour.
+export function resolveAgent(doc, key) {
+  const rows = doc && Array.isArray(doc.agents) ? doc.agents : [];
+  if (!key || typeof key !== "object") {
+    return null;
+  }
+  for (const row of rows) {
+    if (!row || typeof row !== "object") {
+      continue;
+    }
+    if (key.kind === "id") {
+      if (row.id !== null && row.id !== undefined && String(row.id) === key.id) {
+        return row;
+      }
+    } else if (key.kind === "ticket") {
+      if (!hasTicket(row)) {
+        continue;
+      }
+      if (String(row.repo) !== key.repo || String(row.number) !== key.number) {
+        continue;
+      }
+      if (
+        key.role !== null &&
+        (row.role === null || row.role === undefined || String(row.role) !== key.role)
+      ) {
+        continue;
+      }
+      return row;
+    }
+  }
+  return null;
+}
+
 // Milliseconds between version rechecks while the page stays open.
 // The API major is compared at each unlock, then on this cadence
 // and whenever the page becomes visible again.
