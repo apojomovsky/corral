@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, drive, launch, quota_ledger
+from corral import admission, board, drive, drivehub, launch, quota_ledger
 from corral import projects as projects_mod
 from tests.test_tracker import FakeTracker, reading
 
@@ -440,7 +440,7 @@ class CmdDriveTest(unittest.TestCase):
         old = os.environ.get("CORRAL_STATE")
         os.environ["CORRAL_STATE"] = tmp.name
         try:
-            code = drive.cmd_drive(argparse.Namespace(plan=True))
+            code = drivehub.cmd_drive(argparse.Namespace(plan=True))
         finally:
             if old is None:
                 del os.environ["CORRAL_STATE"]
@@ -504,7 +504,7 @@ class HoldLabelWiringTest(unittest.TestCase):
                 mock.patch.object(drive, "production_stopper", return_value=None),
                 mock.patch.object(drive, "run_pass", side_effect=fake_run_pass),
             ):
-                code = drive.cmd_drive(argparse.Namespace(plan=plan, drive_verb=None))
+                code = drivehub.cmd_drive(argparse.Namespace(plan=plan, drive_verb=None))
         finally:
             if old is None:
                 del os.environ["CORRAL_STATE"]
