@@ -21,15 +21,25 @@ import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
-from corral import prompts, resources, units
+from corral import pressure, prompts, resources, units
 
 #: The pressure files the doctor probes. An unreadable one reads as
 #: unknown: admission continues on charged tags and the pressure row warns.
+#: The load and memory paths resolve in `pressure`, next to the reader
+#: that parses them; the stall files have no other reader, so they live here.
 SENSOR_FILES = (
-    "/proc/loadavg",
-    "/proc/meminfo",
+    pressure.LOADAVG_PATH,
+    pressure.MEMINFO_PATH,
     "/proc/pressure/cpu",
     "/proc/pressure/memory",
+)
+
+
+#: The saturation line when no `[resources.pressure]` table sets one,
+#: resolved next to the reader that parses the values (`pressure`).
+_DEFAULT_PRESSURE_CAPS = (
+    pressure.DEFAULT_MAX_LOAD_PER_CPU,
+    pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
 )
 
 
@@ -41,8 +51,12 @@ class ResourceReadings(NamedTuple):
     ``controllers_error``, ``ledger_error`` and ``marker_error`` carry
     their unreadable or mismatched file. ``slices`` maps existing slice
     names to their kernel-reported properties, empty when no queried
-    slice exists yet, None when the listing itself failed. Tests build
-    this directly; only production reads disk.
+    slice exists yet, None when the listing itself failed. ``pressure``
+    is the measured host pressure as ``(load_per_cpu, mem_available_pct)``,
+    Nones when unknown; None means not gathered, and then the pressure
+    row skips saturation. ``pressure_caps`` is the saturation line as
+    ``(max_load_per_cpu, min_mem_available_pct)``. Tests build this
+    directly; only production reads disk.
     """
 
     host: resources.Usage | None
@@ -65,6 +79,8 @@ class ResourceReadings(NamedTuple):
     sensor_errors: tuple
     slices: Mapping[str, Mapping[str, str]] | None
     config_path: str
+    pressure: tuple[float | None, float | None] | None = None
+    pressure_caps: tuple[float, float] = _DEFAULT_PRESSURE_CAPS
 
 
 class ResourceRow(NamedTuple):
@@ -228,7 +244,12 @@ def _check_marker(state: ResourceReadings) -> ResourceRow:
 
 
 def _check_pressure(state: ResourceReadings) -> ResourceRow:
-    """The pressure sensors: unreadable reads as unknown and warns."""
+    """The pressure sensors: unreadable warns, saturation fails the row.
+
+    A saturated reading fails even when shares are free: only new
+    launches wait, running agents are never paused or killed. Unknown
+    readings never trip the line.
+    """
     if state.sensor_errors:
         return ResourceRow(
             "resources-pressure",
@@ -236,6 +257,22 @@ def _check_pressure(state: ResourceReadings) -> ResourceRow:
             f"pressure readings unreadable: {'; '.join(state.sensor_errors)}",
             "check /proc is mounted and readable, then run `corral doctor` again",
         )
+    if state.pressure is not None:
+        measured = pressure.Reading(
+            load_per_cpu=state.pressure[0], mem_available_pct=state.pressure[1]
+        )
+        hot, detail = pressure.saturated(
+            measured,
+            max_load_per_cpu=state.pressure_caps[0],
+            min_mem_available_pct=state.pressure_caps[1],
+        )
+        if hot:
+            return ResourceRow(
+                "resources-pressure",
+                "fail",
+                f"host saturated ({detail}): launches wait",
+                "wait for the load to drop, then retry the launch",
+            )
     return ResourceRow("resources-pressure", "ok", "host pressure readings are available", "")
 
 

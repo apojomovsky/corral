@@ -25,17 +25,23 @@ def req(project="web", role="worker"):
     return R.Request(project=project, role=role)
 
 
-def limits(host=(8000, 16000, 4096), projects=None, roles=None, foreign=(), gone_s=600.0):
+def limits(
+    host=(8000, 16000, 4096), projects=None, roles=None, foreign=(), gone_s=600.0, pressure=None
+):
     if host is not None:
         host = triple(*host)
     if roles is None:
         roles = {"worker": dict(WORKER), "reviewer": dict(REVIEWER)}
+    kwargs = {}
+    if pressure is not None:
+        kwargs["pressure"] = pressure
     return R.Limits(
         host=host,
         projects=dict(projects or {}),
         roles=dict(roles),
         foreign=list(foreign),
         gone_s=gone_s,
+        **kwargs,
     )
 
 
@@ -492,6 +498,90 @@ class Codes(unittest.TestCase):
             (R.OK, R.HOST_FULL, R.PROJECT_SHARE, R.PROJECT_CEILING, R.ROLE_COST),
             ("ok", "host-full", "project-share", "project-ceiling", "role-cost"),
         )
+        self.assertEqual(R.PRESSURE, "pressure")
+
+
+def hot(load_per_cpu=8.0, mem_available_pct=50.0):
+    return {"load_per_cpu": load_per_cpu, "mem_available_pct": mem_available_pct}
+
+
+class Saturated(unittest.TestCase):
+    def test_a_saturated_host_refuses_while_shares_are_free(self):
+        verdict = R.admit(req(), charged(), limits(), NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (False, "pressure"))
+        self.assertIn("load", verdict.reason)
+
+    def test_low_memory_refuses_and_names_memory(self):
+        verdict = R.admit(req(), charged(), limits(), NOW, pressure=hot(0.2, 3.0))
+        self.assertEqual((verdict.allowed, verdict.code), (False, "pressure"))
+        self.assertIn("MemAvailable", verdict.reason)
+
+    def test_an_unknown_reading_never_blocks(self):
+        verdict = R.admit(
+            req(),
+            charged(),
+            limits(),
+            NOW,
+            pressure={"load_per_cpu": None, "mem_available_pct": None},
+        )
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_no_reading_is_an_unknown_reading(self):
+        verdict = R.admit(req(), charged(), limits(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_saturation_waits_even_below_the_floor(self):
+        poor = limits(projects={"web": {"weight": 1, "cpu_floor_m": 7000}})
+        verdict = R.admit(req(), charged((8000, 16000, 4096)), poor, NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (False, "pressure"))
+
+    def test_no_host_budget_passes_a_saturated_host(self):
+        verdict = R.admit(req(), charged(), limits(host=None), NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_lax_thresholds_admit_a_hot_host(self):
+        lax = limits()
+        lax = R.Limits(
+            host=lax.host,
+            projects=lax.projects,
+            roles=lax.roles,
+            foreign=lax.foreign,
+            gone_s=lax.gone_s,
+            pressure={"max_load_per_cpu": 16.0, "min_mem_available_pct": 1.0},
+        )
+        verdict = R.admit(req(), charged(), lax, NOW, pressure=hot())
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_garbage_reading_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError) as caught:
+            R.admit(req(), charged(), limits(), NOW, pressure={"load_per_cpu": "hot"})
+        self.assertIn("pressure", str(caught.exception))
+
+
+class PressureCaps(unittest.TestCase):
+    def test_defaults_are_conservative(self):
+        caps = R.caps()
+        self.assertEqual((caps.max_load_per_cpu, caps.min_mem_available_pct), (2.0, 10.0))
+
+    def test_limits_without_caps_read_as_defaults(self):
+        verdict = R.admit(req(), charged(), limits(), NOW, pressure=hot(1.0, 50.0))
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_zero_max_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"max_load_per_cpu": 0}))
+
+    def test_a_negative_min_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"min_mem_available_pct": -1.0}))
+
+    def test_a_min_above_a_hundred_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"min_mem_available_pct": 101.0}))
+
+    def test_a_non_number_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError):
+            R.validate_limits(limits(pressure={"max_load_per_cpu": "lots"}))
 
 
 if __name__ == "__main__":

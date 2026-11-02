@@ -425,6 +425,101 @@ class Defaults(unittest.TestCase):
             self.assertEqual(hl.marker_path(), os.path.join("/x/state/corral", hl.MARKER_NAME))
 
 
+class DropIns(LedgerCase):
+    """The drop-in foreign-claim dir, merged at read, never persisted."""
+
+    def claims_dir(self):
+        return os.path.join(self.dir, hl.FOREIGN_CLAIMS_DIR)
+
+    def drop(self, name, payload):
+        os.makedirs(self.claims_dir(), exist_ok=True)
+        with open(os.path.join(self.claims_dir(), name), "w", encoding="utf-8") as handle:
+            handle.write(payload if isinstance(payload, str) else json.dumps(payload))
+
+    def test_the_claims_dir_sits_beside_the_ledger(self):
+        self.assertEqual(hl.claims_dir(self.path), os.path.join(self.dir, hl.FOREIGN_CLAIMS_DIR))
+
+    def test_a_missing_dir_reads_as_no_claims(self):
+        self.assertEqual(hl.drop_in_claims(self.claims_dir()), [])
+
+    def test_a_drop_in_merges_after_the_ledger_entries(self):
+        self.write(json.dumps({**hl.empty(), "foreign": [{"name": "ledger", "cpu_m": 1}]}))
+        self.drop("b.json", {"name": "b", "cpu_m": 2})
+        self.drop("a.json", {"name": "a", "cpu_m": 3})
+        merged = hl.load(self.path)
+        self.assertEqual([entry["name"] for entry in merged["foreign"]], ["ledger", "a", "b"])
+
+    def test_non_json_files_are_ignored(self):
+        self.drop("note.txt", "not a claim")
+        self.assertEqual(hl.drop_in_claims(self.claims_dir()), [])
+
+    def test_a_claim_without_a_name_refuses_naming_the_file(self):
+        self.drop("bad.json", {"cpu_m": 1})
+        with self.assertRaisesRegex(hl.LedgerError, r"bad\.json"):
+            hl.drop_in_claims(self.claims_dir())
+
+    def test_malformed_json_refuses_naming_the_file(self):
+        self.drop("bad.json", "{nope")
+        with self.assertRaisesRegex(hl.LedgerError, r"bad\.json"):
+            hl.drop_in_claims(self.claims_dir())
+
+    def test_a_scalar_refuses_naming_the_file(self):
+        self.drop("bad.json", "[1, 2]")
+        with self.assertRaisesRegex(hl.LedgerError, r"bad\.json"):
+            hl.drop_in_claims(self.claims_dir())
+
+    def test_an_unknown_key_refuses_naming_the_key(self):
+        self.drop("bad.json", {"name": "x", "turbo": True})
+        with self.assertRaisesRegex(hl.LedgerError, r"bad\.json.*turbo"):
+            hl.drop_in_claims(self.claims_dir())
+
+    def test_a_bad_amount_refuses_naming_the_file(self):
+        self.drop("bad.json", {"name": "x", "cpu_m": -1})
+        with self.assertRaisesRegex(hl.LedgerError, r"bad\.json"):
+            hl.drop_in_claims(self.claims_dir())
+
+    def test_claimed_at_defaults_to_the_file_mtime(self):
+        self.drop("a.json", {"name": "a", "cpu_m": 1})
+        (found,) = hl.drop_in_claims(self.claims_dir())
+        mtime = os.path.getmtime(os.path.join(self.claims_dir(), "a.json"))
+        self.assertEqual(found["claimed_at"], mtime)
+
+    def test_an_explicit_claimed_at_wins_over_the_mtime(self):
+        self.drop("a.json", {"name": "a", "cpu_m": 1, "claimed_at": 12.5})
+        (found,) = hl.drop_in_claims(self.claims_dir())
+        self.assertEqual(found["claimed_at"], 12.5)
+
+    def test_a_duplicate_name_across_ledger_and_drop_ins_refuses(self):
+        self.write(json.dumps({**hl.empty(), "foreign": [{"name": "desk", "cpu_m": 1}]}))
+        self.drop("desk.json", {"name": "desk", "cpu_m": 2})
+        with self.assertRaisesRegex(hl.LedgerError, "desk"):
+            hl.load(self.path)
+
+    def test_update_never_persists_drop_ins(self):
+        self.write(json.dumps(hl.empty()))
+        self.drop("desk.json", {"name": "desk", "cpu_m": 100, "claimed_at": 1.0})
+        out = hl.update(
+            lambda ledger: {**ledger, "host_budget": {"cpu_m": 1}},
+            path=self.path,
+            state_dir=self.state,
+        )
+        self.assertEqual(out["host_budget"], {"cpu_m": 1})
+        self.assertEqual(out["foreign"], [])
+        self.assertEqual(hl.load(self.path)["foreign"][0]["name"], "desk")
+
+    def test_an_unlistable_claims_dir_refuses(self):
+        with open(os.path.join(self.dir, "file-not-dir"), "w", encoding="utf-8") as handle:
+            handle.write("x")
+        with self.assertRaises(hl.LedgerError):
+            hl.drop_in_claims(os.path.join(self.dir, "file-not-dir"))
+
+    def test_the_error_is_a_configuration_error(self):
+        self.drop("bad.json", "{nope")
+        with self.assertRaises(hl.LedgerError) as caught:
+            hl.drop_in_claims(self.claims_dir())
+        self.assertEqual(hl.LedgerError.exit_code, 4)
+
+
 class NoLiveSeams(unittest.TestCase):
     def test_the_module_imports_no_live_seam(self):
         root = Path(__file__).resolve().parent.parent
@@ -437,6 +532,7 @@ class NoLiveSeams(unittest.TestCase):
             "errno",
             "fcntl",
             "json",
+            "math",
             "os",
             "time",
         }
