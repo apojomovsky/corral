@@ -282,9 +282,9 @@ def _check_pressure(state: ResourceReadings) -> ResourceRow:
 def _parse_claim(entry: object, index: int) -> tuple[str, float]:
     """(name, claimed_at) for one raw ledger claim, else a ValueError naming it.
 
-    A missing claimed_at reads as 0.0, the same default the budget gate
-    validates, so the row reports the claim as expired and ignored
-    rather than failing it.
+    A missing claimed_at reads as `resources.DEFAULT_CLAIMED_AT`, the
+    same default the budget gate validates, so the row reports the
+    claim as expired and ignored rather than failing it.
     """
     if not isinstance(entry, Mapping):
         raise ValueError(f"foreign claim {index} must be an object, not {entry!r}")
@@ -292,7 +292,7 @@ def _parse_claim(entry: object, index: int) -> tuple[str, float]:
     if not isinstance(name, str) or not name:
         raise ValueError(f"foreign claim {index} needs a non-empty name, not {name!r}")
     if "claimed_at" not in entry:
-        return name, 0.0
+        return name, resources.DEFAULT_CLAIMED_AT
     claimed_at = entry.get("claimed_at")
     if (
         isinstance(claimed_at, bool)
@@ -308,9 +308,9 @@ def _check_foreign(state: ResourceReadings) -> ResourceRow:
 
     An unreadable ledger warns unknown: the load was never read, so an
     empty claim list is unknown, not zero. A claim without claimed_at
-    reads as 0.0 like the budget gate, so it reports as expired and
-    ignored. Entries in the drop-in dir that are not .json are never
-    counted; they warn naming the entries.
+    reads as `resources.DEFAULT_CLAIMED_AT` like the budget gate, so
+    it reports as expired and ignored. Entries in the drop-in dir that
+    are not .json are never counted; they warn naming the entries.
     """
     if state.limits_error is not None and "foreign claim" in state.limits_error:
         return ResourceRow(

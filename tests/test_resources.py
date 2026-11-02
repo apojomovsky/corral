@@ -227,6 +227,16 @@ class HostFull(unittest.TestCase):
         self.assertEqual((verdict.allowed, verdict.code), (False, "host-full"))
         self.assertIn("8000", verdict.reason)
 
+    def test_total_plus_cost_exactly_at_available_is_allowed(self):
+        load = charged(total=(7000, 0, 0), by_project={"a": (0, 0, 0), "b": (7000, 0, 0)})
+        verdict = R.admit(req("a"), load, self.host(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_one_unit_past_available_is_host_full(self):
+        load = charged(total=(7001, 0, 0), by_project={"a": (0, 0, 0), "b": (7001, 0, 0)})
+        verdict = R.admit(req("a"), load, self.host(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "host-full"))
+
     def test_a_full_memory_pool_names_memory(self):
         host = limits(
             host=(64000, 3000, 4096),
@@ -274,6 +284,14 @@ class FloorBypassDimensions(unittest.TestCase):
         verdict = R.admit(req("a", "small"), load, self.host(), NOW)
         self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
 
+    def test_exactly_at_floor_in_a_full_pool_waits(self):
+        load = charged(
+            total=(8000, 3500, 0),
+            by_project={"a": (1000, 500, 0), "b": (7000, 3000, 0)},
+        )
+        verdict = R.admit(req("a", "small"), load, self.host(), NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "host-full"))
+
 
 class ForeignClaims(unittest.TestCase):
     def host(self, foreign):
@@ -302,11 +320,32 @@ class ForeignClaims(unittest.TestCase):
         verdict = R.admit(req(), charged(), host, NOW)
         self.assertEqual((verdict.allowed, verdict.code), (False, "role-cost"))
 
+    def test_a_cost_exactly_at_the_shrunk_pool_is_allowed(self):
+        host = limits(
+            projects={"web": {"weight": 1}},
+            foreign=[claim(cpu_m=7000, memory_mb=11000)],
+        )
+        verdict = R.admit(req(), charged(), host, NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_cost_one_unit_past_the_shrunk_pool_is_role_cost(self):
+        host = limits(
+            projects={"web": {"weight": 1}},
+            foreign=[claim(cpu_m=7001, memory_mb=11000)],
+        )
+        verdict = R.admit(req(), charged(), host, NOW)
+        self.assertEqual((verdict.allowed, verdict.code), (False, "role-cost"))
+
     def test_a_claim_past_the_pool_refuses_as_role_cost(self):
         host = self.host([claim(cpu_m=7500, memory_mb=15000)])
         verdict = R.admit(req(), charged(), host, NOW)
         self.assertEqual((verdict.allowed, verdict.code), (False, "role-cost"))
         self.assertIn("7500", verdict.reason)
+
+    def test_missing_claimed_at_reads_as_the_shared_default(self):
+        self.assertEqual(R.ForeignClaim(name="desktop").claimed_at, R.DEFAULT_CLAIMED_AT)
+        parsed = R._claim({"name": "desktop"}, "foreign claim 9")
+        self.assertEqual(parsed.claimed_at, R.DEFAULT_CLAIMED_AT)
 
 
 class PlainData(unittest.TestCase):
@@ -389,6 +428,116 @@ class ValidateLimits(unittest.TestCase):
         self.assertEqual(R.LimitsError.exit_code, 4)
 
 
+class NonMappingTables(unittest.TestCase):
+    MISSING = object()
+
+    def table(self, projects=MISSING, roles=MISSING, foreign=MISSING):
+        if projects is self.MISSING:
+            projects = {"web": {"weight": 1}}
+        if roles is self.MISSING:
+            roles = {"worker": dict(WORKER)}
+        if foreign is self.MISSING:
+            foreign = []
+        return {
+            "host": triple(8000, 16000, 4096),
+            "projects": projects,
+            "roles": roles,
+            "foreign": foreign,
+            "gone_s": 600.0,
+        }
+
+    def test_non_mapping_projects_are_a_limits_error(self):
+        for bad in ([], ["web"], "web", 5, None):
+            with self.subTest(projects=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.validate_limits(self.table(projects=bad))
+                with self.assertRaises(R.LimitsError):
+                    R.admit(req(), charged(), self.table(projects=bad), NOW)
+                with self.assertRaises(R.LimitsError):
+                    R.share_cap(self.table(projects=bad), "web", NOW)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_non_mapping_roles_are_a_limits_error(self):
+        for bad in ([], ["worker"], "worker", 5, None):
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.validate_limits(self.table(roles=bad))
+                with self.assertRaises(R.LimitsError):
+                    R.admit(req(), charged(), self.table(roles=bad), NOW)
+                with self.assertRaises(R.LimitsError):
+                    R.share_cap(self.table(roles=bad), "web", NOW)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_direct_limits_with_list_tables_refuse_at_construction(self):
+        host = triple(8000, 16000, 4096)
+        good_projects: Any = {"web": {"weight": 1}}
+        good_roles: Any = {"worker": dict(WORKER)}
+        bad_projects: tuple[Any, ...] = ([], ["web"])
+        bad_roles: tuple[Any, ...] = ([], ["worker"])
+        for bad in bad_projects:
+            with self.subTest(projects=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.Limits(host=host, projects=bad, roles=dict(good_roles))
+        for bad in bad_roles:
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.Limits(host=host, projects=dict(good_projects), roles=bad)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_non_mapping_foreign_is_a_limits_error(self):
+        bad_values: tuple[Any, ...] = (5, "x", [1], {"name": "desk"})
+        for bad in bad_values:
+            with self.subTest(foreign=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.validate_limits(self.table(foreign=bad))
+                with self.assertRaises(R.LimitsError):
+                    R.admit(req(), charged(), self.table(foreign=bad), NOW)
+                with self.assertRaises(R.LimitsError):
+                    R.share_cap(self.table(foreign=bad), "web", NOW)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_direct_limits_with_bad_foreign_refuses_at_construction(self):
+        host = triple(8000, 16000, 4096)
+        bad_values: tuple[Any, ...] = (5, "x", [1], {"name": "desk"})
+        for bad in bad_values:
+            with self.subTest(foreign=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.Limits(
+                        host=host,
+                        projects={"web": {"weight": 1}},
+                        roles={"worker": dict(WORKER)},
+                        foreign=bad,
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_none_foreign_reads_as_empty(self):
+        none: Any = None
+        made = R.Limits(
+            host=triple(8000, 16000, 4096),
+            projects={"web": {"weight": 1}},
+            roles={"worker": dict(WORKER)},
+            foreign=none,
+        )
+        self.assertEqual(made.foreign, [])
+        R.validate_limits(made)
+        R.validate_limits(self.table(foreign=None))
+
+    def test_tuple_and_claim_entries_are_accepted(self):
+        entry = {"name": "desk", "cpu_m": 100, "claimed_at": NOW}
+        tupled: Any = (dict(entry),)
+        made = R.Limits(
+            host=triple(8000, 16000, 4096),
+            projects={"web": {"weight": 1}},
+            roles={"worker": dict(WORKER)},
+            foreign=tupled,
+        )
+        self.assertEqual(made.foreign, [entry])
+        R.validate_limits(made)
+        R.validate_limits(
+            self.table(foreign=[R.ForeignClaim(name="desk", cpu_m=100, claimed_at=NOW)])
+        )
+
+
 class Join(unittest.TestCase):
     def base(self, host=(8000, 16000, 4096)):
         return R.Limits(
@@ -440,6 +589,14 @@ class Join(unittest.TestCase):
                 [],
                 where="config.toml",
             )
+
+    def test_non_list_foreign_is_a_limits_error(self):
+        bad_values: tuple[Any, ...] = (5, "x", [1])
+        for bad in bad_values:
+            with self.subTest(foreign=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.join(self.base(), {"web": {"weight": 1}}, bad, where="config.toml")
+        self.assertEqual(R.LimitsError.exit_code, 4)
 
     def test_an_admit_on_joined_limits_enforces_the_share(self):
         joined = R.join(
@@ -958,6 +1115,18 @@ class RequestDefaults(unittest.TestCase):
             R._request({"project": "web"}),
             R.Request(project="web", role=prompts.DEFAULT_ROLE),
         )
+
+    def test_an_explicit_empty_role_is_not_coerced_to_the_default(self):
+        self.assertEqual(
+            R._request({"project": "web", "role": ""}),
+            R.Request(project="web", role=""),
+        )
+
+    def test_an_explicit_empty_role_is_a_configuration_error(self):
+        with self.assertRaises(R.LimitsError) as caught:
+            R.admit({"project": "web", "role": ""}, charged(), limits(), NOW)
+        self.assertIn("unknown role", str(caught.exception))
+        self.assertEqual(R.LimitsError.exit_code, 4)
 
 
 class CapacityReportShape(unittest.TestCase):
