@@ -1207,6 +1207,9 @@ class BoardView(ServeCase):
                 "/v1/board?max_age=many",
                 "/v1/board?max_age=-1",
                 "/v1/board?max_age=nan",
+                "/v1/board?max_age=inf",
+                "/v1/board?max_age=-inf",
+                "/v1/board?max_age=Infinity",
             ):
                 with self.subTest(target=target):
                     status, _, body = self.fetch(server, "GET", target)
@@ -1524,6 +1527,9 @@ class EventsView(ServeCase):
             "/v1/events?project=demo&resolved_since=",
             "/v1/events?project=demo&resolved_since=-1",
             "/v1/events?project=demo&resolved_since=nan",
+            "/v1/events?project=demo&resolved_since=inf",
+            "/v1/events?project=demo&resolved_since=-inf",
+            "/v1/events?project=demo&resolved_since=Infinity",
         ):
             with self.subTest(target=target):
                 status, _, body = self.fetch(server, "GET", target)

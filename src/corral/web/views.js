@@ -7,6 +7,9 @@ import {
   LOG_EVENTS_CAP,
   LOG_JOURNAL_CAP,
   LOG_KINDS,
+  agentKey,
+  detailHash,
+  hasTicket,
   isErrorSection,
   snapshotProjects,
 } from "./api.js";
@@ -457,7 +460,15 @@ function agentsSection(agents, project, nowMs) {
     for (const row of group) {
       const item = document.createElement("li");
       const shown = agentText(row, nowMs);
-      item.appendChild(el("span", shown.line));
+      const key = agentKey(row);
+      if (key === null) {
+        item.appendChild(el("span", shown.line));
+      } else {
+        const link = document.createElement("a");
+        link.setAttribute("href", detailHash(key));
+        link.textContent = cleanText(shown.line);
+        item.appendChild(link);
+      }
       if (shown.note !== null && shown.note !== undefined && String(shown.note) !== "") {
         item.appendChild(el("span", "  note: " + String(shown.note)));
       }
@@ -468,9 +479,11 @@ function agentsSection(agents, project, nowMs) {
   return section;
 }
 
-export function renderChips(projects, selected, base) {
-  const nav = document.getElementById("chips");
-  nav.textContent = "";
+// One chip row builder for both views: the log view links back to
+// its own route, the overview to its own. The base stays explicit
+// so the two link shapes cannot drift apart unnoticed.
+function chipsNodes(projects, selected, base) {
+  const nodes = [];
   const all = document.createElement("a");
   if (base === "#/log") {
     all.setAttribute("href", "#/log");
@@ -481,7 +494,7 @@ export function renderChips(projects, selected, base) {
   if (selected === null) {
     all.setAttribute("aria-current", "true");
   }
-  nav.appendChild(all);
+  nodes.push(all);
   for (const name of projects) {
     const chip = document.createElement("a");
     if (base === "#/log") {
@@ -493,8 +506,13 @@ export function renderChips(projects, selected, base) {
     if (name === selected) {
       chip.setAttribute("aria-current", "true");
     }
-    nav.appendChild(chip);
+    nodes.push(chip);
   }
+  return nodes;
+}
+
+export function renderChips(projects, selected, base) {
+  document.getElementById("chips").replaceChildren(...chipsNodes(projects, selected, base));
 }
 
 // The view tabs. The board arrives with its own view and hub mode
@@ -540,29 +558,136 @@ function headerLine(header) {
 
 // The overview: header counts, one card per snapshot section
 // (failed sections as error cards, never hidden), then agents
-// grouped by project under the selected filter.
+// grouped by project under the selected filter. Every node builds
+// off-DOM and the live sections swap once, so a throw below leaves
+// the last good page in place for the poll loop's catch instead of
+// a half-drawn update.
 export function renderOverview(doc, { project, nowMs, notice }) {
   renderTabs("overview");
-  renderChips(snapshotProjects(doc), project);
+  const chips = chipsNodes(snapshotProjects(doc), project);
+  const cards = [
+    headerLine(doc.fleet_header),
+    quotaCard(doc.quota, nowMs),
+    capacityCard(doc.capacity),
+    resourcesCard(doc.resources),
+    diskCard(doc.disk),
+    driveCard(doc.drive, nowMs),
+  ];
+  const agents = agentsSection(doc.agents, project, nowMs);
+  document.getElementById("detail").hidden = true;
+  const nav = document.getElementById("chips");
+  nav.hidden = false;
+  nav.replaceChildren(...chips);
   const note = document.getElementById("notice");
-  note.textContent = "";
-  if (notice) {
-    note.hidden = false;
-    note.appendChild(document.createTextNode(cleanText(notice)));
-  } else {
-    note.hidden = true;
+  note.textContent = notice ? cleanText(notice) : "";
+  note.hidden = !notice;
+  const cardsNode = document.getElementById("cards");
+  cardsNode.hidden = false;
+  cardsNode.replaceChildren(...cards);
+  const agentsNode = document.getElementById("agents");
+  agentsNode.hidden = false;
+  agentsNode.replaceChildren(agents);
+}
+
+function ticketTitle(row) {
+  if (!hasTicket(row)) {
+    return "no ticket";
   }
-  const cards = document.getElementById("cards");
-  cards.textContent = "";
-  cards.appendChild(headerLine(doc.fleet_header));
-  cards.appendChild(quotaCard(doc.quota, nowMs));
-  cards.appendChild(capacityCard(doc.capacity));
-  cards.appendChild(resourcesCard(doc.resources));
-  cards.appendChild(diskCard(doc.disk));
-  cards.appendChild(driveCard(doc.drive, nowMs));
-  const agents = document.getElementById("agents");
-  agents.textContent = "";
-  agents.appendChild(agentsSection(doc.agents, project, nowMs));
+  return String(row.repo) + "#" + String(row.number);
+}
+
+function fieldValue(value) {
+  return value === null || value === undefined || value === "" ? "not reported" : String(value);
+}
+
+// The agent detail: every row field, then the tail pane for rows
+// with a ticket. Fields build off-DOM and swap once like the
+// overview; the tail pane is owned by the tail poll and stays put
+// across field re-renders.
+export function renderDetail(row, { nowMs }) {
+  // No tab is current on a detail: the tabs name the list views only.
+  renderTabs(null);
+  const info = row && typeof row === "object" ? row : {};
+  const project =
+    typeof info.project === "string" && info.project !== "" ? info.project : null;
+  const backHref = project === null ? "#/" : "#/?project=" + encodeURIComponent(project);
+  const shown = agentText(info, nowMs);
+  const lines = [
+    el("h2", ticketTitle(info) + "  " + String(info.state)),
+    el("p", shown.line),
+  ];
+  if (shown.note !== null && shown.note !== undefined && String(shown.note) !== "") {
+    lines.push(el("p", "note: " + String(shown.note)));
+  }
+  lines.push(el("p", "id: " + fieldValue(info.id)));
+  lines.push(el("p", "project: " + (project === null ? "none" : project)));
+  lines.push(el("p", "profile: " + fieldValue(info.profile)));
+  const ticketed = hasTicket(info);
+  if (!ticketed) {
+    lines.push(el("p", "no ticket, no tail"));
+  }
+  document.getElementById("chips").hidden = true;
+  document.getElementById("cards").hidden = true;
+  document.getElementById("agents").hidden = true;
+  const back = document.getElementById("detail-back");
+  back.setAttribute("href", backHref);
+  document.getElementById("detail-fields").replaceChildren(...lines);
+  document.getElementById("tail-controls").hidden = !ticketed;
+  document.getElementById("tail").hidden = !ticketed;
+  if (!ticketed) {
+    document.getElementById("tail").textContent = "";
+    document.getElementById("tail-state").textContent = "";
+  }
+  document.getElementById("detail").hidden = false;
+}
+
+// A detail key that names nothing in the fresh document. States the
+// miss in the detail pane; never a guessed neighbour.
+export function renderDetailMissing() {
+  renderTabs(null);
+  document.getElementById("chips").hidden = true;
+  document.getElementById("cards").hidden = true;
+  document.getElementById("agents").hidden = true;
+  const back = document.getElementById("detail-back");
+  back.setAttribute("href", "#/");
+  document
+    .getElementById("detail-fields")
+    .replaceChildren(el("p", "this agent is no longer listed"));
+  document.getElementById("tail-controls").hidden = true;
+  document.getElementById("tail").hidden = true;
+  document.getElementById("tail").textContent = "";
+  document.getElementById("tail-state").textContent = "";
+  document.getElementById("detail").hidden = false;
+}
+
+// The tail pane is one text node, replaced per poll: memory stays
+// flat and no per-line nodes ever exist.
+export function renderTail(text) {
+  document.getElementById("tail").textContent = cleanText(text === null ? "" : String(text));
+  document.getElementById("tail-state").textContent = "";
+}
+
+export function renderTailMissing() {
+  document.getElementById("tail").textContent = "nothing to show";
+  document.getElementById("tail-state").textContent = "";
+}
+
+export function renderTailFailed() {
+  document.getElementById("tail-state").textContent = "tail unavailable, retrying";
+}
+
+export function renderTailLoading() {
+  document.getElementById("tail").textContent = "";
+  document.getElementById("tail-state").textContent = "loading the tail";
+}
+
+export function renderTailPaused(paused) {
+  document.getElementById("tail-state").textContent = paused ? "tail paused" : "";
+}
+
+export function renderTailButtons(paused, follow) {
+  document.getElementById("tail-pause").textContent = paused ? "tail: resume" : "tail: pause";
+  document.getElementById("tail-follow").textContent = follow ? "follow: on" : "follow: off";
 }
 
 function eventLine(row, nowMs) {
@@ -713,6 +838,10 @@ function journalCard(view, nowMs) {
 // its logbook. "All" shows the project picker, never a merged log.
 export function renderLog(view, { nowMs, notice }) {
   renderTabs("log");
+  // The detail view hides these sections; coming back unhides them.
+  document.getElementById("detail").hidden = true;
+  const nav = document.getElementById("chips");
+  nav.hidden = false;
   renderChips(view.choices, view.project, "#/log");
   const note = document.getElementById("notice");
   note.textContent = "";
@@ -739,7 +868,10 @@ export function renderLog(view, { nowMs, notice }) {
     cards.appendChild(eventsCard(view, nowMs));
     cards.appendChild(journalCard(view, nowMs));
   }
-  document.getElementById("agents").textContent = "";
+  cards.hidden = false;
+  const agents = document.getElementById("agents");
+  agents.hidden = false;
+  agents.textContent = "";
 }
 
 // A fatal gate: the API major moved or the document schema is too
@@ -754,4 +886,5 @@ export function renderStopped(message) {
   note.appendChild(document.createTextNode(cleanText(message)));
   document.getElementById("cards").textContent = "";
   document.getElementById("agents").textContent = "";
+  document.getElementById("detail").hidden = true;
 }

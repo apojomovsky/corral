@@ -342,7 +342,7 @@ class SourceDiscipline(unittest.TestCase):
 
     def test_every_poll_await_sits_inside_a_try(self):
         text = web_bytes("app.js").decode("utf-8")
-        for name in ("loadSnapshot", "loadConfig", "loadVersion"):
+        for name in ("loadSnapshot", "loadConfig", "loadVersion", "loadTail"):
             sites = list(re.finditer(r"await\s+" + name + r"\s*\(", text))
             self.assertTrue(sites, name)
             for site in sites:
@@ -354,8 +354,10 @@ class SourceDiscipline(unittest.TestCase):
     def test_schedule_uses_the_shared_next_delay(self):
         app = web_bytes("app.js").decode("utf-8")
         self.assertIn("nextDelay(failures)", app)
-        self.assertNotIn("POLL_MS", app)
-        self.assertNotIn("BACKOFF_MS", app)
+        # Word boundaries: the tail cadence TAIL_POLL_MS is an api.js
+        # import, not a number restated in app.js.
+        self.assertIsNone(re.search(r"\bPOLL_MS\b", app))
+        self.assertIsNone(re.search(r"\bBACKOFF_MS\b", app))
 
     def test_schedule_runs_only_from_a_finally(self):
         # The poll loop is structurally unable to die: the single
