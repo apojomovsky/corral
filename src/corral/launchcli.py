@@ -26,6 +26,7 @@ from corral import (
     launch,
     models,
     paths,
+    pressure,
     projects,
     prompts,
     resources,
@@ -73,6 +74,10 @@ class Seams(NamedTuple):
     #: `usage(path) -> (total, used, free)` for the disk gate. None means
     #: the production reader. Tests pass a fake.
     usage: Callable | None = None
+    #: `pressure_fn() -> pressure.Reading` for the saturation backoff.
+    #: None reads as unknown and never blocks; only `production_seams`
+    #: sets the live reader. Tests pass a fake or leave it unset.
+    pressure_fn: Callable | None = None
     #: The board store for the ticket's profile assignment (an object with
     #: `.item`), or None to open the real store. Tests pass a fake.
     store: object | None = None
@@ -100,6 +105,7 @@ def production_seams() -> Seams:
         host_ledger_fn=host_ledger.ensure,
         labels_fn=labels_fn,
         usage=disk.production_usage,
+        pressure_fn=pressure.production_read,
     )
 
 
@@ -292,6 +298,7 @@ def cmd_launch(args, seams: Seams) -> int:
         run=seams.run,
         usage=seams.usage or disk.production_usage,
         host_ledger_fn=seams.host_ledger_fn,
+        pressure_fn=seams.pressure_fn,
         store=seams.store,
         tracker=tracker,
     )
@@ -332,6 +339,7 @@ def cmd_resume(args, seams: Seams) -> int:
         run=seams.run,
         usage=seams.usage or disk.production_usage,
         host_ledger_fn=seams.host_ledger_fn,
+        pressure_fn=seams.pressure_fn,
         store=seams.store,
         tracker=_profile_tracker(seams, args, tgt),
     )

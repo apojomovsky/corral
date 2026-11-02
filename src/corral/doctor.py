@@ -33,6 +33,7 @@ from corral import (
     host_ledger,
     hub,
     paths,
+    pressure,
     profiles,
     projects,
     prompts,
@@ -1084,6 +1085,30 @@ def _read_text(path: str) -> str:
         return handle.read()
 
 
+def _read_pressure(reader) -> tuple[float | None, float | None]:
+    """The measured host pressure through the injected file reader.
+
+    Unreadable or unparsable files read as unknown (None), never raising:
+    a half-blind host still decides on the half it can see, and unknown
+    never blocks admission. `reader` is the same seam the sensor check
+    uses, so tests inject one fake for both.
+    """
+    try:
+        loadavg = reader(pressure.LOADAVG_PATH)
+    except OSError:
+        loadavg = None
+    try:
+        meminfo = reader(pressure.MEMINFO_PATH)
+    except OSError:
+        meminfo = None
+    try:
+        ncpu = os.cpu_count()
+    except Exception:  # noqa: BLE001 - any counter failure reads as unknown
+        ncpu = None
+    reading = pressure.read(loadavg, meminfo, ncpu)
+    return (reading.load_per_cpu, reading.mem_available_pct)
+
+
 def load_resource_readings(
     resolved: settings.Resolved | None,
     *,
@@ -1132,6 +1157,7 @@ def load_resource_readings(
     else:
         controllers_error = None
     sensor_errors = resourcedoctor.load_sensor_errors(read=reader)
+    pressure_values = _read_pressure(reader)
     names = [units.HOST_SLICE]
     for entry in registered:
         try:
@@ -1174,6 +1200,16 @@ def load_resource_readings(
         limits, limits_error = None, str(err)
     else:
         limits_error = None
+    if limits is not None and limits.pressure is not None:
+        pressure_caps = (
+            limits.pressure.max_load_per_cpu,
+            limits.pressure.min_mem_available_pct,
+        )
+    else:
+        pressure_caps = (
+            pressure.DEFAULT_MAX_LOAD_PER_CPU,
+            pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
+        )
     return resourcedoctor.ResourceReadings(
         host=limits.host if limits is not None else None,
         shares=dict(limits.projects) if limits is not None else {},
@@ -1195,6 +1231,8 @@ def load_resource_readings(
         sensor_errors=sensor_errors,
         slices=slices,
         config_path=where,
+        pressure=pressure_values,
+        pressure_caps=pressure_caps,
     )
 
 

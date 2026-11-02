@@ -272,6 +272,69 @@ class PressureSensors(unittest.TestCase):
         rows = by_name(resourcedoctor.check(readings()))
         self.assertEqual(rows["resources-pressure"].status, "ok")
 
+    def test_a_hot_load_fails_the_pressure_row(self):
+        rows = by_name(resourcedoctor.check(readings(pressure=(8.0, 50.0))))
+        row = rows["resources-pressure"]
+        self.assertEqual(row.status, "fail")
+        self.assertIn("8.0", row.detail)
+        self.assertIn("launches wait", row.detail)
+
+    def test_low_memory_fails_the_pressure_row(self):
+        rows = by_name(resourcedoctor.check(readings(pressure=(0.2, 4.0))))
+        row = rows["resources-pressure"]
+        self.assertEqual(row.status, "fail")
+        self.assertIn("MemAvailable", row.detail)
+
+    def test_unknown_readings_never_block(self):
+        rows = by_name(resourcedoctor.check(readings(pressure=(None, None))))
+        self.assertEqual(rows["resources-pressure"].status, "ok")
+
+    def test_a_half_blind_reading_still_decides(self):
+        rows = by_name(resourcedoctor.check(readings(pressure=(None, 4.0))))
+        self.assertEqual(rows["resources-pressure"].status, "fail")
+        rows = by_name(resourcedoctor.check(readings(pressure=(None, 50.0))))
+        self.assertEqual(rows["resources-pressure"].status, "ok")
+
+    def test_generous_caps_keep_a_busy_host_ok(self):
+        rows = by_name(
+            resourcedoctor.check(readings(pressure=(8.0, 50.0), pressure_caps=(16.0, 10.0)))
+        )
+        self.assertEqual(rows["resources-pressure"].status, "ok")
+
+    def test_an_unreadable_sensor_beats_a_hot_reading(self):
+        rows = by_name(
+            resourcedoctor.check(
+                readings(pressure=(8.0, 50.0), sensor_errors=("/proc/meminfo: boom",))
+            )
+        )
+        self.assertEqual(rows["resources-pressure"].status, "warn")
+
+    def test_saturation_beside_an_expired_claim_fails_pressure_and_warns_foreign(self):
+        rows = by_name(
+            resourcedoctor.check(
+                readings(
+                    pressure=(8.0, 50.0),
+                    foreign=[
+                        {
+                            "name": "desktop",
+                            "cpu_m": 1000,
+                            "memory_mb": 1024,
+                            "claimed_at": 1_000_000.0 - 3600.0,
+                        }
+                    ],
+                )
+            )
+        )
+        self.assertEqual(rows["resources-pressure"].status, "fail")
+        self.assertEqual(rows["resources-foreign"].status, "warn")
+        self.assertIn("desktop", rows["resources-foreign"].detail)
+
+    def test_a_saturated_pressure_row_exits_1(self):
+        from tests.test_doctor import env
+
+        checks = doctor.run_checks(env(resource_readings=readings(pressure=(8.0, 50.0))))
+        self.assertEqual(doctor.exit_code(checks), 1)
+
 
 class ForeignClaims(unittest.TestCase):
     def claim(self, name, age_s, **extra):
@@ -295,6 +358,10 @@ class ForeignClaims(unittest.TestCase):
         rows = by_name(resourcedoctor.check(readings(foreign=[self.claim("desktop", 60.0)])))
         self.assertEqual(rows["resources-foreign"].status, "ok")
         self.assertIn("1", rows["resources-foreign"].detail)
+
+    def test_a_claim_exactly_at_the_bound_still_counts_as_live(self):
+        rows = by_name(resourcedoctor.check(readings(foreign=[self.claim("desktop", 600.0)])))
+        self.assertEqual(rows["resources-foreign"].status, "ok")
 
     def test_no_claims_is_ok(self):
         rows = by_name(resourcedoctor.check(readings()))
