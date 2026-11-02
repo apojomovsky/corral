@@ -67,8 +67,14 @@ def cmd_serve(args: argparse.Namespace) -> int:
     if lease_ttl_s <= 0:
         _err(f"hub.lease_ttl_s {lease_ttl_s!r} must be positive")
         return USAGE
+    stale_after_s = resolved["hub.stale_after_s"]
+    if stale_after_s <= 0:
+        _err(f"hub.stale_after_s {stale_after_s!r} must be positive")
+        return USAGE
     try:
-        server = hub.make_server(args.bind, args.port, db_path, lease_ttl_s=lease_ttl_s)
+        server = hub.make_server(
+            args.bind, args.port, db_path, lease_ttl_s=lease_ttl_s, stale_after_s=stale_after_s
+        )
     except hub.HubError as err:
         _err(str(err))
         return USAGE
