@@ -22,6 +22,7 @@ import hmac
 import io
 import ipaddress
 import json
+import math
 import os
 import secrets
 import select
@@ -261,8 +262,9 @@ def read_project_events(project: str) -> list:
 def _read_jsonl_rows(path: str) -> list:
     """Dict rows from one JSONL file, oldest first.
 
-    The same rule as `coord._read_entries`: blank lines and
-    unparseable or non-dict rows drop out, so a hand edit never
+    Reads through `coord._parse_entry`, the one rule for journal
+    lines, so archive and live reads never diverge: blank,
+    unparseable and non-dict lines drop out, and a hand edit never
     breaks a read.
     """
     try:
@@ -272,13 +274,8 @@ def _read_jsonl_rows(path: str) -> list:
         return []
     rows = []
     for line in lines:
-        if not line.strip():
-            continue
-        try:
-            row = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(row, dict):
+        row = coord._parse_entry(line)
+        if row is not None:
             rows.append(row)
     return rows
 
@@ -304,22 +301,12 @@ def read_project_journal(project: str) -> list:
 
 
 def _resolved_at_epoch(row: dict) -> float | None:
-    """Epoch seconds of a row's `resolved_at`, or None when absent or unparseable."""
-    import datetime
+    """Epoch seconds of a row's `resolved_at`, or None when absent or unparseable.
 
-    at = row.get("resolved_at")
-    if not at:
-        return None
-    try:
-        moment = datetime.datetime.fromisoformat(str(at))
-    except ValueError:
-        return None
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=datetime.timezone.utc)
-    try:
-        return moment.timestamp()
-    except (OverflowError, OSError, ValueError):
-        return None
+    Reads through `coordevents.resolved_at_epoch`, the one parser for
+    resolved stamps, so the served filter and queue pruning agree.
+    """
+    return coordevents.resolved_at_epoch(row.get("resolved_at"))
 
 
 def _event_row(row: dict) -> dict:
@@ -411,6 +398,26 @@ def _page_int(raw: str | None, name: str, default: int) -> tuple[int, str | None
         return default, f"{name} {raw!r} is not an integer"
     if value < 0:
         return default, f"{name} {raw!r} must be 0 or more"
+    return value, None
+
+
+def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
+    """A validated seconds parameter, or the 400 body when it is unusable.
+
+    Missing reads as None. A non-number, a negative, or NaN is an
+    error, never a silent default: the caller must know its filter is
+    not what it asked. A present-but-blank value is not a number, so
+    it errors instead of folding to absent. `max_age` and
+    `resolved_since` both read through this one validator.
+    """
+    if raw is None:
+        return None, None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None, f"{name} {raw!r} is not seconds"
+    if value < 0 or math.isnan(value):
+        return None, f"{name} {raw!r} must be 0 or more"
     return value, None
 
 
@@ -699,14 +706,10 @@ class _Handler(BaseHTTPRequestHandler):
         repo = query.get("repo") or None
         state = query.get("state") or None
         label = query.get("label") or None
-        raw_age = query.get("max_age")
-        max_age = None
-        if raw_age is not None:
-            try:
-                max_age = float(raw_age)
-            except ValueError:
-                self._send_json(400, {"error": f"max_age {raw_age!r} is not seconds"})
-                return
+        max_age, age_problem = _page_float(query.get("max_age"), "max_age")
+        if age_problem is not None:
+            self._send_json(400, {"error": age_problem})
+            return
         limit, problem = _page_int(query.get("limit"), "limit", BOARD_LIMIT_DEFAULT)
         if problem is None:
             offset, problem = _page_int(query.get("offset"), "offset", 0)
@@ -783,14 +786,10 @@ class _Handler(BaseHTTPRequestHandler):
         if project is None:
             self._send_json(400, {"error": "events needs ?project="})
             return
-        raw_since = query.get("resolved_since")
-        since = None
-        if raw_since is not None:
-            try:
-                since = float(raw_since)
-            except ValueError:
-                self._send_json(400, {"error": f"resolved_since {raw_since!r} is not seconds"})
-                return
+        since, since_problem = _page_float(query.get("resolved_since"), "resolved_since")
+        if since_problem is not None:
+            self._send_json(400, {"error": since_problem})
+            return
         now = self.server_state.clock()
         reader = self.server_state.events_fn or read_project_events
         try:

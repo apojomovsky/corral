@@ -131,19 +131,34 @@ def _read_rows(root=None):
     return [row for line in lines for row in [_parse_row(line)] if row is not None]
 
 
-def _resolved_old(row, now_epoch, keep_s):
-    at = row.get("resolved_at")
-    if not at:
-        return False
+def resolved_at_epoch(value):
+    """Epoch seconds of a `resolved_at` stamp, or None when absent or unparseable.
+
+    The one parser for resolved stamps: a naive stamp reads as UTC.
+    `_resolved_old` and the serve layer both read through it, so queue
+    pruning and the served filter never diverge.
+    """
+    if not value:
+        return None
     try:
         import datetime
 
-        moment = datetime.datetime.fromisoformat(str(at))
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=datetime.timezone.utc)
-        return now_epoch - moment.timestamp() > keep_s
-    except (ValueError, TypeError, OverflowError):
+        moment = datetime.datetime.fromisoformat(str(value))
+    except (ValueError, TypeError):
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    try:
+        return moment.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _resolved_old(row, now_epoch, keep_s):
+    at = resolved_at_epoch(row.get("resolved_at"))
+    if at is None:
         return False
+    return now_epoch - at > keep_s
 
 
 def _write_rows(rows, root=None):
