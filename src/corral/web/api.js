@@ -150,3 +150,124 @@ export function isSupportedDocument(doc, expectedSchema) {
 export function isSupportedApi(version, expectedApi) {
   return !!version && version.api === expectedApi;
 }
+
+// Log view (host mode) data access. The log routes take exactly one
+// project; "All" never merges logs, it shows the project picker.
+
+// The log poll cadence and the render bounds of section 2: the board
+// and the log poll every 15s; the events stack renders at most 100
+// rows with the true unresolved count stated when capped; journal
+// pages are 100 rows and at most 300 nodes stay rendered.
+export const LOG_POLL_MS = 15000;
+export const LOG_JOURNAL_PAGE = 100;
+export const LOG_JOURNAL_CAP = 300;
+export const LOG_EVENTS_CAP = 100;
+
+// The kind filter chips: exactly the tuple the journal route
+// validates against, so a chip can never answer 400. Pinned equal
+// by the suite, since the script cannot import the server tuple.
+export const LOG_KINDS = ["decision", "action", "incident", "followup", "done", "handoff", "note"];
+
+// The log backoff: the 15s cadence is the floor, the shared table
+// the ceiling, so a failing log view backs off 15, 15, 30, 60s.
+export function nextLogDelay(failures) {
+  if (failures <= 0) {
+    return LOG_POLL_MS;
+  }
+  return Math.max(LOG_POLL_MS, nextDelay(failures));
+}
+
+// The unresolved stack for one project, oldest first, unpaged: the
+// view caps what it renders and states the true count when capped.
+export function loadEvents(project, token) {
+  return fetchJson("/v1/events?project=" + encodeURIComponent(project), token);
+}
+
+function journalPath(project, kind, limit, cursor) {
+  let path = "/v1/journal?project=" + encodeURIComponent(project);
+  if (kind) {
+    path += "&kind=" + encodeURIComponent(kind);
+  }
+  if (limit !== null && limit !== undefined) {
+    path += "&limit=" + encodeURIComponent(String(limit));
+  }
+  if (cursor !== null && cursor !== undefined) {
+    path += "&cursor=" + encodeURIComponent(String(cursor));
+  }
+  return path;
+}
+
+export function loadJournal(project, kind, limit, cursor, token) {
+  return fetchJson(journalPath(project, kind, limit, cursor), token);
+}
+
+// The newest journal window. The journal pages oldest first, so the
+// view learns `total` from a one-row reply and then requests the
+// trailing window by index. A future cursor reminting breaks the
+// suite pin first, not a browser.
+export async function loadJournalLast(project, kind, token) {
+  let path = "/v1/journal?project=" + encodeURIComponent(project);
+  if (kind) {
+    path += "&kind=" + encodeURIComponent(kind);
+  }
+  const first = await fetchJson(path + "&limit=1", token);
+  if (first.status !== 200 || !first.data || typeof first.data.total !== "number") {
+    return first;
+  }
+  const total = first.data.total;
+  if (total <= 1) {
+    return first;
+  }
+  const start = Math.max(0, total - LOG_JOURNAL_PAGE);
+  return fetchJson(path + "&limit=" + String(LOG_JOURNAL_PAGE) + "&cursor=" + String(start), token);
+}
+
+// The previous journal window above `start`: the "load older" page.
+// `start` is the index of the oldest rendered entry.
+export function loadJournalOlder(project, kind, start, token) {
+  return loadJournal(project, kind, LOG_JOURNAL_PAGE, olderStart(start), token);
+}
+
+// The index arithmetic the log view needs without naming the page
+// size outside this module.
+export function olderStart(start) {
+  return Math.max(0, start - LOG_JOURNAL_PAGE);
+}
+
+// The registered names, names only, behind the same auth as data.
+export function loadProjects(token) {
+  return fetchJson("/v1/projects", token);
+}
+
+// The offered project list: the route answer unioned with the set
+// derived from activity, never intersected, so a project missing
+// from either source is still offered.
+export function projectNames(registered, derived) {
+  const names = new Set();
+  for (const list of [registered, derived]) {
+    if (Array.isArray(list)) {
+      for (const name of list) {
+        if (typeof name === "string" && name !== "") {
+          names.add(name);
+        }
+      }
+    }
+  }
+  return [...names].sort();
+}
+
+// The rendered events, capped: the true count travels beside the
+// capped rows so the view can state it when capped.
+export function capEvents(rows) {
+  return rows.slice(0, LOG_EVENTS_CAP);
+}
+
+// Drop the oldest rendered entries past the cap, keeping the newest
+// window the operator was reading, with the start index adjusted.
+export function capJournal(entries, start) {
+  if (entries.length > LOG_JOURNAL_CAP) {
+    const dropped = entries.length - LOG_JOURNAL_CAP;
+    return { entries: entries.slice(dropped), start: start + dropped };
+  }
+  return { entries, start };
+}
