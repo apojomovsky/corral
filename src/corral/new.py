@@ -64,12 +64,16 @@ def names():
     return sorted(entry.name for entry in entries if entry.name != "__pycache__")
 
 
-def _collect(node, rel, found, label):
+def _collect(node, rel, found, label, *, root=None):
     """Every file under `node` into `found`, keyed by path relative to it.
 
     `label` names the source in failures. `__pycache__` directories are
-    skipped: interpreter residue, never author content.
+    skipped: interpreter residue, never author content. A symlink entry
+    is refused (exit 4 naming it), like the write path's symlink
+    refusal: following one could loop forever on a self-referential
+    link or copy bytes from outside the template directory.
     """
+    root = node if root is None else root
     try:
         entries = sorted(node.iterdir(), key=lambda entry: entry.name)
     except OSError as err:
@@ -79,11 +83,28 @@ def _collect(node, rel, found, label):
             continue
         child = f"{rel}/{entry.name}" if rel else entry.name
         try:
+            is_link = entry.is_symlink()
+        except AttributeError:
+            is_link = False
+        except OSError as err:
+            raise NewError(f"corral: cannot read {label}: {err}") from None
+        if is_link:
+            raise NewError(
+                f"corral: cannot read {label}: {child} is a symlink: refusing to follow it"
+            )
+        if isinstance(entry, Path):
+            real_root = os.path.realpath(root)
+            real_entry = os.path.realpath(entry)
+            if real_entry != real_root and not real_entry.startswith(real_root + os.sep):
+                raise NewError(
+                    f"corral: cannot read {label}: {child} escapes the template directory"
+                )
+        try:
             is_dir = entry.is_dir()
         except OSError as err:
             raise NewError(f"corral: cannot read {label}: {err}") from None
         if is_dir:
-            _collect(entry, child, found, label)
+            _collect(entry, child, found, label, root=root)
         else:
             try:
                 found[child] = entry.read_bytes()

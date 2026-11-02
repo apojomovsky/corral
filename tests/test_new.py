@@ -1464,6 +1464,27 @@ class TemplateDir(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.snapshot(target)["README.md"], edited)
 
+    def test_self_referential_link_is_exit_4_naming_the_entry(self):
+        os.symlink(self.source, os.path.join(self.source, "loop"))
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual(code, 4)
+        self.assertIn("loop", err)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(os.path.exists(self.target()))
+
+    def test_symlink_escaping_the_template_dir_is_exit_4(self):
+        outside = os.path.join(self.parent, "outside.txt")
+        with open(outside, "w", encoding="utf-8") as handle:
+            handle.write("outside\n")
+        os.symlink(outside, os.path.join(self.source, "evil.md"))
+        fake = FakeGit(root=self.parent)
+        code, _, err = run_new(path=self.parent, template_dir=self.source, git=fake)
+        self.assertEqual(code, 4)
+        self.assertIn("evil.md", err)
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(os.path.exists(self.target()))
+
     def test_cli_accepts_template_dir(self):
         xdg = tempfile.mkdtemp(prefix="corral-xdg-")
         self.addCleanup(shutil.rmtree, xdg, True)
