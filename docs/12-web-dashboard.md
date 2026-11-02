@@ -1280,12 +1280,13 @@ Options:
 **D4: a hub claims view in the UI.** `GET /v1/claims`
 already exists and W7 admits reader tokens to it (section 8),
 so no route work remains; the question is only whether the
-Hosts view gains a read-only claims list. Agent rows and board
-holders cover the daily question (section 2).
+Hosts view gains a read-only claims list in version two.
+Agent rows and board holders cover the daily question
+(section 2).
 
 Options:
-1. Defer; no claims view in version one (recommended).
-2. Read-only claims list on the Hosts view in version two.
+1. Defer; no claims view in version one.
+2. Read-only claims list on the Hosts view in version two (recommended).
 
 **D5: a host projects route.** Without it, projects with no
 current activity are invisible to the log view (section 2).
