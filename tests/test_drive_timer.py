@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import cli, drive, paths, units
+from corral import cli, drive, drivehub, paths, units
 
 
 def proc(stdout="", stderr="", returncode=0):
@@ -111,6 +111,36 @@ class TimerState(unittest.TestCase):
     def test_masked_reads_as_masked(self):
         state = drive.timer_state(run=lambda argv, timeout: proc("masked\n", returncode=1))
         self.assertEqual(state, "masked")
+
+    def test_masked_runtime_reads_as_masked(self):
+        state = drive.timer_state(run=lambda argv, timeout: proc("masked-runtime\n", returncode=1))
+        self.assertEqual(state, "masked")
+
+    def test_static_states_read_as_disabled(self):
+        for out in ("static\n", "indirect\n", "generated\n", "transient\n"):
+            with self.subTest(out=out):
+                state = drive.timer_state(run=lambda argv, timeout: proc(out, returncode=1))
+                self.assertEqual(state, "disabled")
+
+    def test_missing_variants_read_as_missing(self):
+        for err in (
+            "Failed to get unit file state for corral-drive.timer.",
+            "Unit corral-drive.timer could not be found.",
+            "No such file or directory",
+        ):
+            with self.subTest(err=err):
+                state = drive.timer_state(run=lambda argv, timeout: proc("", err, 1))
+                self.assertEqual(state, "missing")
+
+    def test_an_unknown_answer_raises_with_exit_3(self):
+        with self.assertRaises(units.Unreachable) as ctx:
+            drive.timer_state(run=lambda argv, timeout: proc("mystery\n", returncode=1))
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_an_unknown_success_answer_raises_with_exit_3(self):
+        with self.assertRaises(units.Unreachable) as ctx:
+            drive.timer_state(run=lambda argv, timeout: proc("mystery\n"))
+        self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_a_missing_unit_file_reads_as_missing(self):
         def run(argv, timeout):
@@ -256,7 +286,9 @@ class InstallVerb(unittest.TestCase):
 
         with mock.patch.object(drive, "install_timer", return_value=("/s", "/t")) as installed:
             with redirect_stdout(io.StringIO()):
-                code = drive.cmd_drive(argparse.Namespace(plan=False, drive_verb="install-timer"))
+                code = drivehub.cmd_drive(
+                    argparse.Namespace(plan=False, drive_verb="install-timer")
+                )
         installed.assert_called_once_with()
         self.assertEqual(code, 0)
 
@@ -267,15 +299,34 @@ class InstallVerb(unittest.TestCase):
             with mock.patch.object(
                 drive, "install_timer", side_effect=AssertionError("must not install")
             ):
-                code = drive.cmd_drive(argparse.Namespace(plan=True, drive_verb=None))
+                code = drivehub.cmd_drive(argparse.Namespace(plan=True, drive_verb=None))
         self.assertEqual(code, 4)
 
     def test_plan_combined_with_install_is_a_usage_error(self):
         with mock.patch.object(
             drive, "install_timer", side_effect=AssertionError("must not install")
         ):
-            code = drive.cmd_drive(argparse.Namespace(plan=True, drive_verb="install-timer"))
+            code = drivehub.cmd_drive(argparse.Namespace(plan=True, drive_verb="install-timer"))
         self.assertEqual(code, 4)
+
+    def test_plan_after_the_verb_parses_and_is_a_usage_error(self):
+        import io
+        from contextlib import redirect_stderr
+
+        args = cli.build_parser().parse_args(["drive", "install-timer", "--plan"])
+        self.assertEqual(args.drive_verb, "install-timer")
+        self.assertTrue(args.plan)
+        with mock.patch.object(
+            drive, "install_timer", side_effect=AssertionError("must not install")
+        ):
+            with redirect_stderr(io.StringIO()):
+                code = drivehub.cmd_drive(args)
+        self.assertEqual(code, 4)
+
+    def test_plan_before_the_verb_survives_the_install_subparser(self):
+        args = cli.build_parser().parse_args(["drive", "--plan", "install-timer"])
+        self.assertEqual(args.drive_verb, "install-timer")
+        self.assertTrue(args.plan)
 
     def test_install_reports_the_unit_paths(self):
         import io
@@ -284,7 +335,9 @@ class InstallVerb(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(drive, "install_timer", return_value=("/u/svc", "/u/tmr")):
             with redirect_stdout(out):
-                code = drive.cmd_drive(argparse.Namespace(plan=False, drive_verb="install-timer"))
+                code = drivehub.cmd_drive(
+                    argparse.Namespace(plan=False, drive_verb="install-timer")
+                )
         self.assertEqual(code, 0)
         self.assertIn("/u/svc", out.getvalue())
         self.assertIn(drive.TIMER_NAME, out.getvalue())
@@ -299,7 +352,7 @@ class InstallVerb(unittest.TestCase):
         ):
             with mock.patch.object(drive, "install_timer", side_effect=error):
                 with redirect_stderr(io.StringIO()):
-                    code = drive.cmd_drive(
+                    code = drivehub.cmd_drive(
                         argparse.Namespace(plan=False, drive_verb="install-timer")
                     )
             self.assertEqual(code, want)

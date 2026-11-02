@@ -585,22 +585,36 @@ def _archive_stamp(entry):
     return at[:10] if len(at) >= 10 else ""
 
 
+def journal_archive_names(directory):
+    """Dated journal archive file names in `directory`, oldest first.
+
+    Only `journal-YYYY-MM-DD.jsonl` with a real calendar stamp counts:
+    filename order is time order, and a stray file never joins a read.
+    A missing or unreadable directory reads as no archives.
+    """
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    dated = []
+    for name in names:
+        if not (name.startswith(JOURNAL_ARCHIVE_PREFIX) and name.endswith(".jsonl")):
+            continue
+        try:
+            datetime.date.fromisoformat(name[len(JOURNAL_ARCHIVE_PREFIX) : -len(".jsonl")])
+        except ValueError:
+            continue
+        dated.append(name)
+    return sorted(dated)
+
+
 def _prune_archives(root, now):
     day = _as_moment(now).date()
     kept, removed = [], []
     directory = os.path.join(root if root is not None else project_root(), LEASE_DIRNAME)
-    try:
-        names = os.listdir(directory)
-    except FileNotFoundError:
-        return kept, removed
-    for name in names:
-        if not (name.startswith(JOURNAL_ARCHIVE_PREFIX) and name.endswith(".jsonl")):
-            continue
+    for name in journal_archive_names(directory):
         stamp = name[len(JOURNAL_ARCHIVE_PREFIX) : -len(".jsonl")]
-        try:
-            file_day = datetime.date.fromisoformat(stamp)
-        except ValueError:
-            continue
+        file_day = datetime.date.fromisoformat(stamp)
         if (day - file_day).days > ARCHIVE_KEEP_DAYS:
             with contextlib.suppress(OSError):
                 os.remove(os.path.join(directory, name))

@@ -10,11 +10,12 @@ recording fakes. No `gh`, no systemd, no network, no real state dir.
 
 import io
 import os
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, hub, registry
+from corral import board, drive, drivehub, hub, registry
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, FakeStop, claimed
@@ -325,7 +326,8 @@ class HubReconcileTest(unittest.TestCase):
         out = fields.pop("out", io.StringIO())
         values = {"stop_unit": stop, "out": out, "err": io.StringIO(), "now": NOW}
         values.update(fields)
-        table = drive.reconcile_hub(store, drive.HubMode(fake_hub, HOST), **values)
+        hub = drivehub.HubMode(fake_hub, HOST)
+        table = hub.reconcile(store, **values)
         return table, stop, out.getvalue()
 
     def test_fence_drops_the_superseded_row(self):
@@ -441,32 +443,40 @@ class HubReconcileTest(unittest.TestCase):
         self.assertIn("older", logged)
 
     def test_reconcile_continues_when_a_drop_fails(self):
-        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
-        self.addCleanup(store.close)
-        first = claimed(store, "app", 7)
-        second = claimed(store, "app", 8)
-        fake_hub = FakeHub()
-        fake_hub.rows = [
-            hub_row("app", 7, first.agent, epoch=first.epoch + 1),
-            hub_row("app", 8, second.agent, epoch=second.epoch + 1),
-        ]
-        real_release = store.release
+        failures = {
+            "race": board.Claimed("app#7 is held"),
+            "missing row": board.StoreError("unknown item app#7"),
+            "write failure": sqlite3.Error("database is locked"),
+        }
+        for name, failure in failures.items():
+            with self.subTest(name):
+                db = os.path.join(self.tmp.name, f"drop-{name.replace(' ', '-')}.sqlite")
+                store = stored(db, [("app", 7, "open"), ("app", 8, "open")])
+                self.addCleanup(store.close)
+                first = claimed(store, "app", 7)
+                second = claimed(store, "app", 8)
+                fake_hub = FakeHub()
+                fake_hub.rows = [
+                    hub_row("app", 7, first.agent, epoch=first.epoch + 1),
+                    hub_row("app", 8, second.agent, epoch=second.epoch + 1),
+                ]
+                real_release = store.release
 
-        def flaky(repo, number, agent, epoch, *, now):
-            if number == 7:
-                raise board.StoreError("unknown item app#7")
-            return real_release(repo, number, agent, epoch, now=now)
+                def flaky(repo, number, agent, epoch, *, now, _failure=failure):
+                    if number == 7:
+                        raise _failure
+                    return real_release(repo, number, agent, epoch, now=now)
 
-        stop = FakeStop()
-        out = io.StringIO()
-        with mock.patch.object(store, "release", side_effect=flaky):
-            table, _, logged = self.reconcile(store, fake_hub, stop=stop, out=out)
-        self.assertEqual(stop.calls, [("app", 7), ("app", 8)])
-        kept = store.claim_of("app", 7)
-        assert kept is not None
-        self.assertEqual(kept.epoch, first.epoch)
-        self.assertIsNone(store.claim_of("app", 8))
-        self.assertIn("left held", logged)
+                stop = FakeStop()
+                out = io.StringIO()
+                with mock.patch.object(store, "release", side_effect=flaky):
+                    table, _, logged = self.reconcile(store, fake_hub, stop=stop, out=out)
+                self.assertEqual(stop.calls, [("app", 7), ("app", 8)])
+                kept = store.claim_of("app", 7)
+                assert kept is not None
+                self.assertEqual(kept.epoch, first.epoch)
+                self.assertIsNone(store.claim_of("app", 8))
+                self.assertIn("left held", logged)
 
     def test_fence_never_touches_a_foreign_local_claim(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -610,16 +620,18 @@ class HubStuckWiringTest(unittest.TestCase):
 
 class HubClientForTest(unittest.TestCase):
     def test_no_url_means_no_client(self):
-        self.assertIsNone(drive.hub_client_for({"hub.url": "", "hub.host_id": ""}, token_path="/t"))
+        self.assertIsNone(
+            drivehub.hub_client_for({"hub.url": "", "hub.host_id": ""}, token_path="/t")
+        )
 
     def test_url_without_host_id_is_refused(self):
-        with self.assertRaises(hub.HubError):
-            drive.hub_client_for(
+        with self.assertRaises(drive.HubConfigError):
+            drivehub.hub_client_for(
                 {"hub.url": "http://host-1:8000", "hub.host_id": ""}, token_path="/t"
             )
 
     def test_client_carries_url_host_and_token_path(self):
-        client = drive.hub_client_for(
+        client = drivehub.hub_client_for(
             {"hub.url": "http://host-1:8000", "hub.host_id": "host-1"}, token_path="/t/hub-token"
         )
         assert client is not None

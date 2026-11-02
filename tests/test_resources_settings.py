@@ -345,3 +345,70 @@ class ProjectShares(unittest.TestCase):
             (found,) = projects.load_all(config_dir)
         assert found.resources is not None
         self.assertEqual((found.resources["weight"], found.resources["cpu_floor_m"]), (0, 500))
+
+
+class PressureThresholds(unittest.TestCase):
+    def test_no_pressure_table_reads_as_defaults(self):
+        tables = resolve(host=host_config(HOST)).resources
+        assert tables is not None
+        self.assertIsNone(tables.pressure)
+        caps = R.caps()
+        self.assertEqual((caps.max_load_per_cpu, caps.min_mem_available_pct), (2.0, 10.0))
+
+    def test_the_documented_pressure_table_loads(self):
+        tables = resolve(
+            host=host_config(
+                HOST, {"pressure": {"max_load_per_cpu": 4.0, "min_mem_available_pct": 5.0}}
+            )
+        ).resources
+        assert tables is not None
+        assert tables.pressure is not None
+        self.assertEqual(
+            (tables.pressure.max_load_per_cpu, tables.pressure.min_mem_available_pct), (4.0, 5.0)
+        )
+
+    def test_a_partial_pressure_table_keeps_defaults(self):
+        tables = resolve(host=host_config(HOST, {"pressure": {"max_load_per_cpu": 4.0}})).resources
+        assert tables is not None
+        assert tables.pressure is not None
+        self.assertEqual(
+            (tables.pressure.max_load_per_cpu, tables.pressure.min_mem_available_pct), (4.0, 10.0)
+        )
+
+    def test_whole_numbers_read_as_thresholds(self):
+        tables = resolve(
+            host=host_config(
+                HOST, {"pressure": {"max_load_per_cpu": 4, "min_mem_available_pct": 5}}
+            )
+        ).resources
+        assert tables is not None
+        assert tables.pressure is not None
+        self.assertEqual(
+            (tables.pressure.max_load_per_cpu, tables.pressure.min_mem_available_pct), (4.0, 5.0)
+        )
+
+    def test_an_unknown_pressure_key_names_it(self):
+        with self.assertRaisesRegex(
+            S.SettingsError, r"config\.toml.*\[resources\.pressure\].*'turbo'"
+        ):
+            resolve(host=host_config(HOST, {"pressure": {"turbo": True}}))
+
+    def test_a_zero_max_names_it(self):
+        with self.assertRaisesRegex(
+            S.SettingsError, r"config\.toml.*\[resources\.pressure\].*max_load_per_cpu"
+        ):
+            resolve(host=host_config(HOST, {"pressure": {"max_load_per_cpu": 0}}))
+
+    def test_a_min_above_a_hundred_names_it(self):
+        with self.assertRaisesRegex(
+            S.SettingsError, r"config\.toml.*\[resources\.pressure\].*min_mem_available_pct"
+        ):
+            resolve(host=host_config(HOST, {"pressure": {"min_mem_available_pct": 101}}))
+
+    def test_a_non_number_names_it(self):
+        with self.assertRaisesRegex(S.SettingsError, r"config\.toml.*\[resources\.pressure\]"):
+            resolve(host=host_config(HOST, {"pressure": {"max_load_per_cpu": "lots"}}))
+
+    def test_an_empty_pressure_table_is_an_error(self):
+        with self.assertRaisesRegex(S.SettingsError, "empty table"):
+            resolve(host=host_config(HOST, {"pressure": {}}))

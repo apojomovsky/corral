@@ -12,8 +12,9 @@ from corral import (
     deps,
     diskcli,
     doctor,
-    drive,
+    drivehub,
     gccli,
+    githubcli,
     hubcli,
     init,
     launch,
@@ -22,11 +23,13 @@ from corral import (
     mirrorcli,
     new,
     paths,
+    profilecli,
     projects,
     promptscli,
     quotacli,
     registry,
     reviewcli,
+    serve,
     settings,
     snapshot,
     syncli,
@@ -166,7 +169,14 @@ def cmd_budget(args: argparse.Namespace) -> int:
 
     from corral import diffscope
 
-    print(budget.dispatch_block(diffscope.default_base(args.base)))
+    try:
+        root, repo = budget.resolve_root_repo(args.root, args.repo)
+        cfg = budget.load_numbers(root=root, repo=repo)
+        text = budget.dispatch_block(diffscope.default_base(args.base), cfg=cfg)
+    except settings.SettingsError as err:
+        print(f"corral: {err}", file=sys.stderr)
+        return USAGE
+    print(text)
     return OK
 
 
@@ -197,6 +207,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="print the stable document")
     p.set_defaults(func=cmd_projects)
+    from corral import budget
     from corral.diffscope import BASE_HELP
 
     base_help = f"base ref to diff against ({BASE_HELP})"
@@ -214,30 +225,30 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_push)
     p = sub.add_parser(
         "budget",
-        help="derive a reviewer dispatch's time budget from the diff scope",
-        epilog="Prints the dispatch block the review gate asks for: the one "
-        "question, the scope, and an expected duration plus hard limit "
-        "computed from <base>...HEAD. Paste it into the reviewer prompt "
-        "so the budget is reproducible rather than hand-picked.",
+        help=budget.BUDGET_HELP,
+        epilog=budget.BUDGET_EPILOG,
     )
-    p.add_argument("--base", default=None, help=base_help)
+    budget.add_flags(p)
     p.set_defaults(func=cmd_budget)
     init.add_parser(sub)
     coordcli.add_parser(sub)
     diskcli.add_parser(sub)
-    drive.add_parser(sub)
+    drivehub.add_parser(sub)
     hubcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
+    githubcli.add_parser(sub)
     quotacli.add_parser(sub)
+    serve.add_parser(sub)
     snapshot.add_parser(sub)
     syncli.add_parser(sub)
     leakcli.add_parser(sub)
     takeoffcli.add_parser(sub)
     mirrorcli.add_parser(sub)
     new.add_parser(sub)
+    profilecli.add_parser(sub, profilecli.production_seams())
     promptscli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
     doctor.add_parser(sub, doctor.production_env)

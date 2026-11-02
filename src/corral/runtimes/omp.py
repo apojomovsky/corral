@@ -22,7 +22,11 @@ NAME = "omp"
 #: Where omp installs for a user, when PATH does not have it.
 FALLBACK = "~/.local/bin/omp"
 CONFIG_NAME = "overlay.yml"
+#: The profile options the last `write_config` recorded, read back by `argv`.
+OPTIONS_NAME = "options.json"
 SESSION_SUFFIX = ".jsonl"
+#: The approval mode without a recorded option: headless runs approve tools.
+DEFAULT_AUTO_APPROVE = True
 #: A headless turn kills background jobs, so omp never backgrounds one. omp
 #: backgrounds bash calls over a minute, and runs task sub-agents as background
 #: jobs while `async.enabled` holds; in `-p` mode the agent would end its turn to
@@ -105,8 +109,40 @@ def overlay_text(config):
 
 
 def options_schema():
-    """The profile options omp accepts: none yet; a later ticket owns the schema."""
-    return {}
+    """The profile options omp accepts: the approval mode for the headless run."""
+    return {"auto_approve": (bool, "whether to pass --auto-approve for the headless run")}
+
+
+def _read_options(session_dir):
+    """The recorded profile options, or {} when none were recorded.
+
+    A corrupt file, an unreadable one, or a non-object raises ValueError
+    naming the file, so a launch never silently runs on the wrong setup.
+    """
+    path = os.path.join(session_dir, OPTIONS_NAME)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            options = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    except OSError as err:
+        raise ValueError(f"cannot read {path}: {err}") from err
+    except ValueError as err:
+        raise ValueError(f"cannot parse {path}: {err}") from err
+    if not isinstance(options, dict):
+        raise ValueError(f"cannot parse {path}: want a JSON object")
+    return options
+
+
+def _auto_approve_of(session_dir):
+    """Whether the run passes --auto-approve: the recorded option, else the default."""
+    options = _read_options(session_dir)
+    if "auto_approve" not in options:
+        return DEFAULT_AUTO_APPROVE
+    if not isinstance(options["auto_approve"], bool):
+        path = os.path.join(session_dir, OPTIONS_NAME)
+        raise ValueError(f"cannot parse {path}: want auto_approve to be a boolean")
+    return options["auto_approve"]
 
 
 def with_models(config, chains):
@@ -132,9 +168,20 @@ def with_models(config, chains):
 
 
 def write_config(session_dir, config):
-    """Write `overlay.yml` into the session dir, atomically."""
+    """Write `overlay.yml` into the session dir, atomically.
+
+    Profile options travel beside it in `options.json`, so `argv` can read
+    them back; they never land in the overlay, which holds omp settings.
+    """
+    options = {}
+    rest = dict(config or {})
+    if "auto_approve" in rest:
+        options["auto_approve"] = rest.pop("auto_approve")
     os.makedirs(session_dir, exist_ok=True)
-    paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), overlay_text(config))
+    paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), overlay_text(rest))
+    if options:
+        text = json.dumps(options, indent=1) + "\n"
+        paths.atomic_write_text(os.path.join(session_dir, OPTIONS_NAME), text)
 
 
 def argv(
@@ -151,8 +198,9 @@ def argv(
         max_time,
         "--config",
         os.path.join(session_dir, CONFIG_NAME),
-        "--auto-approve",
     ]
+    if _auto_approve_of(session_dir):
+        command += ["--auto-approve"]
     if resume:
         command += ["-r", resume]
     if model:

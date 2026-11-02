@@ -311,6 +311,14 @@ any future reaper (a pressure-triggered pauser or killer takes its stop
 function as a required argument and fails closed without one). This design
 adds no pauser or killer; backoff applies to launches only.
 
+Changed limits reach running slices only by an operator refresh. Launch
+creation sets each slice's limits once and never rewrites a slice under
+a live agent, so after the operator lowers a number the admission gate
+and the kernel enforcement disagree until the operator refreshes the
+slices: stop the slice, or run `systemctl --user daemon-reload` and
+restart the affected units. That refresh is an operator action, not a
+launch step. The doctor ticket gains a row reporting the drift.
+
 ## 7. Testing
 
 No test touches the real host (AGENTS.md): no systemd, no cgroup

@@ -43,6 +43,7 @@ from corral import (
     disk,
     eligibility,
     hold,
+    host_ledger,
     launch,
     mirror,
     paths,
@@ -57,11 +58,9 @@ from corral import (
     units,
     worktrees,
 )
-from corral import hub as hubmod
 from corral import syncli
 from corral import tracker as iface
 from corral.eligibility import StartRequest, TicketRow
-from corral.github.tracker import NEEDS_DECISION, PRIORITIES
 
 OK, NO, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
@@ -137,8 +136,8 @@ def priority_rank(priority) -> int:
     Follows the tracker's highest-first priority order; anything outside
     it (including no priority) ranks zero and sorts last.
     """
-    if priority in PRIORITIES:
-        return len(PRIORITIES) - PRIORITIES.index(priority)
+    if priority in iface.PRIORITIES:
+        return len(iface.PRIORITIES) - iface.PRIORITIES.index(priority)
     return 0
 
 
@@ -265,6 +264,7 @@ def gate(
     ledger,
     now,
     finished=None,
+    agent_roles=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -276,9 +276,12 @@ def gate(
     proceeds only for PR-ready rows: unclaimed with a finished worker
     behind them, whose id the reviewer passes as its author. Rows
     reviewed since the last work are merge-ready and ignored, and a fix
-    round requested after the fix already landed is skipped. Every input
-    is plain data or an injected seam (`read_labels`); nothing is
-    launched, claimed or written.
+    round requested after the fix already landed is skipped. A fix or
+    resume behind a reviewer holder (from `agent_roles`) skips with the
+    claim kept, matching the claiming pass, so `--plan` prints the
+    verdict the real pass would print. Every input is plain data or an
+    injected seam (`read_labels`); nothing is launched, claimed or
+    written.
     """
     if candidate.request is None:
         row = candidate.row
@@ -356,12 +359,12 @@ def gate(
     )
     if held is not None:
         return _skip(candidate, kind, "hold", held)
-    if NEEDS_DECISION in (row.labels or ()):
+    if iface.NEEDS_DECISION in (row.labels or ()):
         return _skip(
             candidate,
             kind,
             "hold",
-            f"{ref}: carries {NEEDS_DECISION}, waiting on a human, never started",
+            f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, never started",
         )
 
     decided = admission.admit(
@@ -385,6 +388,14 @@ def gate(
         blocked = shut["blocked"]
         roles = ", ".join(f"role {name!r} ({blocked[name]['state']})" for name in sorted(blocked))
         return _skip(candidate, kind, "quota", f"{ref}: quota refuses {roles}: skipped")
+
+    if kind in ("resume", "fix") and (agent_roles or {}).get(holder) == "reviewer":
+        return _skip(
+            candidate,
+            kind,
+            "claim",
+            f"{ref}: reviewer `{holder}` still holds the claim, fix waits for release",
+        )
 
     if kind == "start" and request.kind in ("resume", "fix"):
         reason = f"{ref}: {request.kind} on an unclaimed ticket, fresh start instead"
@@ -800,10 +811,13 @@ def timer_state(run=units.default_run) -> str:
     """Whether the user timer is enabled: one of "enabled", "disabled",
     "masked" or "missing". Pure over the `run` seam.
 
-    A manager that cannot be asked raises `units.Unreachable` (exit 3):
-    a missing `systemctl`, a dead bus, or an answered state outside the
-    known words. Anything else the manager answers that is not an
-    enabled, disabled or masked state reads as "missing".
+    The enabled words read as "enabled" and the masked words as
+    "masked"; "disabled", "static", "indirect", "generated" and
+    "transient" read as "disabled"; the known not-installed answers
+    read as "missing". A manager that cannot be asked raises
+    `units.Unreachable` (exit 3): a missing `systemctl`, a dead bus,
+    or an answered state outside those known words, success or not.
+    An unknown answer is never guessed at.
     """
     import subprocess
 
@@ -823,7 +837,7 @@ def timer_state(run=units.default_run) -> str:
         raise units.Unreachable(f"cannot ask whether {TIMER_NAME} is enabled: {err_text or out}")
     if out in ("masked", "masked-runtime"):
         return "masked"
-    if proc.returncode == 0 or out in (
+    if out in (
         "disabled",
         "static",
         "indirect",
@@ -1070,6 +1084,7 @@ def _gate_all(
     hold_label,
     released=None,
     finished=None,
+    agent_roles=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -1080,7 +1095,9 @@ def _gate_all(
     released this pass) simulates the post-release rows, so a plan over
     still-claimed rows gates what the real pass would gate after the
     release; `finished` carries the newest finished entry per ticket for
-    the reviewer and fix-round readiness. Nothing is written.
+    the reviewer and fix-round readiness; `agent_roles` ({agent id:
+    role}) feeds the gate's reviewer-holder skip, so a plan matches
+    the claiming pass. Nothing is written.
     """
     rows = eligibility.rows_from_items(items)
     by_key = {(row.repo, row.number): row for row in rows}
@@ -1131,8 +1148,7 @@ def _gate_all(
         counted[entry_project] = counted.get(entry_project, 0) + 1
 
     def floor_of(name):
-        entry = limits.projects.get(name) or {}
-        return entry.get("floor", 0)
+        return admission.bounds(limits.projects.get(name))[0]
 
     stop_starts = False
     gated_rows = []
@@ -1167,6 +1183,7 @@ def _gate_all(
             ledger=ledger_data,
             now=now,
             finished=finished,
+            agent_roles=agent_roles,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1191,15 +1208,16 @@ def _pass(
     pool,
     agent_states=None,
     finished_for=None,
+    agent_roles=None,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
     Nothing is synced, claimed, enqueued, started, mirrored or journaled.
     A project whose policy or quota settings fail is skipped with one
     error line; the pass still gates every other project and exits 4.
-    `agent_states` and `finished_for` feed the reviewer and fix-round
-    readiness exactly like the claiming pass, so the plan shows the
-    verdicts the real pass would print; both are reads only.
+    `agent_states`, `finished_for` and `agent_roles` feed the reviewer
+    and fix-round readiness exactly like the claiming pass, so the plan
+    shows the verdicts the real pass would print; all are reads only.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1246,6 +1264,7 @@ def _pass(
         hold_label=hold_label,
         released=released,
         finished=finished,
+        agent_roles=agent_roles,
     )
     table = [
         Candidate(
@@ -1518,189 +1537,27 @@ class HubGone(Exception):
     """The hub is down for this pass: skip every claim-needing row."""
 
 
-class HubMode:
-    """One pass's hub conversation: propose first, short-circuit when down.
+class HubConflict(Exception):
+    """The hub refused a claim: another holder owns the ticket.
 
-    `client` is the injected hub seam (a `hub.HubClient` or a fake with
-    the same methods); `host_id` is this host's operator-assigned id.
-    The first `HubUnreachable` flips `down` and every later call raises
-    `HubGone` without touching the client, so a dead hub costs one
-    failed call per pass. Hub mode is the presence of this object:
-    with no hub configured the pass never builds one and makes zero
-    hub calls (single-host behavior is the absence of the step, not a
-    client pointed at localhost).
+    Raised by the hub facade (which translates the hub's conflict)
+    so the pass never names the hub module: `holder` is the hub's
+    holder mapping, and the pass reports the owning agent from it.
     """
 
-    def __init__(self, client, host_id):
-        self.client = client
-        self.host_id = host_id
-        self.down = False
-        self.table: dict = {}
-
-    def epoch_of(self, repo, number):
-        """The hub's fencing epoch for (`repo`, `number`), for the stuck check.
-
-        `None` when the hub shows no row; raises `HubUnreachable` when
-        the hub is down, which the stuck sweep reports as unreadable
-        and skips. The pass refreshes `table` from the reconnect, so
-        this never serves an epoch a re-grant just replaced.
-        """
-        if self.down:
-            raise hubmod.HubUnreachable("hub unreachable")
-        return self.table.get((repo, number))
-
-    def _call(self, call):
-        if self.down:
-            raise HubGone("hub unreachable")
-        try:
-            return call()
-        except hubmod.HubUnreachable as err:
-            self.down = True
-            raise HubGone(str(err)) from None
-
-    def fetch(self):
-        """Every hub claim row, for the reconnect compare."""
-        return self._call(lambda: self.client.claims())
-
-    def propose(self, repo, number, agent):
-        """Grant or refuse one claim: the receipt, or `Hub.Conflict`."""
-        return self._call(lambda: self.client.propose(repo, number, agent))
-
-    def renew(self, repo, number, agent, epoch):
-        """Extend a live lease without changing its epoch."""
-        return self._call(lambda: self.client.renew(repo, number, agent, epoch))
-
-    def release(self, repo, number, agent, epoch):
-        """Release a hub row the host holds nothing for. Returns the kept epoch."""
-        return self._call(lambda: self.client.release(repo, number, agent, epoch))
+    def __init__(self, holder):
+        super().__init__("hub refused the claim: another holder owns the ticket")
+        self.holder = holder
 
 
-def hub_client_for(resolved, *, token_path):
-    """The hub client for this pass, or None in single-host mode.
+class HubConfigError(Exception):
+    """The hub is misconfigured or answered garbage (exit 4).
 
-    Pure except for storing the token path: with no `hub.url` there is
-    no client and the pass makes zero hub calls. With one but no
-    `hub.host_id` the pass is refused (`HubError`, exit 4): a host
-    that cannot name itself must never propose. The client reads the
-    token at call time, so construction touches no file.
+    Raised by the hub facade (which translates the hub's usage
+    error) so the pass never names the hub module. A dead hub is
+    `HubGone` instead: unreachable skips claims, misconfiguration
+    refuses the pass.
     """
-    url = str(resolved.get("hub.url", "") or "").strip()
-    if not url:
-        return None
-    host_id = str(resolved.get("hub.host_id", "") or "").strip()
-    if not host_id:
-        raise hubmod.HubError("hub.url is set but hub.host_id is empty: register this host first")
-    return hubmod.HubClient(url, host_id, token_path)
-
-
-def reconcile_hub(store, hub, *, stop_unit, out, err, now):
-    """Section-3 steps 2-4: fetch, fence the stale, re-adopt the live.
-
-    Compares the hub claims table against locally held claims, ticket
-    by ticket, in store order. A local claim the hub shows under a
-    newer epoch or a different holder is fenced through
-    `drop_stale_claim` (stop, drop locally, never touch the hub row). A
-    live row renews a live lease or re-grants a lapsed one, adopting
-    the bumped epoch locally; a hub 409 in either case fences instead.
-    Hub rows naming this host with no local record are released
-    unconditionally. A local claim the hub shows no row for, or an
-    older epoch for, is kept with a log line, as is any foreign local
-    claim: the pass never touches those. Raises `HubGone` when the hub
-    is down. Returns the post-reconcile hub epoch table
-    {(repo, number): epoch} for the stuck check: re-grants update it,
-    so the sweep never reads an epoch it just replaced. A failing row
-    defers that ticket instead of aborting the loop. Steps are
-    idempotent, so a pass cut mid-reconcile is safe to re-run.
-    """
-    remote = hub.fetch()
-    by_ticket = {(row["repo"], row["number"]): row for row in remote}
-    table = {key: row["epoch"] for key, row in by_ticket.items()}
-    try:
-        items = store.items()
-    except (board.StoreError, sqlite3.Error) as problem:
-        print(f"corral drive: hub reconcile unreadable ({problem}), skipped", file=err)
-        return table
-    held: set = set()
-    for item in items:
-        ref = f"{item.repo}#{item.number}"
-        try:
-            claim = store.claim_of(item.repo, item.number)
-        except (board.StoreError, sqlite3.Error) as problem:
-            print(f"{ref}: hub reconcile unreadable ({problem}), left held", file=out)
-            continue
-        if claim is None or not claim.agent:
-            continue
-        held.add((claim.repo, claim.number))
-        row = by_ticket.get((claim.repo, claim.number))
-        if row is None:
-            print(f"{ref}: hub shows no row, claim kept", file=out)
-            continue
-        if not is_managed_agent(claim.agent):
-            print(f"{ref}: foreign local claim by `{claim.agent}`, never touched", file=out)
-            continue
-        if (
-            row["host_id"] == hub.host_id
-            and row["agent"] == claim.agent
-            and row["epoch"] == claim.epoch
-        ):
-            if row["lease_expires"] > now:
-                try:
-                    hub.renew(claim.repo, claim.number, claim.agent, claim.epoch)
-                except hubmod.Conflict:
-                    drop_stale_claim(
-                        store, claim.repo, claim.number, stop_unit=stop_unit, out=out, now=now
-                    )
-                continue
-            try:
-                receipt = hub.propose(claim.repo, claim.number, claim.agent)
-            except hubmod.Conflict:
-                drop_stale_claim(
-                    store, claim.repo, claim.number, stop_unit=stop_unit, out=out, now=now
-                )
-                continue
-            try:
-                store.claim(
-                    claim.repo,
-                    claim.number,
-                    claim.agent,
-                    claim.host,
-                    now=now,
-                    epoch=receipt.epoch,
-                )
-            except (board.Claimed, board.ExternalItem, board.StoreError, sqlite3.Error) as problem:
-                print(f"{ref}: re-grant adoption refused ({problem}), left held", file=out)
-                continue
-            table[(claim.repo, claim.number)] = receipt.epoch
-            print(
-                f"{ref}: re-granted on reconnect, adopted hub epoch {receipt.epoch}",
-                file=out,
-            )
-            continue
-        if (
-            row["host_id"] == hub.host_id
-            and row["agent"] == claim.agent
-            and row["epoch"] < claim.epoch
-        ):
-            print(
-                f"{ref}: hub epoch {row['epoch']} is older than local epoch"
-                f" {claim.epoch}, claim kept",
-                file=out,
-            )
-            continue
-        drop_stale_claim(store, claim.repo, claim.number, stop_unit=stop_unit, out=out, now=now)
-    for (repo, number), row in by_ticket.items():
-        if row["host_id"] != hub.host_id or not row["agent"]:
-            continue
-        if (repo, number) in held:
-            continue
-        ref = f"{repo}#{number}"
-        try:
-            hub.release(repo, number, row["agent"], row["epoch"])
-        except hubmod.Conflict as problem:
-            print(f"{ref}: hub release raced ({problem}), left to lapse", file=out)
-            continue
-        print(f"{ref}: released a hub row with no local claim", file=out)
-    return table
 
 
 #: Automatic restarts per ticket in any sliding window.
@@ -2241,7 +2098,7 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         )
         return
     try:
-        tracker.add_label(claim.repo, claim.number, NEEDS_DECISION)
+        tracker.add_label(claim.repo, claim.number, iface.NEEDS_DECISION)
         tracker.comment(
             claim.repo,
             claim.number,
@@ -2387,7 +2244,7 @@ def _mint_claim(store, gated, *, host, now, kind=None, hub=None):
             return None, _skip_as(
                 gated, title_kind, f"{ref}: hub unreachable, the pass moves on ({gone})", "hub"
             )
-        except hubmod.Conflict as err:
+        except HubConflict as err:
             holder = err.holder.get("agent", "?")
             return None, _skip_as(
                 gated,
@@ -2546,7 +2403,8 @@ def _claim_and_launch(
     row's reason. `released` ({(repo, number): worker id} released
     this pass) and `finished` (the newest finished entry per ticket)
     feed the reviewer author. With no `launcher` the pass stops after
-    claiming and records that, so no row counts as launched. The day
+    claiming and records that, releasing a reviewer claim again like a
+    failed launch, so no row counts as launched. The day
     cap counts `start`, `review` and fresh `fix` launches: each one
     starts a new agent. A `resume` reuses the holder's claim and stays
     exempt. When `start_budget` is not None, at most that many launch;
@@ -2614,15 +2472,16 @@ def _claim_and_launch(
                 rows.append(skipped)
                 continue
             if launcher is None:
+                suffix = _release_reviewer_claim(store, gated.repo, gated.number, agent, now=now)
                 rows.append(
                     Gated(
                         project=gated.project,
                         repo=gated.repo,
                         number=gated.number,
                         kind=gated.kind,
-                        verdict=gated.verdict,
-                        reason=f"{gated.reason}; launch skipped (no launcher)",
-                        code=gated.code,
+                        verdict="skip",
+                        reason=f"{gated.reason}; launch skipped (no launcher){suffix}",
+                        code="launch",
                     )
                 )
                 continue
@@ -3151,10 +3010,13 @@ def _reviewer_prompt(root, tgt, number, title, author):
 
     The worker id rides in the prompt text: the reviewer passes it as
     `review record --author`, and the record refuses a self-review. A
-    blank author raises LaunchError before anything is claimed, since a
-    reviewer that cannot record is a wasted run. Validated before the
-    launch makes anything, so a bad override never leaves a stray branch
-    behind. The heartbeat lines go on in `launch.launch`, not here.
+    blank author raises LaunchError before anything is launched, since
+    a reviewer that cannot record is a wasted run. The no-claim
+    guarantee is the author skip in the claim path, not this guard:
+    this renderer runs at launch time, after the claim. Validated
+    before the launch makes anything, so a bad override never leaves a
+    stray branch behind. The heartbeat lines go on in `launch.launch`,
+    not here.
     """
     worker = str(author or "").strip()
     if not worker:
@@ -3233,6 +3095,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
                 list_fn=list_fn,
                 run=units.default_run,
                 usage=disk.production_usage,
+                host_ledger_fn=host_ledger.ensure,
             )
             return unit
         if kind == "resume":
@@ -3252,6 +3115,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
                 list_fn=list_fn,
                 run=units.default_run,
                 usage=disk.production_usage,
+                host_ledger_fn=host_ledger.ensure,
                 git=worktrees.git,
             )
             return unit
@@ -3265,6 +3129,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
             list_fn=list_fn,
             run=units.default_run,
             usage=disk.production_usage,
+            host_ledger_fn=host_ledger.ensure,
         )
         return unit
 
@@ -3305,8 +3170,7 @@ def _launching_pass(
     day_path=None,
     max_starts=None,
     hub_epoch_of=None,
-    hub_client=None,
-    hub_host_id=None,
+    hub=None,
 ) -> int:
     """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
@@ -3335,8 +3199,9 @@ def _launching_pass(
     give-up, and its end with verdict counts; a journal write failure
     warns and the pass continues. When `day_path` and `max_starts` are
     set, at most the remaining starts launch and the pass ends with exit
-    1 once the cap stops a start. `hub_client` (with `hub_host_id`) is
-    the injected hub seam; None means single-host, zero hub calls.
+    1 once the cap stops a start. `hub` is the injected hub facade
+    (built CLI-side: `drive` never names the hub module); None means
+    single-host, zero hub calls.
     """
     events: list[dict] = []
     released = 0
@@ -3384,13 +3249,12 @@ def _launching_pass(
         return finish(USAGE)
     for line in sync_errors + sync_store_errors:
         print(f"corral drive: {line}", file=err)
-    hub = HubMode(hub_client, hub_host_id) if hub_client is not None else None
     if hub is not None:
         try:
-            hub.table = reconcile_hub(store, hub, stop_unit=stop_unit, out=out, err=err, now=now)
+            hub.reconcile(store, stop_unit=stop_unit, out=out, err=err, now=now)
         except HubGone as gone:
             print(f"corral drive: hub unreachable, new claims skipped ({gone})", file=err)
-        except hubmod.HubError as problem:
+        except HubConfigError as problem:
             print(f"corral drive: {problem}", file=err)
             return finish(USAGE)
         if hub_epoch_of is None:
@@ -3545,7 +3409,7 @@ def _launching_pass(
             events=events if journal_path is not None else None,
             hub=hub,
         )
-    except hubmod.HubError as problem:
+    except HubConfigError as problem:
         print(f"corral drive: {problem}", file=err)
         return finish(USAGE)
     stuck_capped = False
@@ -3704,8 +3568,7 @@ def run_pass(
     day_path=None,
     max_starts=None,
     hub_epoch_of=None,
-    hub_client=None,
-    hub_host_id=None,
+    hub=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
@@ -3738,14 +3601,15 @@ def run_pass(
     left held; a failed seam keeps the claim. `hub_epoch_of` maps
     (repo, number) to the hub row's fencing epoch for the stuck epoch
     check (None means single-host: no check); an explicit seam wins
-    over the hub table the pass builds. `hub_client` (with
-    `hub_host_id`) is the injected hub seam for the claim path and the
-    reconnect (None means single-host: zero hub calls). `finished_for`
+    over the hub table the pass builds. `hub` is the injected hub
+    facade for the claim path and the reconnect (None means
+    single-host: zero hub calls). `finished_for`
     ({(repo, number): (agent id, role)} for the newest finished entry per
     ticket) feeds the reviewer and fix-round readiness alongside the
     same-pass releases. `agent_roles` ({agent id: role} for visible
     entries) serializes a fix behind a reviewer holder; unknown
-    holders proceed as before. When `pause_path` names an
+    holders proceed as before. The plan pass reads it too, so `--plan`
+    prints the same reviewer-holder skips. When `pause_path` names an
     existing pause file, either pass reports it and exits 1, starting
     nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
@@ -3784,6 +3648,7 @@ def run_pass(
             label="plan",
             agent_states=agent_states,
             finished_for=finished_for,
+            agent_roles=agent_roles,
             **args,
         )
     try:
@@ -3812,8 +3677,7 @@ def run_pass(
                 day_path=day_path,
                 max_starts=max_starts,
                 hub_epoch_of=hub_epoch_of,
-                hub_client=hub_client,
-                hub_host_id=hub_host_id,
+                hub=hub,
                 **args,
             )
     except LockHeld as held:
@@ -3828,7 +3692,7 @@ def cmd_install_timer(args: argparse.Namespace) -> int:
     """Install and enable the user timer: the explicit operator step.
 
     The only path that writes or enables units. Passes never reach it:
-    `cmd_drive` calls it only for the `install-timer` verb.
+    the `drive` verb calls it only for `install-timer`.
     """
     _ = args
     try:
@@ -3841,138 +3705,3 @@ def cmd_install_timer(args: argparse.Namespace) -> int:
         return USAGE
     sys.stdout.write(f"installed {service_path}\ninstalled {timer_path}\nenabled {TIMER_NAME}\n")
     return OK
-
-
-def cmd_drive(args: argparse.Namespace) -> int:
-    if getattr(args, "drive_verb", None) == "install-timer":
-        if getattr(args, "plan", False):
-            print(
-                "corral drive: --plan changes nothing, install-timer installs; pick one",
-                file=sys.stderr,
-            )
-            return USAGE
-        return cmd_install_timer(args)
-    try:
-        store = board.open_store()
-    except board.StoreError as problem:
-        print(f"corral drive: {problem}", file=sys.stderr)
-        return USAGE
-    try:
-        host_settings = settings.load(root=None)
-        max_starts = host_settings["drive.max_starts_per_day"]
-        hold_label = host_settings["board.hold_label"]
-        hub_url = host_settings.get("hub.url", "")
-        hub_host_id = host_settings.get("hub.host_id", "")
-    except settings.SettingsError as problem:
-        print(f"corral drive: {problem}", file=sys.stderr)
-        return USAGE
-    hub_client = None
-    if not args.plan and str(hub_url or "").strip():
-        try:
-            hub_client = hub_client_for(
-                {"hub.url": hub_url, "hub.host_id": hub_host_id},
-                token_path=paths.hub_token_path(),
-            )
-        except (hubmod.HubError, paths.PathError) as problem:
-            print(f"corral drive: {problem}", file=sys.stderr)
-            return USAGE
-    with store:
-        if args.plan:
-            try:
-                registered = projects.load_all()
-            except projects.ProjectsError as problem:
-                print(f"corral drive: {problem}", file=sys.stderr)
-                return USAGE
-            moment = time.time()
-            try:
-                planned_states, _ = production_stuck_inputs(registered, now=moment)
-                planned_finished = production_finished_for(now=moment)
-            except settings.SettingsError as problem:
-                print(f"corral drive: {problem}", file=sys.stderr)
-                return USAGE
-            return run_pass(
-                plan=True,
-                store=store,
-                lock_path=lock_path(),
-                out=sys.stdout,
-                err=sys.stderr,
-                hold_label=hold_label,
-                pause_path=pause_path(),
-                agent_states=planned_states,
-                finished_for=planned_finished,
-            )
-        try:
-            registered = projects.load_all()
-        except projects.ProjectsError as problem:
-            print(f"corral drive: {problem}", file=sys.stderr)
-            return USAGE
-        operators, problem = production_operators(registered, syncli._git)
-        if problem is not None:
-            print(f"corral drive: {problem}", file=sys.stderr)
-            return USAGE
-        by_repo: dict = {}
-        for project in registered:
-            try:
-                names = settings.repo_names(project.root)
-            except settings.SettingsError as err:
-                print(f"corral drive: {err}", file=sys.stderr)
-                return USAGE
-            mapping, problem = trackers.production_trackers(project.root, names, git=syncli._git)
-            if problem is not None:
-                print(f"corral drive: {problem}", file=sys.stderr)
-                return USAGE
-            for entry in mapping.values():
-                by_repo.setdefault(entry.tracker_repo, entry.tracker)
-
-        def tracker_factory(repo, _by_repo=by_repo):
-            return _by_repo[repo]
-
-        moment = time.time()
-        try:
-            stuck_states, stuck_stale = production_stuck_inputs(registered, now=moment)
-            finished_for = production_finished_for(now=moment)
-            agent_roles = production_agent_roles(now=moment)
-        except settings.SettingsError as problem:
-            print(f"corral drive: {problem}", file=sys.stderr)
-            return USAGE
-        return run_pass(
-            plan=False,
-            store=store,
-            lock_path=lock_path(),
-            out=sys.stdout,
-            err=sys.stderr,
-            hold_label=hold_label,
-            projects_fn=lambda: registered,
-            tracker_factory=tracker_factory,
-            operators=operators,
-            launcher=production_launcher(registered, store=store, hold_label=hold_label),
-            agent_states=stuck_states,
-            stale_s=stuck_stale,
-            stop_unit=production_stopper(registered),
-            restarts_path=restarts_path(),
-            stuck_project=lambda repo, number: production_stuck_project(registered, repo),
-            agent_roles=agent_roles,
-            finished_for=finished_for,
-            journal_path=journal_path(),
-            pause_path=pause_path(),
-            day_path=day_path(),
-            max_starts=max_starts,
-            hub_client=hub_client,
-            hub_host_id=hub_host_id,
-        )
-
-
-def add_parser(sub) -> None:
-    """Register `drive` on the top-level subparsers."""
-    p = sub.add_parser("drive", help="run one dispatch pass over the board store")
-    p.add_argument(
-        "--plan",
-        action="store_true",
-        help="print the candidate table and change nothing",
-    )
-    verbs = p.add_subparsers(dest="drive_verb", required=False)
-    verbs.add_parser(
-        "install-timer",
-        help="install and enable the user timer that repeats the pass",
-    )
-    p.set_defaults(func=cmd_drive)
