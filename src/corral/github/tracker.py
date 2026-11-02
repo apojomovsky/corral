@@ -10,24 +10,20 @@ import json
 
 from corral import tracker as iface
 from corral.github.gh import is_rate_limited, retry_after_s
+from corral.tracker import NEEDS_DECISION, PRIORITIES
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
 
-#: Priority labels, highest first. The adapter derives the plain string
-#: the store keeps from the highest-ranked ``priority:<name>`` label.
-PRIORITIES = ("urgent", "high", "normal", "low", "backlog")
+#: The label prefixes the adapter reads and writes. The priority order
+#: and the decision label live on the provider-neutral protocol; this
+#: adapter only derives the plain strings the store keeps from them.
 _PRIORITY_PREFIX = "priority:"
 
 #: Corral-owned fields live on the tracker as labels. One label per field
 #: at most; when several share a prefix the smallest wins and the rest
 #: are pruned on the next write of that field.
 _FIELD_PREFIX = {"agent": "agent:", "status": "status:"}
-
-#: The only people-owned label the adapter ever adds. The decision
-#: protocol holds a ticket for a human with this label; the adapter
-#: exposes no general label write, so any other name is refused.
-NEEDS_DECISION = "needs-decision"
 
 
 def priority_of(names) -> str:
