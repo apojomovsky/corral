@@ -407,6 +407,21 @@ def _page_int(raw: str | None, name: str, default: int) -> tuple[int, str | None
     return value, None
 
 
+def _body_flag(raw: str | None, name: str) -> tuple[bool, str | None]:
+    """Whether board rows carry `body` and `extra`, or the 400 body.
+
+    Missing or `1` reads full rows, the reply every existing consumer
+    already gets; `0` slims rows for the list view the browser polls.
+    Anything else is an error, the paging validators' rule: the poller
+    must know its slimming is not what it asked.
+    """
+    if raw is None or raw == "1":
+        return True, None
+    if raw == "0":
+        return False, None
+    return True, f"{name} {raw!r} must be 0 or 1"
+
+
 def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
     """A validated seconds parameter, or the 400 body when it is unusable.
 
@@ -429,9 +444,19 @@ def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
     return value, None
 
 
-def _board_row(item: board.Item, fresh: bool, claim: board.Claim | None) -> dict:
-    """One board row: the stored item, its freshness, and its holder."""
+def _board_row(
+    item: board.Item, fresh: bool, claim: board.Claim | None, slim: bool = False
+) -> dict:
+    """One board row: the stored item, its freshness, and its holder.
+
+    Slim rows (`body=0`) drop exactly `body` and `extra`: the list
+    view never renders them and stops paying their bytes on every
+    poll, while every other key stays identical to the full row.
+    """
     row = asdict(item)
+    if slim:
+        row.pop("body", None)
+        row.pop("extra", None)
     row["fresh"] = fresh
     if claim is None:
         row["claim"] = None
@@ -757,6 +782,10 @@ class _Handler(BaseHTTPRequestHandler):
         repo = query.get("repo") or None
         state = query.get("state") or None
         label = query.get("label") or None
+        full, body_problem = _body_flag(query.get("body"), "body")
+        if body_problem is not None:
+            self._send_json(400, {"error": body_problem})
+            return
         max_age, age_problem = _page_float(query.get("max_age"), "max_age")
         if age_problem is not None:
             self._send_json(400, {"error": age_problem})
@@ -780,7 +809,11 @@ class _Handler(BaseHTTPRequestHandler):
                     item, fresh = store.item(got.repo, got.number, now=now, max_age=max_age)
                     if item is None:
                         continue
-                    rows.append(_board_row(item, fresh, store.claim_of(item.repo, item.number)))
+                    rows.append(
+                        _board_row(
+                            item, fresh, store.claim_of(item.repo, item.number), slim=not full
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001 - a request never drops the connection
             print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
             self._send_json(500, {"error": "board unavailable"})
