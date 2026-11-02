@@ -29,7 +29,8 @@ import os
 import subprocess
 import sys
 import textwrap
-from typing import NamedTuple
+from dataclasses import dataclass
+from typing import cast
 
 from corral import settings
 
@@ -124,11 +125,17 @@ BUGFIX_REVIEW_CHECKS = (
 )
 
 
-class Numbers(NamedTuple):
+@dataclass(frozen=True)
+class Numbers:
     """The five budget numbers for one project: the one resolved record.
 
     Every reader below goes through `numbers()`; nothing reads the module
-    constants or the settings registry directly.
+    constants or the settings registry directly. The construction is the
+    one range check: each field must be a positive int and the floor must
+    stay below the ceiling, so no path (layered settings, a plain mapping,
+    or a hand-built record) can carry a zero divisor into the arithmetic
+    below. A bad value is a SettingsError (exit 4) naming the field, never
+    a ZeroDivisionError or a traceback.
     """
 
     base_minutes: int
@@ -136,6 +143,26 @@ class Numbers(NamedTuple):
     limit_multiple: int
     floor_minutes: int
     ceiling_minutes: int
+
+    def __post_init__(self):
+        """The one range check for every budget number."""
+        for name in (
+            "base_minutes",
+            "seconds_per_line",
+            "limit_multiple",
+            "floor_minutes",
+            "ceiling_minutes",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise settings.SettingsError(
+                    f"review.budget.{name} must be a positive integer, not {value!r}"
+                )
+        if self.floor_minutes >= self.ceiling_minutes:
+            raise settings.SettingsError(
+                f"review.budget.floor_minutes ({self.floor_minutes}) must be below "
+                f"review.budget.ceiling_minutes ({self.ceiling_minutes})"
+            )
 
 
 #: The registered keys, in Numbers field order.
@@ -160,20 +187,6 @@ BUDGET_EPILOG = (
 )
 
 
-def _setting_int(raw, key):
-    """The resolved value for `key` as an int.
-
-    The settings layer only stores type-checked ints here, so this is a
-    narrowing guard for hand-built inputs: a non-int is a configuration
-    error (exit 4), never an arithmetic traceback. The range check lives
-    where the value is set; only the type is reaffirmed here.
-    """
-    value = raw[key]
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise settings.SettingsError(f"{key} must be an integer, not {value!r}")
-    return value
-
-
 def _origin(resolved, key):
     """The layer to blame for `key` in a cross-key error.
 
@@ -195,13 +208,14 @@ def numbers(resolved=None):
     """The budget numbers, from `resolved` or from the built-in defaults.
 
     With no resolved settings the result is today's constants, so current
-    behavior is byte-identical. Each number's own range (a positive int) is
-    checked where the value is set, naming the file and key. The checks
-    that compare two numbers stay here, and each names the layer behind
-    the offending values, which the resolved settings already record. A
-    mapping missing a key is a SettingsError naming it, not a KeyError.
-    A plain mapping has no layer record, so cross-key errors there blame
-    the generic input.
+    behavior is byte-identical. Each number's own range (a positive int)
+    is checked where the value is set, naming the file and key, and again
+    once in the Numbers construction below, which also refuses a floor at
+    or above the ceiling naming the fields. The check that compares the
+    smallest printable limit against the floor stays here, and it names
+    the layer behind each offending value, which the resolved settings
+    already record. A mapping missing a key is a SettingsError naming it,
+    not a KeyError.
     """
     if resolved is None:
         raw = {key: settings.REGISTRY[key].default for key in NUMBERS_KEYS}
@@ -214,20 +228,17 @@ def numbers(resolved=None):
             raise settings.SettingsError(
                 f"budget setting {err.args[0]!r} is missing from the resolved settings"
             ) from None
+    # The casts are for the type checker only: the resolved values are
+    # typed as objects, and the construction below re-validates each one
+    # at runtime, naming the field on failure.
     cfg = Numbers(
-        base_minutes=_setting_int(raw, "review.budget.base_minutes"),
-        seconds_per_line=_setting_int(raw, "review.budget.seconds_per_line"),
-        limit_multiple=_setting_int(raw, "review.budget.limit_multiple"),
-        floor_minutes=_setting_int(raw, "review.budget.floor_minutes"),
-        ceiling_minutes=_setting_int(raw, "review.budget.ceiling_minutes"),
+        base_minutes=cast(int, raw["review.budget.base_minutes"]),
+        seconds_per_line=cast(int, raw["review.budget.seconds_per_line"]),
+        limit_multiple=cast(int, raw["review.budget.limit_multiple"]),
+        floor_minutes=cast(int, raw["review.budget.floor_minutes"]),
+        ceiling_minutes=cast(int, raw["review.budget.ceiling_minutes"]),
     )
     floor_key = "review.budget.floor_minutes"
-    ceiling_key = "review.budget.ceiling_minutes"
-    if cfg.floor_minutes >= cfg.ceiling_minutes:
-        raise settings.SettingsError(
-            f"{floor_key} ({cfg.floor_minutes}, from {origins[floor_key]}) must be "
-            f"below {ceiling_key} ({cfg.ceiling_minutes}, from {origins[ceiling_key]})"
-        )
     base_key = "review.budget.base_minutes"
     multiple_key = "review.budget.limit_multiple"
     smallest = min(cfg.base_minutes, _max_expected(cfg)) * cfg.limit_multiple

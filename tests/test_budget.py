@@ -439,23 +439,29 @@ class NumbersTest(unittest.TestCase):
                         bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
 
     def test_a_floor_at_or_above_the_ceiling_is_refused(self):
+        # The floor-versus-ceiling rule lives in the Numbers construction,
+        # so the error names the fields, not the layers that set them.
         bad = dict(CUSTOM, floor_minutes=60)
         with self.assertRaisesRegex(
             S.SettingsError,
-            r"review\.budget\.floor_minutes \(60, from project\) must be below "
-            r"review\.budget\.ceiling_minutes \(60, from project\)",
+            r"review\.budget\.floor_minutes \(60\) must be below "
+            r"review\.budget\.ceiling_minutes \(60\)",
         ):
             bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
 
     def test_a_cross_key_error_reports_each_value_layer(self):
-        # The floor comes from the environment here, the ceiling from the
-        # project file: the error names the layer behind each value.
+        # The floor comes from the environment here, the base and multiple
+        # from the project file: the smallest-limit error names the layer
+        # behind each value.
         resolved = resolve_settings(
             project=custom_project(),
-            env={"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES": "60"},
+            env={"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES": "30"},
         )
         with self.assertRaisesRegex(
-            S.SettingsError, r"floor_minutes \(60, from env\).*ceiling_minutes \(60, from project\)"
+            S.SettingsError,
+            r"smallest limit \(20 minutes, from base_minutes 10 set by project "
+            r"and limit_multiple 2 set by project\) is below "
+            r"review\.budget\.floor_minutes \(30, from env\)",
         ):
             bu.numbers(resolved)
 
@@ -490,13 +496,28 @@ class NumbersTest(unittest.TestCase):
             ),
         )
 
-    def test_a_plain_dict_cross_key_error_names_a_generic_origin(self):
+    def test_a_plain_dict_floor_error_names_the_fields(self):
+        # The floor-versus-ceiling rule lives in the Numbers construction,
+        # which has no layer record: the error names the fields, never a
+        # generic origin.
         plain = dict(zip(bu.NUMBERS_KEYS, (10, 10, 2, 60, 60)))
         with self.assertRaisesRegex(
             S.SettingsError,
-            r"review\.budget\.floor_minutes \(60, from input\) must be below",
+            r"review\.budget\.floor_minutes \(60\) must be below "
+            r"review\.budget\.ceiling_minutes \(60\)",
         ):
             bu.numbers(plain)
+
+    def test_a_plain_mapping_with_each_field_at_zero_is_refused(self):
+        # A plain mapping never passes through the settings layer, so the
+        # construction is what refuses the zero divisor: no ZeroDivisionError
+        # reaches the arithmetic below.
+        for key in bu.NUMBERS_KEYS:
+            plain = dict(zip(bu.NUMBERS_KEYS, (10, 10, 2, 20, 60)))
+            plain[key] = 0
+            with self.subTest(key=key):
+                with self.assertRaisesRegex(S.SettingsError, key.replace(".", r"\.")):
+                    bu.numbers(plain)
 
     def test_a_floor_no_limit_can_clear_is_refused(self):
         # base * multiple below the floor: even an empty diff prints a
@@ -515,6 +536,112 @@ class NumbersTest(unittest.TestCase):
             r"review\.budget\.floor_minutes \(30, from project\)",
         ):
             bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
+
+
+class NumbersConstructionTest(unittest.TestCase):
+    """Every Numbers field is validated once, at construction.
+
+    The construction is the one range check: a zero or negative field, a
+    non-integer, or a floor at or above the ceiling is a SettingsError
+    (exit 4) naming the field, never a ZeroDivisionError further down.
+    """
+
+    def valid(self, **kw):
+        args = {
+            "base_minutes": 10,
+            "seconds_per_line": 10,
+            "limit_multiple": 2,
+            "floor_minutes": 20,
+            "ceiling_minutes": 60,
+        }
+        args.update(kw)
+        return args
+
+    def test_each_field_at_zero_is_refused(self):
+        for field in (
+            "base_minutes",
+            "seconds_per_line",
+            "limit_multiple",
+            "floor_minutes",
+            "ceiling_minutes",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(S.SettingsError, rf"review\.budget\.{field}"):
+                    bu.Numbers(**self.valid(**{field: 0}))
+
+    def test_each_field_negative_is_refused(self):
+        for field in (
+            "base_minutes",
+            "seconds_per_line",
+            "limit_multiple",
+            "floor_minutes",
+            "ceiling_minutes",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(S.SettingsError, rf"review\.budget\.{field}"):
+                    bu.Numbers(**self.valid(**{field: -1}))
+
+    def test_each_field_must_be_an_int(self):
+        for field in (
+            "base_minutes",
+            "seconds_per_line",
+            "limit_multiple",
+            "floor_minutes",
+            "ceiling_minutes",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(S.SettingsError, rf"review\.budget\.{field}"):
+                    bu.Numbers(**self.valid(**{field: "10"}))
+                with self.assertRaisesRegex(S.SettingsError, rf"review\.budget\.{field}"):
+                    bu.Numbers(**self.valid(**{field: True}))
+
+    def test_a_floor_at_or_above_the_ceiling_is_refused(self):
+        for floor, ceiling in ((60, 60), (61, 60)):
+            with self.subTest(floor=floor, ceiling=ceiling):
+                with self.assertRaisesRegex(
+                    S.SettingsError,
+                    r"review\.budget\.floor_minutes \(%d\) must be below "
+                    r"review\.budget\.ceiling_minutes \(%d\)" % (floor, ceiling),
+                ):
+                    bu.Numbers(**self.valid(floor_minutes=floor, ceiling_minutes=ceiling))
+
+    def test_a_valid_construction_resolves_verbatim(self):
+        self.assertEqual(
+            bu.Numbers(**self.valid()),
+            bu.Numbers(
+                base_minutes=10,
+                seconds_per_line=10,
+                limit_multiple=2,
+                floor_minutes=20,
+                ceiling_minutes=60,
+            ),
+        )
+
+    def test_budget_with_each_field_at_zero_is_a_settings_error(self):
+        # The constructor refuses the zero before budget() can divide by
+        # it: a SettingsError names the field, never a ZeroDivisionError.
+        for field in (
+            "base_minutes",
+            "seconds_per_line",
+            "limit_multiple",
+            "floor_minutes",
+            "ceiling_minutes",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(S.SettingsError):
+                    bu.budget(0, bu.Numbers(**self.valid(**{field: 0})))
+
+    def test_max_reviewable_lines_with_each_field_at_zero_is_a_settings_error(self):
+        for field in (
+            "base_minutes",
+            "seconds_per_line",
+            "limit_multiple",
+            "floor_minutes",
+            "ceiling_minutes",
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(S.SettingsError):
+                    bu.max_reviewable_lines(bu.Numbers(**self.valid(**{field: 0})))
 
 
 class OneResolverTest(unittest.TestCase):
