@@ -11,7 +11,9 @@ quota ledger precedent with a deadline: a lock still busy past
 ``LOCK_TIMEOUT_S`` refuses with exit 75 instead of blocking forever. A
 missing file is tolerated only by creating it under the lock; a
 present-but-corrupt file is never reinitialized, the launch refuses with
-exit 4. Number semantics (floors, weights, ceilings, role charges) live
+exit 4. The only public writers are ``ensure`` and ``update``: both take
+the state dir and check the marker first, so no writer bypasses the
+guard. Number semantics (floors, weights, ceilings, role charges) live
 in ``resources``; this module only stores the envelope and the marker.
 """
 
@@ -54,8 +56,12 @@ class StateDirError(LedgerError):
     exit_code = 4
 
 
-class LedgerLocked(LedgerError):
-    """The ledger lock stayed busy past the timeout (exit 75, try later)."""
+class LedgerLocked(Exception):
+    """The ledger lock stayed busy past the timeout (exit 75, try later).
+
+    A sibling of ``LedgerError``, never a subclass: an ``except
+    LedgerError`` handler must never turn a lock timeout into exit 4.
+    """
 
     exit_code = 75
 
@@ -108,12 +114,16 @@ def _check_ledger(ledger: object, target: str) -> dict:
     foreign = ledger.get("foreign", [])
     if not isinstance(foreign, list) or any(not isinstance(entry, dict) for entry in foreign):
         raise LedgerError(f"host ledger {target} is corrupt: foreign must be a list of objects")
+    seen = set()
     for index, entry in enumerate(foreign):
         name = entry.get("name")
         if not isinstance(name, str) or not name:
             raise LedgerError(
                 f"host ledger {target} is corrupt: foreign claim {index} needs a non-empty name"
             )
+        if name in seen:
+            raise LedgerError(f"host ledger {target} is corrupt: duplicate foreign claim {name}")
+        seen.add(name)
     checked = dict(ledger)
     checked["version"] = LEDGER_VERSION
     checked["host_budget"] = host_budget
@@ -231,13 +241,6 @@ def load(path: str | None = None) -> dict:
     except (OSError, ValueError) as exc:
         raise LedgerError(f"host ledger {target} is corrupt: {exc}") from exc
     return _check_ledger(raw, target)
-
-
-def save(ledger: dict, path: str | None = None, timeout: float = LOCK_TIMEOUT_S) -> dict:
-    """Persist `ledger` atomically under the ledger lock. Returns it checked."""
-    target = path or ledger_path()
-    with _locked(target, timeout):
-        return _write(target, ledger)
 
 
 def ensure(
