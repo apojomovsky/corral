@@ -1,10 +1,11 @@
 """The sync pass: feed the board store from the tracker. Fakes only."""
 
 import os
+import sqlite3
 import tempfile
 import unittest
 from typing import Any
-from corral import board, sync, tracker
+from corral import board, drive, sync, tracker
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -66,7 +67,7 @@ class SyncRepoTest(StoreCase):
         fake = FakeTracker()
         cursor = tracker.format_cursor(T0)
         result = sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=cursor)
-        self.assertEqual(result, sync.SyncResult(0, cursor, ()))
+        self.assertEqual(result, sync.SyncResult(0, cursor, (), (), ()))
         self.assertEqual(self.store.get_cursor(REPO, sync.CURSOR_NAME), cursor)
 
     def test_redelivery_is_idempotent(self):
@@ -221,7 +222,7 @@ class AuditTest(StoreCase):
         self.stored(1)
         fake = FakeTracker([reading(number=1, updated_at=T0)])
         result = sync.audit_repo(self.store, fake, REPO, operators=["alice"], now=T0, limit=0)
-        self.assertEqual(result, sync.SyncResult(0, None, ()))
+        self.assertEqual(result, sync.SyncResult(0, None, (), (), ()))
 
 
 class ResyncAdoptionTest(StoreCase):
@@ -318,6 +319,103 @@ class ResyncAdoptionTest(StoreCase):
         self.assertEqual(result.conflicts, ())
         row, _ = self.store.item(REPO, 1, now=T0)
         self.assertEqual(row.agent, "")
+
+
+class SyncAllTest(StoreCase):
+    OTHER = "acme/api"
+
+    def corrupt(self, repo, number):
+        raw = sqlite3.connect(self.path)
+        try:
+            raw.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                ("{{{broken", repo, number),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+
+    def factory(self, feeds):
+        table = {repo: FakeTracker(items) for repo, items in feeds.items()}
+        return table.__getitem__
+
+    def test_healthy_repos_sync_with_no_lines(self):
+        self.stored(1, tracker_updated_at=T0 - 100)
+        self.stored(2, repo=self.OTHER, tracker_updated_at=T0 - 100)
+        seen, errors, store_errors = drive.sync_all(
+            self.store,
+            self.factory(
+                {
+                    REPO: [reading(number=1, updated_at=T0)],
+                    self.OTHER: [reading(repo=self.OTHER, number=2, updated_at=T0)],
+                }
+            ),
+            operators=["alice"],
+            now=T0,
+        )
+        self.assertEqual((seen, errors, store_errors), (2, [], []))
+        self.assertEqual(self.store.get_cursor(REPO, sync.CURSOR_NAME), tracker.format_cursor(T0))
+        self.assertEqual(
+            self.store.get_cursor(self.OTHER, sync.CURSOR_NAME), tracker.format_cursor(T0)
+        )
+
+    def test_corrupt_repo_reports_one_line_while_other_repo_syncs(self):
+        self.stored(1, tracker_updated_at=T0 - 100)
+        self.stored(2, repo=self.OTHER, tracker_updated_at=T0 - 100)
+        self.corrupt(REPO, 1)
+        seen, errors, store_errors = drive.sync_all(
+            self.store,
+            self.factory(
+                {
+                    REPO: [reading(number=1, updated_at=T0)],
+                    self.OTHER: [reading(repo=self.OTHER, number=2, updated_at=T0)],
+                }
+            ),
+            operators=["alice"],
+            now=T0,
+        )
+        self.assertEqual(seen, 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(store_errors), 1)
+        self.assertIn(f"{REPO}#1", store_errors[0])
+        self.assertEqual(
+            self.store.get_cursor(self.OTHER, sync.CURSOR_NAME), tracker.format_cursor(T0)
+        )
+        self.assertIsNone(self.store.get_cursor(REPO, sync.CURSOR_NAME))
+
+    def test_unknown_repo_is_a_tracker_line_not_a_store_line(self):
+        self.stored(1, tracker_updated_at=T0 - 100)
+        seen, errors, store_errors = drive.sync_all(
+            self.store, self.factory({}), operators=["alice"], now=T0
+        )
+        self.assertEqual(seen, 0)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(REPO, errors[0])
+        self.assertEqual(store_errors, [])
+
+    def test_no_factory_syncs_nothing(self):
+        self.assertEqual(drive.sync_all(self.store, None, operators=["alice"], now=T0), (0, [], []))
+
+
+class StoreErrorKindTest(StoreCase):
+    def test_sync_repo_routes_a_corrupt_row_to_store_errors(self):
+        self.stored(1, tracker_updated_at=T0 - 100)
+        self.stored(2, tracker_updated_at=T0 - 100)
+        raw = sqlite3.connect(self.path)
+        try:
+            raw.execute(
+                "UPDATE items SET extra=? WHERE repo=? AND number=?",
+                ("{{{broken", REPO, 1),
+            )
+            raw.commit()
+        finally:
+            raw.close()
+        fake = FakeTracker([reading(number=1, updated_at=T0), reading(number=2, updated_at=T0)])
+        result = sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{REPO}#1", result.store_errors[0])
 
 
 if __name__ == "__main__":

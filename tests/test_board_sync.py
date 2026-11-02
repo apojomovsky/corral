@@ -337,8 +337,9 @@ class BoardPollTest(BoardCase):
             )
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{REPO}#1", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{REPO}#1", result.store_errors[0])
         self.assertEqual(self.stored(2).extra, {"pool": "c"})
         self.assertEqual(result.cursor, tracker.format_cursor(T0))
 

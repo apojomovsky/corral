@@ -439,11 +439,21 @@ class GraphqlPacer:
         atomic_write_text(self.path, json.dumps(state))
 
 
-def _pacer() -> GraphqlPacer:
-    """The machine-wide pacer, in corral's state dir."""
+def pacing_path() -> str:
+    """The machine-wide bucket file: the only resolver for the default path.
+
+    `_pacer` builds the shared bucket on it, and the test tripwire
+    compares against it, so the guarded default cannot drift from the
+    production one.
+    """
     from corral.paths import state_dir
 
-    return GraphqlPacer(os.path.join(state_dir(), "graphql-pacing.json"))
+    return os.path.join(state_dir(), "graphql-pacing.json")
+
+
+def _pacer() -> GraphqlPacer:
+    """The machine-wide pacer, in corral's state dir."""
+    return GraphqlPacer(pacing_path())
 
 
 def graphql(query: str, run=None, pacer=None, **variables) -> dict:

@@ -69,9 +69,7 @@ class _GuardedPacerClass(_REAL_PACER_CLASS):
     _corral_pacer_guard = True
 
     def __init__(self, path, *args, **kwargs):
-        from corral.paths import state_dir
-
-        default = os.path.abspath(os.path.join(state_dir(), "graphql-pacing.json"))
+        default = os.path.abspath(gh.pacing_path())
         if os.path.abspath(path) == default:
             suiteguard.record("constructed the default GraphQL pacer (no injected pacer)")
             raise AssertionError("test constructed the default GraphQL pacer: inject a fake pacer")
@@ -568,9 +566,10 @@ class SyncExtraTest(unittest.TestCase):
             now=self.T0 + 10,
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#1", result.errors[0])
-        self.assertEqual(result.errors[0].count("\n"), 0)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#1", result.store_errors[0])
+        self.assertEqual(result.store_errors[0].count("\n"), 0)
         self.assertEqual(self.stored_extra(2), {"pool": "dispatch"})
 
     def test_sync_reports_an_unusable_reading_and_applies_the_rest(self):
@@ -585,8 +584,9 @@ class SyncExtraTest(unittest.TestCase):
             now=self.T0 + 10,
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#2", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
         row, _ = self.store.item(self.REPO, 1, now=self.T0 + 10)
         self.assertEqual(row.title, "Title")
 
@@ -625,8 +625,9 @@ class SyncExtraTest(unittest.TestCase):
             now=self.T0,
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#1", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#1", result.store_errors[0])
         self.assertEqual(self.stored_extra(2), {"pool": "dispatch"})
 
     def test_resync_reports_an_unreadable_row_at_adoption_without_aborting(self):
@@ -660,8 +661,9 @@ class SyncExtraTest(unittest.TestCase):
             now=self.T0,
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#1", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#1", result.store_errors[0])
 
     def test_resync_reports_a_corrupt_absent_row_without_aborting(self):
         self.sync(
@@ -681,8 +683,9 @@ class SyncExtraTest(unittest.TestCase):
             now=self.T0,
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#2", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
 
     def test_audit_reports_a_corrupt_row_without_raising(self):
         self.sync(
@@ -705,8 +708,9 @@ class SyncExtraTest(unittest.TestCase):
             limit=10,
         )
         self.assertEqual(result.items_seen, 0)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#2", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
 
     def test_audit_reports_an_unusable_reading_and_audits_the_rest(self):
         self.sync(
@@ -738,8 +742,9 @@ class SyncExtraTest(unittest.TestCase):
             limit=10,
         )
         self.assertEqual(result.items_seen, 1)
-        self.assertEqual(len(result.errors), 1)
-        self.assertIn(f"{self.REPO}#2", result.errors[0])
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.store_errors), 1)
+        self.assertIn(f"{self.REPO}#2", result.store_errors[0])
         row, _ = self.store.item(self.REPO, 1, now=self.T0)
         self.assertEqual(row.title, "Audited")
 
@@ -1015,6 +1020,20 @@ class PacerGuardTest(unittest.TestCase):
         with mock.patch.object(suiteguard, "record") as record:
             with self.assertRaises(AssertionError):
                 gh.GraphqlPacer(default_path)
+        record.assert_called_once_with("constructed the default GraphQL pacer (no injected pacer)")
+
+    def test_resolver_matches_what_the_factory_builds(self):
+        # The one agreement pin: the production resolver and the real
+        # factory must name the same file, so the guard cannot drift.
+        # Constructing the real pacer performs no I/O (path only).
+        with mock.patch.object(gh, "GraphqlPacer", _REAL_PACER_CLASS):
+            factory_path = _REAL_PACER_FACTORY().path
+        self.assertEqual(os.path.abspath(gh.pacing_path()), os.path.abspath(factory_path))
+
+    def test_direct_construction_on_the_resolver_path_records_and_raises(self):
+        with mock.patch.object(suiteguard, "record") as record:
+            with self.assertRaises(AssertionError):
+                gh.GraphqlPacer(gh.pacing_path())
         record.assert_called_once_with("constructed the default GraphQL pacer (no injected pacer)")
 
     def test_construction_off_the_default_path_builds_a_real_pacer(self):

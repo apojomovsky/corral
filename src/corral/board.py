@@ -406,6 +406,18 @@ class Store:
             out.append(found)
         return out
 
+    def repos(self):
+        """Tracker repos holding cached rows, sorted, without parsing any row.
+
+        Raw repo names only: ``items`` parses every row's JSON, so one
+        corrupt row breaks the whole listing, while this query never
+        touches row JSON and a corrupt row cannot hide the healthy
+        repos. The only resolver for the repo list the sync step fans
+        out over.
+        """
+        rows = self._conn.execute("SELECT DISTINCT repo FROM items ORDER BY repo").fetchall()
+        return [row[0] for row in rows]
+
     def claim_of(self, repo, number):
         """The decided claim holding (``repo``, ``number``), or None.
 
