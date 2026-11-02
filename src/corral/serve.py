@@ -5,6 +5,7 @@ S1 covers the request router, `GET /v1/snapshot` from `snapshot.build`,
 S2 adds the `serve.*` settings, the token file, the bind rules, CORS and
 the `serve` verb. S3 adds the filtered views: `/v1/agents`,
 `/v1/quota`, `/v1/capacity`, `/v1/disks`, `/v1/board` and `/v1/tail`.
+`GET /v1/projects` names the registered projects, sorted, names only.
 S4 adds `/v1/events`, `/v1/journal` (live plus archives, opaque
 cursors), and the `/v1/stream` Server-Sent Events over the snapshot
 digest, the event queue, and the logbook.
@@ -37,7 +38,7 @@ from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlsplit
 
-from corral import board, coord, coordevents, launch, settings, snapshot
+from corral import board, coord, coordevents, launch, projects, settings, snapshot
 from corral.netbind import server_family
 
 OK, RACE, UNREACHABLE, USAGE = 0, 2, 3, 4
@@ -459,6 +460,7 @@ class _State:
         token_required: bool = False,
         token_reader: Callable[[], str | None] | None = None,
         board_open: Callable[[], board.Store] | None = None,
+        projects_fn: Callable[[], list] | None = None,
         tail_fn: Callable[[str, int, int], str] | None = None,
         tail_max: int = TAIL_MAX_DEFAULT,
         events_fn: Callable[[str], list] | None = None,
@@ -479,6 +481,7 @@ class _State:
         self.token_required = token_required
         self.token_reader = token_reader
         self.board_open = board_open
+        self.projects_fn = projects_fn
         self.tail_fn = tail_fn
         self.tail_max = tail_max
         self.events_fn = events_fn
@@ -744,6 +747,24 @@ class _Handler(BaseHTTPRequestHandler):
                 "offset": offset,
             },
         )
+
+    def _serve_projects(self) -> None:
+        """The registered project names, sorted, names only.
+
+        A missing registry dir reads as an empty list (a host with
+        one unregistered project), never an error. A bad
+        registration answers the generic 500 body with the detail on
+        stderr, the board route's pattern, so no path, root or
+        policy entry point ever reaches the wire.
+        """
+        reader = self.server_state.projects_fn or projects.load_all
+        try:
+            found = reader()
+        except Exception as exc:  # noqa: BLE001 - a request never drops the connection
+            print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
+            self._send_json(500, {"error": "projects unavailable"})
+            return
+        self._send_json(200, {"projects": sorted(project.name for project in found)})
 
     def _serve_tail(self) -> None:
         query = self._query()
@@ -1157,6 +1178,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._serve_section("disk")
         elif path == "/v1/board":
             self._serve_board()
+        elif path == "/v1/projects":
+            self._serve_projects()
         elif path == "/v1/tail":
             self._serve_tail()
         elif path == "/v1/events":
@@ -1220,6 +1243,7 @@ def make_server(
     token_required: bool = False,
     token_reader: Callable[[], str | None] | None = None,
     board_open: Callable[[], board.Store] | None = None,
+    projects_fn: Callable[[], list] | None = None,
     tail_fn: Callable[[str, int, int], str] | None = None,
     tail_max: int = TAIL_MAX_DEFAULT,
     events_fn: Callable[[str], list] | None = None,
@@ -1236,7 +1260,9 @@ def make_server(
     built document names. `bind` defaults to loopback and `port` to an
     ephemeral one; the bound address reads as `server.server_address`.
     `board_open` opens the board store per board request (`board.open_store`
-    by default); `tail_fn` renders tail output (`read_tail` by default),
+    by default); `projects_fn` lists the registered projects
+    (`projects.load_all` by default); `tail_fn` renders tail output
+    (`read_tail` by default),
     capped at `tail_max` lines; `events_fn` reads one project's event
     rows (`read_project_events` by default); `journal_fn` reads one
     project's logbook (`read_project_journal` by default). Past
@@ -1257,6 +1283,7 @@ def make_server(
         token_required=token_required,
         token_reader=token_reader,
         board_open=board_open,
+        projects_fn=projects_fn,
         tail_fn=tail_fn,
         tail_max=tail_max,
         events_fn=events_fn,
