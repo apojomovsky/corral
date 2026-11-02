@@ -13,7 +13,7 @@ other tools and is not spent on reads the REST budget serves.
 import json
 import re
 
-from corral import forge
+from corral import forge, paths
 
 #: One page of the PR list; the maximum the endpoint serves.
 PER_PAGE = 100
@@ -134,25 +134,30 @@ def _parse_index_item(item):
 def _check_create_shape(owner, name):
     """``(owner, name)`` for a remote create, else ``ForgeError``.
 
-    Names follow the same rule every repo-named path shares (one path
-    part, no ``.git`` suffix); owners hold no slash or whitespace. The
-    check is fail-closed and pure, so callers map it to a usage error
-    without any network read.
+    The name follows the one rule every repo-named path shares
+    (``paths.plain_repo_name``); the owner holds no slash or
+    whitespace. The check is fail-closed and pure, so callers map it
+    to a usage error without any network read.
     """
-    for value, what in ((owner, "owner"), (name, "name")):
-        if not isinstance(value, str) or not value:
-            raise _shape(f"bad {what} {value!r}")
-        if "/" in value or any(ch.isspace() for ch in value):
-            raise _shape(f"bad {what} {value!r}")
-    if name.endswith(".git"):
+    if not isinstance(owner, str) or not owner or "/" in owner or any(ch.isspace() for ch in owner):
+        raise _shape(f"bad owner {owner!r}")
+    if not paths.plain_repo_name(name):
         raise _shape(f"bad name {name!r}")
     return owner, name
 
 
+#: gh's missing-repo answer. The status matches inside its parentheses,
+#: so a port number like 4040 never reads as missing.
+_NOT_FOUND_RE = re.compile(r"\(HTTP 404\)", re.IGNORECASE)
+
+
 def _is_not_found(err):
-    """Whether a failed `gh` call answered repo-not-found (else unreachable)."""
-    text = str(err)
-    return "404" in text or "not found" in text.lower()
+    """Whether a failed `gh` call answered repo-not-found (else unreachable).
+
+    Only gh's own shape counts: an unauthorized answer (a 401 or 403)
+    reads as unreachable, never as missing.
+    """
+    return _NOT_FOUND_RE.search(str(err)) is not None
 
 
 def _is_already_exists(err):

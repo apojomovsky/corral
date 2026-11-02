@@ -7,18 +7,38 @@ module: everything else sees ``TrackerItem``.
 """
 
 import json
+import re
 
 from corral import tracker as iface
 from corral.github.gh import is_rate_limited, retry_after_s
-from corral.tracker import NEEDS_DECISION, PRIORITIES
+from corral.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
 
 #: One page of the issues feed; the maximum the endpoint serves.
 PER_PAGE: int = 100
 
-#: The label prefixes the adapter reads and writes. The priority order
-#: and the decision label live on the provider-neutral protocol; this
-#: adapter only derives the plain strings the store keeps from them.
-_PRIORITY_PREFIX = "priority:"
+#: The bootstrap label colors, a provider detail the interface never
+#: sees. Every `BOOTSTRAP_LABELS` name has an entry here; the ensure
+#: tests assert the two agree.
+_BOOTSTRAP_COLORS = {
+    "ready": "0e8a16",
+    "needs-triage": "fbca04",
+    "needs-decision": "d93f0b",
+    "hold": "5319e7",
+    "priority:urgent": "b60205",
+    "priority:high": "d93f0b",
+    "priority:normal": "fbca04",
+    "priority:low": "0e8a16",
+    "priority:backlog": "cccccc",
+}
+
+#: A label create the account may not perform, in the provider's shape.
+_REFUSED_RE = re.compile(r"\(HTTP 403\)", re.IGNORECASE)
+
+#: A label create that lost a race to an existing label, in the
+#: provider's shape: the 422 status plus the already-exists wording.
+#: Both must match, so a 422 for a malformed create never reads as kept.
+_ALREADY_EXISTS_STATUS_RE = re.compile(r"\(HTTP 422\)", re.IGNORECASE)
+_ALREADY_EXISTS_PHRASE_RE = re.compile(r"already[_-]?exists", re.IGNORECASE)
 
 #: Corral-owned fields live on the tracker as labels. One label per field
 #: at most; when several share a prefix the smallest wins and the rest
@@ -33,9 +53,9 @@ def priority_of(names) -> str:
     """
     best = ""
     for name in names or ():
-        if not isinstance(name, str) or not name.startswith(_PRIORITY_PREFIX):
+        if not isinstance(name, str) or not name.startswith(PRIORITY_PREFIX):
             continue
-        suffix = name[len(_PRIORITY_PREFIX) :]
+        suffix = name[len(PRIORITY_PREFIX) :]
         if suffix in PRIORITIES and (not best or PRIORITIES.index(suffix) < PRIORITIES.index(best)):
             best = suffix
     return best
@@ -106,6 +126,30 @@ def _parse_names(entries, field):
             raise _fail(f"bad {field} entry {entry!r}")
         names.append(name)
     return tuple(names)
+
+
+def _is_refused(err):
+    """Whether a failed label create is a permission refusal.
+
+    A 403 in the provider's shape reads as refused (in someone else's
+    organisation the account may not create labels); anything else fails
+    closed through ``_write_error``.
+    """
+    return _REFUSED_RE.search(str(err)) is not None
+
+
+def _is_already_exists(err):
+    """Whether a failed label create lost a race to an existing label.
+
+    Only the provider's own shape counts: the 422 status plus the
+    already-exists wording, so a 422 for a malformed create still fails
+    closed through ``_write_error``.
+    """
+    text = str(err)
+    return (
+        _ALREADY_EXISTS_STATUS_RE.search(text) is not None
+        and _ALREADY_EXISTS_PHRASE_RE.search(text) is not None
+    )
 
 
 class GithubTracker:
@@ -336,6 +380,96 @@ class GithubTracker:
             )
         except Exception as err:
             raise self._write_error(err) from err
+
+    def _list_label_names(self, repo: str) -> set[str]:
+        """Every label name on ``repo``, across all list pages.
+
+        Pages ``per_page`` at a time until a short page ends the list,
+        like ``pr_index``. A missing or malformed page fails closed: a
+        truncated list would read a present label as missing, post a
+        create, and lose on the already-exists answer.
+        """
+        have = set()
+        page = 1
+        while True:
+            try:
+                payload = json.loads(
+                    self._run(["api", f"repos/{repo}/labels?per_page={PER_PAGE}&page={page}"])
+                )
+            except Exception as err:
+                raise self._write_error(err) from err
+            if not isinstance(payload, list):
+                raise _fail(f"labels of {repo} are not a list")
+            for entry in payload:
+                name = entry.get("name") if isinstance(entry, dict) else None
+                if not isinstance(name, str):
+                    raise _fail(f"bad label entry {entry!r} on {repo}")
+                have.add(name)
+            if len(payload) < PER_PAGE:
+                return have
+            page += 1
+
+    def _read_label_name(self, repo: str, name: str) -> str:
+        """The one label ``name`` on ``repo``, fresh, else ``TrackerError``.
+
+        The proof for a create that answered already-exists: only a
+        label that reads back counts as kept. A failed read fails
+        closed, never as kept.
+        """
+        try:
+            payload = json.loads(self._run(["api", f"repos/{repo}/labels/{name}"]))
+        except Exception as err:
+            raise self._write_error(err) from err
+        if not isinstance(payload, dict) or payload.get("name") != name:
+            raise _fail(f"bad label {payload!r} on {repo}")
+        return name
+
+    def ensure_labels(self, repo: str) -> iface.LabelReport:
+        """Create the missing bootstrap labels on ``repo``, leave the rest alone.
+
+        Missing labels are created with the adapter's colors; existing
+        labels are left byte-identical, never overwritten. A 403 on a
+        create reads as refused (the account may not create labels in
+        someone else's organisation) and the pass continues; a 422
+        already-exists on a create reads as kept once the label reads
+        back (a concurrent setup created it first); anything else fails
+        closed through ``_write_error``.
+        """
+        have = self._list_label_names(repo)
+        created, kept, refused = [], [], []
+        for wanted in iface.BOOTSTRAP_LABELS:
+            if wanted.name in have:
+                kept.append(wanted.name)
+                continue
+            try:
+                self._run(
+                    [
+                        "api",
+                        "--method",
+                        "POST",
+                        f"repos/{repo}/labels",
+                        "-f",
+                        f"name={wanted.name}",
+                        "-f",
+                        f"color={_BOOTSTRAP_COLORS[wanted.name]}",
+                        "-f",
+                        f"description={wanted.description}",
+                    ]
+                )
+            except Exception as err:
+                # A rate limit answers 403 too: it stays retryable and
+                # never reads as a permission refusal.
+                if is_rate_limited(str(err)):
+                    raise self._write_error(err) from err
+                if _is_refused(err):
+                    refused.append(wanted.name)
+                    continue
+                if _is_already_exists(err):
+                    kept.append(self._read_label_name(repo, wanted.name))
+                    continue
+                raise self._write_error(err) from err
+            created.append(wanted.name)
+        return iface.LabelReport(tuple(created), tuple(kept), tuple(refused))
 
     def write(self, repo: str, number: int, field: str, value: str) -> None:
         """Set one corral-owned field through the issues-labels endpoint.
