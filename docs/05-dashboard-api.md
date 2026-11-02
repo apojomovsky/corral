@@ -51,7 +51,7 @@ the snapshot only summarizes:
 - `GET /v1/quota`: the `quota` section plus `now`.
 - `GET /v1/capacity`: the `capacity` section plus `now`.
 - `GET /v1/disks`: the `disk` section plus `now`.
-- `GET /v1/board?repo=&state=&label=&max_age=`: board store rows
+- `GET /v1/board?repo=&state=&label=&max_age=&limit=&offset=`: board store rows
   oldest first, each with its confidence (`confirmed`, `pending`,
   `dirty`), `fetched_at`, claim holder (agent, host, epoch,
   claimed_at) when held, and queued agent/status overlays. Listing
@@ -63,7 +63,13 @@ the snapshot only summarizes:
   to every per-row call, so rows near the `max_age` boundary cannot
   disagree inside one listing. A decision-grade consumer asks for
   freshness with `max_age` and sees staleness in the reply instead of
-  guessing it.
+  guessing it. The listing pages with `limit` (default 100 rows,
+  maximum 1000: a larger value clamps, it never errors) and `offset`
+  (default 0); the reply carries the page plus `total` and the applied
+  `limit` and `offset`, so a poller knows whether it is complete. A
+  non-integer or negative `limit` or `offset` is a `400`. The bounds
+  live as module constants in `serve.py` (`BOARD_LIMIT_DEFAULT`,
+  `BOARD_LIMIT_MAX`), not as settings.
 - `GET /v1/events?project=`: one project's unresolved coordinator
   events oldest first (`coordevents.unresolved`), each with id, kind,
   ref, evidence, state, first_seen. A `resolved_since` parameter
@@ -269,8 +275,9 @@ design in `08-hub-multihost.md`.
 - Cost bounds: a snapshot is local file reads plus one SQLite query
   set; `tail` is capped at a server side maximum (`serve.tail_max`,
   default 200 lines: a larger `last` is clamped, not refused);
-  `board` and `journal` page with `limit` defaults (100 rows) and
-  maxima; the stream emits at most one event per store change per
+  `board` pages with `limit` (default 100 rows, maximum 1000) and
+  `journal` pages with a `limit` default (100 rows) and maximum; the
+  stream emits at most one event per store change per
   poll interval. Disk usage reuses `shutil.disk_usage` (no tree
   walk): the API reports filesystem free space, never the reclaim
   plan's directory walk, which stays a CLI cost. Concurrent

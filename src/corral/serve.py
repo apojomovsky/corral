@@ -66,6 +66,12 @@ API_VERSION = 1
 #: Read through `snapshot`, the one owner of the section names.
 ERROR_SECTIONS = snapshot.ERROR_SECTIONS
 
+#: Board rows one listing returns unless `?limit=` says otherwise.
+BOARD_LIMIT_DEFAULT = 100
+
+#: Board rows one listing never returns more than; a larger `?limit=` clamps.
+BOARD_LIMIT_MAX = 1000
+
 #: The generic 500 body: the detail goes to stderr, never the wire.
 UNAVAILABLE = "snapshot unavailable"
 
@@ -189,6 +195,24 @@ def read_tail(repo: str, number: int, last: int) -> str:
     out = io.StringIO()
     launch.tail(tgt, number, last=last, out=out, pool_fn=lambda: [])
     return out.getvalue()
+
+
+def _page_int(raw: str | None, name: str, default: int) -> tuple[int, str | None]:
+    """A validated paging parameter, or the 400 body when it is unusable.
+
+    Missing reads as `default`; above any maximum clamps at the call
+    site, never here. A non-integer or a negative is an error, never a
+    silent default: the poller must know its page is not what it asked.
+    """
+    if raw is None:
+        return default, None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default, f"{name} {raw!r} is not an integer"
+    if value < 0:
+        return default, f"{name} {raw!r} must be 0 or more"
+    return value, None
 
 
 def _board_row(item: board.Item, fresh: bool, claim: board.Claim | None) -> dict:
@@ -397,6 +421,15 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send_json(400, {"error": f"max_age {raw_age!r} is not seconds"})
                 return
+        limit, problem = _page_int(query.get("limit") or None, "limit", BOARD_LIMIT_DEFAULT)
+        if problem is None:
+            offset, problem = _page_int(query.get("offset") or None, "offset", 0)
+        else:
+            offset = 0
+        if problem is not None:
+            self._send_json(400, {"error": problem})
+            return
+        limit = min(limit, BOARD_LIMIT_MAX)
         now = self.server_state.clock()
         opener = self.server_state.board_open or board.open_store
         try:
@@ -412,7 +445,16 @@ class _Handler(BaseHTTPRequestHandler):
             print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)
             self._send_json(500, {"error": "board unavailable"})
             return
-        self._send_json(200, {"now": now, "board": rows})
+        self._send_json(
+            200,
+            {
+                "now": now,
+                "board": rows[offset : offset + limit],
+                "total": len(rows),
+                "limit": limit,
+                "offset": offset,
+            },
+        )
 
     def _serve_tail(self) -> None:
         query = self._query()
@@ -441,7 +483,7 @@ class _Handler(BaseHTTPRequestHandler):
         reader = self.server_state.tail_fn or read_tail
         try:
             text = reader(repo, number, limit)
-        except launch.LaunchError:
+        except (launch.LaunchError, settings.SettingsError):
             self._send_json(404, {"error": "not found"})
         except Exception as exc:  # noqa: BLE001 - a request never drops the connection
             print(f"corral serve: {snapshot.error_text(exc)}", file=sys.stderr)

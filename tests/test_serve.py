@@ -1072,6 +1072,63 @@ class BoardView(ServeCase):
         self.assertEqual(status, 500)
         self.assertEqual(json.loads(body), {"error": "board unavailable"})
 
+    def open_many(self, tmp, count):
+        specs = [{"number": n, "fetched_at": T0 + n} for n in range(1, count + 1)]
+        return self.open_store(tmp, *specs)
+
+    def test_board_defaults_to_the_first_100_with_total(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 250)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            payload = self.get_json(server, "/v1/board")
+            self.assertEqual(payload["total"], 250)
+            self.assertEqual(payload["limit"], 100)
+            self.assertEqual(payload["offset"], 0)
+            self.assertEqual([row["number"] for row in payload["board"]], list(range(1, 101)))
+
+    def test_board_limit_clamps_at_the_maximum(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 250)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            payload = self.get_json(server, "/v1/board?limit=5000")
+            self.assertEqual(payload["limit"], 1000)
+            self.assertEqual(payload["total"], 250)
+            self.assertEqual(payload["offset"], 0)
+            self.assertEqual(len(payload["board"]), 250)
+
+    def test_board_pages_cover_every_row_exactly_once(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 250)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            seen = []
+            offset = 0
+            while True:
+                payload = self.get_json(server, f"/v1/board?limit=100&offset={offset}")
+                self.assertEqual(payload["total"], 250)
+                self.assertEqual(payload["limit"], 100)
+                self.assertEqual(payload["offset"], offset)
+                seen.extend(row["number"] for row in payload["board"])
+                if len(payload["board"]) < 100:
+                    break
+                offset += 100
+            self.assertEqual(sorted(seen), list(range(1, 251)))
+            self.assertEqual(len(seen), 250)
+
+    def test_board_bad_paging_is_a_400(self):
+        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+            opener = self.open_many(tmp, 3)
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            for target in (
+                "/v1/board?limit=many",
+                "/v1/board?limit=-1",
+                "/v1/board?offset=many",
+                "/v1/board?offset=-3",
+            ):
+                with self.subTest(target=target):
+                    status, _, body = self.fetch(server, "GET", target)
+                    self.assertEqual(status, 400, target)
+                    self.assertIn("error", json.loads(body))
+
 
 class FilteredViews(ServeCase):
     def test_agents_view_matches_the_snapshot_sections(self):
@@ -1159,6 +1216,13 @@ class TailView(ServeCase):
         tail = FakeTail(error=launch.LaunchError("no session"))
         server, _ = self.start(tail)
         status, _, body = self.get_text(server, "/v1/tail?repo=app&number=7")
+        self.assertEqual(status, 404)
+        self.assertEqual(json.loads(body), {"error": "not found"})
+
+    def test_tail_unknown_repo_is_404(self):
+        tail = FakeTail(error=settings.SettingsError("unknown repo 'nosuch'"))
+        server, _ = self.start(tail)
+        status, _, body = self.get_text(server, "/v1/tail?repo=nosuch&number=1")
         self.assertEqual(status, 404)
         self.assertEqual(json.loads(body), {"error": "not found"})
 
