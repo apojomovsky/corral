@@ -294,6 +294,12 @@ class ClaimRouteTest(ServerCase):
         )
         self.assertEqual(payload["lease_expires"], 1090.0)
 
+    def test_grant_reply_carries_the_version_exchange(self):
+        status, payload = self.propose()
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["api"], hub.HUB_API)
+        self.assertEqual(payload["schema_version"], hub.SCHEMA_VERSION)
+
     def test_conflict_names_the_holder(self):
         self.propose()
         status, payload = self.propose(agent="drive-bbb", host="host-2", token=self.token_b)
@@ -913,7 +919,16 @@ class RenewReleaseRouteTest(ServerCase):
         self.propose()
         status, payload = self.release()
         self.assertEqual(status, 200)
-        self.assertEqual(payload, {"repo": "app", "number": 7, "epoch": 1})
+        self.assertEqual(
+            payload,
+            {
+                "api": hub.HUB_API,
+                "schema_version": hub.SCHEMA_VERSION,
+                "repo": "app",
+                "number": 7,
+                "epoch": 1,
+            },
+        )
         status, granted = self.propose(agent="drive-bbb", host="host-2", token=self.token_b)
         self.assertEqual(status, 200)
         self.assertEqual(granted["epoch"], 2)
@@ -1047,6 +1062,14 @@ class ClaimsRouteTest(ServerCase):
         )
         self.assertIn("lease_expires", row)
 
+    def test_claims_list_carries_the_version_exchange(self):
+        self.propose()
+        status, payload = self.call("GET", "/v1/claims", token=self.token_a)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["api"], hub.HUB_API)
+        self.assertEqual(payload["schema_version"], hub.SCHEMA_VERSION)
+        self.assertEqual(len(payload["claims"]), 1)
+
     def test_missing_or_wrong_token_is_401_without_a_leak(self):
         self.propose()
         for bad in ("unset", "", "wrong-token"):
@@ -1151,6 +1174,37 @@ class HubClientTest(ServerCase):
         client.url = "https://127.0.0.1:1/"
         with self.assertRaises(hub.HubError):
             client.propose("app", 7, "drive-aaa")
+
+    def test_propose_refuses_a_newer_api_major(self):
+        from unittest import mock
+
+        client = self.make_client()
+        newer = {
+            "api": hub.HUB_API + 1,
+            "schema_version": hub.SCHEMA_VERSION,
+            "repo": "app",
+            "number": 7,
+            "agent": "drive-aaa",
+            "host_id": "host-1",
+            "epoch": 1,
+            "lease_expires": 1090.0,
+        }
+        with mock.patch.object(
+            client, "_request", return_value=(200, json.dumps(newer).encode("utf-8"))
+        ):
+            with self.assertRaises(hub.HubVersionError) as caught:
+                client.propose("app", 7, "drive-aaa")
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertIn(str(hub.HUB_API + 1), str(caught.exception))
+        self.assertIn(str(hub.HUB_API), str(caught.exception))
+
+    def test_claims_refuses_a_versionless_reply(self):
+        from unittest import mock
+
+        client = self.make_client()
+        with mock.patch.object(client, "_request", return_value=(200, b'{"claims": []}')):
+            with self.assertRaises(hub.HubVersionError):
+                client.claims()
 
 
 class ImportClosureTest(unittest.TestCase):
@@ -1489,38 +1543,42 @@ class OlderMajorRouteTest(ServerCase):
         self.assertEqual(payload, {"api": hub.HUB_API, "schema_version": hub.SCHEMA_VERSION})
 
 
+def raw_exchange(port, request):
+    """One raw request: the response head and body, then whether the server closed."""
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        sock.sendall(request)
+        data = b""
+        while b"\r\n\r\n" not in data:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        head, _, rest = data.partition(b"\r\n\r\n")
+        length = 0
+        for line in head.split(b"\r\n"):
+            if line.lower().startswith(b"content-length:"):
+                length = int(line.split(b":", 1)[1].strip())
+        while len(rest) < length:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            rest += chunk
+        sock.settimeout(5)
+        try:
+            tail = sock.recv(1024)
+        except ConnectionResetError:
+            return head, rest, b""
+        except socket.timeout:
+            return head, rest, None
+        return head, rest, tail
+    finally:
+        sock.close()
+
+
 class OversizeBodyTest(ServerCase):
     def raw_exchange(self, request):
-        """One raw request: the response head and body, then whether the server closed."""
-        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
-        try:
-            sock.sendall(request)
-            data = b""
-            while b"\r\n\r\n" not in data:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                data += chunk
-            head, _, rest = data.partition(b"\r\n\r\n")
-            length = 0
-            for line in head.split(b"\r\n"):
-                if line.lower().startswith(b"content-length:"):
-                    length = int(line.split(b":", 1)[1].strip())
-            while len(rest) < length:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                rest += chunk
-            sock.settimeout(5)
-            try:
-                tail = sock.recv(1024)
-            except ConnectionResetError:
-                return head, rest, b""
-            except socket.timeout:
-                return head, rest, None
-            return head, rest, tail
-        finally:
-            sock.close()
+        return raw_exchange(self.port, request)
 
     def post(self, body, content_length=None):
         length = len(body) if content_length is None else content_length
@@ -1549,6 +1607,69 @@ class OversizeBodyTest(ServerCase):
         self.assertIn(b" 400 ", head.split(b"\r\n")[0])
         self.assertTrue(json.loads(rest)["error"])
         self.assertEqual(tail, b"")
+
+
+class UnreadBodyDropTest(ServerCase):
+    """Handlers that answer without reading a body drop the connection.
+
+    One rule for every such path: when the request carries a body the
+    handler does not read, the server closes the connection instead of
+    parsing the leftover bytes as the next request on a keep-alive
+    connection.
+    """
+
+    def ask(self, method, path, body=b'{"a": 1}'):
+        request = (
+            f"{method} {path} HTTP/1.1\r\n".encode()
+            + b"Host: 127.0.0.1\r\n"
+            + f"Authorization: Bearer {self.token_a}\r\n".encode()
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: keep-alive\r\n\r\n"
+            + body
+        )
+        return raw_exchange(self.port, request)
+
+    def test_put_with_a_body_is_a_405_that_closes_the_connection(self):
+        head, rest, tail = self.ask("PUT", "/v1/claims")
+        self.assertIn(b" 405 ", head.split(b"\r\n")[0])
+        self.assertEqual(tail, b"")
+
+    def test_unknown_post_route_with_a_body_is_a_404_that_closes(self):
+        head, rest, tail = self.ask("POST", "/v1/nope")
+        self.assertIn(b" 404 ", head.split(b"\r\n")[0])
+        self.assertEqual(tail, b"")
+
+    def test_old_major_post_with_a_body_is_a_typed_404_that_closes(self):
+        head, rest, tail = self.ask("POST", "/v2/claims")
+        self.assertIn(b" 404 ", head.split(b"\r\n")[0])
+        self.assertEqual(json.loads(rest)["api"], hub.HUB_API)
+        self.assertEqual(tail, b"")
+
+    def test_plain_get_keeps_the_connection_alive(self):
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        try:
+            for _ in range(2):
+                sock.sendall(
+                    b"GET /v1/version HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n"
+                )
+                data = b""
+                while b"\r\n\r\n" not in data:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    data += chunk
+                head, _, rest = data.partition(b"\r\n\r\n")
+                length = 0
+                for line in head.split(b"\r\n"):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":", 1)[1].strip())
+                while len(rest) < length:
+                    rest += sock.recv(65536)
+                self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+                self.assertEqual(json.loads(rest)["api"], hub.HUB_API)
+        finally:
+            sock.close()
 
 
 class StoreUnavailableTest(ServerCase):

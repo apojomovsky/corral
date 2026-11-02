@@ -758,5 +758,21 @@ class HubClientForTest(unittest.TestCase):
         )
 
 
+class HubVersionMappingTest(unittest.TestCase):
+    def test_a_newer_hub_major_on_the_claim_path_is_a_config_error(self):
+        class OldHost(FakeHub):
+            def propose(self, repo, number, agent):
+                raise hub.HubVersionError(
+                    f"hub speaks api {hub.HUB_API + 1}, this host speaks api {hub.HUB_API}:"
+                    " upgrade the hub and the hosts in lockstep"
+                )
+
+        mode = drivehub.HubMode(OldHost(), HOST)
+        with self.assertRaises(drive.HubConfigError) as caught:
+            mode.propose("app", 7, "drive-aaa")
+        self.assertIn(str(hub.HUB_API + 1), str(caught.exception))
+        self.assertIn(str(hub.HUB_API), str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

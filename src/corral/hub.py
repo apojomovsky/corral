@@ -136,6 +136,8 @@ class Receipt:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "api": HUB_API,
+            "schema_version": SCHEMA_VERSION,
             "repo": self.repo,
             "number": self.number,
             "agent": self.agent,
@@ -456,12 +458,14 @@ class HubVersionError(Exception):
     exit_code = 4
 
 
-def check_version(hub_api: int, hub_schema: int) -> None:
+def check_version(hub_api: object, hub_schema: object) -> None:
     """Fail closed when the hub's API major differs from this host's.
 
     Both versions are named in the error: the operator upgrades the hub
     and the hosts in lockstep. The schema version floats within a
-    major: additive-only changes never break the exchange.
+    major: additive-only changes never break the exchange. Anything
+    that is not the served major, including a missing version from a
+    versionless reply, fails closed the same way.
     """
     _ = hub_schema
     if hub_api != HUB_API:
@@ -1202,7 +1206,14 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             if self._authed_host(conn) is None:
                 self._reject("unknown hub host")
                 return
-            self._send(200, {"claims": list_claims(conn)})
+            self._send(
+                200,
+                {
+                    "api": HUB_API,
+                    "schema_version": SCHEMA_VERSION,
+                    "claims": list_claims(conn),
+                },
+            )
         finally:
             conn.close()
 
@@ -1215,6 +1226,7 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         major = _path_major(self.path)
         if major is None or major == HUB_API:
             return False
+        self._close_on_unread_body()
         self._send(
             404,
             {
@@ -1225,9 +1237,27 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         )
         return True
 
+    def _close_on_unread_body(self) -> None:
+        """Drop the connection when the request carries a body this handler will not read.
+
+        One rule for every path that answers without consuming the body:
+        an unread body on a keep-alive connection would parse as the next
+        request, so the server closes instead (fail closed, no drain of a
+        body of unknown size). A request with no body framing keeps its
+        connection.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            self.close_connection = True
+            return
+        if length > 0 or self.headers.get("Transfer-Encoding"):
+            self.close_connection = True
+
     def do_GET(self) -> None:
         if self._refuse_old_major():
             return
+        self._close_on_unread_body()
         split = urllib.parse.urlsplit(self.path)
         if split.path == "/v1/version":
             self._send(200, {"api": HUB_API, "schema_version": SCHEMA_VERSION})
@@ -1375,7 +1405,16 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
         except HubError as err:
             self._send(400, {"error": str(err)})
         else:
-            self._send(200, {"repo": body["repo"], "number": body["number"], "epoch": kept})
+            self._send(
+                200,
+                {
+                    "api": HUB_API,
+                    "schema_version": SCHEMA_VERSION,
+                    "repo": body["repo"],
+                    "number": body["number"],
+                    "epoch": kept,
+                },
+            )
 
     def _post_register(
         self, server: HubServer, conn: sqlite3.Connection, body: dict[str, Any]
@@ -1543,9 +1582,11 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
             return
         path = urllib.parse.urlsplit(self.path).path
         if path == "/v1/version":
+            self._close_on_unread_body()
             self._send(405, {"error": "hub v1 takes GET and POST only"})
             return
         if path not in POST_PATHS:
+            self._close_on_unread_body()
             self._send(404, {"error": f"unknown hub route {path}"})
             return
         server = _server(self)
@@ -1580,26 +1621,31 @@ class HubHandler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         if self._refuse_old_major():
             return
+        self._close_on_unread_body()
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_DELETE(self) -> None:
         if self._refuse_old_major():
             return
+        self._close_on_unread_body()
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_PATCH(self) -> None:
         if self._refuse_old_major():
             return
+        self._close_on_unread_body()
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_HEAD(self) -> None:
         if self._refuse_old_major():
             return
+        self._close_on_unread_body()
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
     def do_OPTIONS(self) -> None:
         if self._refuse_old_major():
             return
+        self._close_on_unread_body()
         self._send(405, {"error": "hub v1 takes GET and POST only"})
 
 
@@ -1612,7 +1658,9 @@ class HubClient:
     ``token_path``, and the token never appears in an error. A refused,
     timed-out, reset, or 500 answer raises ``HubUnreachable`` (exit 3,
     retry later); a 401, a 400, or a malformed reply raises
-    ``HubError`` (exit 4, configuration); a 409 raises ``Conflict``
+    ``HubError`` (exit 4, configuration); a 200 with the wrong API
+    major, or no versions at all, raises ``HubVersionError`` (exit 4,
+    fail closed, naming both versions); a 409 raises ``Conflict``
     naming the holder.
     """
 
@@ -1691,7 +1739,12 @@ class HubClient:
         return Receipt(repo, number, agent, holder, epoch, float(lease))
 
     def _checked(self, what: str, repo: str, number: int, status: int, payload: bytes):
-        """The decoded body for a 200, else the typed error the status means."""
+        """The decoded body for a 200, else the typed error the status means.
+
+        A 200 passes the version exchange before anything reads it: an
+        older hub major, or a reply with no versions at all, is
+        ``HubVersionError`` (exit 4, fail closed), naming both versions.
+        """
         if status == 500:
             raise HubUnreachable(f"hub at {self.url} answered 500: store unavailable")
         decoded = self._decode(payload)
@@ -1709,6 +1762,7 @@ class HubClient:
             raise HubError(f"hub at {self.url} refused this host: check hub.host_id and its token")
         if status != 200:
             raise HubError(f"hub at {self.url} answered {status} for {what}")
+        check_version(decoded.get("api"), decoded.get("schema_version"))
         return decoded
 
     def _post(self, path: str, repo: str, number: int, agent: str, epoch: int | None) -> Receipt:
