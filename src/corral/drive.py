@@ -40,6 +40,7 @@ from corral import (
     disk,
     eligibility,
     hold,
+    host_ledger,
     launch,
     mirror,
     paths,
@@ -3027,6 +3028,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
                 list_fn=list_fn,
                 run=units.default_run,
                 usage=disk.production_usage,
+                host_ledger_fn=host_ledger.ensure,
             )
             return unit
         if kind == "resume":
@@ -3046,6 +3048,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
                 list_fn=list_fn,
                 run=units.default_run,
                 usage=disk.production_usage,
+                host_ledger_fn=host_ledger.ensure,
                 git=worktrees.git,
             )
             return unit
@@ -3059,6 +3062,7 @@ def production_launcher(registered, *, store=None, hold_label=None):
             list_fn=list_fn,
             run=units.default_run,
             usage=disk.production_usage,
+            host_ledger_fn=host_ledger.ensure,
         )
         return unit
 

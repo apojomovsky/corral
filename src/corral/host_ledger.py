@@ -244,36 +244,43 @@ def load(path: str | None = None) -> dict:
 
 
 def ensure(
-    state_dir: str | None = None, path: str | None = None, timeout: float = LOCK_TIMEOUT_S
+    *, state_dir: str | None = None, path: str | None = None, timeout: float = LOCK_TIMEOUT_S
 ) -> dict:
     """The ledger with this host's guard in place, creating both under the lock.
 
     First creation writes the ledger and records `state_dir` in the
     marker beside it. A later call from another state dir raises
-    ``StateDirError``; the marker is never updated by a call.
+    ``StateDirError``; the marker is never updated by a call. A
+    caller-supplied `state_dir` is normalized, so a trailing-slash
+    spelling names the same fleet. All three arguments are keyword-only.
     """
     target = path or ledger_path()
-    want = state_dir or paths.state_dir()
+    want = os.path.normpath(state_dir) if state_dir else paths.state_dir()
     with _locked(target, timeout):
         return _prepare(target, want)
 
 
 def update(
     change,
+    *,
     path: str | None = None,
     state_dir: str | None = None,
     timeout: float = LOCK_TIMEOUT_S,
 ) -> dict:
     """Locked read-modify-write: `change` maps the ledger to its replacement.
 
-    The guard runs first: a foreign state dir raises ``StateDirError``
-    before `change` is called. A missing file starts empty and is always
+    The argument to `change` is read-only: mutate it and return None and
+    the mutation is dropped on disk while the mutated object is returned,
+    so a change that should land must return its replacement. The guard
+    runs first: a foreign state dir raises ``StateDirError`` before
+    `change` is called. A missing file starts empty and is always
     materialized, even when `change` returns None for no change: readers
     tolerate a missing file only by creating it under the lock. A
-    corrupt file raises instead of being overwritten.
+    corrupt file raises instead of being overwritten. All arguments but
+    `change` are keyword-only.
     """
     target = path or ledger_path()
-    want = state_dir or paths.state_dir()
+    want = os.path.normpath(state_dir) if state_dir else paths.state_dir()
     with _locked(target, timeout):
         ledger = _prepare(target, want)
         result = change(ledger)
