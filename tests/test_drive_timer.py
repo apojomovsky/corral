@@ -202,6 +202,28 @@ class PeriodSetting(unittest.TestCase):
                 drive.timer_text(period)
             self.assertEqual(ctx.exception.exit_code, 4)
 
+    def test_timer_text_refuses_control_characters(self):
+        for period in ("*-*-* *:00:00\nPersistent=false", "hourly\tdaily"):
+            with self.subTest(period=period):
+                with self.assertRaises(drive.TimerError) as ctx:
+                    drive.timer_text(period)
+                self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_a_period_with_control_characters_is_rejected(self):
+        for period in ("*-*-* *:00:00\nPersistent=false", "hourly\tdaily"):
+            with self.subTest(period=period):
+                with self.assertRaises(drive.settings.SettingsError):
+                    drive.settings.resolve(host={"drive.period": period}, project={}, env={})
+
+    def test_timer_text_refuses_non_ascii_controls_and_separators(self):
+        for period in ("hourly\u0085daily", "hourly\u2028daily", "hourly\u200bdaily"):
+            with self.subTest(period=period):
+                with self.assertRaises(drive.TimerError) as ctx:
+                    drive.timer_text(period)
+                self.assertEqual(ctx.exception.exit_code, 4)
+                with self.assertRaises(drive.settings.SettingsError):
+                    drive.settings.resolve(host={"drive.period": period}, project={}, env={})
+
 
 class InstallTimer(unittest.TestCase):
     def test_install_writes_both_units_then_reloads_and_enables(self):
@@ -284,6 +306,21 @@ class InstallTimer(unittest.TestCase):
             with self.assertRaises(drive.TimerError) as ctx:
                 drive.install_timer(env=env, run=run, period=period)
             self.assertEqual(ctx.exception.exit_code, 4)
+        service_path, timer_path = drive.unit_paths(env=env)
+        self.assertFalse(os.path.exists(service_path))
+        self.assertFalse(os.path.exists(timer_path))
+
+    def test_a_control_character_period_writes_nothing_and_is_exit_4(self):
+        env = home_env()
+
+        def run(argv, timeout):
+            raise AssertionError("a refused period must not reach systemctl")
+
+        for period in ("*-*-* *:00:00\nPersistent=false", "hourly\tdaily"):
+            with self.subTest(period=period):
+                with self.assertRaises(drive.TimerError) as ctx:
+                    drive.install_timer(env=env, run=run, period=period)
+                self.assertEqual(ctx.exception.exit_code, 4)
         service_path, timer_path = drive.unit_paths(env=env)
         self.assertFalse(os.path.exists(service_path))
         self.assertFalse(os.path.exists(timer_path))

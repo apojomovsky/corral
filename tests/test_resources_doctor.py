@@ -376,6 +376,12 @@ class ForeignClaims(unittest.TestCase):
         self.assertEqual(rows["resources-foreign"].status, "fail")
         self.assertIn("/state/corral/host-resources.json", rows["resources-foreign"].fix)
 
+    def test_missing_claimed_at_reads_as_the_gate_default(self):
+        self.assertEqual(
+            resourcedoctor._parse_claim({"name": "desktop"}, 0),
+            ("desktop", R.DEFAULT_CLAIMED_AT),
+        )
+
     def test_a_claim_without_claimed_at_warns_as_expired_and_ignored(self):
         rows = by_name(resourcedoctor.check(readings(foreign=[{"name": "desktop"}])))
         row = rows["resources-foreign"]
