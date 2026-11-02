@@ -172,7 +172,10 @@ registry that does not exist yet.
   posture as the state dir itself. On a non-loopback bind the token is
   required and every request needs `Authorization: Bearer <token>`;
   without it the server answers `401` and logs only the fact of the
-  rejection, never the presented value. This matches the milestone 2
+  rejection, never the presented value. A token file that exists but
+  cannot be read is a configuration error instead (exit 4, section 4),
+  on loopback too: failing closed keeps a broken credential from
+  reading as no credential. This matches the milestone 2
   rule corral already records: host plus Bearer token, never the
   network layer, is the authentication.
 - Token file permissions: created `0600` when `corral serve
