@@ -536,8 +536,12 @@ def ticket_assignment(
     carries at most one assignment, and guessing would bill the wrong
     setup. `repo` and `number` only name the ticket in the source text.
     """
+    if not isinstance(labels, (list, tuple)):
+        raise ProfileError(
+            f"ticket {repo}#{number}: labels must be a list or tuple, not {type(labels).__name__}"
+        )
     names: list[str] = []
-    for label in labels or ():
+    for label in labels:
         if not isinstance(label, str) or not label.startswith(LABEL_PREFIX):
             continue
         name = label[len(LABEL_PREFIX) :]
@@ -590,6 +594,36 @@ def ticket_assignment(
     )
 
 
+def load_tracker_assignment(store, tracker, *, repo, number, now, stale_after):
+    """One ticket's shared assignment from its store row, live when stale.
+
+    Returns (name, source, None): `ticket_assignment` over the row's
+    labels and board `extra`, with name None when the ticket carries no
+    assignment. The cached row stands when fresh; past `stale_after` the
+    assignment is re-read live through `tracker`, exactly like the claim
+    freshness rule, and the live reading is used, not stored (the sync
+    pass owns store writes). With `tracker` None there is no live check,
+    so the cached row stands. Returns (None, "", reason) when the store
+    holds no row: the ticket is withdrawn and the launch skips it. A
+    stale row with an unreachable tracker raises `TrackerError` (exit 3),
+    an unreadable store raises `StoreError` (exit 4), and a corrupt shared
+    value raises `ProfileError` (exit 4): none of them skip.
+    """
+    found, fresh = store.item(repo, number, now=now, max_age=stale_after)
+    if found is None:
+        return None, "", f"{repo}#{number}: no store row, skipped as withdrawn"
+    if not fresh and tracker is not None:
+        live = tracker.item(repo, number)
+        name, source = ticket_assignment(
+            labels=live.labels, extra=live.extra, repo=repo, number=number
+        )
+        return name, source, None
+    name, source = ticket_assignment(
+        labels=found.labels, extra=found.extra, repo=repo, number=number
+    )
+    return name, source, None
+
+
 @dataclass(frozen=True)
 class _Committed:
     """Committed defaults as resolve reads them: the global name plus maps."""
@@ -624,7 +658,9 @@ def _check_request(repo, role, number, now, committed) -> tuple[float, _Committe
         _check_name(default, "resolve: committed default")
     tables: dict[str, dict[str, str]] = {"repos": {}, "roles": {}}
     for key, layer in (("repos", "project"), ("roles", "role")):
-        raw = committed.get(key) or {}
+        raw = committed.get(key)
+        if raw is None:
+            raw = {}
         if not isinstance(raw, dict):
             raise ProfileError(
                 f"resolve: committed {key} must be a table, not {type(raw).__name__}"
