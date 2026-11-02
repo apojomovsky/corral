@@ -305,6 +305,175 @@ class Adapters(unittest.TestCase):
     def test_an_unrecorded_session_defaults_to_omp(self):
         self.assertEqual(rt.DEFAULT_RUNTIME, "omp")
 
+    def test_each_runtime_covers_the_section_6_checklist_shape(self):
+        for adapter in (omp.RUNTIME, opencode.RUNTIME):
+            with self.subTest(runtime=adapter.name):
+                for method in (
+                    "argv",
+                    "env",
+                    "write_config",
+                    "with_models",
+                    "resume_handle",
+                    "activity_file",
+                    "options_schema",
+                ):
+                    self.assertTrue(callable(getattr(adapter, method)), method)
+
+
+class OmpOptionsSchema(unittest.TestCase):
+    def test_the_schema_is_pinned(self):
+        self.assertEqual(
+            omp.RUNTIME.options_schema(),
+            {"auto_approve": (bool, "whether to pass --auto-approve for the headless run")},
+        )
+
+    def test_a_second_call_returns_the_same_shape(self):
+        first = omp.RUNTIME.options_schema()
+        first["auto_approve"] = "mutated"
+        self.assertEqual(
+            omp.RUNTIME.options_schema(),
+            {"auto_approve": (bool, "whether to pass --auto-approve for the headless run")},
+        )
+
+
+class OmpApprovalOption(SessionCase):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(omp, "binary", return_value="/fake/omp")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_auto_approve_defaults_on(self):
+        self.assertIn("--auto-approve", omp.RUNTIME.argv(self.sdir, PROMPT))
+
+    def test_setting_auto_approve_keeps_the_flag_and_the_overlay(self):
+        omp.RUNTIME.write_config(self.sdir, {"auto_approve": True})
+        with open(os.path.join(self.sdir, "overlay.yml"), encoding="utf-8") as handle:
+            self.assertNotIn("auto_approve", handle.read())
+        with open(os.path.join(self.sdir, "options.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"auto_approve": True})
+        self.assertIn("--auto-approve", omp.RUNTIME.argv(self.sdir, PROMPT))
+
+    def test_clearing_auto_approve_drops_the_flag(self):
+        omp.RUNTIME.write_config(self.sdir, {"auto_approve": False})
+        argv = omp.RUNTIME.argv(self.sdir, PROMPT)
+        self.assertNotIn("--auto-approve", argv)
+        self.assertEqual(argv[-1], PROMPT)
+
+    def test_a_non_boolean_auto_approve_refuses_the_run(self):
+        omp.RUNTIME.write_config(self.sdir, {"auto_approve": "yes"})
+        with self.assertRaises(ValueError):
+            omp.RUNTIME.argv(self.sdir, PROMPT)
+
+    def test_a_corrupt_options_file_refuses_the_run(self):
+        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        with self.assertRaises(ValueError):
+            omp.RUNTIME.argv(self.sdir, PROMPT)
+
+
+class OmpHomeProof(SessionCase):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(omp, "binary", return_value="/fake/omp")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_no_argv_entry_points_at_a_home_config_or_state(self):
+        omp.RUNTIME.write_config(self.sdir, {"auto_approve": True})
+        argvs = [
+            omp.RUNTIME.argv(self.sdir, PROMPT),
+            omp.RUNTIME.argv(self.sdir, PROMPT, model=MODEL, resume="/s/a.jsonl"),
+        ]
+        for argv in argvs:
+            for entry in argv:
+                self.assertNotIn(".config/", entry)
+                self.assertNotIn(".local/share/", entry)
+
+    def test_no_argv_entry_points_at_the_session_options_file(self):
+        omp.RUNTIME.write_config(self.sdir, {"auto_approve": False})
+        for entry in omp.RUNTIME.argv(self.sdir, PROMPT):
+            self.assertNotIn("options.json", entry)
+
+    def test_the_environment_carries_no_home_paths(self):
+        env = omp.RUNTIME.env(self.sdir)
+        self.assertEqual(env, {})
+        for value in env.values():
+            self.assertNotIn(".config/", value)
+            self.assertNotIn(".local/share/", value)
+
+
+class OpencodeOptionsSchema(unittest.TestCase):
+    def test_the_schema_is_pinned(self):
+        self.assertEqual(
+            opencode.RUNTIME.options_schema(),
+            {"bash_timeout_ms": (int, "the bash tool timeout in milliseconds")},
+        )
+
+
+class OpencodeTimeoutOption(SessionCase):
+    def test_the_default_timeout_is_an_hour(self):
+        self.assertEqual(
+            opencode.RUNTIME.env(self.sdir)["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"],
+            str(opencode.BASH_TIMEOUT_MS),
+        )
+        self.assertEqual(opencode.BASH_TIMEOUT_MS, 3600 * 1000)
+
+    def test_setting_the_timeout_moves_the_environment(self):
+        opencode.RUNTIME.write_config(self.sdir, {"bash_timeout_ms": 60000})
+        self.assertEqual(
+            opencode.RUNTIME.env(self.sdir)["OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"],
+            "60000",
+        )
+
+    def test_the_session_config_holds_no_corral_only_key(self):
+        opencode.RUNTIME.write_config(self.sdir, {"model": MODEL, "bash_timeout_ms": 60000})
+        with open(os.path.join(self.sdir, "opencode.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"model": MODEL})
+        with open(os.path.join(self.sdir, "options.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"bash_timeout_ms": 60000})
+
+    def test_a_config_without_a_timeout_writes_no_sidecar(self):
+        opencode.RUNTIME.write_config(self.sdir, {"model": MODEL})
+        self.assertEqual(os.listdir(self.sdir), ["opencode.json"])
+
+    def test_a_non_integer_timeout_refuses_the_run(self):
+        opencode.RUNTIME.write_config(self.sdir, {"bash_timeout_ms": True})
+        with self.assertRaises(ValueError):
+            opencode.RUNTIME.env(self.sdir)
+
+    def test_a_corrupt_options_file_refuses_the_run(self):
+        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        with self.assertRaises(ValueError):
+            opencode.RUNTIME.env(self.sdir)
+
+    def test_a_non_object_options_file_refuses_the_run(self):
+        with open(os.path.join(self.sdir, "options.json"), "w", encoding="utf-8") as handle:
+            handle.write("[1, 2]")
+        with self.assertRaises(ValueError):
+            opencode.RUNTIME.env(self.sdir)
+
+
+class OpencodeHomeProof(SessionCase):
+    def setUp(self):
+        super().setUp()
+        patch = mock.patch.object(opencode, "binary", return_value="/fake/opencode")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_no_argv_entry_points_at_a_home_config_or_state(self):
+        argv = opencode.RUNTIME.argv(self.sdir, PROMPT, model=MODEL, resume="ses_1")
+        for entry in argv:
+            self.assertNotIn(".config/opencode", entry)
+            self.assertNotIn(".local/share/", entry)
+
+    def test_the_session_config_pointer_stays_inside_the_session_dir(self):
+        env = opencode.RUNTIME.env(self.sdir)
+        self.assertEqual(env["OPENCODE_CONFIG"], os.path.join(self.sdir, "opencode.json"))
+        for value in env.values():
+            self.assertNotIn(".config/opencode", value)
+
 
 class PromptAsFlag(unittest.TestCase):
     """The prompt is the last argument; one that starts with `-` would be read as a flag."""

@@ -84,7 +84,8 @@ class Runtime(Protocol):
         ...
 
     def options_schema(self) -> dict:
-        """Allowed profile option key to its type and one-line meaning."""
+        """Allowed profile option key to its type, one-line meaning and,
+        optionally, its allowed values as a third tuple element."""
         ...
 
 

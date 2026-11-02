@@ -885,6 +885,7 @@ def launch(
                         reviewer=reviewer,
                         session_id=session_id,
                     )
+                env = _env(adapter, session, unit)
             except ValueError as err:
                 raise LaunchError(str(err)) from None
             argv = units.unit_argv(
@@ -892,7 +893,7 @@ def launch(
                 workdir,
                 session,
                 command,
-                _env(adapter, session, unit),
+                env,
                 RUNTIME_MAX_S,
                 **_slice_props(
                     decided,
@@ -1165,6 +1166,7 @@ def resume(
                 max_time=runtimes.DEFAULT_MAX_TIME,
                 reviewer=(recorded == "reviewer"),
             )
+            env = _env(adapter, session, unit)
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(
@@ -1172,7 +1174,7 @@ def resume(
             workdir,
             session,
             command,
-            _env(adapter, session, unit),
+            env,
             RUNTIME_MAX_S,
             **_slice_props(
                 decided,
