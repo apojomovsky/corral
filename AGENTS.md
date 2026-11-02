@@ -18,7 +18,7 @@ corral is public. Nothing in it identifies a person, a host or an account, and t
 - private repositories, their tickets, or the projects of a particular user;
 - providers, accounts, quota numbers or incidents tied to a real deployment.
 
-Use generic stand-ins: `example.com`, `suite@corral.invalid`, `~/.config/corral/`, "a project", `host-1`. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
+Use generic stand-ins: `example.com`, `suite@corral.invalid`, `~/.config/corral/`, "a project", `host-1`. The only named person in the repository is the copyright holder in `LICENSE`; everything else stays generic. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
 
 ## Layout
 
