@@ -263,9 +263,16 @@ class WebBoardSources(unittest.TestCase):
             self.assertGreater(app.rfind("try {", 0, start), app.rfind("catch", 0, start))
 
     def test_shell_has_board_tab(self):
+        # The tabs render from JS into an empty nav (the log view's
+        # pin reads the same way), so the pin is on the renderer:
+        # the board destination sits between overview and log.
+        views = web_bytes("views.js").decode("utf-8")
+        self.assertIn('["#/", "Overview", "overview"]', views)
+        self.assertIn('["#/board", "Board", "board"]', views)
+        self.assertIn('["#/log", "Log", "log"]', views)
         html = web_bytes("index.html").decode("utf-8")
-        self.assertIn('href="#/board"', html)
-        self.assertIn('href="#/"', html)
+        self.assertIn('id="tabs"', html)
+        self.assertIn('id="board"', html)
 
 
 if __name__ == "__main__":
