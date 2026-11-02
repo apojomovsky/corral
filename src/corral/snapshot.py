@@ -233,7 +233,15 @@ def resources_section(
         roles = limits.roles
         host_budget = limits.host
     elif isinstance(limits, Mapping):
-        roles = limits.get("roles") or {}
+        raw_roles = limits.get("roles")
+        if raw_roles is None:
+            roles = {}
+        elif isinstance(raw_roles, Mapping):
+            roles = raw_roles
+        else:
+            raise resources.LimitsError(
+                f"roles must be a mapping of role names to charges, not {raw_roles!r}"
+            )
         host_budget = limits.get("host")
     else:
         raise resources.LimitsError(f"limits must be a Limits table, not {limits!r}")
@@ -633,10 +641,14 @@ def collect_kwargs() -> dict:
         resources_view = exc
     else:
         own_prefix = resolved["agents.unit_prefix"]
+        local = next(
+            (entry.name for entry in registered if entry.unit_prefix == own_prefix),
+            own_prefix,
+        )
         try:
             listing = resources.live_units_by_owner(
                 [(entry.name, entry.unit_prefix) for entry in registered],
-                own_prefix,
+                local,
                 own_prefix,
                 units.list_units,
             )

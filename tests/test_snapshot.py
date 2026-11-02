@@ -773,6 +773,81 @@ class ChargedMatchesGate(unittest.TestCase):
         )
         self.assertNotIn("", section["by_project"])
 
+    def test_snapshot_keyed_by_project_name_matches_the_gate(self):
+        """The snapshot way (project name as key) equals the gate's sum.
+
+        Registered projects proj-a/pa- and proj-b/pb-, one ticketed unit
+        and one ticketless unit under the local prefix: the snapshot must
+        report the gate's totals and by_project keys, with no phantom
+        prefix key and no double charge.
+        """
+        from corral import launch
+
+        rows = [
+            (
+                {
+                    "id": "pa-lib-5",
+                    "role": "worker",
+                    "ticket": {"project": "proj-a", "repo": "lib", "number": 5},
+                    "host": HOST,
+                },
+                "live",
+            ),
+            ({"id": "pa-ops-9", "role": "reviewer", "ticket": None, "host": HOST}, "live"),
+            ({"id": "pb-web-3", "role": "reviewer", "ticket": None, "host": HOST}, "live"),
+        ]
+        table = {
+            self.PREFIX_A: [
+                ("pa-lib-5", "active", "running"),
+                ("pa-ops-9", "active", "running"),
+            ],
+            self.PREFIX_B: [("pb-web-3", "active", "running")],
+        }
+
+        def list_fn(prefix):
+            return list(table.get(prefix, []))
+
+        with mock.patch("corral.registry.visible", return_value=list(rows)):
+            charged = launch._charged_usage(
+                "proj-a",
+                self.PREFIX_A,
+                self.registered(),
+                list_fn,
+                dict(self.ROLES),
+                None,
+                T0,
+            )
+        listing = R.live_units_by_owner(
+            [(item.name, item.unit_prefix) for item in self.registered()],
+            "proj-a",
+            self.PREFIX_A,
+            list_fn,
+        )
+        self.assertEqual(set(listing), {"proj-a", "proj-b"})
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner=listing,
+            project_names={"proj-a", "proj-b"},
+        )
+        self.assertEqual(section["charged"], R.usage_dict(charged.total))
+        self.assertEqual(
+            section["by_project"],
+            {name: R.usage_dict(used) for name, used in charged.by_project.items()},
+        )
+        self.assertEqual(
+            section["by_project"],
+            {
+                "proj-a": {"cpu_m": 1500, "memory_mb": 3072, "pids": 150},
+                "proj-b": dict(self.REVIEWER),
+            },
+        )
+        self.assertNotIn("pa-", section["by_project"])
+
     def test_no_projects_ticketless_unit_keys_match(self):
         """Gate and snapshot key an unregistered ticketless unit the same way."""
         from corral import launch
@@ -829,6 +904,41 @@ class MappingLimitsBranch(unittest.TestCase):
         )
         self.assertEqual(section["charged"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
         self.assertEqual(section["host_budget"], {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096})
+
+    def test_falsy_non_mapping_roles_raise(self):
+        rows = view((entry("a1", role="worker"), "live"))
+        host = {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096}
+        for bad in (0, "", [], False):
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    snapshot.resources_section(
+                        rows,
+                        HOST,
+                        {"host": dict(host), "roles": bad},
+                        doc_pressure(),
+                        [],
+                        None,
+                        live_by_owner={"proj-a": ["a1"]},
+                        project_names={"proj-a"},
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_missing_or_null_roles_charge_zero(self):
+        rows = view((entry("a1", role="worker"), "live"))
+        host = {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096}
+        for limits in ({"host": dict(host)}, {"host": dict(host), "roles": None}):
+            with self.subTest(limits=limits):
+                section = snapshot.resources_section(
+                    rows,
+                    HOST,
+                    limits,
+                    doc_pressure(),
+                    [],
+                    None,
+                    live_by_owner={"proj-a": ["a1"]},
+                    project_names={"proj-a"},
+                )
+                self.assertEqual(section["charged"], {"cpu_m": 0, "memory_mb": 0, "pids": 0})
 
     def test_non_limits_and_a_non_mapping_listing_raise(self):
         rows = view((entry("a1", role="worker"), "live"))

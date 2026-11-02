@@ -1170,16 +1170,18 @@ def live_units_by_owner(entries, key, own_prefix, list_fn):
     the launch gate and the snapshot both: only live, well-formed
     units count. `entries` is `[(name, prefix)]` for every registered
     project, so every registered project gets a key even with no live
-    units and its name stays attributable. `key` is the project asking
-    (the gate) or the launching prefix itself (the snapshot's
-    single-project key): when no registration owns `own_prefix`, the
-    fallback lists under `key`, never an empty name. `list_fn(prefix)`
-    is the injected manager seam.
+    units and its name stays attributable. `key` is the asking
+    project's name and `own_prefix` the prefix its units list under:
+    when no registration owns `own_prefix`, the fallback lists under
+    `key`, never an empty name, and only then. An already-listed
+    prefix is never read twice. `list_fn(prefix)` is the injected
+    manager seam.
     """
     from corral import units
 
     prefixes = dict(entries)
-    prefixes.setdefault(key, own_prefix)
+    if own_prefix not in prefixes.values():
+        prefixes.setdefault(key, own_prefix)
     return {
         owner: [
             name

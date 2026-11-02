@@ -928,6 +928,24 @@ class LiveUnitsByOwner(unittest.TestCase):
             {"proj-a": [], "other": ["pb-web-3"]},
         )
 
+    def test_an_already_listed_prefix_is_never_read_twice(self):
+        calls = []
+
+        def fake(prefix):
+            calls.append(prefix)
+            return [(self.PREFIX_A + "lib-5", "active", "running")]
+
+        self.assertEqual(
+            R.live_units_by_owner(
+                [("proj-a", self.PREFIX_A), ("proj-b", self.PREFIX_B)],
+                "pa-",
+                self.PREFIX_A,
+                fake,
+            ),
+            {"proj-a": ["pa-lib-5"], "proj-b": []},
+        )
+        self.assertEqual(sorted(calls), [self.PREFIX_A, self.PREFIX_B])
+
 
 class RequestDefaults(unittest.TestCase):
     def test_a_role_less_request_is_priced_as_the_default_role(self):
