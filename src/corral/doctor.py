@@ -399,9 +399,9 @@ def run_checks(env: Env) -> list[Check]:
 def exit_code(checks: Sequence[Check]) -> int:
     """0 ok or warn only, 1 at least one fail, 3 the manager bus is gone.
 
-    Only an unreachable bus selects 3: a linger failure, or a user-manager
-    failure with the bus fix. A bad `agents.unit_prefix` is an ordinary
-    fail with exit 1.
+    Only an unreachable bus selects 3: a linger failure, or a
+    user-manager or drive-timer failure with the bus fix. A bad
+    `agents.unit_prefix` is an ordinary fail with exit 1.
     """
     for check in checks:
         if check.status != "fail":

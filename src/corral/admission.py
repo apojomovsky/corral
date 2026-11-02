@@ -98,8 +98,12 @@ def _occupants(state):
     return {tuple(entry) for entry in list(state.live) + list(state.pending)}
 
 
-def _bounds(entry):
-    """A project's ``(floor, ceiling)``: zero and none when unknown."""
+def bounds(entry):
+    """A project's ``(floor, ceiling)``: zero and none when unknown.
+
+    Shared with the dispatch pass, whose total-full shortcut reads the
+    same floors the gate admits against.
+    """
     entry = entry or {}
     return entry.get("floor", 0), entry.get("ceiling")
 
@@ -118,7 +122,7 @@ def admit(request, state, limits):
     effective = limits.total + len(forced)
     project_used = sum(1 for entry in occupants if entry[0] == request.project)
     repo_used = sum(1 for entry in occupants if entry[1] == request.repo)
-    floor, ceiling = _bounds(limits.projects.get(request.project))
+    floor, ceiling = bounds(limits.projects.get(request.project))
     described = f"{request.kind} {request.project} {request.repo}#{request.ticket}"
 
     if ceiling is not None and project_used >= ceiling:
@@ -188,7 +192,7 @@ def validate_limits(limits):
         raise LimitsError(f"admission.repo_cap {limits.repo_cap} must be zero or more")
     floors = 0
     for name in sorted(limits.projects):
-        floor, ceiling = _bounds(limits.projects[name])
+        floor, ceiling = bounds(limits.projects[name])
         if floor < 0:
             raise LimitsError(f"project {name} floor {floor} must be zero or more")
         if ceiling is not None and ceiling < 0:
