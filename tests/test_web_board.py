@@ -275,5 +275,75 @@ class WebBoardSources(unittest.TestCase):
         self.assertIn('id="board"', html)
 
 
+def app_text():
+    return web_bytes("app.js").decode("utf-8")
+
+
+def loop_body(text, name):
+    at = text.find(name)
+    assert at > -1, name
+    return text[at : text.find("\n}\n", at)]
+
+
+class RetiredLoopsRetire(unittest.TestCase):
+    """Item 7: a retired poll loop draws nothing after navigation."""
+
+    def test_tick_checks_gen_after_every_await(self):
+        body = loop_body(app_text(), "async function tick(")
+        awaits = [m.start() for m in re.finditer(r"await\s+\w+", body)]
+        self.assertGreaterEqual(len(awaits), 2)
+        for pos in awaits:
+            guard = body.find("gen !== pollGen", pos)
+            next_await = body.find("await", pos + 1)
+            render = body.find("render", pos)
+            failure = body.find("failures +=", pos)
+            bound = min(x for x in (next_await, render, failure) if x > -1)
+            self.assertGreater(guard, -1)
+            self.assertLess(guard, bound)
+
+    def test_board_tick_checks_gen_after_every_await(self):
+        body = loop_body(app_text(), "async function boardTick(")
+        awaits = [m.start() for m in re.finditer(r"await\s+\w+", body)]
+        self.assertGreaterEqual(len(awaits), 2)
+        for pos in awaits:
+            guard = body.find("gen !== pollGen", pos)
+            next_await = body.find("await", pos + 1)
+            render = body.find("render", pos)
+            failure = body.find("failures +=", pos)
+            bound = min(x for x in (next_await, render, failure) if x > -1)
+            self.assertGreater(guard, -1)
+            self.assertLess(guard, bound)
+
+    def test_hashchange_clears_the_timer(self):
+        app = app_text()
+        at = app.find('window.addEventListener("hashchange"')
+        self.assertGreater(at, -1)
+        window = app[at : at + 800]
+        self.assertIn("pollGen += 1", window)
+        self.assertIn("clearTimeout(timer)", window)
+
+
+class BoardPagerClamp(unittest.TestCase):
+    """Item 8: the pager stays honest when offset passes total."""
+
+    def test_board_tick_clamps_offset_to_the_last_page(self):
+        body = loop_body(app_text(), "async function boardTick(")
+        self.assertIn("boardOffset", body)
+        self.assertIn("Math.ceil", body)
+        self.assertIn("BOARD_PAGE_SIZE", body)
+
+    def test_render_board_rows_never_inverts_the_count(self):
+        views = web_bytes("views.js").decode("utf-8")
+        at = views.find("export function renderBoardRows(")
+        self.assertGreater(at, -1)
+        end = views.find("export function ", at + 10)
+        body = views[at:end] if end > -1 else views[at:]
+        self.assertIn("Math.min", body)
+        count_at = body.find('+ " of " +')
+        self.assertGreater(count_at, -1)
+        window = body[max(0, count_at - 600) : count_at + 200]
+        self.assertTrue("Math.min" in window or "Math.max" in window)
+
+
 if __name__ == "__main__":
     unittest.main()

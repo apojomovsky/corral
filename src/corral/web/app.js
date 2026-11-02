@@ -316,6 +316,7 @@ function shellFor(config, doc) {
 // snapshot arrives from the shared poll below, so this draws the
 // stacks only; auth, failure and staleness stay in one place.
 async function tickLog(config, token, route, doc) {
+  const gen = pollGen;
   lastDoc = doc;
   lastFingerprint = canonicalJson(stripVolatile(doc));
   lastAgentKey = null;
@@ -324,6 +325,9 @@ async function tickLog(config, token, route, doc) {
     regReply = await loadProjects(token);
   } catch {
     regReply = null;
+  }
+  if (gen !== pollGen) {
+    return;
   }
   let registered = null;
   let derivedOnly = false;
@@ -375,6 +379,9 @@ async function tickLog(config, token, route, doc) {
   } catch {
     eventsReply = null;
   }
+  if (gen !== pollGen) {
+    return;
+  }
   // The kind comes from the route's own tuple and the paging is
   // computed, so a 400 from either stack reads as a bad project
   // name: the project may have been removed since the list loaded.
@@ -384,6 +391,9 @@ async function tickLog(config, token, route, doc) {
       journalReply = await loadJournalLast(route.project, logKind, token);
     } catch {
       journalReply = null;
+    }
+    if (gen !== pollGen) {
+      return;
     }
   }
   if (
@@ -427,7 +437,19 @@ async function tickLog(config, token, route, doc) {
     logJournalTotal =
       typeof journalReply.data.total === "number" ? journalReply.data.total : entries.length;
     logJournal = entries;
-    logJournalStart = Math.max(0, logJournalTotal - entries.length);
+    // The window reply carries its own cursor (pos + len); derive
+    // start from it so entries arriving between the probe and the
+    // window cannot mislabel the rendered range.
+    const rawCursor = journalReply.data.cursor;
+    const parsedCursor =
+      typeof rawCursor === "string"
+        ? Number.parseInt(rawCursor, 10)
+        : typeof rawCursor === "number"
+          ? rawCursor
+          : NaN;
+    logJournalStart = Number.isFinite(parsedCursor)
+      ? Math.max(0, parsedCursor - entries.length)
+      : Math.max(0, logJournalTotal - entries.length);
   } else if (!logHistory) {
     journalState = "failed";
   }
@@ -447,6 +469,8 @@ async function tickLog(config, token, route, doc) {
     history: logHistory,
   };
   const fingerprint =
+    String(logKind || "") +
+    "|" +
     canonicalJson(stripVolatile(eventsReply ? eventsReply.data : null)) +
     "|" +
     canonicalJson(choices) +
@@ -571,7 +595,7 @@ function bindTailButtons(config, getToken) {
       renderTailPaused(true);
     } else {
       renderTailPaused(false);
-      void tick(config, getToken());
+      void tickTail(config, getToken());
     }
   });
   follow.addEventListener("click", () => {
@@ -600,6 +624,9 @@ async function tick(config, token) {
     } catch {
       versionOk = true;
     }
+    if (gen !== pollGen) {
+      return;
+    }
     if (!versionOk) {
       return;
     }
@@ -608,6 +635,9 @@ async function tick(config, token) {
       reply = await loadSnapshot(token);
     } catch {
       reply = null;
+    }
+    if (gen !== pollGen) {
+      return;
     }
     if (reply && reply.status === 200 && reply.data) {
       seenMs = Date.now();
@@ -626,6 +656,9 @@ async function tick(config, token) {
         const route = routeFromHash();
         if (route.name === "log") {
           await tickLog(config, token, route, reply.data);
+          if (gen !== pollGen) {
+            return;
+          }
         } else {
           const fingerprint = canonicalJson(stripVolatile(reply.data));
           const agentKeyText = route.name === "agent" ? canonicalJson(route.key) : null;
@@ -753,8 +786,19 @@ async function pollOlder(token) {
     reply = null;
   }
   if (!(reply && reply.status === 200 && reply.data && Array.isArray(reply.data.entries))) {
-    failures += 1;
-    renderConnection({ live: false, seenMs });
+    // The snapshot poll is the freshness signal; a failed older
+    // page reads as the journal card's retry text only, never as a
+    // disconnected banner.
+    const prior = lastLogView ? lastLogView.view : null;
+    if (prior !== null && !prior.unknown && prior.project !== null) {
+      const next = { ...prior, journalState: "failed" };
+      lastLogView = { key: lastLogView.key, view: next };
+      try {
+        renderLog(next, { nowMs: Date.now(), notice: lastNotice });
+      } catch {
+        // A failed retry draw keeps the last good page in place.
+      }
+    }
     return;
   }
   const entries = reply.data.entries;
@@ -828,6 +872,9 @@ async function boardTick(config, token) {
     } catch {
       versionOk = true;
     }
+    if (gen !== pollGen) {
+      return;
+    }
     if (!versionOk) {
       return;
     }
@@ -843,6 +890,9 @@ async function boardTick(config, token) {
     } catch {
       reply = null;
     }
+    if (gen !== pollGen) {
+      return;
+    }
     if (reply && reply.status === 200 && reply.data) {
       seenMs = Date.now();
       failures = 0;
@@ -854,6 +904,11 @@ async function boardTick(config, token) {
         seenMs,
         serverNowMs: typeof reply.data.now === "number" ? reply.data.now * 1000 : null,
       });
+      const boardTotal = typeof reply.data.total === "number" ? reply.data.total : boardOffset;
+      const lastPageStart = Math.max(0, (Math.ceil(boardTotal / BOARD_PAGE_SIZE) - 1) * BOARD_PAGE_SIZE);
+      if (boardOffset > lastPageStart) {
+        boardOffset = lastPageStart;
+      }
       renderBoardRows(reply.data, { limit: BOARD_PAGE_SIZE, offset: boardOffset, nowMs: seenMs });
       renderConnection({ live: true, seenMs });
     } else if (reply && reply.status === 401) {
@@ -1014,6 +1069,10 @@ async function boot() {
   window.addEventListener("hashchange", () => {
     failures = 0;
     pollGen += 1;
+    if (timer !== null) {
+      window.clearTimeout(timer);
+      timer = null;
+    }
     if (routeFromHash().name === "board") {
       stopTail();
       mountBoard(config);
