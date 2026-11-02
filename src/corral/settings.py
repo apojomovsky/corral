@@ -20,7 +20,7 @@ their own stores. Nothing in the registry holds one.
 import os
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -51,6 +51,11 @@ class Setting:
     type: type
     default: object
     help: str
+    #: An optional range check: takes the parsed value, returns it unchanged,
+    #: and raises ValueError with the rule when it fails. The settings layer
+    #: reports the failure naming the file and key, so the check only states
+    #: the rule, never where the value came from.
+    check: Callable[[object], object] | None = None
 
     @property
     def env(self) -> str:
@@ -60,13 +65,15 @@ class Setting:
 REGISTRY: dict[str, Setting] = {}
 
 
-def register(key, type_, default, help_):
+def register(key, type_, default, help_, check=None):
     """Declare a setting. Each module registers its own, once, at import."""
     if key in REGISTRY:
         raise ValueError(f"setting {key!r} is registered twice")
     if not isinstance(default, type_):
         raise ValueError(f"setting {key!r}: default {default!r} is not {type_.__name__}")
-    REGISTRY[key] = Setting(key, type_, default, help_)
+    if check is not None and not callable(check):
+        raise ValueError(f"setting {key!r}: check is not callable")
+    REGISTRY[key] = Setting(key, type_, default, help_, check)
     return REGISTRY[key]
 
 
@@ -190,6 +197,21 @@ def _flatten(table, where, prefix=""):
     return out
 
 
+def _apply_check(setting, value, where):
+    """The setting's range check on `value`, else `value` unchanged.
+
+    A failure is a SettingsError naming where and key, so the check itself
+    only states the rule. This is the one place range checks run: every
+    layer's values pass through here.
+    """
+    if setting.check is None:
+        return value
+    try:
+        return setting.check(value)
+    except ValueError as err:
+        raise SettingsError(f"{where}: {setting.key} {err}") from None
+
+
 def _check(key, value, where):
     setting = REGISTRY.get(key)
     if setting is None:
@@ -199,7 +221,7 @@ def _check(key, value, where):
         raise SettingsError(
             f"{where}: {key} must be {setting.type.__name__}, not {type(value).__name__}"
         )
-    return value
+    return _apply_check(setting, value, where)
 
 
 def _check_models(raw, where):
@@ -542,7 +564,8 @@ def resolve(
     for key, setting in REGISTRY.items():
         raw = env.get(setting.env)
         if raw is not None and raw != "":
-            result[key] = Value(_parse_env(setting, raw), ENV)
+            parsed = _parse_env(setting, raw)
+            result[key] = Value(_apply_check(setting, parsed, setting.env), ENV)
     for key, value in (flags or {}).items():
         if value is not None:
             result[key] = Value(_check(key, value, "flag"), FLAG)

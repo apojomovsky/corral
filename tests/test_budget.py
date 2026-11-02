@@ -14,7 +14,7 @@ import io
 import os
 import subprocess
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import unittest
 from unittest import mock
 
@@ -64,6 +64,19 @@ class BudgetTest(unittest.TestCase):
                 f"{lines} lines printed {expected}m/{limit}m, below the 3x floor",
             )
 
+    def test_a_hand_built_floor_violation_is_a_settings_error(self):
+        # numbers() never sees a hand-built Numbers, so budget() reports
+        # the broken floor itself: a SettingsError (exit 4), not a traceback.
+        cfg = bu.Numbers(
+            base_minutes=1,
+            seconds_per_line=1,
+            limit_multiple=1,
+            floor_minutes=30,
+            ceiling_minutes=120,
+        )
+        with self.assertRaisesRegex(S.SettingsError, "below the 30-minute floor"):
+            bu.budget(0, cfg)
+
 
 class CeilingTest(unittest.TestCase):
     """A limit the dispatcher cannot act on is not a limit. The runtime kills
@@ -82,13 +95,15 @@ class CeilingTest(unittest.TestCase):
     def test_three_times_the_expectation_always_fits(self):
         for lines in (0, 100, 530, 100_000):
             expected, _ = bu.budget(lines)
-            self.assertLessEqual(expected, bu.MAX_EXPECTED_MINUTES)
+            self.assertLessEqual(expected, bu._max_expected(bu.numbers()))
             self.assertGreaterEqual(expected, bu.BASE_MINUTES)
 
     def test_the_ceiling_is_still_above_the_gate_minimum(self):
         # If these ever crossed, every budget would be forced outside the
         # gate's own bounds and no line count would be reviewable at all.
-        self.assertGreater(bu.MAX_LIMIT_MINUTES, bu.GATE_MIN_LIMIT_MINUTES)
+        top = bu._max_expected(bu.numbers()) * bu.LIMIT_MULTIPLE
+        self.assertLess(top, bu.MACHINE_CEILING_MINUTES)
+        self.assertGreater(top, bu.GATE_MIN_LIMIT_MINUTES)
 
     def test_the_gate_minimum_holds_for_every_diff(self):
         # The floor holds because the base expectation alone exceeds a third
@@ -120,7 +135,7 @@ class SplitTest(unittest.TestCase):
         # gets a shortened expectation with no warning (or a warning with a
         # full-length one).
         for lines in (0, 229, 230, 231, 1000):
-            shortened = bu.natural_expected_minutes(lines) > bu.MAX_EXPECTED_MINUTES
+            shortened = bu.natural_expected_minutes(lines) > bu._max_expected(bu.numbers())
             self.assertEqual(bu.needs_splitting(lines), shortened, f"{lines} lines")
 
     def test_the_boundary_line_count_is_flagged(self):
@@ -296,6 +311,47 @@ class LayersTest(unittest.TestCase):
             resolve_settings(project={"review": {"budget": {"base_minutes": True}}})
 
 
+class RangeSourceTest(unittest.TestCase):
+    """A bad budget number names the source that set it, not just the key.
+
+    The range lives in the settings layer where the file (or variable) is
+    known; numbers() keeps only the cross-key checks.
+    """
+
+    def test_a_non_positive_host_value_names_the_host_file(self):
+        with self.assertRaisesRegex(
+            S.SettingsError, r"host-config\.toml.*review\.budget\.base_minutes"
+        ):
+            resolve_settings(
+                host={"review": {"budget": {"base_minutes": 0}}},
+                host_name="host-config.toml",
+            )
+
+    def test_a_non_positive_project_value_names_the_project_file(self):
+        with self.assertRaisesRegex(
+            S.SettingsError, r"corral\.toml.*review\.budget\.seconds_per_line"
+        ):
+            resolve_settings(project={"review": {"budget": {"seconds_per_line": -2}}})
+
+    def test_a_non_positive_repo_value_names_the_entry(self):
+        project = {"repo": [{"name": "a", "review": {"budget": {"limit_multiple": 0}}}]}
+        with self.assertRaisesRegex(
+            S.SettingsError, r"\[\[repo\]\] a.*review\.budget\.limit_multiple"
+        ):
+            resolve_settings(project=project, repo="a")
+
+    def test_a_non_positive_env_value_names_the_variable(self):
+        with self.assertRaisesRegex(
+            S.SettingsError,
+            r"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES.*review\.budget\.floor_minutes",
+        ):
+            resolve_settings(env={"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES": "0"})
+
+    def test_a_non_positive_flag_value_names_the_key(self):
+        with self.assertRaisesRegex(S.SettingsError, r"flag.*review\.budget\.ceiling_minutes"):
+            resolve_settings(flags={"review.budget.ceiling_minutes": 0})
+
+
 class NumbersTest(unittest.TestCase):
     def test_no_resolved_settings_reads_as_todays_constants(self):
         cfg = bu.numbers()
@@ -329,8 +385,24 @@ class NumbersTest(unittest.TestCase):
 
     def test_a_floor_at_or_above_the_ceiling_is_refused(self):
         bad = dict(CUSTOM, floor_minutes=60)
-        with self.assertRaisesRegex(S.SettingsError, "review.budget.floor_minutes"):
+        with self.assertRaisesRegex(
+            S.SettingsError,
+            r"review\.budget\.floor_minutes \(60, from project\) must be below "
+            r"review\.budget\.ceiling_minutes \(60, from project\)",
+        ):
             bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
+
+    def test_a_cross_key_error_reports_each_value_layer(self):
+        # The floor comes from the environment here, the ceiling from the
+        # project file: the error names the layer behind each value.
+        resolved = resolve_settings(
+            project=custom_project(),
+            env={"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES": "60"},
+        )
+        with self.assertRaisesRegex(
+            S.SettingsError, r"floor_minutes \(60, from env\).*ceiling_minutes \(60, from project\)"
+        ):
+            bu.numbers(resolved)
 
     def test_a_floor_no_limit_can_clear_is_refused(self):
         # base * multiple below the floor: even an empty diff prints a
@@ -342,7 +414,12 @@ class NumbersTest(unittest.TestCase):
             "floor_minutes": 30,
             "ceiling_minutes": 120,
         }
-        with self.assertRaises(S.SettingsError):
+        with self.assertRaisesRegex(
+            S.SettingsError,
+            r"smallest limit \(1 minutes, from base_minutes 1 set by project "
+            r"and limit_multiple 1 set by project\) is below "
+            r"review\.budget\.floor_minutes \(30, from project\)",
+        ):
             bu.numbers(resolve_settings(project={"review": {"budget": bad}}))
 
 
@@ -466,18 +543,94 @@ class BudgetFlagsTest(unittest.TestCase):
         self.assertEqual(rc, 4)
         self.assertIn("review.budget.base_minutes", err.getvalue())
 
-    def test_main_cli_takes_root_and_repo(self):
+
+class StrictFlagsTest(unittest.TestCase):
+    """Both spellings share one parser and one root/repo check.
+
+    Unknown or valueless flags exit 4, and a --root without a corral.toml
+    exits 4, whether the budget runs as `corral budget` or as
+    `python -m corral.budget`. This replaces the lax main_cli test, which
+    pinned the old hand-rolled parsing that silently ignored all of these.
+    """
+
+    def run_both(self, argv, project_toml=None, with_root=True):
+        """[(verb rc, out, err), (module rc, out, err)] for the same flags.
+
+        A temp dir is the --root when with_root holds; it carries
+        project_toml, or no corral.toml when project_toml is None. The
+        working directory is always the temp dir, so a missing --root never
+        accidentally finds a project file uphill.
+        """
+        from corral import cli
+
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
+        if project_toml is not None:
+            with open(os.path.join(tmp.name, "corral.toml"), "w", encoding="utf-8") as handle:
+                handle.write(project_toml)
+        flags = ["--root", tmp.name, *argv] if with_root else list(argv)
         config_home = os.path.join(tmp.name, "config")
         os.makedirs(config_home)
-        proc = subprocess.CompletedProcess([], 0, "4\t0\tsrc/a.rs\n", "")
-        out = io.StringIO()
+        proc = subprocess.CompletedProcess([], 0, "100\t0\tsrc/a.rs\n", "")
+        results = []
         with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
-            with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
-                rc = bu.main_cli(["--root", tmp.name, "--base", "HEAD~3"])
-        self.assertEqual(rc, 0)
-        self.assertIn("HEAD~3", out.getvalue())
+            with mock.patch.object(bu, "_git", return_value=proc):
+                with mock.patch.object(os, "getcwd", return_value=tmp.name):
+                    calls = (lambda: cli.main(["budget", *flags]), lambda: bu.main_cli(flags))
+                    for call in calls:
+                        out, err = io.StringIO(), io.StringIO()
+                        with redirect_stdout(out), redirect_stderr(err):
+                            results.append((call(), out.getvalue(), err.getvalue()))
+        return results
+
+    def test_unknown_flag_exits_4_in_both_spellings(self):
+        for rc, out, err in self.run_both(["--bogus"], project_toml="", with_root=False):
+            with self.subTest(rc=rc):
+                self.assertEqual(rc, 4)
+
+    def test_valueless_trailing_flag_exits_4_in_both_spellings(self):
+        for rc, out, err in self.run_both(["--root"], project_toml="", with_root=False):
+            with self.subTest(rc=rc):
+                self.assertEqual(rc, 4)
+
+    def test_root_without_a_project_file_exits_4_in_both_spellings(self):
+        for rc, out, err in self.run_both([], project_toml=None):
+            with self.subTest(rc=rc, err=err):
+                self.assertEqual(rc, 4)
+                self.assertIn("no corral.toml in --root", err)
+
+    def test_repo_without_a_root_exits_4_in_both_spellings(self):
+        results = self.run_both(["--repo", "a"], project_toml=None, with_root=False)
+        for rc, out, err in results:
+            with self.subTest(rc=rc, err=err):
+                self.assertEqual(rc, 4)
+                self.assertIn("--repo needs an ops root", err)
+
+    def test_root_repo_and_base_agree_in_both_spellings(self):
+        results = self.run_both(["--base", "HEAD~3"], project_toml="")
+        for rc, out, err in results:
+            with self.subTest(rc=rc, out=out):
+                self.assertEqual(rc, 0)
+                self.assertIn("HEAD~3", out)
+
+    def test_repo_flag_selects_the_entry_in_both_spellings(self):
+        toml = (
+            '[[repo]]\nname = "a"\n[repo.review.budget]\nbase_minutes = 10\n'
+            "seconds_per_line = 10\nlimit_multiple = 2\nfloor_minutes = 20\n"
+            "ceiling_minutes = 60\n"
+        )
+        results = self.run_both(["--repo", "a"], project_toml=toml)
+        for rc, out, err in results:
+            with self.subTest(rc=rc, out=out):
+                self.assertEqual(rc, 0)
+                self.assertIn("expected 27 minutes, hard limit 54 minutes", out)
+
+    def test_a_bad_value_is_exit_4_in_both_spellings(self):
+        results = self.run_both([], project_toml="[review.budget]\nbase_minutes = 0\n")
+        for rc, out, err in results:
+            with self.subTest(rc=rc, err=err):
+                self.assertEqual(rc, 4)
+                self.assertIn("review.budget.base_minutes", err)
 
 
 if __name__ == "__main__":

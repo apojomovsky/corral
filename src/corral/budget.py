@@ -9,8 +9,8 @@ stated limit can be cancelled on a rule rather than a hunch.
 
 Everything is in whole minutes, and the limit is derived from the rounded
 expectation rather than the other way round: the gate's floor (the limit
-is at least three times the expectation) has to hold for the numbers that
-get printed, not merely for the seconds behind them.
+is at least the configured multiple of the expectation) has to hold for
+the numbers that get printed, not merely for the seconds behind them.
 
 The hard limit is capped below the machine ceiling, because a limit at or
 above it is not a limit: the agent runtime would kill the reviewer first,
@@ -24,8 +24,10 @@ its own; the defaults are corral's own review gate. `numbers()` is the
 one resolver: every reader goes through it.
 """
 
+import argparse
 import os
 import subprocess
+import sys
 import textwrap
 from typing import NamedTuple
 
@@ -53,43 +55,59 @@ GATE_MIN_LIMIT_MINUTES = 30
 MACHINE_CEILING_MINUTES = 120
 
 # A limit has to stay strictly below the kill point, or the dispatcher
-# never gets to act on it. Everything else is derived from that one bound,
-# so the cap and the split threshold cannot drift apart.
-MAX_LIMIT_MINUTES = MACHINE_CEILING_MINUTES - 1
-MAX_EXPECTED_MINUTES = MAX_LIMIT_MINUTES // LIMIT_MULTIPLE
+# never gets to act on it. The cap on the expectation below derives from
+# that one bound, so the cap and the split threshold cannot drift apart.
 
 # The defaults above are corral's own review gate (the 3x multiple and the
 # 30-minute floor in AGENTS.md). A project configures its own numbers
 # through these settings; the gate rule stays corral's, not the project's.
+
+
+def _positive_int(value):
+    """One budget number's range, for the settings layer: a positive int.
+
+    The settings layer names the file and key around this rule; numbers()
+    below keeps only the checks that compare two numbers.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"must be a positive integer, not {value!r}")
+    return value
+
+
 settings.register(
     "review.budget.base_minutes",
     int,
     BASE_MINUTES,
     "reviewer minutes before the diff size matters (loading, build, fast gates)",
+    check=_positive_int,
 )
 settings.register(
     "review.budget.seconds_per_line",
     int,
     SECONDS_PER_LINE,
     "reviewer seconds per changed line in the diff",
+    check=_positive_int,
 )
 settings.register(
     "review.budget.limit_multiple",
     int,
     LIMIT_MULTIPLE,
     "hard limit as a multiple of the expected duration",
+    check=_positive_int,
 )
 settings.register(
     "review.budget.floor_minutes",
     int,
     GATE_MIN_LIMIT_MINUTES,
     "hard limit floor in minutes, however small the diff",
+    check=_positive_int,
 )
 settings.register(
     "review.budget.ceiling_minutes",
     int,
     MACHINE_CEILING_MINUTES,
     "agent runtime ceiling in minutes for one dispatched reviewer",
+    check=_positive_int,
 )
 
 # Standing checks every bug-fix review makes beyond its one question: the
@@ -129,12 +147,30 @@ NUMBERS_KEYS = (
     "review.budget.ceiling_minutes",
 )
 
+#: What the `corral budget` verb prints for --help: the same text serves the
+#: standalone `python -m corral.budget`, so the two spellings agree.
+BUDGET_HELP = "derive a reviewer dispatch's time budget from the diff scope"
+BUDGET_EPILOG = (
+    "Prints the dispatch block the review gate asks for: the one "
+    "question, the scope, and an expected duration plus hard limit "
+    "computed from <base>...HEAD. Paste it into the reviewer prompt "
+    "so the budget is reproducible rather than hand-picked. The "
+    "numbers come from the review.budget.* settings, so --repo prints "
+    "that entry's budget."
+)
 
-def _number(key, raw):
-    """One budget number: a positive int, else a SettingsError naming the key."""
+
+def _setting_int(raw, key):
+    """The resolved value for `key` as an int.
+
+    The settings layer only stores type-checked ints here, so this is a
+    narrowing guard for hand-built inputs: a non-int is a configuration
+    error (exit 4), never an arithmetic traceback. The range check lives
+    where the value is set; only the type is reaffirmed here.
+    """
     value = raw[key]
-    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-        raise settings.SettingsError(f"{key} must be a positive integer, not {value!r}")
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise settings.SettingsError(f"{key} must be an integer, not {value!r}")
     return value
 
 
@@ -142,34 +178,42 @@ def numbers(resolved=None):
     """The budget numbers, from `resolved` or from the built-in defaults.
 
     With no resolved settings the result is today's constants, so current
-    behavior is byte-identical. Bad values are a SettingsError naming the
-    key: each number must be positive, the floor must sit below the
-    ceiling, and the smallest printable limit must still clear the floor,
-    for every diff size.
+    behavior is byte-identical. Each number's own range (a positive int) is
+    checked where the value is set, naming the file and key. The checks
+    that compare two numbers stay here, and each names the layer behind
+    the offending values, which the resolved settings already record.
     """
     if resolved is None:
         raw = {key: settings.REGISTRY[key].default for key in NUMBERS_KEYS}
+        origins = dict.fromkeys(NUMBERS_KEYS, settings.DEFAULT)
     else:
         raw = {key: resolved[key] for key in NUMBERS_KEYS}
+        origins = {key: resolved.values[key].origin for key in NUMBERS_KEYS}
     cfg = Numbers(
-        base_minutes=_number("review.budget.base_minutes", raw),
-        seconds_per_line=_number("review.budget.seconds_per_line", raw),
-        limit_multiple=_number("review.budget.limit_multiple", raw),
-        floor_minutes=_number("review.budget.floor_minutes", raw),
-        ceiling_minutes=_number("review.budget.ceiling_minutes", raw),
+        base_minutes=_setting_int(raw, "review.budget.base_minutes"),
+        seconds_per_line=_setting_int(raw, "review.budget.seconds_per_line"),
+        limit_multiple=_setting_int(raw, "review.budget.limit_multiple"),
+        floor_minutes=_setting_int(raw, "review.budget.floor_minutes"),
+        ceiling_minutes=_setting_int(raw, "review.budget.ceiling_minutes"),
     )
+    floor_key = "review.budget.floor_minutes"
+    ceiling_key = "review.budget.ceiling_minutes"
     if cfg.floor_minutes >= cfg.ceiling_minutes:
         raise settings.SettingsError(
-            f"review.budget.floor_minutes ({cfg.floor_minutes}) must be below "
-            f"review.budget.ceiling_minutes ({cfg.ceiling_minutes})"
+            f"{floor_key} ({cfg.floor_minutes}, from {origins[floor_key]}) must be "
+            f"below {ceiling_key} ({cfg.ceiling_minutes}, from {origins[ceiling_key]})"
         )
+    base_key = "review.budget.base_minutes"
+    multiple_key = "review.budget.limit_multiple"
     smallest = min(cfg.base_minutes, _max_expected(cfg)) * cfg.limit_multiple
     if smallest < cfg.floor_minutes:
         raise settings.SettingsError(
             "review.budget leaves no printable budget: the smallest limit "
-            f"({smallest} minutes) is below review.budget.floor_minutes "
-            f"({cfg.floor_minutes}); raise review.budget.base_minutes or "
-            "review.budget.limit_multiple, or lower review.budget.floor_minutes"
+            f"({smallest} minutes, from base_minutes {cfg.base_minutes} set by "
+            f"{origins[base_key]} and limit_multiple {cfg.limit_multiple} set by "
+            f"{origins[multiple_key]}) is below {floor_key} "
+            f"({cfg.floor_minutes}, from {origins[floor_key]}); raise {base_key} "
+            f"or {multiple_key}, or lower {floor_key}"
         )
     return cfg
 
@@ -256,12 +300,14 @@ def budget(lines, cfg=None):
     expected = min(natural_expected_minutes(lines, cfg), _max_expected(cfg))
     limit = expected * cfg.limit_multiple
     # The floor holds because the smallest printable limit clears it; the
-    # check keeps that a fact rather than a coincidence if the numbers are
-    # ever tuned. `numbers()` refuses settings that would fail it.
-    assert limit >= cfg.floor_minutes, (
-        f"budget {expected}m/{limit}m is below the {cfg.floor_minutes}-minute "
-        "floor; raise review.budget.base_minutes or review.budget.limit_multiple"
-    )
+    # check keeps that a fact rather than a coincidence for a hand-built
+    # Numbers that numbers() never saw. A SettingsError is exit 4, not a
+    # traceback, since a bad budget is a configuration error.
+    if limit < cfg.floor_minutes:
+        raise settings.SettingsError(
+            f"budget {expected}m/{limit}m is below the {cfg.floor_minutes}-minute "
+            "floor; raise review.budget.base_minutes or review.budget.limit_multiple"
+        )
     return expected, limit
 
 
@@ -321,43 +367,84 @@ def dispatch_block(base, cwd=None, cfg=None):
     return "\n".join(body)
 
 
+def add_flags(parser):
+    """--base/--root/--repo on `parser`, shared by the two budget spellings.
+
+    The one definition of the flags: the `corral budget` verb and the
+    standalone parser below both build from here, so a flag means the same
+    thing however the budget is run.
+    """
+    from corral.diffscope import BASE_HELP
+
+    parser.add_argument("--base", default=None, help=f"base ref to diff against ({BASE_HELP})")
+    parser.add_argument(
+        "--root", default=None, help="the ops root (default: nearest corral.toml upward)"
+    )
+    parser.add_argument("--repo", default=None, help="resolve for this [[repo]] entry")
+
+
+class _Exit4Parser(argparse.ArgumentParser):
+    """An ArgumentParser that exits 4 on a usage error instead of 2.
+
+    Exit codes are a public interface: 4 is the configuration-or-usage
+    error, whatever the spelling. --help still exits 0.
+    """
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(4, f"{self.prog}: error: {message}\n")
+
+
+def build_parser():
+    """The standalone budget parser: the same flags as the `corral budget` verb.
+
+    Unknown or valueless flags exit 4, the usage-error code, like every
+    other corral spelling.
+    """
+    parser = _Exit4Parser(prog="corral budget", description=BUDGET_HELP, epilog=BUDGET_EPILOG)
+    add_flags(parser)
+    return parser
+
+
+def resolve_root_repo(root, repo):
+    """The (root, repo) pair for a budget run, else a SettingsError (exit 4).
+
+    The one validation of the two spellings' --root/--repo pair: a --root
+    must hold a corral.toml, and --repo needs the ops root that file lives
+    in. The messages match the `corral config` verb's, so every spelling
+    agrees word for word.
+    """
+    if root and not os.path.isfile(os.path.join(root, settings.PROJECT_FILE)):
+        raise settings.SettingsError(f"no {settings.PROJECT_FILE} in --root {root}")
+    root = root or settings.find_root(os.getcwd())
+    if repo and not root:
+        raise settings.SettingsError("--repo needs an ops root (corral.toml)")
+    return root, repo
+
+
 def main_cli(argv):
     """`python -m corral.budget [--base <ref>]`: print the dispatch block.
 
-    Mirrors the `corral budget` verb's flags so the two spellings cannot
-    disagree about how the base ref or the project settings are given.
+    Built from the same parser and root/repo check as the `corral budget`
+    verb, so the two spellings cannot disagree about flags, a missing
+    project file, or bad values.
     """
-    import sys
-
     from corral.diffscope import default_base
 
-    base = default_base()
-    root, repo = None, None
-    rest = list(argv)
-    while rest:
-        arg = rest.pop(0)
-        if arg == "--base" and rest:
-            base = rest.pop(0)
-        elif arg.startswith("--base="):
-            base = arg.split("=", 1)[1]
-        elif arg == "--root" and rest:
-            root = rest.pop(0)
-        elif arg.startswith("--root="):
-            root = arg.split("=", 1)[1]
-        elif arg == "--repo" and rest:
-            repo = rest.pop(0)
-        elif arg.startswith("--repo="):
-            repo = arg.split("=", 1)[1]
     try:
+        args = build_parser().parse_args(argv)
+    except SystemExit as err:
+        return 0 if err.code == 0 else 4
+    try:
+        root, repo = resolve_root_repo(args.root, args.repo)
         cfg = load_numbers(root=root, repo=repo)
+        text = dispatch_block(default_base(args.base), cfg=cfg)
     except settings.SettingsError as err:
         print(f"corral budget: {err}", file=sys.stderr)
         return 4
-    print(dispatch_block(base, cfg=cfg))
+    print(text)
     return 0
 
 
 if __name__ == "__main__":
-    import sys
-
     sys.exit(main_cli(sys.argv[1:]))

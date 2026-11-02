@@ -166,19 +166,14 @@ def cmd_budget(args: argparse.Namespace) -> int:
 
     from corral import diffscope
 
-    if args.root and not os.path.isfile(os.path.join(args.root, settings.PROJECT_FILE)):
-        print(f"corral: no {settings.PROJECT_FILE} in --root {args.root}", file=sys.stderr)
-        return USAGE
-    root = args.root or settings.find_root(os.getcwd())
-    if args.repo and not root:
-        print("corral: --repo needs an ops root (corral.toml)", file=sys.stderr)
-        return USAGE
     try:
-        cfg = budget.load_numbers(root=root, repo=args.repo)
+        root, repo = budget.resolve_root_repo(args.root, args.repo)
+        cfg = budget.load_numbers(root=root, repo=repo)
+        text = budget.dispatch_block(diffscope.default_base(args.base), cfg=cfg)
     except settings.SettingsError as err:
         print(f"corral: {err}", file=sys.stderr)
         return USAGE
-    print(budget.dispatch_block(diffscope.default_base(args.base), cfg=cfg))
+    print(text)
     return OK
 
 
@@ -209,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--json", action="store_true", help="print the stable document")
     p.set_defaults(func=cmd_projects)
+    from corral import budget
     from corral.diffscope import BASE_HELP
 
     base_help = f"base ref to diff against ({BASE_HELP})"
@@ -226,19 +222,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_push)
     p = sub.add_parser(
         "budget",
-        help="derive a reviewer dispatch's time budget from the diff scope",
-        epilog="Prints the dispatch block the review gate asks for: the one "
-        "question, the scope, and an expected duration plus hard limit "
-        "computed from <base>...HEAD. Paste it into the reviewer prompt "
-        "so the budget is reproducible rather than hand-picked. The "
-        "numbers come from the review.budget.* settings, so --repo prints "
-        "that entry's budget.",
+        help=budget.BUDGET_HELP,
+        epilog=budget.BUDGET_EPILOG,
     )
-    p.add_argument("--base", default=None, help=base_help)
-    p.add_argument(
-        "--root", default=None, help="the ops root (default: nearest corral.toml upward)"
-    )
-    p.add_argument("--repo", default=None, help="resolve for this [[repo]] entry")
+    budget.add_flags(p)
     p.set_defaults(func=cmd_budget)
     init.add_parser(sub)
     coordcli.add_parser(sub)
