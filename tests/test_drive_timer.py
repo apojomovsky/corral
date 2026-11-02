@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import cli, drive, paths, units
+from corral import cli, drive, drivehub, paths, units
 
 
 def proc(stdout="", stderr="", returncode=0):
@@ -286,7 +286,9 @@ class InstallVerb(unittest.TestCase):
 
         with mock.patch.object(drive, "install_timer", return_value=("/s", "/t")) as installed:
             with redirect_stdout(io.StringIO()):
-                code = drive.cmd_drive(argparse.Namespace(plan=False, drive_verb="install-timer"))
+                code = drivehub.cmd_drive(
+                    argparse.Namespace(plan=False, drive_verb="install-timer")
+                )
         installed.assert_called_once_with()
         self.assertEqual(code, 0)
 
@@ -297,14 +299,14 @@ class InstallVerb(unittest.TestCase):
             with mock.patch.object(
                 drive, "install_timer", side_effect=AssertionError("must not install")
             ):
-                code = drive.cmd_drive(argparse.Namespace(plan=True, drive_verb=None))
+                code = drivehub.cmd_drive(argparse.Namespace(plan=True, drive_verb=None))
         self.assertEqual(code, 4)
 
     def test_plan_combined_with_install_is_a_usage_error(self):
         with mock.patch.object(
             drive, "install_timer", side_effect=AssertionError("must not install")
         ):
-            code = drive.cmd_drive(argparse.Namespace(plan=True, drive_verb="install-timer"))
+            code = drivehub.cmd_drive(argparse.Namespace(plan=True, drive_verb="install-timer"))
         self.assertEqual(code, 4)
 
     def test_plan_after_the_verb_parses_and_is_a_usage_error(self):
@@ -318,7 +320,7 @@ class InstallVerb(unittest.TestCase):
             drive, "install_timer", side_effect=AssertionError("must not install")
         ):
             with redirect_stderr(io.StringIO()):
-                code = drive.cmd_drive(args)
+                code = drivehub.cmd_drive(args)
         self.assertEqual(code, 4)
 
     def test_plan_before_the_verb_survives_the_install_subparser(self):
@@ -333,7 +335,9 @@ class InstallVerb(unittest.TestCase):
         out = io.StringIO()
         with mock.patch.object(drive, "install_timer", return_value=("/u/svc", "/u/tmr")):
             with redirect_stdout(out):
-                code = drive.cmd_drive(argparse.Namespace(plan=False, drive_verb="install-timer"))
+                code = drivehub.cmd_drive(
+                    argparse.Namespace(plan=False, drive_verb="install-timer")
+                )
         self.assertEqual(code, 0)
         self.assertIn("/u/svc", out.getvalue())
         self.assertIn(drive.TIMER_NAME, out.getvalue())
@@ -348,7 +352,7 @@ class InstallVerb(unittest.TestCase):
         ):
             with mock.patch.object(drive, "install_timer", side_effect=error):
                 with redirect_stderr(io.StringIO()):
-                    code = drive.cmd_drive(
+                    code = drivehub.cmd_drive(
                         argparse.Namespace(plan=False, drive_verb="install-timer")
                     )
             self.assertEqual(code, want)

@@ -253,47 +253,26 @@ def project_live_counts(registered, list_fn, cfg):
     return counts
 
 
-def _add_usage(first, second):
-    """The summed usage of two triples."""
-    return resources.Usage(
-        cpu_m=first.cpu_m + second.cpu_m,
-        memory_mb=first.memory_mb + second.memory_mb,
-        pids=first.pids + second.pids,
-    )
-
-
 def _charged_usage(key, own_prefix, registered, list_fn, roles, cfg, now):
     """Charged usage: the summed role costs of live agents, total and per project.
 
     Live means listed by the manager under a registered prefix: an entry
     whose unit is gone holds no share, so a crash frees the pool at
-    once. Roles come from the registry entry, worker when the unit was
-    never registered. A unit counts for the project its registry ticket
-    names, else the project whose prefix lists it.
+    once. The listing comes from `resources.live_units_by_owner` and
+    the sum itself is `resources.charge_live_units`, the same helpers
+    the snapshot reads, so the gate and the report agree.
     """
+    live_by_owner = resources.live_units_by_owner(
+        [(project.name, project.unit_prefix) for project in registered],
+        key,
+        own_prefix,
+        list_fn,
+    )
     names = {project.name for project in registered}
-    entries = {}
-    for entry, _state in registry.visible(now, cfg):
-        entries.setdefault(entry.get("id"), entry)
-    by_project: dict[str, resources.Usage] = {}
-    total = resources.Usage()
-    prefixes = {project.name: project.unit_prefix for project in registered}
-    prefixes.setdefault(key, own_prefix)
-    for owner, prefix in prefixes.items():
-        for name, active, _sub in list_fn(prefix):
-            if active not in units.LIVE_STATES or not units.parse_unit(prefix, name):
-                continue
-            entry = entries.get(name) or {}
-            role = entry.get("role") or prompts.DEFAULT_ROLE
-            ticket = entry.get("ticket") or {}
-            named = ticket.get("project") if isinstance(ticket, dict) else None
-            charged_for = named if isinstance(named, str) and named in names else owner
-            cost = roles.get(role) or resources.Usage()
-            total = _add_usage(total, cost)
-            by_project[charged_for] = _add_usage(
-                by_project.get(charged_for, resources.Usage()), cost
-            )
-    return resources.Charged(total=total, by_project=by_project)
+    charged, _per_unit = resources.charge_live_units(
+        registry.visible(now, cfg), live_by_owner, names, roles
+    )
+    return charged
 
 
 def _slice_props(decided, roles, role, controllers_read):

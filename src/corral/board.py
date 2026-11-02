@@ -623,12 +623,21 @@ class Store:
             raise ExternalItem(f"item {repo}#{number} is external: read-only")
         return row
 
-    def claim(self, repo, number, agent, host, *, now):
+    def claim(self, repo, number, agent, host, *, now, epoch=None):
         """Decide one claim in a single transaction, zero tracker calls.
         The item must exist, be open and not external. A second claimant
         gets ``Claimed`` naming the holder; the same agent claiming again
         is idempotent. Each new owner after a release gets a strictly
-        higher epoch."""
+        higher epoch. In hub mode the pass adopts the hub receipt's
+        ``epoch`` instead of minting, so there is still one minter: a
+        passed epoch is stored as the fencing token, never minted
+        beside, and anything but a positive integer is ``StoreError``."""
+        if epoch is not None and (
+            isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 1
+        ):
+            raise StoreError(
+                f"adopted epoch {epoch!r} for {repo}#{number} must be a positive integer"
+            )
         with _txn(self._conn):
             self._require_writable(repo, number)
             row = self._conn.execute(
@@ -638,15 +647,21 @@ class Store:
             if row is not None and row[0] and row[0] != agent:
                 raise Claimed(f"item {repo}#{number} is claimed by {row[0]}")
             if row is not None and row[0] == agent:
+                if epoch is not None and epoch != row[2]:
+                    self._conn.execute(
+                        "UPDATE claims SET epoch=?, claimed_at=? WHERE repo=? AND number=?",
+                        (epoch, now, repo, number),
+                    )
+                    return Claim(repo, number, row[0], row[1], epoch, now)
                 return Claim(repo, number, row[0], row[1], row[2], row[3])
-            epoch = (row[2] if row is not None else 0) + 1
+            kept = epoch if epoch is not None else (row[2] if row is not None else 0) + 1
             self._conn.execute(
                 "INSERT INTO claims(repo, number, agent, host, epoch, claimed_at)"
                 " VALUES(?, ?, ?, ?, ?, ?)"
                 " ON CONFLICT(repo, number) DO UPDATE SET agent=excluded.agent,"
                 " host=excluded.host, epoch=excluded.epoch,"
                 " claimed_at=excluded.claimed_at",
-                (repo, number, agent, host, epoch, now),
+                (repo, number, agent, host, kept, now),
             )
             self._conn.execute(
                 "INSERT INTO outbox(repo, number, field, value, created_at,"
@@ -657,7 +672,7 @@ class Store:
                 "UPDATE items SET confidence=? WHERE repo=? AND number=?",
                 (PENDING, repo, number),
             )
-            return Claim(repo, number, agent, host, epoch, now)
+            return Claim(repo, number, agent, host, kept, now)
 
     def refresh_claim(self, repo, number, agent, epoch, *, now):
         """Refresh a held claim's heartbeat without changing its owner.

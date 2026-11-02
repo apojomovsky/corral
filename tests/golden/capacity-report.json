@@ -1,0 +1,16 @@
+{
+  "by_project": {
+    "proj-a": {"cpu_m": 2000, "memory_mb": 4096, "pids": 100},
+    "proj-b": {"cpu_m": 500, "memory_mb": 1024, "pids": 20}
+  },
+  "charged": {"cpu_m": 2500, "memory_mb": 5120, "pids": 120},
+  "host_budget": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
+  "pressure": {
+    "cpu_some_avg10": null,
+    "load_per_cpu": 0.4,
+    "mem_available_pct": 55.0,
+    "memory_some_avg10": null,
+    "saturated": false
+  },
+  "schema_version": 1
+}

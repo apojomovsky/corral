@@ -12,7 +12,7 @@ from corral import (
     deps,
     diskcli,
     doctor,
-    drive,
+    drivehub,
     gccli,
     githubcli,
     hubcli,
@@ -233,7 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_parser(sub)
     coordcli.add_parser(sub)
     diskcli.add_parser(sub)
-    drive.add_parser(sub)
+    drivehub.add_parser(sub)
     hubcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)

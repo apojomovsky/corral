@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -341,7 +342,7 @@ class ClaimRouteTest(ServerCase):
     def test_unknown_path_is_404_and_wrong_method_is_405(self):
         status, _ = self.call("GET", "/v1/nope", token=self.token_a)
         self.assertEqual(status, 404)
-        status, _ = self.call("GET", "/v1/claims", token=self.token_a)
+        status, _ = self.call("GET", "/v1/claims/renew", token=self.token_a)
         self.assertEqual(status, 405)
 
     def test_version_is_open_and_names_both_versions(self):
@@ -950,6 +951,158 @@ class RenewReleaseRouteTest(ServerCase):
             with self.subTest(path=path):
                 status, _ = self.call("GET", path, token=self.token_a)
                 self.assertEqual(status, 405)
+
+
+class ListClaimsTest(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.add_host()
+
+    def test_an_empty_table_lists_nothing(self):
+        self.assertEqual(hub.list_claims(self.store), [])
+
+    def test_lists_rows_with_holder_lease_and_clocks(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        rows = hub.list_claims(self.store)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            rows[0],
+            {
+                "repo": "app",
+                "number": 7,
+                "host_id": "host-1",
+                "agent": "drive-aaa",
+                "epoch": 1,
+                "lease_expires": 1090.0,
+                "updated_at": 1000.0,
+            },
+        )
+
+    def test_released_rows_stay_listed_with_an_empty_holder(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        hub.release(self.store, "app", 7, "drive-aaa", 1, now=1030.0)
+        rows = hub.list_claims(self.store)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["agent"], rows[0]["host_id"], rows[0]["epoch"]), ("", "", 1))
+
+
+class ClaimsRouteTest(ServerCase):
+    def test_lists_the_claims_table(self):
+        self.propose()
+        status, payload = self.call("GET", "/v1/claims", token=self.token_a)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["claims"]), 1)
+        row = payload["claims"][0]
+        self.assertEqual(
+            (row["repo"], row["number"], row["host_id"], row["agent"], row["epoch"]),
+            ("app", 7, "host-1", "drive-aaa", 1),
+        )
+        self.assertIn("lease_expires", row)
+
+    def test_missing_or_wrong_token_is_401_without_a_leak(self):
+        self.propose()
+        for bad in ("unset", "", "wrong-token"):
+            status, payload = self.call("GET", "/v1/claims", token=bad)
+            self.assertEqual(status, 401)
+            self.assertNotIn(self.token_a, json.dumps(payload))
+
+    def test_a_token_for_another_host_still_lists(self):
+        self.propose()
+        status, payload = self.call("GET", "/v1/claims", token=self.token_b)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(payload["claims"]), 1)
+
+    def test_renew_and_release_stay_post_only(self):
+        for path in ("/v1/claims/renew", "/v1/claims/release"):
+            status, _ = self.call("GET", path, token=self.token_a)
+            self.assertEqual(status, 405)
+
+
+class HubClientTest(ServerCase):
+    def make_client(self, host="host-1", token=None, port=None, **over):
+        token_path = os.path.join(self.tmp.name, f"{host}.token")
+        with open(token_path, "w", encoding="utf-8") as handle:
+            handle.write(token if token is not None else self.token_a)
+        os.chmod(token_path, 0o600)
+        url = f"http://127.0.0.1:{self.port if port is None else port}"
+        return hub.HubClient(url, host, token_path, **over)
+
+    def test_propose_grants_epoch_one(self):
+        client = self.make_client()
+        receipt = client.propose("app", 7, "drive-aaa")
+        self.assertEqual(
+            (receipt.agent, receipt.host_id, receipt.epoch), ("drive-aaa", "host-1", 1)
+        )
+
+    def test_propose_conflict_names_the_holder(self):
+        client = self.make_client()
+        client.propose("app", 7, "drive-aaa")
+        with self.assertRaises(hub.Conflict) as caught:
+            client.propose("app", 7, "drive-bbb")
+        self.assertEqual(caught.exception.holder["agent"], "drive-aaa")
+
+    def test_renew_moves_the_lease_and_keeps_the_epoch(self):
+        client = self.make_client()
+        first = client.propose("app", 7, "drive-aaa")
+        renewed = client.renew("app", 7, "drive-aaa", first.epoch)
+        self.assertEqual(renewed.epoch, first.epoch)
+        self.assertGreaterEqual(renewed.lease_expires, first.lease_expires)
+
+    def test_renew_conflict_names_the_holder(self):
+        client = self.make_client()
+        client.propose("app", 7, "drive-aaa")
+        with self.assertRaises(hub.Conflict):
+            client.renew("app", 7, "drive-bbb", 1)
+
+    def test_release_returns_the_kept_epoch_and_fences(self):
+        client = self.make_client()
+        first = client.propose("app", 7, "drive-aaa")
+        self.assertEqual(client.release("app", 7, "drive-aaa", first.epoch), first.epoch)
+        second = client.propose("app", 7, "drive-bbb")
+        self.assertEqual(second.epoch, first.epoch + 1)
+
+    def test_claims_lists_rows(self):
+        client = self.make_client()
+        client.propose("app", 7, "drive-aaa")
+        rows = client.claims()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(
+            (rows[0]["repo"], rows[0]["number"], rows[0]["agent"], rows[0]["epoch"]),
+            ("app", 7, "drive-aaa", 1),
+        )
+
+    def test_an_unreachable_hub_is_hub_unreachable(self):
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        free = probe.getsockname()[1]
+        probe.close()
+        client = self.make_client(port=free)
+        for call in (
+            lambda: client.propose("app", 7, "drive-aaa"),
+            lambda: client.renew("app", 7, "drive-aaa", 1),
+            lambda: client.release("app", 7, "drive-aaa", 1),
+            lambda: client.claims(),
+        ):
+            with self.assertRaises(hub.HubUnreachable):
+                call()
+
+    def test_a_wrong_token_is_a_hub_error(self):
+        client = self.make_client(token="wrong-token")
+        with self.assertRaises(hub.HubError):
+            client.propose("app", 7, "drive-aaa")
+
+    def test_a_missing_token_file_is_a_hub_error(self):
+        client = hub.HubClient(
+            f"http://127.0.0.1:{self.port}", "host-1", os.path.join(self.tmp.name, "absent")
+        )
+        with self.assertRaises(hub.HubError):
+            client.propose("app", 7, "drive-aaa")
+
+    def test_a_non_http_url_is_a_hub_error(self):
+        client = self.make_client()
+        client.url = "https://127.0.0.1:1/"
+        with self.assertRaises(hub.HubError):
+            client.propose("app", 7, "drive-aaa")
 
 
 class ImportClosureTest(unittest.TestCase):

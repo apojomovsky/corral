@@ -344,6 +344,45 @@ class ClaimTest(TempStoreTest):
         second = store.claim("app", 7, "agent-2", "host-2", now=1300.0)
         self.assertGreater(second.epoch, first.epoch)
 
+    def test_claim_with_an_adopted_epoch_skips_minting(self):
+        store = self.stored()
+        claim = store.claim("app", 7, "agent-1", "host-1", now=1100.0, epoch=7)
+        self.assertEqual((claim.agent, claim.epoch), ("agent-1", 7))
+        item, _ = store.item("app", 7, now=1100.0)
+        self.assertEqual(item.confidence, board.PENDING)
+        queued = store.queued_writes()
+        self.assertEqual([(row.field, row.value) for row in queued], [("agent", "agent-1")])
+
+    def test_reclaim_with_an_adopted_epoch_updates_the_row(self):
+        store = self.stored()
+        first = store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        second = store.claim("app", 7, "agent-1", "host-1", now=1200.0, epoch=first.epoch + 1)
+        self.assertEqual(second.epoch, first.epoch + 1)
+        found = store.claim_of("app", 7)
+        assert found is not None
+        self.assertEqual(found.epoch, first.epoch + 1)
+
+    def test_an_adopted_epoch_must_be_a_positive_integer(self):
+        store = self.stored()
+        for bad in (0, -1, True, "3"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(board.StoreError):
+                    store.claim("app", 7, "agent-1", "host-1", now=1100.0, epoch=bad)
+
+    def test_an_adopted_epoch_for_a_stranger_still_loses(self):
+        store = self.stored()
+        store.claim("app", 7, "agent-1", "host-1", now=1100.0)
+        with self.assertRaises(board.Claimed):
+            store.claim("app", 7, "agent-2", "host-2", now=1101.0, epoch=9)
+
+    def test_release_matches_the_adopted_epoch(self):
+        store = self.stored()
+        claim = store.claim("app", 7, "agent-1", "host-1", now=1100.0, epoch=7)
+        with self.assertRaises(board.Claimed):
+            store.release("app", 7, "agent-1", claim.epoch + 1, now=1101.0)
+        store.release("app", 7, "agent-1", claim.epoch, now=1102.0)
+        self.assertIsNone(store.claim_of("app", 7))
+
     def test_old_holder_release_refused(self):
         store = self.stored()
         first = store.claim("app", 7, "agent-1", "host-1", now=1100.0)

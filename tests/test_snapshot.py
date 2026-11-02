@@ -6,13 +6,14 @@ real state dirs.
 
 import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, registry, snapshot
+from corral import cli, registry, resources as R, settings, snapshot
 
 T0 = 1_800_000_000.0
 HOST = "host-1"
@@ -89,18 +90,104 @@ def usage(path):
     return (1000, 400, 600)
 
 
+def default_rows():
+    return view(
+        (entry("a1"), "live"),
+        (entry("a2", state="stale", repo="repo-b", number=2, age=700), "stale"),
+        (entry("a3", state="finished", repo=None), "finished"),
+    )
+
+
+def doc_limits():
+    return R.Limits(
+        host={"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
+        roles={
+            "worker": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+            "reviewer": {"cpu_m": 500, "memory_mb": 1024, "pids": 50},
+        },
+        foreign=[],
+        gone_s=600.0,
+    )
+
+
+def doc_pressure():
+    return R.Pressure(load_per_cpu=0.4, mem_available_pct=55.0, saturated=False)
+
+
+def resolved_settings(**extra):
+    """A real `settings.Resolved` for collectors that read settings objects."""
+    values = {
+        "admission.total_cap": 4,
+        "admission.repo_cap": 1,
+        "agents.unit_prefix": "corral-agent-",
+        "registry.count_toward_cap": True,
+        "registry.stale_s": 600,
+        "registry.gone_s": 3600,
+        "quota.low_pct": 80,
+        "drive.max_starts_per_day": 50,
+        "resources.gone_s": 600,
+    }
+    values.update(extra)
+    return settings.Resolved(
+        values={key: settings.Value(value, "test") for key, value in values.items()},
+        resources=None,
+    )
+
+
+def live_listing(rows):
+    """`{project: [ids]}` for the live-here ticketed rows, like the real collector.
+
+    Ticketless live rows stay unlisted: without a units listing no
+    owner names them, so they hold no share, like a crashed agent.
+    """
+    live = {}
+    for entry, state in rows:
+        ticket = entry.get("ticket") if isinstance(entry, dict) else None
+        project = ticket.get("project") if isinstance(ticket, dict) else None
+        if state == registry.LIVE and entry.get("host", HOST) == HOST and project:
+            live.setdefault(project, []).append(entry.get("id"))
+    return live
+
+
+def names_of(rows):
+    """The ticket projects named in `rows`: the registered names for the test."""
+    names = set()
+    for row_entry, _state in rows:
+        ticket = row_entry.get("ticket") if isinstance(row_entry, dict) else None
+        project = ticket.get("project") if isinstance(ticket, dict) else None
+        if isinstance(project, str) and project:
+            names.add(project)
+    return names
+
+
 def doc_of(**overrides):
+    rows = overrides.pop("registry_view", None)
+    if rows is None:
+        rows = default_rows()
+    resources_view = overrides.pop("resources_view", None)
+    if resources_view is None:
+        resources_view = (
+            rows
+            if isinstance(rows, Exception)
+            else snapshot.resources_section(
+                rows,
+                HOST,
+                doc_limits(),
+                doc_pressure(),
+                [],
+                lambda scope, name, project=None: None,
+                live_by_owner=live_listing(rows),
+                project_names=names_of(rows),
+            )
+        )
     params = {
         "now": T0,
         "host": HOST,
-        "registry_view": view(
-            (entry("a1"), "live"),
-            (entry("a2", state="stale", repo="repo-b", number=2, age=700), "stale"),
-            (entry("a3", state="finished", repo=None), "finished"),
-        ),
+        "registry_view": rows,
         "quota_view": quota_view(),
         "settings": config(),
         "usage_fn": usage,
+        "resources_view": resources_view,
     }
     params.update(overrides)
     return snapshot.build(**params)
@@ -182,13 +269,63 @@ class FullDocument(unittest.TestCase):
                     ]
                 },
                 "drive": {"error": "drive section not collected"},
+                "resources": {
+                    "schema_version": 1,
+                    "host_budget": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
+                    "charged": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+                    "by_project": {"proj-a": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100}},
+                    "measured_by_project": {"proj-a": None},
+                    "agents": [
+                        {
+                            "id": "a1",
+                            "project": "proj-a",
+                            "role": None,
+                            "state": "live",
+                            "charged": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+                            "measured": None,
+                        },
+                        {
+                            "id": "a2",
+                            "project": "proj-a",
+                            "role": None,
+                            "state": "stale",
+                            "charged": {"cpu_m": 0, "memory_mb": 0, "pids": 0},
+                            "measured": None,
+                        },
+                        {
+                            "id": "a3",
+                            "project": None,
+                            "role": None,
+                            "state": "finished",
+                            "charged": {"cpu_m": 0, "memory_mb": 0, "pids": 0},
+                            "measured": None,
+                        },
+                    ],
+                    "pressure": {
+                        "load_per_cpu": 0.4,
+                        "mem_available_pct": 55.0,
+                        "saturated": False,
+                        "cpu_some_avg10": None,
+                        "memory_some_avg10": None,
+                    },
+                    "notes": [],
+                },
             },
         )
 
     def test_top_level_key_order(self):
         self.assertEqual(
             list(doc_of()),
-            ["schema_version", "fleet_header", "agents", "quota", "capacity", "disk", "drive"],
+            [
+                "schema_version",
+                "fleet_header",
+                "agents",
+                "quota",
+                "capacity",
+                "resources",
+                "disk",
+                "drive",
+            ],
         )
 
     def test_agent_without_ticket_reads_null(self):
@@ -300,8 +437,14 @@ class SectionErrors(unittest.TestCase):
         self.assertEqual(doc["agents"], {"error": "agents dir gone"})
         self.assertEqual(doc["fleet_header"], {"error": "agents dir gone"})
         self.assertEqual(doc["capacity"], {"error": "agents dir gone"})
+        self.assertEqual(doc["resources"], {"error": "agents dir gone"})
         self.assertIn("paths", doc["disk"])
         self.assertIn("providers", doc["quota"])
+
+    def test_missing_resources_view_is_its_own_error(self):
+        doc = snapshot.build(T0, HOST, default_rows(), quota_view(), config(), usage)
+        self.assertEqual(doc["resources"], {"error": "resources section not collected"})
+        self.assertIsInstance(doc["agents"], list)
 
     def test_unreadable_disk_path_reports_path_error(self):
         def fail(path):
@@ -382,6 +525,535 @@ class CapacityAgreesWithRegistry(unittest.TestCase):
         self.assertEqual(sum(doc["capacity"]["by_project"].values()), len(counted))
 
 
+def golden_section():
+    rows = view(
+        (entry("a1", role="worker"), "live"),
+        (entry("a2", role="reviewer", repo="repo-b", number=2), "live"),
+        (entry("a9", repo="repo-b", number=9), "live"),
+        (entry("s1", project="proj-b", state="stale", age=700), "stale"),
+    )
+    rows[2][0]["host"] = "host-2"
+    measured = {
+        ("agent", "a1"): R.Measured(cpu_usage_usec=5000, memory_mb=12.5, pids=8),
+        ("project", "proj-a"): R.Measured(cpu_usage_usec=6000, memory_mb=20.0, pids=12),
+    }
+
+    def fake(scope, name, project=None):
+        return measured.get((scope, name))
+
+    return snapshot.resources_section(
+        rows,
+        HOST,
+        doc_limits(),
+        R.Pressure(
+            load_per_cpu=0.4,
+            mem_available_pct=55.0,
+            saturated=False,
+            cpu_some_avg10=0.02,
+            memory_some_avg10=0.01,
+        ),
+        [],
+        fake,
+        live_by_owner={"proj-a": ["a1", "a2"]},
+        project_names={"proj-a", "proj-b"},
+    )
+
+
+class ResourcesSection(unittest.TestCase):
+    def test_section_matches_the_golden_file(self):
+        golden = os.path.join(os.path.dirname(__file__), "golden", "snapshot-resources.json")
+        with open(golden, encoding="utf-8") as handle:
+            self.assertEqual(golden_section(), json.load(handle))
+
+    def test_section_key_order_is_stable(self):
+        self.assertEqual(
+            list(golden_section()),
+            [
+                "schema_version",
+                "host_budget",
+                "charged",
+                "by_project",
+                "measured_by_project",
+                "agents",
+                "pressure",
+                "notes",
+            ],
+        )
+
+    def test_no_budget_still_reports_charged_and_pressure(self):
+        section = snapshot.resources_section(
+            view((entry("a1", role="worker"), "live")),
+            HOST,
+            R.Limits(host=None, roles={"worker": {"cpu_m": 1, "memory_mb": 1, "pids": 1}}),
+            None,
+            ["note: /proc/loadavg unreadable"],
+            None,
+            live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
+        )
+        self.assertIsNone(section["host_budget"])
+        self.assertEqual(section["charged"], {"cpu_m": 1, "memory_mb": 1, "pids": 1})
+        self.assertEqual(section["pressure"]["load_per_cpu"], None)
+        self.assertEqual(section["notes"], ["note: /proc/loadavg unreadable"])
+
+    def test_unknown_role_charges_zero_like_the_launch_gate(self):
+        rows = view(
+            (entry("w1", role="worker"), "live"),
+            (entry("x1", role="bogus"), "live"),
+        )
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"proj-a": ["w1", "x1"]},
+            project_names={"proj-a"},
+        )
+        charged = {row["id"]: row["charged"] for row in section["agents"]}
+        self.assertEqual(charged["w1"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
+        self.assertEqual(charged["x1"], {"cpu_m": 0, "memory_mb": 0, "pids": 0})
+
+    def test_measured_defaults_to_null_and_survives_a_broken_reader(self):
+        def boom(scope, name, project=None):
+            raise OSError("slice gone")
+
+        section = snapshot.resources_section(
+            view((entry("a1", role="worker"), "live")),
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            boom,
+            live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
+        )
+        self.assertIsNone(section["agents"][0]["measured"])
+        self.assertIsNone(section["measured_by_project"]["proj-a"])
+
+    def test_agent_without_a_project_pays_its_prefix_owner(self):
+        seen = []
+
+        def fake(scope, name, project=None):
+            seen.append((scope, name, project))
+            return None
+
+        section = snapshot.resources_section(
+            view((entry("solo", repo=None), "live")),
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            fake,
+            live_by_owner={"proj-b": ["solo"]},
+            project_names={"proj-b"},
+        )
+        self.assertEqual(section["charged"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
+        self.assertEqual(section["by_project"], {"proj-b": section["charged"]})
+        self.assertNotIn("", section["by_project"])
+        agent = section["agents"][0]
+        self.assertIsNone(agent["project"])
+        self.assertEqual(agent["charged"], section["charged"])
+        self.assertIsNone(agent["measured"])
+        self.assertEqual(seen, [("agent", "solo", "proj-b"), ("project", "proj-b", None)])
+        self.assertIsNone(section["measured_by_project"]["proj-b"])
+
+
+class ChargedMatchesGate(unittest.TestCase):
+    """The snapshot charges exactly what the launch gate charges.
+
+    Both read the same shared sum over the same registry view and the
+    same units listing: a crashed agent (registry live, unit gone)
+    holds no share in either, and an agent with no ticket project pays
+    its prefix owner, never an empty name.
+    """
+
+    PREFIX_A = "pa-"
+    PREFIX_B = "pb-"
+    UNIT_A = "pa-lib-5"
+    UNIT_B = "pb-web-3"
+    UNIT_GONE = "pa-db-7"
+    ROLES = {
+        "worker": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+        "reviewer": {"cpu_m": 500, "memory_mb": 1024, "pids": 50},
+    }
+    WORKER = {"cpu_m": 1000, "memory_mb": 2048, "pids": 100}
+    REVIEWER = {"cpu_m": 500, "memory_mb": 1024, "pids": 50}
+
+    def rows(self):
+        return [
+            (
+                {
+                    "id": self.UNIT_A,
+                    "role": "worker",
+                    "ticket": {"project": "proj-a", "repo": "lib", "number": 5},
+                    "host": HOST,
+                },
+                "live",
+            ),
+            ({"id": self.UNIT_B, "role": "reviewer", "ticket": None, "host": HOST}, "live"),
+            (
+                {
+                    "id": self.UNIT_GONE,
+                    "role": "worker",
+                    "ticket": {"project": "proj-a", "repo": "db", "number": 7},
+                    "host": HOST,
+                },
+                "live",
+            ),
+        ]
+
+    def listing(self):
+        table = {
+            self.PREFIX_A: [(self.UNIT_A, "active", "running")],
+            self.PREFIX_B: [(self.UNIT_B, "active", "running")],
+        }
+        return table.__getitem__
+
+    def registered(self):
+        from types import SimpleNamespace
+
+        return [
+            SimpleNamespace(name="proj-a", unit_prefix=self.PREFIX_A),
+            SimpleNamespace(name="proj-b", unit_prefix=self.PREFIX_B),
+        ]
+
+    def gate_charged(self, rows):
+        from corral import launch
+
+        with mock.patch("corral.registry.visible", return_value=list(rows)):
+            return launch._charged_usage(
+                "proj-a",
+                self.PREFIX_A,
+                self.registered(),
+                self.listing(),
+                dict(self.ROLES),
+                None,
+                T0,
+            )
+
+    def test_a_crashed_agent_is_charged_by_neither(self):
+        rows = self.rows()
+        charged = self.gate_charged(rows)
+        self.assertEqual(charged.total, R.Usage(1500, 3072, 150), "the gone unit holds no share")
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"proj-a": [self.UNIT_A], "proj-b": [self.UNIT_B]},
+            project_names={"proj-a", "proj-b"},
+        )
+        self.assertEqual(section["charged"], {"cpu_m": 1500, "memory_mb": 3072, "pids": 150})
+
+    def test_snapshot_totals_equal_the_gate_for_the_same_inputs(self):
+        rows = self.rows()
+        charged = self.gate_charged(rows)
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"proj-a": [self.UNIT_A], "proj-b": [self.UNIT_B]},
+            project_names={"proj-a", "proj-b"},
+        )
+        self.assertEqual(section["charged"], R.usage_dict(charged.total))
+        self.assertEqual(
+            section["by_project"],
+            {name: R.usage_dict(used) for name, used in charged.by_project.items()},
+        )
+        self.assertEqual(
+            section["by_project"],
+            {"proj-a": dict(self.WORKER), "proj-b": dict(self.REVIEWER)},
+        )
+        self.assertNotIn("", section["by_project"])
+
+    def test_snapshot_keyed_by_project_name_matches_the_gate(self):
+        """The snapshot way (project name as key) equals the gate's sum.
+
+        Registered projects proj-a/pa- and proj-b/pb-, one ticketed unit
+        and one ticketless unit under the local prefix: the snapshot must
+        report the gate's totals and by_project keys, with no phantom
+        prefix key and no double charge.
+        """
+        from corral import launch
+
+        rows = [
+            (
+                {
+                    "id": "pa-lib-5",
+                    "role": "worker",
+                    "ticket": {"project": "proj-a", "repo": "lib", "number": 5},
+                    "host": HOST,
+                },
+                "live",
+            ),
+            ({"id": "pa-ops-9", "role": "reviewer", "ticket": None, "host": HOST}, "live"),
+            ({"id": "pb-web-3", "role": "reviewer", "ticket": None, "host": HOST}, "live"),
+        ]
+        table = {
+            self.PREFIX_A: [
+                ("pa-lib-5", "active", "running"),
+                ("pa-ops-9", "active", "running"),
+            ],
+            self.PREFIX_B: [("pb-web-3", "active", "running")],
+        }
+
+        def list_fn(prefix):
+            return list(table.get(prefix, []))
+
+        with mock.patch("corral.registry.visible", return_value=list(rows)):
+            charged = launch._charged_usage(
+                "proj-a",
+                self.PREFIX_A,
+                self.registered(),
+                list_fn,
+                dict(self.ROLES),
+                None,
+                T0,
+            )
+        listing = R.live_units_by_owner(
+            [(item.name, item.unit_prefix) for item in self.registered()],
+            "proj-a",
+            self.PREFIX_A,
+            list_fn,
+        )
+        self.assertEqual(set(listing), {"proj-a", "proj-b"})
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner=listing,
+            project_names={"proj-a", "proj-b"},
+        )
+        self.assertEqual(section["charged"], R.usage_dict(charged.total))
+        self.assertEqual(
+            section["by_project"],
+            {name: R.usage_dict(used) for name, used in charged.by_project.items()},
+        )
+        self.assertEqual(
+            section["by_project"],
+            {
+                "proj-a": {"cpu_m": 1500, "memory_mb": 3072, "pids": 150},
+                "proj-b": dict(self.REVIEWER),
+            },
+        )
+        self.assertNotIn("pa-", section["by_project"])
+
+    def test_no_projects_ticketless_unit_keys_match(self):
+        """Gate and snapshot key an unregistered ticketless unit the same way."""
+        from corral import launch
+
+        unit = "corral-agent-lib-5"
+        rows = [({"id": unit, "role": None, "ticket": None, "host": HOST}, "live")]
+
+        def list_fn(prefix):
+            self.assertEqual(prefix, "corral-agent-")
+            return [(unit, "active", "running")]
+
+        with mock.patch("corral.registry.visible", return_value=list(rows)):
+            charged = launch._charged_usage(
+                "corral-agent-",
+                "corral-agent-",
+                [],
+                list_fn,
+                dict(self.ROLES),
+                None,
+                T0,
+            )
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"corral-agent-": [unit]},
+            project_names=[],
+        )
+        self.assertEqual(set(charged.by_project), set(section["by_project"]))
+        self.assertEqual(set(section["by_project"]), {"corral-agent-"})
+        self.assertNotIn("", section["by_project"])
+
+
+class MappingLimitsBranch(unittest.TestCase):
+    def test_mapping_limits_charge_like_objects(self):
+        section = snapshot.resources_section(
+            view((entry("a1", role="worker"), "live")),
+            HOST,
+            {
+                "host": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
+                "roles": {
+                    "worker": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+                    "reviewer": {"cpu_m": 500, "memory_mb": 1024, "pids": 50},
+                },
+            },
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
+        )
+        self.assertEqual(section["charged"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
+        self.assertEqual(section["host_budget"], {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096})
+
+    def test_falsy_non_mapping_roles_raise(self):
+        rows = view((entry("a1", role="worker"), "live"))
+        host = {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096}
+        for bad in (0, "", [], False):
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    snapshot.resources_section(
+                        rows,
+                        HOST,
+                        {"host": dict(host), "roles": bad},
+                        doc_pressure(),
+                        [],
+                        None,
+                        live_by_owner={"proj-a": ["a1"]},
+                        project_names={"proj-a"},
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_missing_or_null_roles_charge_zero(self):
+        rows = view((entry("a1", role="worker"), "live"))
+        host = {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096}
+        for limits in ({"host": dict(host)}, {"host": dict(host), "roles": None}):
+            with self.subTest(limits=limits):
+                section = snapshot.resources_section(
+                    rows,
+                    HOST,
+                    limits,
+                    doc_pressure(),
+                    [],
+                    None,
+                    live_by_owner={"proj-a": ["a1"]},
+                    project_names={"proj-a"},
+                )
+                self.assertEqual(section["charged"], {"cpu_m": 0, "memory_mb": 0, "pids": 0})
+
+    def test_non_limits_and_a_non_mapping_listing_raise(self):
+        rows = view((entry("a1", role="worker"), "live"))
+        for bad in (42, "limits", ["host"]):
+            with self.subTest(limits=bad):
+                with self.assertRaises(R.LimitsError):
+                    snapshot.resources_section(
+                        rows,
+                        HOST,
+                        bad,
+                        doc_pressure(),
+                        [],
+                        None,
+                        live_by_owner={"proj-a": ["a1"]},
+                        project_names={"proj-a"},
+                    )
+        for bad in (["a1"], "proj-a", 5, None):
+            with self.subTest(live_by_owner=bad):
+                with self.assertRaises(R.LimitsError):
+                    snapshot.resources_section(
+                        rows,
+                        HOST,
+                        doc_limits(),
+                        doc_pressure(),
+                        [],
+                        None,
+                        live_by_owner=bad,
+                        project_names={"proj-a"},
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+
+class DefaultMeasured(unittest.TestCase):
+    def test_agent_scope_reads_the_leaf(self):
+        from corral import units
+
+        measured = R.Measured(cpu_usage_usec=5000, memory_mb=12.5, pids=8)
+        with mock.patch("corral.resources.read_slice_use", return_value=(measured, [])) as reader:
+            got = snapshot.default_measured("agent", "corral-agent-lib-5", "proj-a")
+        self.assertEqual(got, measured)
+        (directory,), _ = reader.call_args
+        self.assertEqual(directory, units.agent_cgroup("proj-a", "corral-agent-lib-5"))
+
+    def test_project_scope_reads_the_slice(self):
+        from corral import units
+
+        measured = R.Measured(cpu_usage_usec=6000, memory_mb=20.0, pids=12)
+        with mock.patch("corral.resources.read_slice_use", return_value=(measured, [])) as reader:
+            got = snapshot.default_measured("project", "proj-a")
+        self.assertEqual(got, measured)
+        (directory,), _ = reader.call_args
+        self.assertEqual(directory, units.project_cgroup("proj-a"))
+
+    def test_scopes_without_a_subject_read_null_without_reading(self):
+        with mock.patch(
+            "corral.resources.read_slice_use",
+            side_effect=AssertionError("must not read"),
+        ):
+            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", None))
+            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", ""))
+            self.assertIsNone(snapshot.default_measured("project", None))
+            self.assertIsNone(snapshot.default_measured("project", ""))
+            self.assertIsNone(snapshot.default_measured("bogus", "x", "proj-a"))
+
+    def test_an_unreadable_leaf_and_a_bad_unit_read_null(self):
+        with mock.patch("corral.resources.read_slice_use", side_effect=OSError("slice gone")):
+            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", "proj-a"))
+        with mock.patch(
+            "corral.resources.read_slice_use",
+            side_effect=AssertionError("must not read"),
+        ):
+            self.assertIsNone(snapshot.default_measured("agent", "not a unit!", "proj-a"))
+
+
+class HubPathNeverWritesTheLedger(unittest.TestCase):
+    def test_report_and_snapshot_build_with_writes_rigged_to_fail(self):
+        from corral import host_ledger
+
+        with (
+            mock.patch.object(host_ledger, "update", side_effect=AssertionError("must not write")),
+            mock.patch.object(host_ledger, "ensure", side_effect=AssertionError("must not write")),
+        ):
+            report = R.capacity_report(
+                host_budget={"cpu_m": 1, "memory_mb": 1, "pids": 1},
+                charged=R.Charged(total=R.Usage()),
+                pressure=R.Pressure(),
+            )
+            section = golden_section()
+            doc = doc_of()
+        self.assertEqual(report["schema_version"], 1)
+        self.assertIn("charged", section)
+        self.assertIn("resources", doc)
+
+    def test_report_and_snapshot_modules_never_name_the_ledger(self):
+        import ast
+
+        for dotted in ("corral.snapshot", "corral.resources"):
+            path = os.path.join("src", *dotted.split(".")) + ".py"
+            with open(path, encoding="utf-8") as handle:
+                tree = ast.parse(handle.read())
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name):
+                    names.add(node.id)
+                elif isinstance(node, ast.Attribute):
+                    names.add(node.attr)
+                elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                    for alias in node.names:
+                        names.add(alias.name.split(".")[0])
+                        if alias.asname:
+                            names.add(alias.asname)
+            self.assertNotIn("host_ledger", names, dotted)
+            self.assertNotIn("ledger_path", names, dotted)
+
+
 class CliExits(unittest.TestCase):
     def run_main(self, argv, registry_view=None, quota=None, resolved=None, usage_fn=None):
         from corral import settings
@@ -391,22 +1063,21 @@ class CliExits(unittest.TestCase):
         if quota is None:
             quota = quota_view()
         if resolved is None:
-            resolved = {
-                "admission.total_cap": 4,
-                "admission.repo_cap": 1,
-                "registry.count_toward_cap": True,
-                "registry.stale_s": 600,
-                "registry.gone_s": 3600,
-                "quota.low_pct": 80,
-                "drive.max_starts_per_day": 50,
-            }
+            resolved = resolved_settings()
         out, err = io.StringIO(), io.StringIO()
         with (
             mock.patch("corral.registry.visible", return_value=registry_view),
             mock.patch("corral.accounts.providers", return_value=[]),
             mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
             mock.patch("corral.settings.load", return_value=resolved),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.drive.drive_status", return_value={"last_exit": 0}),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(load_per_cpu=0.4), []),
+            ),
+            mock.patch("corral.snapshot.default_measured", return_value=None),
             mock.patch("socket.gethostname", return_value=HOST),
             mock.patch("shutil.disk_usage", side_effect=lambda path: (1000, 400, 600)),
             redirect_stdout(out),
@@ -425,16 +1096,32 @@ class CliExits(unittest.TestCase):
         doc = json.loads(out)
         self.assertEqual(
             list(doc),
-            ["schema_version", "fleet_header", "agents", "quota", "capacity", "disk", "drive"],
+            [
+                "schema_version",
+                "fleet_header",
+                "agents",
+                "quota",
+                "capacity",
+                "resources",
+                "disk",
+                "drive",
+            ],
         )
         self.assertEqual(doc["schema_version"], 2)
         self.assertEqual(len(doc["agents"]), 1)
         self.assertEqual(doc["drive"], {"last_exit": 0})
+        self.assertEqual(doc["resources"]["schema_version"], 1)
 
     def test_ok_human_output(self):
         code, out, _ = self.run_main(["snapshot"])
         self.assertEqual(code, 0)
         self.assertIn("a1", out)
+
+    def test_human_output_reports_charged_and_pressure(self):
+        code, out, _ = self.run_main(["snapshot"])
+        self.assertEqual(code, 0)
+        self.assertIn("resources: charged", out)
+        self.assertIn("pressure:", out)
 
     def test_human_output_shows_reviewer_vs_worker(self):
         rows = view(
@@ -466,18 +1153,14 @@ class CliExits(unittest.TestCase):
         with (
             mock.patch("corral.registry.visible", side_effect=OSError("gone")),
             mock.patch("corral.accounts.providers", side_effect=OSError("gone")),
-            mock.patch(
-                "corral.settings.load",
-                return_value={
-                    "admission.total_cap": 4,
-                    "admission.repo_cap": 1,
-                    "registry.count_toward_cap": True,
-                    "registry.stale_s": 600,
-                    "registry.gone_s": 3600,
-                    "quota.low_pct": 80,
-                },
-            ),
+            mock.patch("corral.settings.load", return_value=resolved_settings()),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.paths.state_dir", side_effect=OSError("gone")),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(), ["note: gone"]),
+            ),
             mock.patch("socket.gethostname", return_value=HOST),
             redirect_stdout(out),
             redirect_stderr(err),
@@ -490,20 +1173,15 @@ class CliExits(unittest.TestCase):
         with (
             mock.patch("corral.registry.visible", side_effect=OSError("gone")),
             mock.patch("corral.accounts.providers", side_effect=OSError("gone")),
-            mock.patch(
-                "corral.settings.load",
-                return_value={
-                    "admission.total_cap": 4,
-                    "admission.repo_cap": 1,
-                    "registry.count_toward_cap": True,
-                    "registry.stale_s": 600,
-                    "registry.gone_s": 3600,
-                    "quota.low_pct": 80,
-                    "drive.max_starts_per_day": 50,
-                },
-            ),
+            mock.patch("corral.settings.load", return_value=resolved_settings()),
+            mock.patch("corral.projects.load_all", return_value=[]),
+            mock.patch("corral.units.list_units", return_value=[]),
             mock.patch("corral.drive.drive_status", return_value={"last_exit": 0}),
             mock.patch("corral.paths.cache_dir", side_effect=OSError("gone")),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(), ["note: gone"]),
+            ),
             mock.patch("socket.gethostname", return_value=HOST),
             redirect_stdout(out),
             redirect_stderr(err),
