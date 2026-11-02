@@ -22,7 +22,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from corral import prompts, settings
+from corral import pressure, prompts, settings
+from corral.pressure import saturated as _saturated_reading
 
 #: Verdict codes. Stable strings: callers branch on them.
 OK = "ok"
@@ -30,6 +31,7 @@ HOST_FULL = "host-full"
 PROJECT_SHARE = "project-share"
 PROJECT_CEILING = "project-ceiling"
 ROLE_COST = "role-cost"
+PRESSURE = "pressure"
 
 #: Seconds a foreign claim counts against the pool after it is declared.
 DEFAULT_GONE_S = 600.0
@@ -97,6 +99,18 @@ class Request:
 
 
 @dataclass(frozen=True)
+class PressureCaps:
+    """The saturation line: refuse new launches past it, even with shares free.
+
+    Unknown readings never trip it. Both numbers come from the
+    ``[resources.pressure]`` table, else the conservative built-ins.
+    """
+
+    max_load_per_cpu: float = pressure.DEFAULT_MAX_LOAD_PER_CPU
+    min_mem_available_pct: float = pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT
+
+
+@dataclass(frozen=True)
 class Charged:
     """Charged usage: the summed role costs of live agents, total and per project."""
 
@@ -110,7 +124,8 @@ class Limits:
 
     ``host`` None means no budget is configured: the gate passes
     everything. ``gone_s`` bounds foreign claims: a claim older than it
-    is ignored.
+    is ignored. ``pressure`` is the saturation line, None reading as the
+    conservative built-ins.
     """
 
     host: Usage | Mapping[str, object] | None = None
@@ -118,6 +133,7 @@ class Limits:
     roles: dict = field(default_factory=dict)
     foreign: list = field(default_factory=list)
     gone_s: float = DEFAULT_GONE_S
+    pressure: PressureCaps | Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +279,82 @@ def _request(value):
     raise LimitsError(f"request must name a project and a role, not {value!r}")
 
 
+def _threshold(value, what, *, low, high=None, above_zero=False):
+    """A pressure threshold: a finite number inside its range, else LimitsError."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LimitsError(f"{what} must be a number, not {value!r}")
+    if not math.isfinite(value):
+        raise LimitsError(f"{what} must be a finite number, not {value!r}")
+    number = float(value)
+    if above_zero and number <= 0:
+        raise LimitsError(f"{what} must be above zero, not {value!r}")
+    if number < low or (high is not None and number > high):
+        bound = f"{low} to {high}" if high is not None else f"{low} or more"
+        raise LimitsError(f"{what} must be {bound}, not {value!r}")
+    return number
+
+
+def _pressure_caps(value, what="pressure caps"):
+    """PressureCaps from caps, a plain mapping, or None (the built-ins)."""
+    if value is None:
+        return PressureCaps()
+    if isinstance(value, PressureCaps):
+        _threshold(value.max_load_per_cpu, f"{what} max_load_per_cpu", low=0, above_zero=True)
+        _threshold(value.min_mem_available_pct, f"{what} min_mem_available_pct", low=0, high=100)
+        return value
+    if isinstance(value, Mapping):
+        for key in value:
+            if key not in ("max_load_per_cpu", "min_mem_available_pct"):
+                raise LimitsError(f"{what} has no key {key!r}")
+        return PressureCaps(
+            max_load_per_cpu=_threshold(
+                value.get("max_load_per_cpu", pressure.DEFAULT_MAX_LOAD_PER_CPU),
+                f"{what} max_load_per_cpu",
+                low=0,
+                above_zero=True,
+            ),
+            min_mem_available_pct=_threshold(
+                value.get("min_mem_available_pct", pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT),
+                f"{what} min_mem_available_pct",
+                low=0,
+                high=100,
+            ),
+        )
+    raise LimitsError(f"{what} must be pressure caps, not {value!r}")
+
+
+def caps(value=None):
+    """The saturation line: `value` parsed, None reading as the built-ins."""
+    return _pressure_caps(value)
+
+
+def _reading(value):
+    """A pressure Reading from None (unknown), a Reading, or a plain mapping."""
+    if value is None:
+        return pressure.Reading()
+    if isinstance(value, pressure.Reading):
+        item = value
+    elif isinstance(value, Mapping):
+        for key in value:
+            if key not in ("load_per_cpu", "mem_available_pct"):
+                raise LimitsError(f"pressure reading has no key {key!r}")
+        item = pressure.Reading(
+            load_per_cpu=value.get("load_per_cpu"),
+            mem_available_pct=value.get("mem_available_pct"),
+        )
+    else:
+        raise LimitsError(f"pressure reading must be a reading, not {value!r}")
+    for dim in ("load_per_cpu", "mem_available_pct"):
+        side = getattr(item, dim)
+        if side is None:
+            continue
+        if isinstance(side, bool) or not isinstance(side, (int, float)):
+            raise LimitsError(f"pressure reading {dim} must be a number, not {side!r}")
+        if not math.isfinite(side) or side < 0:
+            raise LimitsError(f"pressure reading {dim} must be zero or more, not {side!r}")
+    return item
+
+
 def _n(value):
     """A number for a reason string: whole floats read as ints."""
     if isinstance(value, float) and value.is_integer():
@@ -304,12 +396,14 @@ def validate_limits(limits):
                 roles=dict(limits.get("roles") or {}),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
+                pressure=limits.get("pressure"),
             )
         else:
             raise LimitsError(f"limits must be a Limits table, not {limits!r}")
     gone_s = _moment(limits.gone_s, "gone_s")
     if gone_s < 0:
         raise LimitsError(f"gone_s {limits.gone_s!r} must be zero or more")
+    _pressure_caps(limits.pressure)
     host = None
     if limits.host is not None:
         host = _usage(limits.host, "host budget")
@@ -399,6 +493,7 @@ def join(base, shares, foreign=(), *, where):
         roles=dict(base.roles),
         foreign=list(foreign or []),
         gone_s=base.gone_s,
+        pressure=_pressure_caps(base.pressure),
     )
     validate_limits(joined)
     return joined
@@ -420,6 +515,7 @@ def share_cap(limits, project, now):
                 roles=dict(limits.get("roles") or {}),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
+                pressure=limits.get("pressure"),
             )
         else:
             raise LimitsError(f"limits must be a Limits table, not {limits!r}")
@@ -427,6 +523,7 @@ def share_cap(limits, project, now):
     gone_s = _moment(limits.gone_s, "gone_s")
     if gone_s < 0:
         raise LimitsError(f"gone_s {limits.gone_s!r} must be zero or more")
+    _pressure_caps(limits.pressure)
     if limits.host is None:
         return None
     host = _usage(limits.host, "host budget")
@@ -449,12 +546,14 @@ def _live_foreign(foreign, now, gone_s):
     return [entry for entry in foreign if now - entry.claimed_at <= gone_s]
 
 
-def admit(request, charged, limits, now):
+def admit(request, charged, limits, now, pressure=None):
     """Whether ``request`` may start now against ``charged`` under ``limits``.
 
-    Pure: the caller passes the charged usage and the clock reading in,
-    so no sum here can go stale. A missing host budget passes everything.
-    Ceilings hold always; a project below its floor in every full
+    Pure: the caller passes the charged usage, the clock reading and the
+    pressure reading in, so no sum here can go stale. A missing host
+    budget passes everything. A saturated pressure reading refuses even
+    when shares are free; an unknown reading (None, the default) never
+    blocks. Ceilings hold always; a project below its floor in every full
     dimension starts past a full pool; a charge bigger than the pool is a
     role-cost refusal even on an empty host.
     """
@@ -475,6 +574,7 @@ def admit(request, charged, limits, now):
                 roles=dict(limits.get("roles") or {}),
                 foreign=list(limits.get("foreign") or []),
                 gone_s=limits.get("gone_s", DEFAULT_GONE_S),
+                pressure=limits.get("pressure"),
             )
         else:
             raise LimitsError(f"limits must be a Limits table, not {limits!r}")
@@ -482,6 +582,8 @@ def admit(request, charged, limits, now):
     gone_s = _moment(limits.gone_s, "gone_s")
     if gone_s < 0:
         raise LimitsError(f"gone_s {limits.gone_s!r} must be zero or more")
+    reading = _reading(pressure)
+    line = _pressure_caps(limits.pressure)
     total = _usage(charged.total, "charged total")
     by_project = {
         name: _usage(charged.by_project[name], f"charged project {name}")
@@ -506,6 +608,20 @@ def admit(request, charged, limits, now):
             True,
             OK,
             f"{described} allowed: no host budget configured, the budget gate passes everything",
+            total,
+            used,
+            cost,
+        )
+    hot, detail = _saturated_reading(
+        reading,
+        max_load_per_cpu=line.max_load_per_cpu,
+        min_mem_available_pct=line.min_mem_available_pct,
+    )
+    if hot:
+        return Verdict(
+            False,
+            PRESSURE,
+            f"{described} refused: host saturated ({detail}): launches wait for the load to drop",
             total,
             used,
             cost,
@@ -611,13 +727,16 @@ class Tables:
     file sets no budget: no enforcement, the gate passes everything.
     ``roles`` holds only the roles with a ``[resources.role.<name>]``
     table; ``config`` prices every other known role at zero, and the
-    launch refuses an unpriced role while a host budget is set. Tables
-    never come from the project file or a repo entry: the host budget is
-    one machine fact, and those layers read as unknown settings instead.
+    launch refuses an unpriced role while a host budget is set. ``pressure``
+    is the ``[resources.pressure]`` saturation line, None when the file
+    sets none: the conservative built-ins decide. Tables never come
+    from the project file or a repo entry: the host budget is one machine
+    fact, and those layers read as unknown settings instead.
     """
 
     host: Usage | None
     roles: dict = field(default_factory=dict)
+    pressure: PressureCaps | None = None
 
 
 def _checked_amount(value, what, where):
@@ -653,6 +772,34 @@ def _checked_triple(raw, what, where, *, complete):
     )
 
 
+def _checked_pressure(raw, where):
+    """The ``[resources.pressure]`` table as PressureCaps, with defaults.
+
+    A missing key reads as the conservative built-in; an unknown key, a
+    non-number, or a number outside its range is a SettingsError naming
+    the file and the key. Whole numbers read as thresholds too.
+    """
+    if not isinstance(raw, dict):
+        raise settings.SettingsError(f"{where}: [resources.pressure] must be a table")
+    if not raw:
+        raise settings.SettingsError(f"{where}: [resources.pressure] is an empty table")
+    for key in raw:
+        if key not in ("max_load_per_cpu", "min_mem_available_pct"):
+            raise settings.SettingsError(f"{where}: [resources.pressure] has no key {key!r}")
+    try:
+        return _pressure_caps(
+            {
+                "max_load_per_cpu": raw.get("max_load_per_cpu", pressure.DEFAULT_MAX_LOAD_PER_CPU),
+                "min_mem_available_pct": raw.get(
+                    "min_mem_available_pct", pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT
+                ),
+            },
+            "pressure caps",
+        )
+    except LimitsError as err:
+        raise settings.SettingsError(f"{where}: [resources.pressure] {err}") from None
+
+
 def check_tables(raw, where):
     """The host config's ``[resources]`` value as Tables, None when absent.
 
@@ -669,7 +816,7 @@ def check_tables(raw, where):
     if not raw:
         raise settings.SettingsError(f"{where}: [resources] is an empty table")
     for key in raw:
-        if key not in ("host", "role"):
+        if key not in ("host", "role", "pressure"):
             raise settings.SettingsError(f"{where}: [resources] has no table {key!r}")
     host = None
     if "host" in raw:
@@ -687,7 +834,10 @@ def check_tables(raw, where):
                 f"expected one of {', '.join(prompts.ROLES)}"
             )
         roles[name] = _checked_triple(table, f"[resources.role.{name}]", where, complete=False)
-    return Tables(host=host, roles=roles)
+    line = None
+    if "pressure" in raw:
+        line = _checked_pressure(raw["pressure"], where)
+    return Tables(host=host, roles=roles, pressure=line)
 
 
 def config(resolved=None):
@@ -711,4 +861,5 @@ def config(resolved=None):
         host=tables.host if tables is not None else None,
         roles=dict(roles),
         gone_s=gone_s,
+        pressure=(tables.pressure if tables is not None else None),
     )

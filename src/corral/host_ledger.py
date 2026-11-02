@@ -13,14 +13,17 @@ missing file is tolerated only by creating it under the lock; a
 present-but-corrupt file is never reinitialized, the launch refuses with
 exit 4. The only public writers are ``ensure`` and ``update``: both take
 the state dir and check the marker first, so no writer bypasses the
-guard. Number semantics (floors, weights, ceilings, role charges) live
-in ``resources``; this module only stores the envelope and the marker.
+guard. Drop-in claim files beside the ledger merge into every read and
+are stripped from every write, so the file never stores them. Number
+semantics (floors, weights, ceilings, role charges) live in
+``resources``; this module only stores the envelope and the marker.
 """
 
 import contextlib
 import errno
 import fcntl
 import json
+import math
 import os
 import time
 from collections.abc import Callable
@@ -33,6 +36,15 @@ LEDGER_VERSION = 1
 
 #: The marker beside the ledger holding the state dir that owns this host.
 MARKER_NAME = "host-state-dir"
+
+#: The directory beside the ledger holding drop-in foreign-claim JSON files.
+#: An external fleet declares a claim by dropping one file per claim here;
+#: the files merge with the ledger's own entries at read and are never
+#: written back into the ledger.
+FOREIGN_CLAIMS_DIR = "foreign-claims.d"
+
+#: The keys one drop-in claim file may hold; anything else is a typo.
+CLAIM_KEYS = ("name", "cpu_m", "memory_mb", "pids", "claimed_at")
 
 #: Suffix of the lock sidecar beside the ledger file.
 LOCK_SUFFIX = ".lock"
@@ -82,6 +94,114 @@ def marker_path(path: str | None = None) -> str:
     """Full path of the state-dir marker beside the ledger file."""
     target = path or ledger_path()
     return os.path.join(os.path.dirname(target) or ".", MARKER_NAME)
+
+
+def claims_dir(path: str | None = None) -> str:
+    """The drop-in foreign-claim directory beside the ledger file.
+
+    Beside the ledger, so a shared pool never moves under a running
+    fleet: the same reason the ledger path itself ignores the state-dir
+    override. Every reader of drop-in claims goes through this helper.
+    """
+    target = path or ledger_path()
+    return os.path.join(os.path.dirname(target) or ".", FOREIGN_CLAIMS_DIR)
+
+
+def _claim_amount(value: object, what: str, target: str) -> int:
+    """A whole claim amount of zero or more, else a LedgerError naming it."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise LedgerError(f"host ledger {target} is corrupt: {what} must be zero or more")
+    return value
+
+
+def _drop_in(path: str, mtime: float) -> dict:
+    """One drop-in file as a claim dict; anything else is a LedgerError naming it."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError) as exc:
+        raise LedgerError(f"host ledger {path} is corrupt: cannot read the claim: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise LedgerError(f"host ledger {path} is corrupt: a claim must be an object")
+    for key in raw:
+        if key not in CLAIM_KEYS:
+            raise LedgerError(f"host ledger {path} is corrupt: a claim has no key {key!r}")
+    name = raw.get("name", "")
+    if not isinstance(name, str) or not name:
+        raise LedgerError(f"host ledger {path} is corrupt: a claim needs a non-empty name")
+    claimed_at = raw.get("claimed_at", mtime)
+    if isinstance(claimed_at, bool) or not isinstance(claimed_at, (int, float)):
+        raise LedgerError(f"host ledger {path} is corrupt: claimed_at must be a number of seconds")
+    if not math.isfinite(claimed_at):
+        raise LedgerError(f"host ledger {path} is corrupt: claimed_at must be a finite number")
+    return {
+        "name": name,
+        "cpu_m": _claim_amount(raw.get("cpu_m", 0), "cpu_m", path),
+        "memory_mb": _claim_amount(raw.get("memory_mb", 0), "memory_mb", path),
+        "pids": _claim_amount(raw.get("pids", 0), "pids", path),
+        "claimed_at": claimed_at,
+    }
+
+
+def drop_in_claims(directory: str | None = None) -> list[dict]:
+    """The drop-in foreign claims, sorted by file name.
+
+    A missing directory reads as no claims. Anything else unreadable, or
+    any malformed file, is a LedgerError naming it: a claim the host
+    cannot prove must refuse rather than admit over capacity.
+    """
+    target = directory or claims_dir()
+    try:
+        names = sorted(os.listdir(target))
+    except FileNotFoundError:
+        return []
+    except OSError as err:
+        raise LedgerError(f"cannot list the foreign-claim dir at {target}: {err}") from None
+    found = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(target, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError as err:
+            raise LedgerError(f"host ledger {path} is corrupt: cannot stat it: {err}") from None
+        found.append(_drop_in(path, mtime))
+    return found
+
+
+def _with_drop_ins(ledger: dict, target: str) -> dict:
+    """`ledger` with the drop-in claims merged after its own entries.
+
+    A duplicate name across the ledger and the drop-ins refuses: two
+    entries would charge the pool twice for one declarer.
+    """
+    drops = drop_in_claims(claims_dir(target))
+    names = {entry["name"] for entry in ledger["foreign"]}
+    for entry in drops:
+        if entry["name"] in names:
+            raise LedgerError(
+                f"host ledger {target} is corrupt: "
+                f"duplicate foreign claim {entry['name']!r} in the drop-in dir"
+            )
+        names.add(entry["name"])
+    merged = dict(ledger)
+    merged["foreign"] = [*ledger["foreign"], *drops]
+    return merged
+
+
+def _without_drop_ins(ledger: dict, target: str) -> dict:
+    """`ledger` with only the entries the ledger file itself owns.
+
+    The file never stores drop-in claims: merging happens at read, so a
+    read-modify-write must strip the merged names before persisting.
+    """
+    drops = {entry["name"] for entry in drop_in_claims(claims_dir(target))}
+    stripped = dict(ledger)
+    stripped["foreign"] = [
+        entry for entry in ledger.get("foreign", []) if entry["name"] not in drops
+    ]
+    return stripped
 
 
 def empty() -> dict:
@@ -198,16 +318,30 @@ def _write_marker(target: str, state_dir: str) -> None:
     paths.atomic_write_text(marker, state_dir)
 
 
+def _load_file(target: str) -> dict:
+    """The ledger the file at `target` holds, without drop-in claims."""
+    try:
+        with open(target, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        return empty()
+    except (OSError, ValueError) as exc:
+        raise LedgerError(f"host ledger {target} is corrupt: {exc}") from exc
+    return _check_ledger(raw, target)
+
+
 def _prepare(target: str, state_dir: str) -> dict:
-    """The ledger at `target` under the lock, created with its marker when missing.
+    """The merged ledger at `target` under the lock, created with its marker when missing.
 
     A missing file starts empty and is written back by the caller; a
     corrupt one raises and is never reset. A missing marker adopts the
     caller's state dir; a marker naming another dir raises
-    ``StateDirError`` naming both dirs and the marker.
+    ``StateDirError`` naming both dirs and the marker. The returned
+    ledger merges the drop-in claims; only the file's own entries are
+    ever written back.
     """
     try:
-        ledger = load(target)
+        stored = _load_file(target)
     except LedgerError:
         raise
     created = not os.path.exists(target)
@@ -221,26 +355,19 @@ def _prepare(target: str, state_dir: str) -> dict:
             f"move the marker at {marker_path(target)} by hand to move this host"
         )
     if created:
-        _write(target, ledger)
-    return ledger
+        _write(target, stored)
+    return _with_drop_ins(stored, target)
 
 
 def load(path: str | None = None) -> dict:
-    """The ledger at `path` (default: the host ledger file).
+    """The ledger at `path` (default: the host ledger file), drop-ins merged.
 
     A missing file reads as an empty ledger. Anything unreadable or
     wrong-shaped raises ``LedgerError``: a corrupt file never reads as an
     empty ledger that would silently clear stored shares.
     """
     target = path or ledger_path()
-    try:
-        with open(target, encoding="utf-8") as handle:
-            raw = json.load(handle)
-    except FileNotFoundError:
-        return empty()
-    except (OSError, ValueError) as exc:
-        raise LedgerError(f"host ledger {target} is corrupt: {exc}") from exc
-    return _check_ledger(raw, target)
+    return _with_drop_ins(_load_file(target), target)
 
 
 def ensure(
@@ -286,4 +413,4 @@ def update(
         result = change(ledger)
         if result is None:
             return ledger
-        return _write(target, result)
+        return _write(target, _without_drop_ins(result, target))
