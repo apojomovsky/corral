@@ -33,6 +33,17 @@ class TrackerRateLimited(TrackerError):
         self.retry_after = retry_after
 
 
+#: Priority names, highest first. The shared vocabulary every adapter
+#: derives the plain priority string from, and the order the dispatch
+#: pass ranks by. A second adapter reuses this order; it never forks it.
+PRIORITIES = ("urgent", "high", "normal", "low", "backlog")
+
+#: The only people-owned label corral ever adds. The decision protocol
+#: holds a ticket for a human with this label; no adapter exposes a
+#: general label write, so any other name is refused.
+NEEDS_DECISION = "needs-decision"
+
+
 class UnknownOption(TrackerError):
     """A corral-owned write names a concept the board config never mapped.
 
