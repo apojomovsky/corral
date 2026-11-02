@@ -120,6 +120,11 @@ each adapter's `options_schema()` for options. Every reader of
 profiles goes through it; a launch that resolves an invalid profile
 fails with exit 4 before anything is made (no worktree, no unit).
 
+The built-in `default` profile is defined once, hardcoded in
+`profiles.py`: the shipped default setup (runtime `muse` with the
+default model chains). Layer 6 falls back to it, so resolution always
+succeeds.
+
 ## 2. Scopes and precedence
 
 Decision: one ordered layer list, most specific first, with exactly one
@@ -218,16 +223,16 @@ it stays visible after expiry until explicitly reset.
 
 ```toml
 [override]
-scope = "project:example"   # global, project:<repo>, role:<role>, ticket:<repo>#<n>
+scope = "project:example"   # global, project:<repo>, role:<role> (never ticket: layer 3 cannot beat layer 2)
 profile = "fast-backend"
 until = 1730000000          # epoch seconds; set with --temp 2h or --until
 reason = "trying the new setup for the afternoon"
 ```
 
-- Setting: `corral profile set (--global | --project R | --role O |
-  --ticket R N) NAME --temp 2h` (or `--until <instant>`). Durations
-  accept `m`, `h`, `d` suffixes (`2h`, `1d`) through one small
-  stdlib-only parser owned by `profiles.py`.
+- Setting: `corral profile set (--global | --project R | --role O)
+  NAME --temp 2h` (or `--until <instant>`). `--temp` with `--ticket`
+  is rejected (section 5). Durations reuse `accounts.parse_duration`:
+  `<n>[s|m|h|d]`, bare seconds, floats (`2h`, `90`, `1.5d`).
 - Expiry: past `until`, the resolver ignores the override as if it
   were absent. `profile show` keeps listing it marked `expired`, and
   the doctor reports it (section 5), until `corral profile reset
@@ -250,7 +255,7 @@ snapshot field, and doctor rows. Nothing else changes.
 | --- | --- |
 | `corral profile list [--json]` | every named profile (committed and local) with its runtime and role chains; a shadowed name is marked with its winning source |
 | `corral profile show [--repo R] [--role O] [--ticket N] [--json]` | the resolved profile for that ticket and role, with the full layer chain and provenance (which layer decided, from which source, and any expiry) |
-| `corral profile set (--global \| --project R \| --role O \| --ticket R N) NAME [--temp 2h \| --until T] [--reason R]` | write a local selection (layer 6, 4, 5, or the ticket pin in layer 2) or a temporary override (layer 3 with `--temp` / `--until`) |
+| `corral profile set (--global \| --project R \| --role O \| --ticket R N) NAME [--temp 2h \| --until T] [--reason R]` | write a local selection (layer 6, 4, 5, or the ticket pin in layer 2) or a temporary override (layer 3 with `--temp` / `--until`); `--temp` / `--until` with `--ticket` is rejected with exit 4 naming layer 2 as the shadow, with the fix (clear the ticket assignment or pin first) |
 | `corral profile reset (--global \| --project R \| --role O \| --ticket R N \| --temp)` | remove that local selection, pin, or override; exit 1 when there was nothing to remove |
 
 `corral launch` gains `--profile NAME` (layer 1). `--model` and
@@ -264,7 +269,7 @@ Exit codes follow AGENTS.md (meanings unchanged):
 | Situation | Exit |
 | --- | --- |
 | list / show / set / reset ok | 0 |
-| reset with nothing stored; show with no profile resolvable (no declarations at all) | 1, naming the missing piece |
+| reset with nothing stored | 1, naming the missing piece |
 | ticket already live, lost race (launch path, unchanged) | 2 |
 | tracker unreachable while the ticket layer needs a live read | 3 |
 | unknown profile name, unknown runtime, unknown option key, bad duration, override conflict, ticket assignment naming an unknown profile, runtime binary missing | 4, naming the value and the fix |
@@ -349,6 +354,7 @@ the tests pin this with a case per row.
 | runtime binary missing at launch | 4 | refused with the doctor's install hint; nothing started |
 | ticket assignment names an undeclared profile | 4 | launch refused; the claim stands, the ticket waits for a human |
 | tracker assignment and local pin disagree | 4 | launch refused naming both sources |
+| `profile set --ticket` with `--temp` / `--until` | 4 | refused: layer 3 can never beat the layer-2 ticket assignment; names the shadowing layer and the fix (clear the ticket assignment or pin first) |
 | a second temporary override while one stands | 0 | setting it replaces the first, and `set` names what it replaced; a hand-edited file carrying two `[override]` tables is refused with exit 4 |
 | expired override still on disk | 1 from doctor | resolver already ignores it; `reset --temp` clears it |
 | resolved chain fully exhausted | 75 | unchanged refusal with the earliest reset |
@@ -420,7 +426,9 @@ network, or state dirs; `suiteguard.py` keeps refusing them).
    semantics, session recording of the resolved profile, resume reuse.
    Criteria: override wins before `until` and is ignored after; expired
    entries list until reset; a session launched under an override
-   resumes on its recorded profile after expiry.
+   resumes on its recorded profile after expiry; quota marks and temp
+   overrides accept the same duration strings (`accounts.parse_duration`
+   shared-parser test).
 5. Launch and resume wiring. `--profile`/`--model`/`--runtime` flags,
    resolver call before worktree creation, session record extension,
    `Exhausted` path unchanged (exit 75). Criteria: launch tests through
@@ -428,7 +436,9 @@ network, or state dirs; `suiteguard.py` keeps refusing them).
 6. Operator verbs and doctor. `profile list/show/set/reset` with the
    section-5 table, doctor rows, snapshot `profile` field with the
    `schema_version` bump. Criteria: each verb's golden output;
-   `--json` shapes; README gains its Commands row in this ticket.
+   `--json` shapes; `set --ticket` with `--temp` / `--until` fails
+   exit 4 naming layer 2 and the fix; README gains its Commands row in
+   this ticket.
 7. Adapter schemas and setup checks. Real `options_schema()` for omp,
    opencode and muse, home-proof tests, `system_deps.toml` probe tests.
    Criteria: the section-6 checklist passes per runtime; an unknown
