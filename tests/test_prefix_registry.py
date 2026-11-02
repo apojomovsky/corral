@@ -45,6 +45,7 @@ class PrefixOps(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
 
 
@@ -102,7 +103,11 @@ class LaunchRegistersTest(PrefixOps):
         self.start(number=5)
         with self.assertRaises(units.UnitExists) as ctx:
             launch.admit(
-                launch.target(self.root, "lib"), 5, list_fn=self.system.list_fn, usage=roomy
+                launch.target(self.root, "lib"),
+                5,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
         self.assertEqual(ctx.exception.exit_code, 2)
 
@@ -127,6 +132,7 @@ class LaunchRegistersTest(PrefixOps):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.assertEqual(resumed, "ops-agent-lib-5-r1")
         states = {entry["id"]: state for entry, state in self.visible()}
@@ -206,6 +212,7 @@ class RegisterBeforeStartTest(PrefixOps):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
 
     def finish_and_seed_session(self, unit, number=5):
@@ -276,6 +283,7 @@ class HeartbeatForEveryPromptTest(PrefixOps):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         with open(os.path.join(self.leaf(repo, number), "prompt.md"), encoding="utf-8") as h:
             return h.read()

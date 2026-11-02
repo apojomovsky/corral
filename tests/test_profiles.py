@@ -329,3 +329,26 @@ class EffortTiers(unittest.TestCase):
             )
         self.assertIn("reasoning_effort", str(ctx.exception))
         self.assertIn("turbo", str(ctx.exception))
+
+
+class LookupGuard(unittest.TestCase):
+    def test_a_non_string_unhashable_name_is_exit_4_not_a_bare_type_error(self):
+        parsed = profiles.validate({"slim": raw_profile("omp")}, ["provider-a"])
+        with self.assertRaises(settings.SettingsError):
+            profiles.lookup(parsed, ["slim"])  # ty: ignore[invalid-argument-type]
+
+
+class DefensiveBranches(unittest.TestCase):
+    def test_lookup_with_a_non_dict_parsed_value_is_exit_4(self):
+        with self.assertRaises(settings.SettingsError):
+            profiles.lookup(None, "default")  # ty: ignore[invalid-argument-type]
+
+    def test_a_bare_type_schema_entry_checks_the_type_itself(self):
+        declarations = {"p": raw_profile("omp", options={"a": "x"})}
+        with mock.patch.object(runtimes, "get", return_value=fake_adapter({"a": str})):
+            parsed = profiles.validate(declarations, ["provider-a"])
+        self.assertEqual(parsed["p"].options, {"a": "x"})
+
+    def test_a_non_string_declaration_key_is_refused(self):
+        with self.assertRaises(settings.SettingsError):
+            profiles.validate({123: raw_profile("omp")}, ["provider-a"])

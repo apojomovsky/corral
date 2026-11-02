@@ -9,10 +9,12 @@ real state, config or session dirs; the environment is cleared of CORRAL_*
 and points at temp dirs.
 """
 
+import copy
 import dataclasses
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -22,10 +24,13 @@ from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import accounts, cli, hold, launch, launchcli, models, paths, registry, runtimes
+from corral import accounts, cli, hold, host_ledger, launch, launchcli, models, paths
+from corral import pressure, profiles, registry, resources, runtimes
 from corral import settings, units
 from corral.runtimes import muse, omp, opencode
+from tests.test_profiles_launch import FakeStore
 from tests.test_reviewrecord import git_in
+from tests.test_tracker import FakeTracker
 
 REPOS = ("lib", "my-repo")
 
@@ -68,6 +73,8 @@ class FakeSystem:
         self.started = []
         self.stopped = []
         self.fail = None
+        self.ledger = {"version": 1, "host_budget": None, "projects": {}, "foreign": []}
+        self.ledger_error = None
 
     def list_fn(self, prefix):
         return [(name, state, "running") for name, state in self.units.items()]
@@ -88,11 +95,18 @@ class FakeSystem:
         """The unit ended on its own: no longer live, still in the log."""
         self.units[unit] = "inactive"
 
+    def host_ledger_fn(self):
+        """The ensured host ledger: a copy of `ledger`, or `ledger_error`."""
+        if self.ledger_error is not None:
+            raise self.ledger_error
+        return copy.deepcopy(self.ledger)
+
     def seams(self):
         return launchcli.Seams(
             list_fn=self.list_fn,
             run=self.run,
             stop_fn=self.stop_fn,
+            host_ledger_fn=self.host_ledger_fn,
             labels_fn=lambda kind, repo, number: [],
             usage=roomy,
         )
@@ -207,38 +221,544 @@ class TargetTest(OpsCase):
 
 class AdmitTest(OpsCase):
     def test_a_free_host_admits_the_ticket(self):
-        launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
+        launch.admit(
+            self.target(),
+            5,
+            list_fn=lambda prefix: [],
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+        )
 
     def test_a_live_unit_of_this_ticket_is_already_live(self):
         self.system.units["corral-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(ctx.exception.exit_code, 2)
 
     def test_the_same_number_in_another_repo_is_not_live(self):
         self.system.units["corral-agent-my-repo-5"] = "active"
-        launch.admit(self.target("lib"), 5, list_fn=self.system.list_fn, usage=roomy)
+        launch.admit(
+            self.target("lib"),
+            5,
+            list_fn=self.system.list_fn,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+        )
 
     def test_a_full_host_refuses_with_exit_75(self):
         self.system.units["corral-agent-lib-6"] = "active"
         self.system.units["corral-agent-my-repo-7"] = "activating"
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(ctx.exception.exit_code, 75)
 
     def test_a_registered_worker_on_this_host_holds_a_slot(self):
         registry.register("worker-1", "omp", ticket=registry.make_ticket("my-repo", 9))
         tgt = dataclasses.replace(self.target(), cap=1)
         with self.assertRaises(launch.CapFull):
-            launch.admit(tgt, 5, list_fn=lambda prefix: [], usage=roomy)
+            launch.admit(
+                tgt,
+                5,
+                list_fn=lambda prefix: [],
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
 
     def test_an_unreachable_service_manager_is_exit_3(self):
         def down(prefix):
             raise units.Unreachable("no bus")
 
         with self.assertRaises(units.Unreachable) as ctx:
-            launch.admit(self.target(), 5, list_fn=down, usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=down,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(ctx.exception.exit_code, 3)
+
+
+HOST_BUDGET = "[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n"
+
+WORKER_PRICE = "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+
+REVIEWER_PRICE = "[resources.role.reviewer]\ncpu_m = 500\nmemory_mb = 1024\n"
+
+NOW = 1_000_000.0
+
+
+class BudgetWiringTest(OpsCase):
+    """The budget gate in `launch.admit` and the slice wiring in `launch`."""
+
+    def host_config(self, text=HOST_BUDGET):
+        config = os.environ["CORRAL_CONFIG"]
+        os.makedirs(config, exist_ok=True)
+        with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def register_web(self, share="weight = 1\n"):
+        directory = os.path.join(os.environ["CORRAL_CONFIG"], "projects.d")
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "web.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'name = "web"\nunit_prefix = "corral-agent-"\nroot = "'
+                + os.path.realpath(self.root)
+                + '"\n\n[resources]\n'
+                + share
+            )
+
+    def admit(self, number=5, **kwargs):
+        kwargs.setdefault("list_fn", self.system.list_fn)
+        kwargs.setdefault("usage", roomy)
+        kwargs.setdefault("host_ledger_fn", self.system.host_ledger_fn)
+        return launch.admit(self.target(), number, **kwargs)
+
+    def test_no_host_budget_passes_and_creates_no_slices(self):
+        self.admit()
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(len(self.system.started), 1)
+        self.assertFalse([a for a in self.system.started[0] if "Slice=" in a])
+
+    def test_a_full_budget_refuses_with_75_before_anything_is_made(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.system.units["corral-agent-lib-6"] = "active"
+        with self.assertRaises(launch.CapFull) as caught:
+            self.admit()
+        self.assertEqual(caught.exception.exit_code, 75)
+        self.assertIn("share", str(caught.exception))
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.session("lib", 5)))
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_disk_pressure_wins_over_the_budget(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.system.units["corral-agent-lib-6"] = "active"
+
+        def critical(path):
+            return (100 * 1024**3, 99 * 1024**3, 1 * 1024**3)
+
+        with self.assertRaises(launch.CapFull) as caught:
+            self.admit(usage=critical)
+        self.assertIn("disk", str(caught.exception))
+
+    def test_the_count_gate_wins_over_the_budget(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["corral-agent-my-repo-7"] = "activating"
+        with self.assertRaises(launch.CapFull) as caught:
+            self.admit()
+        self.assertIn("ceiling", str(caught.exception))
+        self.assertNotIn("host full for", str(caught.exception))
+        self.assertNotIn("share", str(caught.exception))
+
+    def test_the_budget_gate_wins_over_quota(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
+            handle.write(TOML + "[models.worker]\nchain = ['fresh/model']\n")
+        self.system.units["corral-agent-lib-6"] = "active"
+        pool = [accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0)]
+        quota_ledger = {
+            "readings": {
+                "fresh": {
+                    "windows": {"hour": {"used_pct": 100, "resets_at": NOW + 3600}},
+                    "read_at": NOW - 120,
+                }
+            },
+            "marks": {},
+        }
+        with self.assertRaises(launch.CapFull):
+            launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+                pool_fn=lambda: pool,
+                ledger_fn=lambda: quota_ledger,
+                now_fn=lambda: NOW,
+            )
+        self.assertEqual(self.system.started, [])
+
+    def test_an_exhausted_quota_still_refuses_when_the_budget_is_roomy(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
+            handle.write(TOML + "[models.worker]\nchain = ['fresh/model']\n")
+        pool = [accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0)]
+        quota_ledger = {
+            "readings": {
+                "fresh": {
+                    "windows": {"hour": {"used_pct": 100, "resets_at": NOW + 3600}},
+                    "read_at": NOW - 120,
+                }
+            },
+            "marks": {},
+        }
+        with self.assertRaises(models.Exhausted) as caught:
+            launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+                pool_fn=lambda: pool,
+                ledger_fn=lambda: quota_ledger,
+                now_fn=lambda: NOW,
+            )
+        self.assertEqual(caught.exception.exit_code, 75)
+        self.assertEqual(self.system.started, [])
+
+    def test_an_unknown_role_charge_is_a_configuration_error(self):
+        self.host_config(HOST_BUDGET)
+        with self.assertRaises(resources.LimitsError) as caught:
+            self.admit(role="auditor")
+        self.assertIn("auditor", str(caught.exception))
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_an_unpriced_role_under_a_host_budget_is_refused_with_4(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaisesRegex(launch.LaunchError, "reviewer") as caught:
+            self.admit(role="reviewer")
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertIn("[resources.role.reviewer]", str(caught.exception))
+        self.assertIn("config.toml", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+
+    def test_an_unpriced_launch_starts_nothing(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaises(launch.LaunchError):
+            launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                role="reviewer",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+                controllers_read=lambda path: "cpu memory pids",
+            )
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.session("lib", 5)))
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_priced_reviewer_launches_with_its_own_charge(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE + REVIEWER_PRICE)
+        self.register_web()
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            role="reviewer",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            controllers_read=lambda path: "cpu memory pids",
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        agent = self.system.started[-1]
+        self.assertIn("--property=Slice=corral-web.slice", agent)
+        self.assertIn("--property=MemoryMax=1024M", agent)
+
+    def test_no_host_budget_leaves_an_unpriced_role_untouched(self):
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            role="reviewer",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(len(self.system.started), 1)
+        self.assertFalse([a for a in self.system.started[0] if "Slice=" in a])
+
+    def test_a_reviewer_fits_where_a_worker_does_not(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 1500\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+            "[resources.role.reviewer]\ncpu_m = 500\nmemory_mb = 1024\n"
+        )
+        self.system.units["corral-agent-lib-6"] = "active"
+        with self.assertRaises(launch.CapFull):
+            self.admit(role="worker")
+        self.admit(role="reviewer")
+
+    def test_an_expired_foreign_claim_frees_the_pool(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        self.system.ledger["foreign"] = [
+            {"name": "desk", "cpu_m": 8000, "memory_mb": 16000, "claimed_at": NOW - 601.0}
+        ]
+        self.admit(now_fn=lambda: NOW)
+
+    def test_a_live_foreign_claim_subtracts_from_the_pool(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.system.ledger["foreign"] = [
+            {"name": "desk", "cpu_m": 7500, "memory_mb": 15000, "claimed_at": NOW}
+        ]
+        with self.assertRaises(launch.CapFull) as caught:
+            self.admit(now_fn=lambda: NOW)
+        self.assertEqual(caught.exception.exit_code, 75)
+
+    def test_a_foreign_state_dir_is_exit_4(self):
+        self.system.ledger_error = host_ledger.StateDirError("belongs elsewhere")
+        with self.assertRaises(host_ledger.StateDirError) as caught:
+            self.admit()
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_a_busy_ledger_lock_is_exit_75(self):
+        self.system.ledger_error = host_ledger.LedgerLocked("busy")
+        with self.assertRaises(host_ledger.LedgerLocked) as caught:
+            self.admit()
+        self.assertEqual(caught.exception.exit_code, 75)
+
+    def test_a_corrupt_ledger_is_exit_4(self):
+        self.system.ledger_error = host_ledger.LedgerError("corrupt file")
+        with self.assertRaises(host_ledger.LedgerError) as caught:
+            self.admit()
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_floors_above_the_host_name_the_file_and_key(self):
+        self.host_config("[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n")
+        self.register_web("weight = 1\ncpu_floor_m = 5000\n")
+        with self.assertRaisesRegex(settings.SettingsError, r"config\.toml.*cpu_m") as caught:
+            self.admit()
+        self.assertIn("[resources.host]", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+
+    def test_slices_are_created_parents_first_with_their_limits(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        self.register_web()
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            controllers_read=lambda path: "cpu memory pids",
+        )
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(len(self.system.started), 3)
+        host_slice, project_slice, agent = self.system.started
+        self.assertIn("--unit=corral.slice", host_slice)
+        self.assertIn("--property=MemoryMax=16000M", host_slice)
+        self.assertIn("--property=CPUQuota=800%", host_slice)
+        self.assertIn("--unit=corral-web.slice", project_slice)
+        self.assertIn("--slice=corral.slice", project_slice)
+        self.assertIn("--property=MemoryMax=16000M", project_slice)
+        self.assertIn("--property=CPUQuota=800%", project_slice)
+        self.assertIn("--unit=corral-agent-lib-5", agent)
+        self.assertIn("--property=Slice=corral-web.slice", agent)
+        self.assertIn("--property=MemoryMax=2048M", agent)
+        self.assertIn("--property=CPUQuota=100%", agent)
+
+    def test_a_missing_required_controller_is_exit_4_before_anything_runs(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        self.register_web()
+        with self.assertRaisesRegex(units.UnitsError, "memory") as caught:
+            launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+                controllers_read=lambda path: "cpu pids",
+            )
+        self.assertEqual(caught.exception.exit_code, 4)
+        self.assertEqual(self.system.started, [])
+
+    def test_a_resume_refuses_a_full_budget(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        unit, _ = launch.launch(
+            self.target("lib", "omp"),
+            5,
+            "do the thing",
+            title="feat: add the thing",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            controllers_read=lambda path: "cpu memory pids",
+        )
+        self.system.finish(unit)
+        with open(os.path.join(self.leaf("lib", 5), "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        self.system.units["corral-agent-lib-6"] = "active"
+        self.host_config(
+            "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        started = len(self.system.started)
+        with self.assertRaises(launch.CapFull) as caught:
+            launch.resume(
+                self.target("lib", "omp"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
+        self.assertEqual(caught.exception.exit_code, 75)
+        self.assertEqual(len(self.system.started), started)
+
+    def test_the_budget_seam_is_required(self):
+        with self.assertRaises(TypeError):
+            launch.admit(  # ty: ignore[missing-argument]
+                self.target(), 5, list_fn=lambda prefix: [], usage=roomy
+            )
+        with self.assertRaises(TypeError):
+            launch.launch(  # ty: ignore[missing-argument]
+                self.target(), 5, "x", list_fn=lambda prefix: [], run=self.system.run, usage=roomy
+            )
+        with self.assertRaises(TypeError):
+            launch.resume(  # ty: ignore[missing-argument]
+                self.target(),
+                5,
+                "x",
+                hold_reason_fn=_free_hold,
+                list_fn=lambda prefix: [],
+                run=self.system.run,
+                usage=roomy,
+            )
+
+    def test_a_full_budget_maps_to_exit_75_on_the_cli(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.system.units["corral-agent-lib-6"] = "active"
+        code = launchcli.run_verb(
+            ["launch", "lib", "5", "--prompt-file", self.prompt_file(), "--root", self.root],
+            self.system.seams(),
+        )
+        self.assertEqual(code, 75)
+
+    def test_a_locked_ledger_maps_to_exit_75_on_the_cli(self):
+        self.system.ledger_error = host_ledger.LedgerLocked("busy")
+        code = launchcli.run_verb(
+            ["launch", "lib", "5", "--prompt-file", self.prompt_file(), "--root", self.root],
+            self.system.seams(),
+        )
+        self.assertEqual(code, 75)
+
+    def test_a_corrupt_ledger_maps_to_exit_4_on_the_cli(self):
+        self.system.ledger_error = host_ledger.LedgerError("corrupt file")
+        code = launchcli.run_verb(
+            ["launch", "lib", "5", "--prompt-file", self.prompt_file(), "--root", self.root],
+            self.system.seams(),
+        )
+        self.assertEqual(code, 4)
+
+
+class PressureWiringTest(OpsCase):
+    """Saturation backoff in `launch.admit`: hot hosts wait with exit 75."""
+
+    def host_config(self, text=HOST_BUDGET):
+        config = os.environ["CORRAL_CONFIG"]
+        os.makedirs(config, exist_ok=True)
+        with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def admit(self, number=5, **kwargs):
+        kwargs.setdefault("list_fn", self.system.list_fn)
+        kwargs.setdefault("usage", roomy)
+        kwargs.setdefault("host_ledger_fn", self.system.host_ledger_fn)
+        return launch.admit(self.target(), number, **kwargs)
+
+    def test_a_saturated_host_refuses_with_75_while_shares_are_free(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        hot = lambda: pressure.Reading(load_per_cpu=8.0, mem_available_pct=50.0)
+        with self.assertRaises(launch.CapFull) as caught:
+            self.admit(now_fn=lambda: NOW, pressure_fn=hot)
+        self.assertEqual(caught.exception.exit_code, 75)
+        self.assertIn("saturated", str(caught.exception))
+        self.assertEqual(self.system.started, [])
+
+    def test_an_unknown_reading_admits(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        unknown = lambda: pressure.Reading(load_per_cpu=None, mem_available_pct=None)
+        self.admit(now_fn=lambda: NOW, pressure_fn=unknown)
+
+    def test_no_seam_reads_as_unknown(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        self.admit(now_fn=lambda: NOW)
+
+    def test_no_host_budget_skips_the_pressure_read(self):
+        def explode():
+            raise AssertionError("no budget configured: nothing may read pressure")
+
+        self.admit(pressure_fn=explode)
+
+    def test_a_saturated_host_maps_to_exit_75_on_the_cli(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        seams = self.system.seams()._replace(
+            pressure_fn=lambda: pressure.Reading(load_per_cpu=8.0, mem_available_pct=50.0)
+        )
+        code = launchcli.run_verb(
+            ["launch", "lib", "5", "--prompt-file", self.prompt_file(), "--root", self.root],
+            seams,
+        )
+        self.assertEqual(code, 75)
 
 
 class LaunchTest(OpsCase):
@@ -251,6 +771,7 @@ class LaunchTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=kwargs.pop("usage", roomy),
+            host_ledger_fn=self.system.host_ledger_fn,
             **kwargs,
         )
 
@@ -317,6 +838,7 @@ class LaunchTest(OpsCase):
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
         self.system.finish("corral-agent-lib-5")
 
@@ -328,6 +850,7 @@ class LaunchTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.assertEqual(unit, "corral-agent-lib-5-r1")
         argv = self.system.started[-1]
@@ -379,6 +902,7 @@ class LaunchTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertEqual(unit, "corral-agent-lib-5-r1")
@@ -428,7 +952,15 @@ class LaunchTest(OpsCase):
             raise units.Unreachable("no bus")
 
         with self.assertRaises(units.Unreachable) as ctx:
-            launch.launch(self.target(), 5, "x", list_fn=down, run=self.system.run, usage=roomy)
+            launch.launch(
+                self.target(),
+                5,
+                "x",
+                list_fn=down,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_a_start_that_loses_the_race_is_exit_2(self):
@@ -454,7 +986,13 @@ class LaunchTest(OpsCase):
         tgt = dataclasses.replace(self.target("lib"), runtime="claude-code")
         with self.assertRaises(launch.LaunchError):
             launch.launch(
-                tgt, 5, "x", list_fn=self.system.list_fn, run=self.system.run, usage=roomy
+                tgt,
+                5,
+                "x",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
         self.assertEqual(self.system.started, [])
 
@@ -467,6 +1005,7 @@ class LaunchTest(OpsCase):
             title="feat: other",
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertNotEqual(self.leaf("lib", 5), self.leaf("my-repo", 5))
@@ -497,6 +1036,7 @@ class MuseSessionTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.assertEqual(unit, "corral-agent-lib-5")
         session = self.leaf("lib", 5)
@@ -516,6 +1056,7 @@ class MuseSessionTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertEqual(resumed, "corral-agent-lib-5-r1")
@@ -534,6 +1075,7 @@ class MuseSessionTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.system.finish(unit)
         os.remove(os.path.join(self.leaf("lib", 5), "muse_session_id"))
@@ -545,6 +1087,7 @@ class MuseSessionTest(OpsCase):
                 hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
         self.assertEqual(len(self.system.started), 1)
@@ -560,6 +1103,7 @@ class MuseSessionTest(OpsCase):
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
         self.assertEqual(ctx.exception.exit_code, 3)
         session = self.leaf("lib", 5)
@@ -575,6 +1119,7 @@ class MuseSessionTest(OpsCase):
                 hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
 
@@ -587,6 +1132,7 @@ class MuseSessionTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         with self.assertRaises(launch.LaunchError):
             launch.tail(self.target("lib"), 5, out=io.StringIO())
@@ -653,6 +1199,7 @@ class ReviewerWiringTest(OpsCase):
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
         return fake, unit
 
@@ -725,6 +1272,7 @@ class ReviewerWiringTest(OpsCase):
                 hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
         self.assertEqual(len(self.system.started), before)
@@ -742,6 +1290,7 @@ class ReviewerWiringTest(OpsCase):
                 hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
         self.assertEqual(len(self.system.started), before)
@@ -782,6 +1331,7 @@ class ReviewerWiringTest(OpsCase):
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
             self.system.finish(unit)
             with mock.patch.object(launch, "_recorded_role", side_effect=flipping):
@@ -792,6 +1342,7 @@ class ReviewerWiringTest(OpsCase):
                     hold_reason_fn=_free_hold,
                     list_fn=self.system.list_fn,
                     usage=roomy,
+                    host_ledger_fn=self.system.host_ledger_fn,
                     run=self.system.run,
                 )
         self.assertEqual(reads, ["worker", "reviewer"])
@@ -818,6 +1369,7 @@ class EnvRefusalTest(OpsCase):
                     list_fn=self.system.list_fn,
                     run=self.system.run,
                     usage=roomy,
+                    host_ledger_fn=self.system.host_ledger_fn,
                 )
         self.assertEqual(ctx.exception.exit_code, 4)
         self.assertEqual(self.system.started, [])
@@ -840,6 +1392,7 @@ class MuseReviewerLaunchTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
 
     def test_reviewer_gets_disable_write_and_worker_does_not(self):
@@ -863,6 +1416,7 @@ class MuseReviewerLaunchTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertEqual(resumed, "corral-agent-lib-5-r1")
@@ -882,6 +1436,7 @@ class MuseReviewerLaunchTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertNotIn("--disable-write", self.system.started[-1])
@@ -897,6 +1452,7 @@ class ResumeTailTest(OpsCase):
                 hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
         self.assertEqual(self.system.started, [])
@@ -914,6 +1470,7 @@ class ResumeTailTest(OpsCase):
                 hold_reason_fn=_free_hold,
                 list_fn=self.system.list_fn,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
 
@@ -926,6 +1483,7 @@ class ResumeTailTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.system.finish("corral-agent-lib-5")
         before = len(self.system.started)
@@ -942,6 +1500,7 @@ class ResumeTailTest(OpsCase):
                     hold_reason_fn=_free_hold,
                     list_fn=self.system.list_fn,
                     usage=roomy,
+                    host_ledger_fn=self.system.host_ledger_fn,
                     run=self.system.run,
                 )
         self.assertEqual(ctx.exception.exit_code, 4)
@@ -997,6 +1556,7 @@ class HoldResumeTest(OpsCase):
             title="feat: go",
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.system.finish("corral-agent-held-5")
@@ -1042,6 +1602,7 @@ class HoldResumeTest(OpsCase):
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
             )
 
 
@@ -1086,6 +1647,7 @@ class CliTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.system.finish(worker)
         reviewer, _ = launch.launch(
@@ -1097,6 +1659,7 @@ class CliTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.system.finish(reviewer)
         for session, text in (
@@ -1245,6 +1808,7 @@ class RaceTest(OpsCase):
             title="feat: add the thing",
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.system.finish("corral-agent-lib-5")
@@ -1272,6 +1836,7 @@ class RaceTest(OpsCase):
                 title="feat: add the thing",
                 list_fn=flipping,
                 usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
                 run=self.system.run,
             )
         self.assertEqual(len(calls), 2)
@@ -1289,6 +1854,7 @@ class RaceTest(OpsCase):
             title="feat: add the thing",
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         session = self.leaf("lib", 5)
@@ -1303,6 +1869,7 @@ class RaceTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.system.finish(first)
@@ -1313,6 +1880,7 @@ class RaceTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertEqual(first, "corral-agent-lib-5-r1")
@@ -1333,19 +1901,37 @@ class RegistryCapTest(OpsCase):
     def test_registered_workers_fill_the_cap_by_default(self):
         self.holders()
         with self.assertRaises(launch.CapFull):
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=lambda prefix: [],
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
 
     def test_count_toward_cap_false_in_the_ops_root_frees_the_slots(self):
         with open(os.path.join(self.root, settings.PROJECT_FILE), "a", encoding="utf-8") as handle:
             handle.write("\n[registry]\ncount_toward_cap = false\n")
         self.holders()
         tgt = self.target()
-        launch.admit(tgt, 5, list_fn=lambda prefix: [], usage=roomy)
+        launch.admit(
+            tgt,
+            5,
+            list_fn=lambda prefix: [],
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+        )
 
     def test_a_registered_live_ticket_refuses_with_the_registry_note(self):
         registry.register("worker-1", "omp", ticket=registry.make_ticket("lib", 5))
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=lambda prefix: [],
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(
             str(ctx.exception),
             "#5 of lib already has a live agent (registered agent, counts until its heartbeat goes stale)",
@@ -1354,7 +1940,13 @@ class RegistryCapTest(OpsCase):
     def test_a_full_host_held_by_registered_agents_is_refused(self):
         self.holders()
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target(), 5, list_fn=lambda prefix: [], usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=lambda prefix: [],
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertEqual(
             str(ctx.exception),
@@ -1364,14 +1956,26 @@ class RegistryCapTest(OpsCase):
     def test_a_unit_holder_gets_no_registry_note(self):
         self.system.units["corral-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertEqual(str(ctx.exception), "#5 of lib already has a live agent")
 
         self.system.units.clear()
         self.system.units["corral-agent-my-repo-6"] = "active"
         self.system.units["corral-agent-my-repo-7"] = "active"
         with self.assertRaises(launch.CapFull) as ctx:
-            launch.admit(self.target(), 5, list_fn=self.system.list_fn, usage=roomy)
+            launch.admit(
+                self.target(),
+                5,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
         self.assertNotIn("registered", str(ctx.exception))
 
 
@@ -1386,6 +1990,7 @@ class StopUnprovenTest(OpsCase):
             title="feat: go",
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.system.units["corral-agent-lib-5-r7"] = "active"
@@ -1424,6 +2029,7 @@ class StopUnprovenTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.system.finish(worker_unit)
         reviewer_unit, _ = launch.launch(
@@ -1435,6 +2041,7 @@ class StopUnprovenTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
         self.system.units[worker_unit] = "active"
         return worker_unit, reviewer_unit
@@ -1525,6 +2132,7 @@ class RoleSessionIsolationTest(OpsCase):
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
         )
 
     def read(self, session, name):
@@ -1558,6 +2166,7 @@ class RoleSessionIsolationTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         (found,) = [e for e in registry.load_all() if e["id"] == resumed]
@@ -1580,6 +2189,7 @@ class RoleSessionIsolationTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         (found,) = [e for e in registry.load_all() if e["id"] == resumed]
@@ -1620,9 +2230,390 @@ class RoleSessionIsolationTest(OpsCase):
             hold_reason_fn=_free_hold,
             list_fn=self.system.list_fn,
             usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
         self.assertEqual(resumed, "corral-agent-lib-5-r1")
+
+
+class ProfileLaunchCliTest(OpsCase):
+    """`launch`/`resume --profile` through the CLI, with fake store and tracker."""
+
+    PROFILES_TOML = """\
+[profiles.fast]
+runtime = "muse"
+"""
+
+    def write_profiles(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text + self.PROFILES_TOML)
+
+    def write_tracker_repo(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            'name = "lib"\nclone = { path = "clones/lib" }',
+            'name = "lib"\nclone = { path = "clones/lib" }\ntracker.repo = "example/lib"',
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def seams(self, store=None, tracker=None):
+        return launchcli.Seams(
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            stop_fn=self.system.stop_fn,
+            host_ledger_fn=self.system.host_ledger_fn,
+            labels_fn=lambda kind, repo, number: [],
+            usage=roomy,
+            store=store,
+            tracker=tracker,
+        )
+
+    def verb(self, *argv, **seams_kw):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = launchcli.run_verb([*argv, "--root", self.root], self.seams(**seams_kw))
+        return code, out.getvalue(), err.getvalue()
+
+    def registered_runtime(self, unit):
+        (found,) = [e for e in registry.load_all() if e["id"] == unit]
+        return found["runtime"]
+
+    def test_launch_with_profile_runs_the_profile_runtime(self):
+        self.write_profiles()
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        unit = out.split()[1]
+        self.assertEqual(self.registered_runtime(unit), "muse")
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "runtime"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "muse\n")
+
+    def test_launch_with_profile_registers_the_profile_name(self):
+        self.write_profiles()
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        unit = out.split()[1]
+        (found,) = [e for e in registry.load_all() if e["id"] == unit]
+        self.assertEqual(found["profile"], "fast")
+
+    def test_launch_with_unknown_profile_is_exit_4(self):
+        self.write_profiles()
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "nope",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("nope", err)
+
+    def test_launch_with_a_truncated_store_is_exit_4(self):
+        self.write_profiles()
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            store=store,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("profile assignment", err)
+
+    def test_launch_with_profile_survives_a_truncated_store(self):
+        self.write_profiles()
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            store=store,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+
+    def test_launch_without_a_profile_and_a_dead_tracker_is_exit_3(self):
+        self.write_profiles()
+        store = FakeStore(found=SimpleNamespace(labels=["ready"], extra={}), fresh=False)
+        tracker = FakeTracker([])
+        tracker.item_errors[("lib", 5)] = "down"
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            store=store,
+            tracker=tracker,
+        )
+        self.assertEqual(code, 3)
+
+    def test_launch_with_profile_survives_a_dead_tracker(self):
+        self.write_profiles()
+        store = FakeStore(found=SimpleNamespace(labels=["ready"], extra={}), fresh=False)
+        tracker = FakeTracker([])
+        tracker.item_errors[("lib", 5)] = "down"
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            store=store,
+            tracker=tracker,
+        )
+        self.assertEqual((code, err), (0, ""))
+
+    def test_launch_records_the_profile_for_resume(self):
+        self.write_profiles()
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        recorded = profiles.recorded_profile(paths.newest_session("lib", 5, "worker"))
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, "fast")
+        self.assertEqual(recorded.runtime, "muse")
+        self.assertEqual(recorded.layer, 1)
+
+    def test_resume_without_flags_reuses_the_recorded_profile_after_expiry(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                text + '[profiles.fast]\nruntime = "muse"\n[profiles.slow]\nruntime = "omp"\n'
+            )
+        tgt = launch.target(self.root, "lib")
+        now = 1_800_000_000.0
+        live = profiles.Selections(
+            default="slow",
+            override=profiles.Override(scope="global", profile="fast", until=now + 3600),
+        )
+        unit, _ = launch.launch(
+            tgt,
+            5,
+            "do the thing",
+            title="feat: go",
+            role="worker",
+            model="provider-a/model-x",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            pool_fn=lambda: [],
+            ledger_fn=lambda: {"readings": {}, "marks": {}},
+            now_fn=lambda: now,
+            selections=live,
+            store=FakeStore(),
+            tracker=None,
+        )
+        self.system.finish(unit)
+        session = paths.newest_session("lib", 5, "worker")
+        recorded = profiles.recorded_profile(session)
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, "fast")
+        expired = profiles.Selections(
+            default="slow",
+            override=profiles.Override(scope="global", profile="fast", until=now - 10),
+        )
+        resumed, _ = launch.resume(
+            tgt,
+            5,
+            "keep going",
+            hold_reason_fn=_free_hold,
+            role="worker",
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            pool_fn=lambda: [],
+            ledger_fn=lambda: {"readings": {}, "marks": {}},
+            now_fn=lambda: now + 7200,
+            selections=expired,
+            store=FakeStore(),
+            tracker=None,
+        )
+        (found,) = [e for e in registry.load_all() if e["id"] == resumed]
+        self.assertEqual(found["model"], "provider-a/model-x")
+        self.assertIn("model-x", " ".join(self.system.started[-1]))
+
+    def test_resume_with_runtime_alone_runs_the_named_runtime(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        with open(os.path.join(session, "out.log"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"sessionID": "session-1"}) + "\n")
+        code, out, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", "--runtime", "opencode"
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.registered_runtime(out.split()[2]), "opencode")
+
+    def test_resume_with_an_unknown_runtime_alone_is_exit_4(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        code, _, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", "--runtime", "nope"
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("nope", err)
+
+    def test_resume_with_profile_records_the_new_profile(self):
+        self.write_profiles()
+        self.write_tracker_repo()
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text + '[profiles.slow]\nruntime = "muse"\n')
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "slow",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        recorded = profiles.recorded_profile(paths.newest_session("lib", 5, "worker"))
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, "slow")
+
+    def test_resume_with_profile_runs_the_profile_runtime(self):
+        self.write_profiles()
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.registered_runtime(out.split()[2]), "muse")
+
+    def test_resume_with_model_alone_keeps_the_old_path(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        with open(os.path.join(paths.newest_session("lib", 5, "worker"), "chat.jsonl"), "w") as h:
+            h.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--model",
+            "m",
+        )
+        self.assertEqual((code, err), (0, ""))
 
 
 if __name__ == "__main__":

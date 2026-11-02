@@ -35,9 +35,10 @@ touched by a read (section 6).
 ## 1. What the API serves, and what it does not
 
 The single source of truth is the `corral snapshot --json` document
-(schema version 1 today): `schema_version`, `fleet_header` (host, now,
+(schema version 2 today): `schema_version`, `fleet_header` (host, now,
 live/stale/finished counts), `agents` rows (id, project, repo, number,
-runtime, model, state, started_at, last_seen, note), `quota` (per
+runtime, role, profile, model, state, started_at, last_seen, note),
+`quota` (per
 provider state, windows, read_at, stale, mark, reader, error),
 `capacity` (total_cap, repo_cap, live, by_project, pending), `disk`
 (per path totals or per path error). `GET /v1/snapshot` returns that
@@ -51,7 +52,7 @@ the snapshot only summarizes:
 - `GET /v1/quota`: the `quota` section plus `now`.
 - `GET /v1/capacity`: the `capacity` section plus `now`.
 - `GET /v1/disks`: the `disk` section plus `now`.
-- `GET /v1/board?repo=&state=&label=&max_age=`: board store rows
+- `GET /v1/board?repo=&state=&label=&max_age=&limit=&offset=`: board store rows
   oldest first, each with its confidence (`confirmed`, `pending`,
   `dirty`), `fetched_at`, claim holder (agent, host, epoch,
   claimed_at) when held, and queued agent/status overlays. Listing
@@ -63,7 +64,13 @@ the snapshot only summarizes:
   to every per-row call, so rows near the `max_age` boundary cannot
   disagree inside one listing. A decision-grade consumer asks for
   freshness with `max_age` and sees staleness in the reply instead of
-  guessing it.
+  guessing it. The listing pages with `limit` (default 100 rows,
+  maximum 1000: a larger value clamps, it never errors) and `offset`
+  (default 0); the reply carries the page plus `total` and the applied
+  `limit` and `offset`, so a poller knows whether it is complete. A
+  non-integer or negative `limit` or `offset` is a `400`. The bounds
+  live as module constants in `serve.py` (`BOARD_LIMIT_DEFAULT`,
+  `BOARD_LIMIT_MAX`), not as settings.
 - `GET /v1/events?project=`: one project's unresolved coordinator
   events oldest first (`coordevents.unresolved`), each with id, kind,
   ref, evidence, state, first_seen. A `resolved_since` parameter
@@ -81,7 +88,7 @@ the snapshot only summarizes:
 - `GET /v1/stream?topics=&cursor=`: Server-Sent Events (section 2)
   over the journal, the event queue, and a snapshot generation
   counter.
-- `GET /v1/version`: `{api: 1, schema_version: 1}` for change
+- `GET /v1/version`: `{api: 1, schema_version: 2}` for change
   detection (section 4).
 - `GET /v1/health`: `{ok, host, now, uptime_s, requests_total,
   requests_304, degraded}` where `ok` is false exactly when
@@ -172,7 +179,10 @@ registry that does not exist yet.
   posture as the state dir itself. On a non-loopback bind the token is
   required and every request needs `Authorization: Bearer <token>`;
   without it the server answers `401` and logs only the fact of the
-  rejection, never the presented value. This matches the milestone 2
+  rejection, never the presented value. A token file that exists but
+  cannot be read is a configuration error instead (exit 4, section 4),
+  on loopback too: failing closed keeps a broken credential from
+  reading as no credential. This matches the milestone 2
   rule corral already records: host plus Bearer token, never the
   network layer, is the authentication.
 - Token file permissions: created `0600` when `corral serve
@@ -182,7 +192,12 @@ registry that does not exist yet.
 - CORS: no `Access-Control-Allow-Origin: *` ever. Default serves
   same-origin only; `--allow-origin ORIGIN` (repeatable, exact match,
   no wildcards) adds named dashboard origins. Preflight answers only
-  the origins configured.
+  the origins configured. A preflight (`OPTIONS` carrying `Origin`
+  and `Access-Control-Request-Method`) is exempt from the Bearer [REDACTED]:
+  it answers `204` with no body, echoing only an exact-match allowed
+  origin, so a browser can probe before sending credentials. Any other
+  `OPTIONS` request answers under the auth and method rules like every
+  other request.
 - No writes: v1 registers GET only. Any other method answers `405`,
   unknown paths answer `404`, and neither path executes anything.
   There is no `POST /v1/ack`, no launch, no stop, no settings edit:
@@ -261,8 +276,9 @@ design in `08-hub-multihost.md`.
 - Cost bounds: a snapshot is local file reads plus one SQLite query
   set; `tail` is capped at a server side maximum (`serve.tail_max`,
   default 200 lines: a larger `last` is clamped, not refused);
-  `board` and `journal` page with `limit` defaults (100 rows) and
-  maxima; the stream emits at most one event per store change per
+  `board` pages with `limit` (default 100 rows, maximum 1000) and
+  `journal` pages with a `limit` default (100 rows) and maximum; the
+  stream emits at most one event per store change per
   poll interval. Disk usage reuses `shutil.disk_usage` (no tree
   walk): the API reports filesystem free space, never the reclaim
   plan's directory walk, which stays a CLI cost. Concurrent
