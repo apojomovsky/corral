@@ -16,9 +16,15 @@ Every refusal names its level (host, project or role cost) with the
 numbers, and maps to exit 75 at the launch seam (no free slot, try later).
 No host budget configured means no enforcement: the gate passes everything.
 Configuration mistakes raise ``LimitsError`` (exit 4).
+
+The same triples feed the read-only side: host pressure parsed from the
+kernel files, per-slice use parsed from the leaf files, and the capacity
+report the hub learns through. The report is built from plain data only
+and never touches the ledger: the hub never reads or writes it.
 """
 
 import math
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -712,3 +718,329 @@ def config(resolved=None):
         roles=dict(roles),
         gone_s=gone_s,
     )
+
+
+#: Schema version of the read-only capacity report. The hub learns
+#: capacity and load through this shape; within a version only
+#: additive changes are compatible.
+REPORT_SCHEMA_VERSION = 1
+
+#: Kernel files read for host pressure. A missing file reads as
+#: unknown and never blocks; the stall files are informational only.
+LOADAVG_PATH = "/proc/loadavg"
+MEMINFO_PATH = "/proc/meminfo"
+PRESSURE_CPU_PATH = "/proc/pressure/cpu"
+PRESSURE_MEMORY_PATH = "/proc/pressure/memory"
+
+#: Saturation thresholds over load per CPU and MemAvailable percent.
+#: Conservative defaults; promoting them to settings belongs to the
+#: pressure-backoff ticket, which owns the saturation refusal.
+DEFAULT_MAX_LOAD_PER_CPU = 2.0
+DEFAULT_MIN_MEM_AVAILABLE_PCT = 10.0
+
+#: Leaf files read for per-slice use, for the snapshot only.
+MEMORY_CURRENT = "memory.current"
+PIDS_CURRENT = "pids.current"
+CPU_STAT = "cpu.stat"
+
+
+@dataclass(frozen=True)
+class Pressure:
+    """Host pressure: load per CPU, available memory percent, saturation.
+
+    Unknown readings are None, never a refusal: measurement informs the
+    snapshot while admission prices from the static role tags.
+    """
+
+    load_per_cpu: float | None = None
+    mem_available_pct: float | None = None
+    saturated: bool = False
+    cpu_some_avg10: float | None = None
+    memory_some_avg10: float | None = None
+
+
+@dataclass(frozen=True)
+class Measured:
+    """Measured slice use: the CPU counter, memory megabytes, pids.
+
+    The CPU counter is cumulative (`cpu.stat` `usage_usec`): a single
+    reading cannot price a rate, so it stays a raw counter.
+    """
+
+    cpu_usage_usec: int | None = None
+    memory_mb: float | None = None
+    pids: int | None = None
+
+
+def _first_float(text):
+    """The first whitespace-separated number, or None when missing."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return float(text.split()[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _meminfo_pct(text):
+    """MemAvailable over MemTotal as a percent, or None when missing."""
+    if not isinstance(text, str):
+        return None
+    fields = {}
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        fields[key.strip()] = value.strip().split()
+    try:
+        total = float(fields["MemTotal"][0])
+        available = float(fields["MemAvailable"][0])
+    except (KeyError, ValueError, IndexError):
+        return None
+    if total <= 0:
+        return None
+    return round(available / total * 100, 1)
+
+
+def _some_avg10(text):
+    """The `avg10=` value of a pressure-stall file, or None when missing."""
+    if not isinstance(text, str):
+        return None
+    for token in text.split():
+        if token.startswith("avg10="):
+            try:
+                return float(token[len("avg10=") :])
+            except ValueError:
+                return None
+    return None
+
+
+def parse_pressure(
+    loadavg_text,
+    meminfo_text,
+    cpu_count,
+    *,
+    cpu_stall=None,
+    memory_stall=None,
+    max_load_per_cpu=DEFAULT_MAX_LOAD_PER_CPU,
+    min_mem_available_pct=DEFAULT_MIN_MEM_AVAILABLE_PCT,
+):
+    """A Pressure from file texts and a CPU count (pure, total).
+
+    Unreadable or unparsable files read as unknown fields, and unknown
+    never saturates. Thresholds are explicit keyword arguments so the
+    saturation rule stays testable without settings.
+    """
+    load = _first_float(loadavg_text)
+    per_cpu = None
+    if load is not None and isinstance(cpu_count, int) and not isinstance(cpu_count, bool):
+        if cpu_count > 0:
+            per_cpu = round(load / cpu_count, 2)
+    pct = _meminfo_pct(meminfo_text)
+    saturated = (per_cpu is not None and per_cpu > max_load_per_cpu) or (
+        pct is not None and pct < min_mem_available_pct
+    )
+    return Pressure(
+        load_per_cpu=per_cpu,
+        mem_available_pct=pct,
+        saturated=saturated,
+        cpu_some_avg10=_some_avg10(cpu_stall),
+        memory_some_avg10=_some_avg10(memory_stall),
+    )
+
+
+def read_pressure(*, read=None, cpu_count=None):
+    """`(Pressure, notes)` from the kernel files through `read(path)`.
+
+    The default reads the real files. An unreadable loadavg or meminfo
+    reads unknown with a note naming the file; absent stall files stay
+    quiet. Never raises for missing files: unknown never blocks.
+    """
+    notes = []
+    texts = {}
+    for path in (LOADAVG_PATH, MEMINFO_PATH):
+        try:
+            texts[path] = read(path) if read is not None else open(path, encoding="utf-8").read()
+        except OSError as err:
+            notes.append(f"pressure file {path} unreadable: {err}")
+            texts[path] = None
+    stalls = {}
+    for path in (PRESSURE_CPU_PATH, PRESSURE_MEMORY_PATH):
+        try:
+            stalls[path] = read(path) if read is not None else open(path, encoding="utf-8").read()
+        except OSError:
+            stalls[path] = None
+    if cpu_count is None:
+        cpu_count = os.cpu_count()
+    reading = parse_pressure(
+        texts[LOADAVG_PATH],
+        texts[MEMINFO_PATH],
+        cpu_count,
+        cpu_stall=stalls[PRESSURE_CPU_PATH],
+        memory_stall=stalls[PRESSURE_MEMORY_PATH],
+    )
+    return reading, notes
+
+
+def _whole(text):
+    """A non-negative int from file text or a whole number, else None."""
+    if isinstance(text, bool):
+        return None
+    if isinstance(text, float):
+        return int(text) if text.is_integer() and text >= 0 else None
+    if isinstance(text, int):
+        return text if text >= 0 else None
+    if not isinstance(text, str):
+        return None
+    try:
+        value = int(text.strip())
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def parse_slice_use(memory_text, pids_text, cpu_stat_text):
+    """A Measured from the three leaf file texts (pure, total).
+
+    Memory bytes read as megabytes, pids as a count, and the `usage_usec`
+    line of `cpu.stat` as the raw counter. Missing or garbage files read
+    as unknown fields.
+    """
+    memory_mb = None
+    raw = _whole(memory_text)
+    if raw is not None:
+        memory_mb = round(raw / (1024 * 1024), 1)
+    use = None
+    if isinstance(cpu_stat_text, str):
+        for line in cpu_stat_text.splitlines():
+            key, _, value = line.partition(" ")
+            if key.strip() == "usage_usec":
+                use = _whole(value)
+                break
+    return Measured(cpu_usage_usec=use, memory_mb=memory_mb, pids=_whole(pids_text))
+
+
+def read_slice_use(slice_dir, *, read=None):
+    """`(Measured, notes)` for one slice directory through `read(path)`.
+
+    The default reads the real leaf files. A missing file reads as an
+    unknown field with a note naming it; a missing directory reads as
+    all unknown. Never raises for missing files.
+    """
+    notes = []
+    texts = {}
+    for name in (MEMORY_CURRENT, PIDS_CURRENT, CPU_STAT):
+        path = os.path.join(slice_dir, name)
+        try:
+            texts[name] = read(path) if read is not None else open(path, encoding="utf-8").read()
+        except OSError as err:
+            notes.append(f"slice file {path} unreadable: {err}")
+            texts[name] = None
+    return (
+        parse_slice_use(texts[MEMORY_CURRENT], texts[PIDS_CURRENT], texts[CPU_STAT]),
+        notes,
+    )
+
+
+def usage_dict(value):
+    """A Usage (or plain mapping) as a JSON-ready triple dict."""
+    usage = _usage(value, "usage")
+    return {"cpu_m": usage.cpu_m, "memory_mb": usage.memory_mb, "pids": usage.pids}
+
+
+def _optional_number(value, what):
+    """A number or None, else a LimitsError naming it."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise LimitsError(f"{what} must be a number or null, not {value!r}")
+    if not math.isfinite(value):
+        raise LimitsError(f"{what} must be a number or null, not {value!r}")
+    return value
+
+
+def pressure_dict(value):
+    """A Pressure (or plain mapping, or None) as a JSON-ready dict."""
+    if value is None:
+        value = Pressure()
+    if isinstance(value, Pressure):
+        item = value
+    elif isinstance(value, Mapping):
+        item = Pressure(
+            load_per_cpu=_optional_number(value.get("load_per_cpu"), "load_per_cpu"),
+            mem_available_pct=_optional_number(value.get("mem_available_pct"), "mem_available_pct"),
+            saturated=bool(value.get("saturated", False)),
+            cpu_some_avg10=_optional_number(value.get("cpu_some_avg10"), "cpu_some_avg10"),
+            memory_some_avg10=_optional_number(value.get("memory_some_avg10"), "memory_some_avg10"),
+        )
+    else:
+        raise LimitsError(f"pressure must be a Pressure or a mapping, not {value!r}")
+    return {
+        "load_per_cpu": item.load_per_cpu,
+        "mem_available_pct": item.mem_available_pct,
+        "saturated": item.saturated,
+        "cpu_some_avg10": item.cpu_some_avg10,
+        "memory_some_avg10": item.memory_some_avg10,
+    }
+
+
+def measured_dict(value):
+    """A Measured (or plain mapping) as a JSON-ready dict; None stays None."""
+    if value is None:
+        return None
+    if isinstance(value, Measured):
+        item = value
+    elif isinstance(value, Mapping):
+        item = Measured(
+            cpu_usage_usec=_whole(value.get("cpu_usage_usec")),
+            memory_mb=_optional_number(value.get("memory_mb"), "memory_mb"),
+            pids=_whole(value.get("pids")),
+        )
+    else:
+        raise LimitsError(f"measured use must be a Measured or a mapping, not {value!r}")
+    return {
+        "cpu_usage_usec": item.cpu_usage_usec,
+        "memory_mb": item.memory_mb,
+        "pids": item.pids,
+    }
+
+
+def role_charge(roles, role):
+    """The charge for `role`: worker when unset, zeros when unpriced.
+
+    Mirrors the launch gate's lookup, but never raises: the snapshot
+    shows an unknown role at zero instead of refusing the document.
+    """
+    name = role or prompts.DEFAULT_ROLE
+    found = roles.get(name) if isinstance(roles, Mapping) else None
+    if found is None:
+        return Usage()
+    return _usage(found, f"role {name}")
+
+
+def capacity_report(*, host_budget, charged, pressure):
+    """The read-only capacity report for the hub, from plain data.
+
+    The section 2 shape: schema version, host budget (or null when no
+    budget is configured), charged totals, per-project charged usage,
+    and pressure. Pure: every input is passed in, so the hub path that
+    builds it can never read or write the ledger.
+    """
+    if not isinstance(charged, Charged):
+        if isinstance(charged, Mapping):
+            charged = Charged(
+                total=charged.get("total"),
+                by_project=dict(charged.get("by_project") or {}),
+            )
+        else:
+            raise LimitsError(f"charged usage must be a Charged table, not {charged!r}")
+    total = _usage(charged.total, "charged total")
+    by_project = {
+        name: _usage(charged.by_project[name], f"charged project {name}")
+        for name in charged.by_project
+    }
+    return {
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "host_budget": None if host_budget is None else usage_dict(host_budget),
+        "charged": usage_dict(total),
+        "by_project": {name: usage_dict(by_project[name]) for name in sorted(by_project)},
+        "pressure": pressure_dict(pressure),
+    }

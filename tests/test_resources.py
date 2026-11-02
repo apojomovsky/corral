@@ -494,5 +494,181 @@ class Codes(unittest.TestCase):
         )
 
 
+LOADAVG = "0.80 0.60 0.45 2/500 12345\n"
+MEMINFO = "MemTotal:        8000000 kB\nMemFree:         1000000 kB\nMemAvailable:    4400000 kB\n"
+
+
+class PressureParse(unittest.TestCase):
+    def test_load_per_cpu_and_mem_pct(self):
+        reading = R.parse_pressure(LOADAVG, MEMINFO, 2)
+        self.assertEqual(reading.load_per_cpu, 0.4)
+        self.assertEqual(reading.mem_available_pct, 55.0)
+        self.assertFalse(reading.saturated)
+
+    def test_saturation_over_load_or_under_mem(self):
+        over = R.parse_pressure("5.00 0.10 0.10 1/100 1\n", MEMINFO, 2)
+        self.assertTrue(over.saturated)
+        under = R.parse_pressure(LOADAVG, MEMINFO.replace("4400000", "400000"), 2)
+        self.assertTrue(under.saturated)
+
+    def test_thresholds_are_explicit(self):
+        reading = R.parse_pressure(
+            LOADAVG, MEMINFO, 2, max_load_per_cpu=0.1, min_mem_available_pct=99.0
+        )
+        self.assertTrue(reading.saturated)
+
+    def test_missing_files_read_unknown_never_saturated(self):
+        for missing in (
+            (None, MEMINFO, 2),
+            (LOADAVG, None, 2),
+            ("garbage\n", MEMINFO, 2),
+            (LOADAVG, "MemTotal: nope\n", 2),
+            (LOADAVG, MEMINFO, None),
+            (LOADAVG, MEMINFO, 0),
+        ):
+            with self.subTest(missing=missing):
+                reading = R.parse_pressure(*missing)
+                self.assertFalse(reading.saturated)
+                if missing[0] is None or missing[0] == "garbage\n":
+                    self.assertIsNone(reading.load_per_cpu)
+                if missing[1] is None or "nope" in (missing[1] or ""):
+                    self.assertIsNone(reading.mem_available_pct)
+                if not missing[2]:
+                    self.assertIsNone(reading.load_per_cpu)
+
+    def test_stall_files_are_informational_only(self):
+        reading = R.parse_pressure(
+            LOADAVG,
+            MEMINFO,
+            2,
+            cpu_stall="some avg10=1.50 avg60=0.20 avg300=0.05 total=123\n",
+            memory_stall=None,
+        )
+        self.assertEqual(reading.cpu_some_avg10, 1.5)
+        self.assertIsNone(reading.memory_some_avg10)
+        self.assertFalse(reading.saturated)
+
+
+class ReadPressure(unittest.TestCase):
+    def test_reads_through_the_injected_reader(self):
+        files = {
+            R.LOADAVG_PATH: LOADAVG,
+            R.MEMINFO_PATH: MEMINFO,
+            R.PRESSURE_CPU_PATH: "some avg10=0.10 avg60=0.05 avg300=0.01 total=9\n",
+            R.PRESSURE_MEMORY_PATH: "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+        }
+        reading, notes = R.read_pressure(read=files.__getitem__, cpu_count=2)
+        self.assertEqual(reading.load_per_cpu, 0.4)
+        self.assertEqual(reading.mem_available_pct, 55.0)
+        self.assertEqual(reading.cpu_some_avg10, 0.1)
+        self.assertEqual(notes, [])
+
+    def test_unreadable_files_read_unknown_with_notes(self):
+        def read(path):
+            raise OSError(f"cannot read {path}")
+
+        reading, notes = R.read_pressure(read=read, cpu_count=2)
+        self.assertIsNone(reading.load_per_cpu)
+        self.assertIsNone(reading.mem_available_pct)
+        self.assertFalse(reading.saturated)
+        self.assertEqual(len(notes), 2)
+        self.assertTrue(all("cannot read" in note for note in notes))
+
+    def test_absent_stall_files_are_quiet(self):
+        files = {R.LOADAVG_PATH: LOADAVG, R.MEMINFO_PATH: MEMINFO}
+
+        def read(path):
+            if path in files:
+                return files[path]
+            raise FileNotFoundError(path)
+
+        reading, notes = R.read_pressure(read=read, cpu_count=2)
+        self.assertIsNone(reading.cpu_some_avg10)
+        self.assertEqual(notes, [])
+
+
+class SliceUseParse(unittest.TestCase):
+    def test_parses_the_three_leaf_files(self):
+        measured = R.parse_slice_use("12582912\n", "8\n", "usage_usec 5000\n")
+        self.assertEqual(
+            (measured.memory_mb, measured.pids, measured.cpu_usage_usec), (12.0, 8, 5000)
+        )
+
+    def test_missing_or_garbage_reads_unknown(self):
+        measured = R.parse_slice_use(None, "garbage\n", "no counter here\n")
+        self.assertIsNone(measured.memory_mb)
+        self.assertIsNone(measured.pids)
+        self.assertIsNone(measured.cpu_usage_usec)
+
+    def test_cpu_stat_finds_usage_among_other_lines(self):
+        measured = R.parse_slice_use(None, None, "user_usec 1\nusage_usec 42\nsystem_usec 2\n")
+        self.assertEqual(measured.cpu_usage_usec, 42)
+
+
+class ReadSliceUse(unittest.TestCase):
+    def test_reads_the_leaf_dir_through_the_reader(self):
+        files = {
+            "/slice/memory.current": "2097152\n",
+            "/slice/pids.current": "3\n",
+            "/slice/cpu.stat": "usage_usec 7000\n",
+        }
+        measured, notes = R.read_slice_use("/slice", read=files.__getitem__)
+        self.assertEqual(
+            (measured.memory_mb, measured.pids, measured.cpu_usage_usec), (2.0, 3, 7000)
+        )
+        self.assertEqual(notes, [])
+
+    def test_missing_leaf_dir_reads_unknown_with_notes(self):
+        def read(path):
+            raise OSError(f"cannot read {path}")
+
+        measured, notes = R.read_slice_use("/slice", read=read)
+        self.assertIsNone(measured.memory_mb)
+        self.assertIsNone(measured.pids)
+        self.assertIsNone(measured.cpu_usage_usec)
+        self.assertEqual(len(notes), 3)
+        self.assertTrue(all("cannot read" in note for note in notes))
+
+
+class CapacityReport(unittest.TestCase):
+    def test_report_shape_matches_the_golden_file(self):
+        import json
+        import os
+
+        report = R.capacity_report(
+            host_budget=triple(8000, 16000, 4096),
+            charged=charged(
+                (2500, 5120, 120), {"proj-a": (2000, 4096, 100), "proj-b": (500, 1024, 20)}
+            ),
+            pressure=R.Pressure(load_per_cpu=0.4, mem_available_pct=55.0, saturated=False),
+        )
+        golden = os.path.join(os.path.dirname(__file__), "golden", "capacity-report.json")
+        with open(golden, encoding="utf-8") as handle:
+            self.assertEqual(report, json.load(handle))
+
+    def test_report_carries_its_schema_version(self):
+        report = R.capacity_report(host_budget=None, charged=charged(), pressure=R.Pressure())
+        self.assertEqual(report["schema_version"], R.REPORT_SCHEMA_VERSION)
+        self.assertIsNone(report["host_budget"])
+        self.assertEqual(
+            report["pressure"],
+            {
+                "load_per_cpu": None,
+                "mem_available_pct": None,
+                "saturated": False,
+                "cpu_some_avg10": None,
+                "memory_some_avg10": None,
+            },
+        )
+
+    def test_by_project_is_sorted(self):
+        report = R.capacity_report(
+            host_budget=None,
+            charged=charged((0, 0, 0), {"b": (1, 1, 1), "a": (2, 2, 2)}),
+            pressure={"load_per_cpu": None, "mem_available_pct": None, "saturated": False},
+        )
+        self.assertEqual(list(report["by_project"]), ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -345,6 +345,41 @@ def project_slice(project):
     return f"corral-{project}.slice"
 
 
+#: Root of the kernel's cgroup filesystem.
+CGROUP_ROOT = "/sys/fs/cgroup"
+
+
+def _check_uid(uid):
+    if isinstance(uid, bool) or not isinstance(uid, int) or uid < 0:
+        raise UnitsError(f"uid {uid!r} must be an integer of zero or more")
+    return uid
+
+
+def user_service_dir(uid=None):
+    """The assumed cgroup dir of the login user's manager.
+
+    The user manager's layout is assumed, not probed: a wrong guess
+    only blanks the measured columns, since missing paths read as
+    unknown. The caller owns `uid`; None reads as this process's own.
+    """
+    if uid is None:
+        uid = os.getuid()
+    _check_uid(uid)
+    return os.path.join(CGROUP_ROOT, "user.slice", f"user-{uid}.slice", f"user@{uid}.service")
+
+
+def project_cgroup(project, uid=None):
+    """The assumed cgroup dir of one project's slice, under the host slice."""
+    return os.path.join(user_service_dir(uid), HOST_SLICE, project_slice(project))
+
+
+def agent_cgroup(project, unit, uid=None):
+    """The assumed cgroup leaf of one agent unit, under its project slice."""
+    if not isinstance(unit, str) or not _WELL_FORMED.fullmatch(unit):
+        raise UnitsError(f"unit name {unit!r} is not a well-formed agent unit name")
+    return os.path.join(project_cgroup(project, uid), f"{unit}.service")
+
+
 def controllers_path(uid=None):
     """The user slice's `cgroup.controllers` file: what the manager may enforce with."""
     if uid is None:

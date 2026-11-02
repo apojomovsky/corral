@@ -59,7 +59,7 @@ class ServeError(Exception):
 API_VERSION = 1
 
 #: Snapshot sections whose `{"error"}` body marks the server degraded.
-ERROR_SECTIONS = ("agents", "quota", "capacity", "disk", "drive")
+ERROR_SECTIONS = ("agents", "quota", "capacity", "resources", "disk", "drive")
 
 #: The generic 500 body: the detail goes to stderr, never the wire.
 UNAVAILABLE = "snapshot unavailable"

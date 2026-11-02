@@ -23,7 +23,18 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
 from corral import cli, paths, serve, settings, snapshot
-from tests.test_snapshot import HOST, T0, config, entry, quota_view, usage, view
+from tests.test_snapshot import (
+    HOST,
+    T0,
+    config,
+    doc_limits,
+    doc_pressure,
+    entry,
+    quota_view,
+    resolved_settings,
+    usage,
+    view,
+)
 
 DRIVE = {
     "last_pass_at": T0,
@@ -43,8 +54,19 @@ DRIVE = {
 
 def healthy_doc():
     """A fully readable snapshot document from canned views."""
+    rows = view((entry("a1"), "live"))
+    resources_view = snapshot.resources_section(
+        rows, HOST, doc_limits(), doc_pressure(), [], lambda *args: None
+    )
     return snapshot.build(
-        T0, HOST, view((entry("a1"), "live")), quota_view(), config(), usage, DRIVE
+        T0,
+        HOST,
+        rows,
+        quota_view(),
+        config(),
+        usage,
+        DRIVE,
+        resources_view=resources_view,
     )
 
 
@@ -351,16 +373,12 @@ class ImportClosure(unittest.TestCase):
 
 class CollectDivergence(unittest.TestCase):
     def test_collect_and_helper_cannot_diverge(self):
+        from corral import resources as R
         from corral import snapshot as snap
 
         registry_view = view((entry("a1"), "live"))
         quota = quota_view()
-        resolved = {
-            "admission.total_cap": 4,
-            "admission.repo_cap": 1,
-            "quota.low_pct": 90,
-            "drive.max_starts_per_day": 4,
-        }
+        resolved = resolved_settings(**{"quota.low_pct": 90, "drive.max_starts_per_day": 4})
         with (
             mock.patch("corral.snapshot._settings_root", return_value=None),
             mock.patch("corral.settings.load", return_value=resolved),
@@ -370,6 +388,11 @@ class CollectDivergence(unittest.TestCase):
             mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
             mock.patch("corral.quotacli.snapshot", return_value=quota),
             mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(load_per_cpu=0.25), []),
+            ),
+            mock.patch("corral.snapshot.default_measured", return_value=None),
             mock.patch("shutil.disk_usage", return_value=(1000, 400, 600)),
             mock.patch("time.time", return_value=T0),
             mock.patch("socket.gethostname", return_value=HOST),
@@ -855,14 +878,11 @@ class ServeCommandTest(unittest.TestCase):
 
 class CollectWiring(unittest.TestCase):
     def test_collect_uses_snapshot_build_with_local_readers(self):
+        from corral import resources as R
+
         registry_view = view((entry("a1"), "live"))
         quota = quota_view()
-        resolved = {
-            "admission.total_cap": 4,
-            "admission.repo_cap": 1,
-            "quota.low_pct": 90,
-            "drive.max_starts_per_day": 4,
-        }
+        resolved = resolved_settings(**{"quota.low_pct": 90, "drive.max_starts_per_day": 4})
         with (
             mock.patch("corral.snapshot._settings_root", return_value=None),
             mock.patch("corral.settings.load", return_value=resolved),
@@ -872,6 +892,10 @@ class CollectWiring(unittest.TestCase):
             mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
             mock.patch("corral.quotacli.snapshot", return_value=quota),
             mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch(
+                "corral.resources.read_pressure",
+                return_value=(R.Pressure(load_per_cpu=0.25), []),
+            ),
             mock.patch("corral.snapshot.build", return_value={"ok": True}) as build,
         ):
             self.assertEqual(serve.collect(), {"ok": True})
@@ -889,6 +913,10 @@ class CollectWiring(unittest.TestCase):
         self.assertEqual(kwargs["drive_view"], DRIVE)
         self.assertIsInstance(kwargs["now"], float)
         self.assertIsInstance(kwargs["host"], str)
+        self.assertEqual(kwargs["resources_view"]["pressure"]["load_per_cpu"], 0.25)
+        self.assertEqual(
+            kwargs["resources_view"]["charged"], {"cpu_m": 0, "memory_mb": 0, "pids": 0}
+        )
 
 
 if __name__ == "__main__":
