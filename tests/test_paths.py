@@ -244,6 +244,69 @@ class LeafTicket(unittest.TestCase):
         self.assertIsNone(paths.leaf_ticket(os.path.join(root, "nonsense")))
 
 
+class HostLedgerPath(unittest.TestCase):
+    def test_default_follows_xdg_state(self):
+        self.assertEqual(
+            paths.host_ledger_path({}),
+            os.path.join(HOME, ".local/state/corral/host-resources.json"),
+        )
+
+    def test_xdg_state_home_moves_it(self):
+        self.assertEqual(
+            paths.host_ledger_path({"XDG_STATE_HOME": "/x/state"}),
+            "/x/state/corral/host-resources.json",
+        )
+
+    def test_a_relative_xdg_value_is_ignored(self):
+        self.assertEqual(
+            paths.host_ledger_path({"XDG_STATE_HOME": "relative/state"}),
+            os.path.join(HOME, ".local/state/corral/host-resources.json"),
+        )
+
+    def test_corral_state_never_moves_the_shared_ledger(self):
+        for env in (
+            {"CORRAL_STATE": "/o/state"},
+            {"XDG_STATE_HOME": "/x/state", "CORRAL_STATE": "/o/state"},
+            {"XDG_STATE_HOME": "relative/state", "CORRAL_STATE": "/o/state"},
+        ):
+            with self.subTest(env=env):
+                self.assertNotIn("/o/state", paths.host_ledger_path(env))
+
+    def test_the_ledger_dir_agrees_with_the_unoverridden_state_dir(self):
+        for env in (
+            {},
+            {"XDG_STATE_HOME": "/x/state"},
+            {"XDG_STATE_HOME": "relative/state"},
+            {"CORRAL_STATE": "/o/state"},
+            {"XDG_STATE_HOME": "/x/state", "CORRAL_STATE": "/o/state"},
+        ):
+            with self.subTest(env=env):
+                base_env = {k: v for k, v in env.items() if k != "CORRAL_STATE"}
+                self.assertEqual(
+                    os.path.dirname(paths.host_ledger_path(env)),
+                    paths.state_dir(base_env),
+                )
+
+    def test_host_ledger_filename_has_one_resolver(self):
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "corral"
+        )
+        hits = []
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".py"):
+                continue
+            with open(os.path.join(root, name), encoding="utf-8") as handle:
+                if "host-resources.json" in handle.read():
+                    hits.append(name)
+        self.assertEqual(hits, ["paths.py"])
+
+    def test_results_are_normalized(self):
+        self.assertEqual(
+            paths.host_ledger_path({"XDG_STATE_HOME": "/x/./state/"}),
+            "/x/state/corral/host-resources.json",
+        )
+
+
 class AtomicWrite(unittest.TestCase):
     def test_replace_is_all_or_nothing_with_no_litter(self):
         tmp = tempfile.TemporaryDirectory()
