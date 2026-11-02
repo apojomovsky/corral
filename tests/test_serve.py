@@ -10,6 +10,7 @@ import argparse
 import ast
 import copy
 import http.client
+import inspect
 import io
 import json
 import os
@@ -1155,7 +1156,7 @@ class FilteredViews(ServeCase):
 
     def test_filtered_views_do_not_rebuild_per_section(self):
         builder = FakeBuilder(healthy_doc())
-        server, _ = self.start_server(builder)
+        server, _ = self.start_server(builder, snapshot_ttl_s=0)
         self.fetch(server, "GET", "/v1/agents")
         self.fetch(server, "GET", "/v1/quota")
         self.assertEqual(builder.calls, 2)
@@ -1267,6 +1268,298 @@ class ProductionTailWiring(unittest.TestCase):
             tail.side_effect = fake
             self.assertEqual(serve.read_tail("app", 7, 3), "line one\n")
         target.assert_called_once()
+
+
+class SnapshotCache(ServeCase):
+    """S5: the snapshot TTL cache, the generation ETag, and 304s.
+
+    Offline: a live loopback server with a counting builder fake and a
+    controllable clock. No `gh`, no network beyond loopback.
+    """
+
+    def start_cached(self, builder, ttl=10, **kwargs):
+        return self.start_server(builder, snapshot_ttl_s=ttl, **kwargs)
+
+    def get(self, server, target, etag=None):
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            headers = {} if etag is None else {"If-None-Match": etag}
+            conn.request("GET", target, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, dict(resp.getheaders()), resp.read()
+        finally:
+            conn.close()
+
+    def test_repeated_polls_within_ttl_share_one_build(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        for _ in range(3):
+            status, _, body = self.get(server, "/v1/snapshot")
+            self.assertEqual(status, 200)
+            self.assertEqual(json.loads(body), healthy_doc())
+        self.assertEqual(builder.calls, 1)
+
+    def test_poll_past_ttl_rebuilds_with_a_new_etag(self):
+        builder = FakeBuilder(healthy_doc())
+        server, now = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/snapshot")
+        first = headers.get("ETag")
+        self.assertTrue(first)
+        now[0] = T0 + 11
+        status, headers, _ = self.get(server, "/v1/snapshot")
+        self.assertEqual(status, 200)
+        self.assertEqual(builder.calls, 2)
+        self.assertIsNotNone(headers.get("ETag"))
+        self.assertNotEqual(headers.get("ETag"), first)
+
+    def test_zero_ttl_rebuilds_every_time(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder, ttl=0)
+        self.get(server, "/v1/snapshot")
+        self.get(server, "/v1/snapshot")
+        self.assertEqual(builder.calls, 2)
+
+    def test_views_share_the_cached_build(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        self.get(server, "/v1/snapshot")
+        self.get(server, "/v1/agents")
+        self.get(server, "/v1/quota")
+        self.assertEqual(builder.calls, 1)
+
+    def test_failed_build_never_populates_the_cache(self):
+        calls = []
+
+        def flaky():
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError("gone")
+            return healthy_doc()
+
+        server, _ = self.start_cached(flaky)
+        status, _, _ = self.get(server, "/v1/snapshot")
+        self.assertEqual(status, 500)
+        status, _, body = self.get(server, "/v1/snapshot")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), healthy_doc())
+        self.assertEqual(len(calls), 2)
+
+    def test_snapshot_carries_etag_and_last_modified(self):
+        server, _ = self.start_cached(FakeBuilder(healthy_doc()))
+        status, headers, _ = self.get(server, "/v1/snapshot")
+        self.assertEqual(status, 200)
+        self.assertTrue(headers.get("ETag", "").startswith('"'))
+        self.assertIn("Last-Modified", headers)
+
+    def test_matching_etag_is_a_304_counted_in_health(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/snapshot")
+        etag = headers.get("ETag")
+        status, again, body = self.get(server, "/v1/snapshot", etag=etag)
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertEqual(builder.calls, 1)
+        _, _, health = self.get(server, "/v1/health")
+        payload = json.loads(health)
+        self.assertEqual(payload["requests_total"], 3)
+        self.assertEqual(payload["requests_304"], 1)
+
+    def test_stale_etag_after_rebuild_is_200_with_a_new_etag(self):
+        builder = FakeBuilder(healthy_doc())
+        server, now = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/snapshot")
+        old = headers.get("ETag")
+        now[0] = T0 + 11
+        status, headers, _ = self.get(server, "/v1/snapshot", etag=old)
+        self.assertEqual(status, 200)
+        self.assertNotEqual(headers.get("ETag"), old)
+
+    def test_wrong_etag_is_200(self):
+        server, _ = self.start_cached(FakeBuilder(healthy_doc()))
+        status, _, body = self.get(server, "/v1/snapshot", etag='"no-such-generation"')
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), healthy_doc())
+
+    def test_wildcard_etag_matches(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        status, _, body = self.get(server, "/v1/snapshot", etag="*")
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(builder.calls, 1)
+
+    def test_etag_is_shared_across_snapshot_views(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/snapshot")
+        etag = headers.get("ETag")
+        for target in ("/v1/agents", "/v1/quota", "/v1/capacity", "/v1/disks"):
+            with self.subTest(target=target):
+                status, _, body = self.get(server, target, etag=etag)
+                self.assertEqual(status, 304, target)
+                self.assertEqual(body, b"")
+        self.assertEqual(builder.calls, 1)
+
+    def test_health_reports_both_counters(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/snapshot")
+        self.get(server, "/v1/snapshot", etag=headers.get("ETag"))
+        _, _, body = self.get(server, "/v1/health")
+        payload = json.loads(body)
+        self.assertEqual(payload["requests_total"], 3)
+        self.assertEqual(payload["requests_304"], 1)
+        self.assertTrue(payload["ok"])
+
+    def test_health_matching_etag_is_a_304_counted(self):
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder)
+        _, headers, _ = self.get(server, "/v1/health")
+        etag = headers.get("ETag")
+        self.assertTrue(etag)
+        status, again, body = self.get(server, "/v1/health", etag=etag)
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertEqual(builder.calls, 1)
+        _, _, fresh = self.get(server, "/v1/health")
+        payload = json.loads(fresh)
+        self.assertEqual(payload["requests_total"], 3)
+        self.assertEqual(payload["requests_304"], 1)
+
+    def get_with_origin(self, server, target, etag=None, origin=None):
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            headers = {}
+            if etag is not None:
+                headers["If-None-Match"] = etag
+            if origin is not None:
+                headers["Origin"] = origin
+            conn.request("GET", target, headers=headers)
+            resp = conn.getresponse()
+            return resp.status, dict(resp.getheaders()), resp.read()
+        finally:
+            conn.close()
+
+    def test_304_echoes_matching_origin(self):
+        origin = "https://dash.example.com"
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder, allowed_origins=(origin,))
+        _, headers, _ = self.get_with_origin(server, "/v1/snapshot", origin=origin)
+        etag = headers.get("ETag")
+        self.assertTrue(etag)
+        self.assertEqual(headers.get("Access-Control-Allow-Origin"), origin)
+        status, again, body = self.get_with_origin(server, "/v1/snapshot", etag=etag, origin=origin)
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertEqual(again.get("Access-Control-Allow-Origin"), origin)
+
+    def test_304_without_matching_origin_has_no_echo(self):
+        origin = "https://dash.example.com"
+        builder = FakeBuilder(healthy_doc())
+        server, _ = self.start_cached(builder, allowed_origins=(origin,))
+        _, headers, _ = self.get_with_origin(server, "/v1/snapshot")
+        etag = headers.get("ETag")
+        status, again, body = self.get_with_origin(
+            server, "/v1/snapshot", etag=etag, origin="https://other.example.com"
+        )
+        self.assertEqual(status, 304)
+        self.assertEqual(body, b"")
+        self.assertEqual(again.get("ETag"), etag)
+        self.assertNotIn("Access-Control-Allow-Origin", again)
+
+    def test_preflight_emits_origin_exactly_once(self):
+        origin = "https://dash.example.com"
+        server, _ = self.start_cached(FakeBuilder(healthy_doc()), allowed_origins=(origin,))
+        port = server.server_address[1]
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        try:
+            conn.request(
+                "OPTIONS",
+                "/v1/snapshot",
+                headers={
+                    "Origin": origin,
+                    "Access-Control-Request-Method": "GET",
+                },
+            )
+            resp = conn.getresponse()
+            raw = resp.getheaders()
+            body = resp.read()
+            status = resp.status
+        finally:
+            conn.close()
+        self.assertEqual(status, 204)
+        self.assertEqual(body, b"")
+        echoed = [v for k, v in raw if k.lower() == "access-control-allow-origin"]
+        self.assertEqual(echoed, [origin])
+
+
+class SnapshotTtlWiring(ServeCommandTest):
+    def test_snapshot_ttl_defaults_to_two_seconds(self):
+        class FakeServer:
+            server_address = ("127.0.0.1", 4321)
+
+            def serve_forever(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        with tempfile.TemporaryDirectory(prefix="corral-serve-ttl-") as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                clear=False,
+            ):
+                with mock.patch.object(serve, "make_server", return_value=FakeServer()) as made:
+                    args = self.parse()
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(args.func(args), 0)
+        self.assertEqual(made.call_args.kwargs["snapshot_ttl_s"], 2)
+
+    def test_snapshot_ttl_default_is_one_fact(self):
+        self.assertEqual(
+            settings.REGISTRY["serve.snapshot_ttl_s"].default,
+            serve.SNAPSHOT_TTL_S_DEFAULT,
+        )
+        state_default = (
+            inspect.signature(serve._State.__init__).parameters["snapshot_ttl_s"].default
+        )
+        make_default = inspect.signature(serve.make_server).parameters["snapshot_ttl_s"].default
+        self.assertEqual(state_default, serve.SNAPSHOT_TTL_S_DEFAULT)
+        self.assertEqual(make_default, serve.SNAPSHOT_TTL_S_DEFAULT)
+
+    def test_snapshot_ttl_setting_reaches_make_server(self):
+        class FakeServer:
+            server_address = ("127.0.0.1", 4321)
+
+            def serve_forever(self):
+                pass
+
+            def server_close(self):
+                pass
+
+        config = "[serve]\nsnapshot_ttl_s = 9\n"
+        with tempfile.TemporaryDirectory(prefix="corral-serve-ttl-") as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                clear=False,
+            ):
+                with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as handle:
+                    handle.write(config)
+                with mock.patch.object(serve, "make_server", return_value=FakeServer()) as made:
+                    args = self.parse()
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(args.func(args), 0)
+        self.assertEqual(made.call_args.kwargs["snapshot_ttl_s"], 9)
 
 
 if __name__ == "__main__":
