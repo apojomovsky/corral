@@ -109,6 +109,7 @@ class FakeSystem:
             host_ledger_fn=self.host_ledger_fn,
             labels_fn=lambda kind, repo, number: [],
             usage=roomy,
+            controllers_read=lambda path: "cpu memory pids",
         )
 
 
@@ -324,6 +325,7 @@ class BudgetWiringTest(OpsCase):
         kwargs.setdefault("list_fn", self.system.list_fn)
         kwargs.setdefault("usage", roomy)
         kwargs.setdefault("host_ledger_fn", self.system.host_ledger_fn)
+        kwargs.setdefault("controllers_read", lambda path: "cpu memory pids")
         return launch.admit(self.target(), number, **kwargs)
 
     def test_no_host_budget_passes_and_creates_no_slices(self):
@@ -414,6 +416,7 @@ class BudgetWiringTest(OpsCase):
                 pool_fn=lambda: pool,
                 ledger_fn=lambda: quota_ledger,
                 now_fn=lambda: NOW,
+                controllers_read=lambda path: "cpu memory pids",
             )
         self.assertEqual(self.system.started, [])
 
@@ -444,6 +447,7 @@ class BudgetWiringTest(OpsCase):
                 pool_fn=lambda: pool,
                 ledger_fn=lambda: quota_ledger,
                 now_fn=lambda: NOW,
+                controllers_read=lambda path: "cpu memory pids",
             )
         self.assertEqual(caught.exception.exit_code, 75)
         self.assertEqual(self.system.started, [])
@@ -621,6 +625,14 @@ class BudgetWiringTest(OpsCase):
             )
         self.assertEqual(caught.exception.exit_code, 4)
         self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.session("lib", 5)))
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_missing_required_controller_is_exit_4_in_admit(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaisesRegex(units.UnitsError, "memory") as caught:
+            self.admit(controllers_read=lambda path: "cpu pids")
+        self.assertEqual(caught.exception.exit_code, 4)
 
     def test_a_resume_refuses_a_full_budget(self):
         self.host_config(
@@ -657,6 +669,7 @@ class BudgetWiringTest(OpsCase):
                 run=self.system.run,
                 usage=roomy,
                 host_ledger_fn=self.system.host_ledger_fn,
+                controllers_read=lambda path: "cpu memory pids",
             )
         self.assertEqual(caught.exception.exit_code, 75)
         self.assertEqual(len(self.system.started), started)
@@ -723,6 +736,7 @@ class PressureWiringTest(OpsCase):
         kwargs.setdefault("list_fn", self.system.list_fn)
         kwargs.setdefault("usage", roomy)
         kwargs.setdefault("host_ledger_fn", self.system.host_ledger_fn)
+        kwargs.setdefault("controllers_read", lambda path: "cpu memory pids")
         return launch.admit(self.target(), number, **kwargs)
 
     def test_a_saturated_host_refuses_with_75_while_shares_are_free(self):
@@ -1123,6 +1137,45 @@ class MuseSessionTest(OpsCase):
                 run=self.system.run,
             )
 
+    def test_a_failed_profile_record_drops_the_fresh_session_id(self):
+        with open(os.path.join(self.root, settings.PROJECT_FILE), "a", encoding="utf-8") as h:
+            h.write('[profiles.fast]\nruntime = "muse"\n')
+        with mock.patch.object(
+            profiles, "record_profile", side_effect=profiles.ProfileError("nope")
+        ):
+            with self.assertRaisesRegex(launch.LaunchError, "profile record"):
+                launch.launch(
+                    self.target("lib", "muse"),
+                    5,
+                    "do the thing",
+                    title="feat: add the thing",
+                    profile="fast",
+                    list_fn=self.system.list_fn,
+                    run=self.system.run,
+                    usage=roomy,
+                    host_ledger_fn=self.system.host_ledger_fn,
+                    pool_fn=lambda: [],
+                    ledger_fn=lambda: {"readings": {}, "marks": {}},
+                    store=FakeStore(),
+                    tracker=None,
+                )
+        session = self.leaf("lib", 5)
+        self.assertFalse(os.path.exists(os.path.join(session, "muse_session_id")))
+        self.assertTrue(os.path.exists(os.path.join(session, "prompt.md")))
+        self.assertTrue(os.path.exists(os.path.join(session, "muse.json")))
+        self.assertEqual(self.system.started, [])
+        with self.assertRaisesRegex(launch.LaunchError, "no muse session to resume"):
+            launch.resume(
+                self.target("lib"),
+                5,
+                "keep going",
+                hold_reason_fn=_free_hold,
+                list_fn=self.system.list_fn,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+                run=self.system.run,
+            )
+
     def test_tail_without_an_out_log_is_refused(self):
         launch.launch(
             self.target("lib", "muse"),
@@ -1349,6 +1402,64 @@ class ReviewerWiringTest(OpsCase):
         self.assertTrue(fake.calls[-1]["reviewer"])
         (found,) = [e for e in registry.load_all() if e["id"] == resumed]
         self.assertEqual(found["role"], "reviewer")
+
+    def test_resume_uses_the_model_reread_under_the_spawn_lock(self):
+        class ResumableAdapter(FakeAdapter):
+            def resume_handle(self, session_dir):
+                return "handle-1"
+
+        fake = ResumableAdapter()
+        reads = []
+
+        def flipping(session_dir):
+            reads.append(session_dir)
+            if len(reads) == 1:
+                return profiles.RecordedProfile(
+                    name="fast",
+                    runtime="omp",
+                    model="provider-a/gen-n",
+                    layer=1,
+                    layer_name="flag",
+                    source="--profile fast",
+                )
+            return profiles.RecordedProfile(
+                name="fast",
+                runtime="omp",
+                model="provider-a/gen-n-plus-1",
+                layer=1,
+                layer_name="flag",
+                source="--profile fast",
+            )
+
+        with mock.patch.object(runtimes, "get", return_value=fake):
+            unit, _ = launch.launch(
+                self.target("lib", "omp"),
+                5,
+                "do the thing",
+                title="feat: add the thing",
+                role="worker",
+                list_fn=self.system.list_fn,
+                run=self.system.run,
+                usage=roomy,
+                host_ledger_fn=self.system.host_ledger_fn,
+            )
+            self.system.finish(unit)
+            with mock.patch.object(profiles, "recorded_profile", side_effect=flipping):
+                resumed, _ = launch.resume(
+                    self.target("lib"),
+                    5,
+                    "keep going",
+                    hold_reason_fn=_free_hold,
+                    list_fn=self.system.list_fn,
+                    usage=roomy,
+                    host_ledger_fn=self.system.host_ledger_fn,
+                    run=self.system.run,
+                )
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(fake.calls[-1]["model"], "provider-a/gen-n-plus-1")
+        self.assertEqual(fake.calls[-1]["resume"], "handle-1")
+        (found,) = [e for e in registry.load_all() if e["id"] == resumed]
+        self.assertEqual(found["model"], "provider-a/gen-n-plus-1")
 
 
 class EnvRefusalTest(OpsCase):

@@ -175,6 +175,24 @@ class ExitCodeTest(SyncRootCase):
         self.assertEqual(self.run_sync(fake), 0)
         self.assertIn(f"{REPO}#1", self.err.getvalue())
 
+    def test_tracker_outage_plus_corrupt_row_exits_4_with_both_lines(self):
+        # Exit precedence: with nothing synced, the store check runs
+        # first, so a pass holding both a tracker failure and a corrupt
+        # row exits 4 rather than 3. Both lines still print to stderr.
+        self.seed(1)
+        self.corrupt(1)
+        fake = FakeTracker(
+            [
+                reading(number=1, author="acme", updated_at=T0),
+                reading(number=2, author="acme", updated_at=T0),
+            ]
+        )
+        fake.items_break_after = 1
+        self.assertEqual(self.run_sync(fake, resync=True), 4)
+        err = self.err.getvalue()
+        self.assertIn(f"{REPO}#1", err)
+        self.assertIn("page error", err)
+
     def test_unknown_repo_exits_4(self):
         self.assertEqual(self.run_sync(FakeTracker(), names=["nope"]), 4)
 

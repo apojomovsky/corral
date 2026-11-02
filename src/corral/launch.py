@@ -343,7 +343,18 @@ def _require_role_price(tgt, role, where):
         )
 
 
-def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None, pressure_fn=None):
+def admit(
+    tgt,
+    number,
+    *,
+    list_fn,
+    usage,
+    host_ledger_fn,
+    role=None,
+    now_fn=None,
+    pressure_fn=None,
+    controllers_read=None,
+):
     """Refuse a ticket that is already live, a pressured host, or a host with no free slot.
 
     Gates run in this order and the first refusal wins: disk pressure,
@@ -363,7 +374,11 @@ def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None
     the CLI passes the production reader. With no host budget the gate
     passes everything and the pressure seam is never called. `role` is
     the prompt role being launched, None reading as worker: the budget
-    prices its charge. Returns the decided `Budget`.
+    prices its charge. `controllers_read(path)` reads the delegated
+    controllers, None reading the real file: with a host budget a
+    missing required controller refuses here (exit 4), before the
+    launch makes any worktree or session. With no host budget the
+    delegation is never read. Returns the decided `Budget`.
     """
     registered = projects.load_all()
     cfg = registry.config(tgt.resolved)
@@ -388,6 +403,7 @@ def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None
         limits = resources.join(base, shares, ledger.get("foreign", []), where=where)
         now = (now_fn or time.time)()
         _require_role_price(tgt, role, where)
+        units.delegated_controllers(read=controllers_read)
     refusal = disk.refusal_text(tgt.resolved, usage=usage)
     if refusal is not None:
         raise CapFull(refusal)
@@ -813,6 +829,7 @@ def launch(
             role=role,
             now_fn=now_fn,
             pressure_fn=pressure_fn,
+            controllers_read=controllers_read,
         )
         if selection is None:
             chains = _model_chains(
@@ -846,6 +863,7 @@ def launch(
             role=role,
             now_fn=now_fn,
             pressure_fn=pressure_fn,
+            controllers_read=controllers_read,
         )
         prompt = prompts.with_heartbeat(prompt)
         leaves = _leaves(tgt, number)
@@ -864,6 +882,7 @@ def launch(
                     session, selection.profile, selection.provenance, model=selection.model
                 )
             except (profiles.ProfileError, OSError) as err:
+                _drop_session_id(session)
                 raise LaunchError(f"cannot write the agent's profile record: {err}") from None
         try:
             unit = units.unit_name(tgt.prefix, tgt.repo, number, _next_unit_gen(leaves))
@@ -1043,6 +1062,7 @@ def resume(
         raise HeldError(reason)
     _check_text(message, "message")
     model = _check_model(model)
+    model_given = model is not None
     role = _check_role(role) or prompts.DEFAULT_ROLE
     session = _newest(tgt, number, role)
     if session is None:
@@ -1068,7 +1088,7 @@ def resume(
         profile_name = recorded.name if recorded is not None else None
         if recorded is not None:
             adapter = _adapter(recorded.runtime)
-            if model is None:
+            if not model_given:
                 model = recorded.model
         else:
             adapter = _adapter(runtimes.recorded(session))
@@ -1096,6 +1116,7 @@ def resume(
             role=role,
             now_fn=now_fn,
             pressure_fn=pressure_fn,
+            controllers_read=controllers_read,
         )
         workdir, _branch = worktrees.ensure_worktree(
             tgt.clone,
@@ -1116,6 +1137,7 @@ def resume(
             role=role,
             now_fn=now_fn,
             pressure_fn=pressure_fn,
+            controllers_read=controllers_read,
         )
         # A concurrent launch of this ticket may have added a newer
         # generation between the pre-lock read and this lock: resolve
@@ -1137,7 +1159,7 @@ def resume(
             profile_name = reread.name if reread is not None else None
             if reread is not None:
                 adapter = _adapter(reread.runtime)
-                if model is None:
+                if not model_given:
                     model = reread.model
             else:
                 adapter = _adapter(runtimes.recorded(session))
