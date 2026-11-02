@@ -54,6 +54,19 @@ def show(memory_bytes="17179869184", quota_usec="8000000", tasks="512"):
     return f"MemoryMax={memory_bytes}\nCPUQuotaPerSecUSec={quota_usec}\nTasksMax={tasks}\n"
 
 
+def never_created_show():
+    """The dump `systemctl --user show` prints for a slice never created."""
+    return (
+        "MemoryMax=infinity\n"
+        "CPUQuotaPerSecUSec=infinity\n"
+        "TasksMax=infinity\n"
+        "LoadState=loaded\n"
+        "ActiveState=inactive\n"
+        "SubState=dead\n"
+        "FragmentPath=\n"
+    )
+
+
 def props(*args):
     return resourcedoctor.parse_show(show(*args))
 
@@ -299,6 +312,21 @@ class ForeignClaims(unittest.TestCase):
         row = rows["resources-foreign"]
         self.assertEqual(row.status, "fail")
         self.assertIn(error, row.detail)
+        self.assertIn("/state/corral/host-resources.json", row.fix)
+
+    def test_unreadable_ledger_reads_as_unknown_not_zero(self):
+        rows = by_name(
+            resourcedoctor.check(
+                readings(
+                    ledger=None,
+                    ledger_error=("host ledger /state/corral/host-resources.json is corrupt: boom"),
+                    foreign=[],
+                )
+            )
+        )
+        row = rows["resources-foreign"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("unknown (ledger unreadable)", row.detail)
         self.assertIn("/state/corral/host-resources.json", row.fix)
 
 
@@ -555,16 +583,26 @@ class LoadSliceActual(unittest.TestCase):
             },
         )
 
-    def test_missing_slice_is_absent_not_a_failure(self):
+    def test_never_created_slice_is_absent_not_drift(self):
         def run(argv):
             if argv[-1] == "corral-web.slice":
-                return SimpleNamespace(returncode=1, stdout="", stderr="gone")
+                return SimpleNamespace(returncode=0, stdout=never_created_show(), stderr="")
             return SimpleNamespace(returncode=0, stdout=show(), stderr="")
 
         actual = resourcedoctor.load_slice_actual(("corral.slice", "corral-web.slice"), run=run)
         self.assertIsNotNone(actual)
         assert actual is not None
         self.assertEqual(list(actual), ["corral.slice"])
+
+    def test_never_created_slices_read_as_no_slices_yet(self):
+        def run(argv):
+            return SimpleNamespace(returncode=0, stdout=never_created_show(), stderr="")
+
+        actual = resourcedoctor.load_slice_actual(("corral.slice", "corral-web.slice"), run=run)
+        self.assertEqual(actual, {})
+        rows = by_name(resourcedoctor.check(readings(slices=actual)))
+        self.assertEqual(rows["resources-slices"].status, "ok")
+        self.assertIn("no resource slices", rows["resources-slices"].detail.lower())
 
     def test_every_dump_failing_reads_as_no_reading(self):
         def run(argv):

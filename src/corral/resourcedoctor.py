@@ -40,8 +40,9 @@ class ResourceReadings(NamedTuple):
     everything. ``limits_error`` carries an unusable budget table;
     ``controllers_error``, ``ledger_error`` and ``marker_error`` carry
     their unreadable or mismatched file. ``slices`` maps existing slice
-    names to their kernel-reported properties, None when the listing
-    itself failed. Tests build this directly; only production reads disk.
+    names to their kernel-reported properties, empty when no queried
+    slice exists yet, None when the listing itself failed. Tests build
+    this directly; only production reads disk.
     """
 
     host: resources.Usage | None
@@ -256,13 +257,24 @@ def _parse_claim(entry: object, index: int) -> tuple[str, float]:
 
 
 def _check_foreign(state: ResourceReadings) -> ResourceRow:
-    """Foreign claims: malformed fails, expired warns, live reads ok."""
+    """Foreign claims: malformed fails, expired warns, live reads ok.
+
+    An unreadable ledger warns unknown: the load was never read, so an
+    empty claim list is unknown, not zero.
+    """
     if state.limits_error is not None and "foreign claim" in state.limits_error:
         return ResourceRow(
             "resources-foreign",
             "fail",
             state.limits_error,
             f"fix the foreign claims in {state.ledger_path}, then run `corral doctor` again",
+        )
+    if state.ledger_error is not None:
+        return ResourceRow(
+            "resources-foreign",
+            "warn",
+            "foreign claims unknown (ledger unreadable): the load is unknown, not zero",
+            f"repair the host ledger at {state.ledger_path}, then run `corral doctor` again",
         )
     live: list[str] = []
     expired: list[str] = []
@@ -377,7 +389,8 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
 
     Launches create missing slices but never reconcile existing ones, so a
     difference warns with the operator refresh step. A missing slice is no
-    drift: the next launch creates it.
+    drift: the next launch creates it. A slice the manager never created
+    (exit 0 with every limit unset, no fragment, inactive) reads as missing.
     """
     if state.host is None or state.limits_error is not None:
         return None
@@ -468,17 +481,34 @@ def load_live_roles(
     return tuple(sorted(roles))
 
 
+def _never_created(props: Mapping[str, str]) -> bool:
+    """Whether a slice dump is a unit the manager never created.
+
+    A never-created slice still answers exit 0, with every limit unset,
+    no fragment backing it and an inactive state. It is absent, not a
+    failure: the next launch creates it.
+    """
+    if props.get("FragmentPath") != "":
+        return False
+    if props.get("ActiveState", "") != "inactive":
+        return False
+    return all(_actual_number(props.get(prop), divisor) is None for _, prop, divisor, _ in _READERS)
+
+
 def load_slice_actual(
     names: Sequence[str], *, run: Callable[[Sequence[str]], object]
 ) -> dict | None:
     """Kernel-reported properties per existing slice; None when unreadable.
 
     One manager dump per slice through the injected `run` seam. A slice
-    the manager does not know is absent, not a failure: the next launch
-    creates it. None when the listing itself failed: the seam raised, or
-    no dump succeeded. Pure over `run`.
+    the manager never created answers exit 0 with every limit unset, no
+    fragment and an inactive state: absent, not a failure, and the next
+    launch creates it. Empty when no queried slice exists yet; None when
+    the listing itself failed: the seam raised, or no dump succeeded.
+    Pure over `run`.
     """
     actual = {}
+    listed = False
     for name in names:
         try:
             proc = run(["systemctl", "--user", "show", name])
@@ -486,8 +516,14 @@ def load_slice_actual(
             return None
         if getattr(proc, "returncode", 1) != 0:
             continue
-        actual[name] = parse_show(getattr(proc, "stdout", "") or "")
-    return actual or None
+        listed = True
+        props = parse_show(getattr(proc, "stdout", "") or "")
+        if _never_created(props):
+            continue
+        actual[name] = props
+    if not listed:
+        return None
+    return actual
 
 
 def _read_text(path: str) -> str:
