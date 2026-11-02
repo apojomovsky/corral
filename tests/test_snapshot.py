@@ -27,6 +27,7 @@ def entry(
     number=1,
     runtime="omp",
     role=None,
+    profile=None,
     model="m1",
     note="working",
     age=10,
@@ -36,6 +37,7 @@ def entry(
         "id": agent_id,
         "runtime": runtime,
         "role": role,
+        "profile": profile,
         "ticket": None
         if repo is None
         else {"project": project or "", "repo": repo, "number": number},
@@ -200,7 +202,7 @@ class FullDocument(unittest.TestCase):
         self.assertEqual(
             doc,
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "fleet_header": {
                     "host": HOST,
                     "now": T0,
@@ -216,6 +218,7 @@ class FullDocument(unittest.TestCase):
                         "number": None,
                         "runtime": "omp",
                         "role": None,
+                        "profile": None,
                         "model": "m1",
                         "state": "finished",
                         "started_at": T0 - 100,
@@ -229,6 +232,7 @@ class FullDocument(unittest.TestCase):
                         "number": 1,
                         "runtime": "omp",
                         "role": None,
+                        "profile": None,
                         "model": "m1",
                         "state": "live",
                         "started_at": T0 - 100,
@@ -242,6 +246,7 @@ class FullDocument(unittest.TestCase):
                         "number": 2,
                         "runtime": "omp",
                         "role": None,
+                        "profile": None,
                         "model": "m1",
                         "state": "stale",
                         "started_at": T0 - 100,
@@ -335,6 +340,7 @@ class FullDocument(unittest.TestCase):
                     "number": None,
                     "runtime": "omp",
                     "role": None,
+                    "profile": None,
                     "model": "m1",
                     "state": "live",
                     "started_at": T0 - 100,
@@ -382,6 +388,7 @@ class FullDocument(unittest.TestCase):
                 "number": None,
                 "runtime": None,
                 "role": None,
+                "profile": None,
                 "model": None,
                 "state": "live",
                 "started_at": None,
@@ -399,6 +406,22 @@ class FullDocument(unittest.TestCase):
         )
         roles = {row["id"]: row["role"] for row in doc["agents"]}
         self.assertEqual(roles, {"w1": "worker", "r1": "reviewer"})
+
+    def test_recorded_profile_shows_in_rows(self):
+        doc = doc_of(
+            registry_view=view(
+                (entry("p1", profile="fast"), "live"),
+                (entry("p2"), "live"),
+            )
+        )
+        by_id = {row["id"]: row["profile"] for row in doc["agents"]}
+        self.assertEqual(by_id, {"p1": "fast", "p2": None})
+
+    def test_entry_without_a_profile_key_reads_null(self):
+        naked = entry("p3")
+        del naked["profile"]
+        doc = doc_of(registry_view=view((naked, "live")))
+        self.assertIsNone(doc["agents"][0]["profile"])
 
 
 class SectionErrors(unittest.TestCase):
@@ -974,7 +997,7 @@ class CliExits(unittest.TestCase):
                 "drive",
             ],
         )
-        self.assertEqual(doc["schema_version"], 1)
+        self.assertEqual(doc["schema_version"], 2)
         self.assertEqual(len(doc["agents"]), 1)
         self.assertEqual(doc["drive"], {"last_exit": 0})
         self.assertEqual(doc["resources"]["schema_version"], 1)

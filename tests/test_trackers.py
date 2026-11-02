@@ -226,5 +226,27 @@ class BackedItemTest(unittest.TestCase):
         self.assertEqual(len(run.graphql_variables("BoardWriteText")), 1)
 
 
+class BackedEnsureTest(unittest.TestCase):
+    """A board repo bootstraps labels through the same REST adapter call."""
+
+    def test_ensure_runs_the_rest_label_calls(self):
+        calls = []
+
+        def run(args):
+            calls.append(list(args))
+            if list(args) == ["api", f"repos/{REPO}/labels?per_page=100&page=1"]:
+                return "[]"
+            if list(args[:4]) == ["api", "--method", "POST", f"repos/{REPO}/labels"]:
+                return "{}"
+            raise AssertionError(f"unexpected gh call {args!r}")
+
+        report = backed_tracker(run).ensure_labels(REPO)
+        self.assertEqual(report.created, tuple(label.name for label in iface.BOOTSTRAP_LABELS))
+        self.assertEqual(
+            len([call for call in calls if "--method" in call]),
+            len(iface.BOOTSTRAP_LABELS),
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

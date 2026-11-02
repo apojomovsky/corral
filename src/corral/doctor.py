@@ -4,9 +4,10 @@ One report over the checks that already exist, plus the host checks that do
 not. It changes nothing and installs nothing; a failing check prints the
 command a human would run, in the style of `corral deps`.
 
-Every external call comes through `Env`: `run` reads `loginctl`,
-`list_fn` lists the systemd user units, and the rest arrives as plain data
-assembled by `production_env`. Only the CLI builds that; tests inject fakes.
+Every external call comes through `Env`: `run` reads `loginctl` and the
+slice dumps, `list_fn` lists the systemd user units, and the rest arrives
+as plain data assembled by `production_env`. Only the CLI builds that;
+tests inject fakes.
 """
 
 import argparse
@@ -28,11 +29,15 @@ from corral import (
     boarddoctor,
     deps,
     drive,
+    host_ledger,
     hub,
     paths,
+    profiles,
     projects,
     prompts,
     registry,
+    resourcedoctor,
+    resources,
     settings,
     units,
 )
@@ -80,6 +85,30 @@ class HubAuth(NamedTuple):
     detail: str
 
 
+class ProfileState(NamedTuple):
+    """The profile readings for the report, gathered once by production.
+
+    `parsed` are the validated declarations (empty when none is
+    declared); `error` is why they are unusable (bad shape, unknown
+    provider or runtime, unreadable pool), or None. `sources` maps each
+    name to its winning source path and `shadowed` maps a shadowed name
+    to the committed source the local table hides. `selections` are the
+    local selections (None when the file is unreadable, with the reason
+    in `selections_error`); `committed` are the committed defaults as
+    `{"default", "repos", "roles"}`; `now` is the clock the override
+    expiry is read against. Tests inject values.
+    """
+
+    parsed: Mapping[str, profiles.Profile]
+    error: str | None
+    sources: Mapping[str, str]
+    shadowed: Mapping[str, str]
+    selections: profiles.Selections | None
+    selections_error: str | None
+    committed: Mapping[str, object]
+    now: float = 0.0
+
+
 class Env(NamedTuple):
     """Everything `run_checks` reads. Only the first rows are required arguments."""
 
@@ -104,6 +133,9 @@ class Env(NamedTuple):
     #: The disk pressure (`ok`, `low`, `critical`, `unknown`), or None when
     #: the caller has no reading: then the report carries no disk row.
     disk: str | None = None
+    #: The host-budget readings for the `resources*` rows. None means the
+    #: caller has no reading, and then the report carries no resources row.
+    resource_readings: resourcedoctor.ResourceReadings | None = None
     #: Repos in board mode to check, with the seams that check them:
     #: `board_fetch` resolves one board config to its live schema and
     #: `board_open_store` opens the store parity rows come from. Empty
@@ -131,6 +163,9 @@ class Env(NamedTuple):
     #: The hub version probe. None means the caller has no reading, and
     #: then the report carries no `hub` row.
     hub_probe: HubProbe | None = None
+    #: The profile readings. None means the caller has no reading, and
+    #: then the report carries no profile row.
+    profile_state: ProfileState | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -399,6 +434,16 @@ def _check_disk(pressure: str | None) -> list[Check]:
     ]
 
 
+def _check_resources(env: Env) -> list[Check]:
+    """The host-budget rows: no row without a reading, else one per aspect."""
+    if env.resource_readings is None:
+        return []
+    return [
+        Check(row.name, row.status, row.detail, row.fix)
+        for row in resourcedoctor.check(env.resource_readings)
+    ]
+
+
 def _check_boards(env: Env) -> list[Check]:
     """One row per repo in board mode, mapped from the board slice."""
     if env.board_error is not None:
@@ -489,6 +534,193 @@ def _check_hub(url: str | None, probe: HubProbe | None) -> list[Check]:
     ]
 
 
+def _profile_references(state: ProfileState) -> list[tuple[str, str]]:
+    """Every `(where, name)` a selection or default points at, in stable order."""
+    refs: list[tuple[str, str]] = []
+    selections = state.selections
+    if selections is not None:
+        if selections.default is not None:
+            refs.append(("the local default", selections.default))
+        for repo in sorted(selections.projects):
+            refs.append((f"the local selection for project {repo!r}", selections.projects[repo]))
+        for role in sorted(selections.roles):
+            refs.append((f"the local selection for role {role!r}", selections.roles[role]))
+        for key in sorted(selections.pins):
+            refs.append((f"the pin for ticket {key}", selections.pins[key]))
+        if selections.override is not None:
+            refs.append(("the temporary override", selections.override.profile))
+    committed = state.committed or {}
+    default = committed.get("default")
+    if isinstance(default, str) and default:
+        refs.append(("the committed profile.default", default))
+    repos = committed.get("repos")
+    if isinstance(repos, dict):
+        for repo in sorted(repos):
+            refs.append((f"the committed [[repo]] {repo!r} profile", repos[repo]))
+    roles = committed.get("roles")
+    if isinstance(roles, dict):
+        for role in sorted(roles):
+            refs.append((f"the committed [role.{role}] profile", roles[role]))
+    return refs
+
+
+def _check_profile_declarations(state: ProfileState) -> list[Check]:
+    """The `profiles` row: declarations validate and every reference dangles nowhere."""
+    if state.error is not None:
+        return [
+            Check(
+                "profiles",
+                "fail",
+                state.error,
+                "fix the named declaration, then run `corral doctor` again",
+            )
+        ]
+    checks = []
+    if state.selections_error is not None:
+        checks.append(
+            Check(
+                "profiles",
+                "fail",
+                state.selections_error,
+                "fix the selections file, then run `corral doctor` again",
+            )
+        )
+    dangling = [
+        (where, name) for where, name in _profile_references(state) if name not in state.parsed
+    ]
+    if dangling:
+        detail = "; ".join(f"{where} names undeclared profile {name!r}" for where, name in dangling)
+        checks.append(
+            Check(
+                "profiles",
+                "fail",
+                detail,
+                "declare [profiles.NAME] or remove the reference, then run `corral doctor` again",
+            )
+        )
+    if not checks:
+        count = len(state.parsed)
+        detail = f"{count} declared profile(s) validate" if count else "no profiles declared"
+        checks.append(Check("profiles", "ok", detail, ""))
+    return checks
+
+
+def _check_profile_runtimes(state: ProfileState, dep_results) -> list[Check]:
+    """The `profile-runtimes` rows: every referenced runtime's binary resolves.
+
+    A missing binary fails with the install command the doctor prints but
+    never runs (installing a runtime needs the maintainer's go-ahead). A
+    runtime no profile references is not this check's business: the `deps`
+    rows already cover it.
+    """
+    referenced = sorted({profile.runtime for profile in state.parsed.values()})
+    if not referenced:
+        return [Check("profile-runtimes", "ok", "no profile references a runtime", "")]
+    by_name = {result.dep.name: result for result in dep_results}
+    missing = []
+    for runtime in referenced:
+        result = by_name.get(runtime)
+        if result is None:
+            missing.append((runtime, f"no system_deps.toml probe for runtime {runtime!r}"))
+        elif not result.ok:
+            missing.append((runtime, result.problem or f"runtime {runtime!r} is missing"))
+    if not missing:
+        return [
+            Check(
+                "profile-runtimes",
+                "ok",
+                f"every referenced runtime resolves ({', '.join(referenced)})",
+                "",
+            )
+        ]
+    checks = []
+    for runtime, problem in missing:
+        names = sorted(name for name, profile in state.parsed.items() if profile.runtime == runtime)
+        if runtime in by_name:
+            fix = " ".join(deps.fixes([by_name[runtime]]))
+        else:
+            fix = f"add a system_deps.toml probe for runtime {runtime!r}"
+        checks.append(
+            Check(
+                f"profile-runtimes:{runtime}",
+                "fail",
+                f"profile(s) {', '.join(names)} need runtime {runtime!r}: {problem}",
+                fix,
+            )
+        )
+    return checks
+
+
+def _check_profile_override(state: ProfileState) -> list[Check]:
+    """The `profile-override` row, only while an override stands.
+
+    An expired override fails until `corral profile reset --temp`
+    clears it; the resolver already ignores it, so the row is the only
+    thing that moves the operator to reset.
+    """
+    selections = state.selections
+    override = selections.override if selections is not None else None
+    if override is None:
+        return []
+    if profiles.is_expired(override, state.now):
+        return [
+            Check(
+                "profile-override",
+                "fail",
+                f"the temporary override for scope {override.scope}"
+                f" (profile {override.profile!r}) expired at {override.until!r}",
+                "run `corral profile reset --temp` to clear it",
+            )
+        ]
+    return [
+        Check(
+            "profile-override",
+            "ok",
+            f"the temporary override for scope {override.scope}"
+            f" (profile {override.profile!r}) runs until {override.until!r}",
+            "",
+        )
+    ]
+
+
+def _check_profile_shadows(state: ProfileState) -> list[Check]:
+    """One `profiles:<name>` note per shadowed declaration, with both sources."""
+    checks = []
+    for name in sorted(state.shadowed):
+        checks.append(
+            Check(
+                f"profiles:{name}",
+                "warn",
+                f"{name!r} is declared in both {state.shadowed[name]}"
+                f" and {state.sources.get(name, 'the host config')}; the local table wins",
+                "keep both (local wins) or remove one to silence this note",
+            )
+        )
+    return checks
+
+
+def check_profiles(state: ProfileState, dep_results) -> list[Check]:
+    """The profile rows: declarations, runtimes, override and shadows.
+
+    Pure over the readings in `state`: declarations validate, every
+    selection, pin, override and committed default names a declared
+    profile, every referenced runtime resolves, and an expired override
+    fails until reset. Unknown runtime, missing binary and expiry fail;
+    a shadowed name is a note.
+    """
+    if state.error is not None:
+        return [
+            *_check_profile_declarations(state),
+            *_check_profile_override(state),
+        ]
+    return [
+        *_check_profile_declarations(state),
+        *_check_profile_runtimes(state, dep_results),
+        *_check_profile_override(state),
+        *_check_profile_shadows(state),
+    ]
+
+
 def run_checks(env: Env) -> list[Check]:
     """Every check, in report order. Pure over the seams in `env`."""
     return [
@@ -505,8 +737,14 @@ def run_checks(env: Env) -> list[Check]:
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
         *_check_disk(env.disk),
+        *_check_resources(env),
         *_check_hub_auth(env.hub_url, env.hub_auth),
         *_check_hub(env.hub_url, env.hub_probe),
+        *(
+            check_profiles(env.profile_state, env.dep_results)
+            if env.profile_state is not None
+            else []
+        ),
     ]
 
 
@@ -716,6 +954,126 @@ def load_disk_pressure(resolved) -> str:
         return _disk.UNKNOWN
 
 
+def _read_text(path: str) -> str:
+    """One file read for the resource sensors; tests inject a fake."""
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def load_resource_readings(
+    resolved: settings.Resolved | None,
+    *,
+    list_fn: Callable[[str], list],
+    run: Callable[[Sequence[str]], object],
+    read=None,
+    now=None,
+) -> resourcedoctor.ResourceReadings | None:
+    """The host-budget readings for the `resources*` rows, or None without settings.
+
+    Best effort per aspect: an unreadable ledger, marker, delegation file,
+    sensor or slice listing is report data, never a traceback. Only the CLI
+    calls this; tests inject `ResourceReadings` data instead.
+    """
+    if resolved is None:
+        return None
+    reader = read or _read_text
+    moment = now if now is not None else time.time()
+    try:
+        registered = projects.load_all()
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError):
+        registered = []
+    ledger_path = host_ledger.ledger_path()
+    try:
+        ledger = host_ledger.load(ledger_path)
+    except host_ledger.LedgerError as err:
+        ledger, ledger_error = None, str(err)
+    else:
+        ledger_error = None
+    try:
+        state = paths.state_dir()
+    except paths.PathError as err:
+        state, marker, marker_error = "", None, str(err)
+    else:
+        marker_path = host_ledger.marker_path(ledger_path)
+        try:
+            marker, marker_error = reader(marker_path).strip(), None
+        except FileNotFoundError:
+            marker, marker_error = None, None
+        except (OSError, ValueError) as err:
+            marker, marker_error = None, f"cannot read the ledger marker at {marker_path}: {err}"
+    try:
+        available = units.read_controllers(read=reader)
+    except units.UnitsError as err:
+        available, controllers_error = None, str(err)
+    else:
+        controllers_error = None
+    sensor_errors = resourcedoctor.load_sensor_errors(read=reader)
+    names = [units.HOST_SLICE]
+    for entry in registered:
+        try:
+            names.append(units.project_slice(entry.name))
+        except units.UnitsError:
+            continue
+    slices = resourcedoctor.load_slice_actual(names, run=run)
+    prefixes = {entry.unit_prefix for entry in registered}
+    try:
+        prefixes.add(str(resolved["agents.unit_prefix"]))
+    except KeyError:
+        pass
+    try:
+        registry_cfg = registry.config(resolved)
+    except (settings.SettingsError, paths.PathError):
+        registry_cfg = None
+    entries: dict = {}
+    if registry_cfg is not None:
+        try:
+            listed = registry.visible(moment, registry_cfg)
+        except (paths.PathError, settings.SettingsError, registry.RegistryError):
+            listed = []
+        for entry, _row_state in listed:
+            entries.setdefault(entry.get("id"), entry)
+    live_roles = resourcedoctor.load_live_roles(prefixes, list_fn=list_fn, entries=entries)
+    tables = resolved.resources
+    priced = frozenset(tables.roles) if tables is not None else frozenset()
+    try:
+        where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
+    except paths.PathError:
+        where = "the host config"
+    try:
+        base = resources.config(resolved)
+        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        foreign = (ledger or {}).get("foreign", [])
+        if not isinstance(foreign, list):
+            foreign = []
+        limits = resources.join(base, shares, foreign, where=where)
+    except (settings.SettingsError, resources.LimitsError) as err:
+        limits, limits_error = None, str(err)
+    else:
+        limits_error = None
+    return resourcedoctor.ResourceReadings(
+        host=limits.host if limits is not None else None,
+        shares=dict(limits.projects) if limits is not None else {},
+        foreign=list(limits.foreign) if limits is not None else [],
+        gone_s=limits.gone_s if limits is not None else 0.0,
+        now=moment,
+        limits_error=limits_error,
+        priced_roles=priced,
+        live_roles=live_roles,
+        controllers=available,
+        controllers_error=controllers_error,
+        ledger=ledger,
+        ledger_error=ledger_error,
+        ledger_path=ledger_path,
+        marker=marker,
+        marker_error=marker_error,
+        state_dir=state,
+        marker_path=host_ledger.marker_path(ledger_path),
+        sensor_errors=sensor_errors,
+        slices=slices,
+        config_path=where,
+    )
+
+
 def load_project_problems() -> list[str]:
     """The registry problems for the live report: bad files and policy
     entries that do not resolve. A gathering failure is one problem
@@ -724,6 +1082,69 @@ def load_project_problems() -> list[str]:
         return list(projects.check())
     except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
         return [str(err)]
+
+
+def load_profile_state(resolved, settings_error: str | None) -> ProfileState:
+    """The profile readings for the live report, gathered once.
+
+    Validates the declared profiles against the account pool and reads
+    the local selections file; every fallible gathering degrades to
+    report data, never a traceback. Only the CLI calls this; tests
+    inject ProfileState data instead.
+    """
+    now = time.time()
+    if resolved is None:
+        return ProfileState(
+            parsed={},
+            error=settings_error or "settings did not resolve",
+            sources={},
+            shadowed={},
+            selections=None,
+            selections_error=None,
+            committed={},
+            now=now,
+        )
+    try:
+        pool = accounts.providers()
+    except (accounts.AccountsError, paths.PathError) as err:
+        return ProfileState(
+            parsed={},
+            error=str(err),
+            sources={},
+            shadowed={},
+            selections=None,
+            selections_error=None,
+            committed={},
+            now=now,
+        )
+    try:
+        parsed = profiles.validate(resolved.profiles, pool)
+    except settings.SettingsError as err:
+        return ProfileState(
+            parsed={},
+            error=str(err),
+            sources=dict(resolved.profile_sources),
+            shadowed=dict(resolved.profile_shadowed),
+            selections=None,
+            selections_error=None,
+            committed=dict(resolved.profile_committed),
+            now=now,
+        )
+    try:
+        selections: profiles.Selections | None = profiles.load_selections()
+        selections_error = None
+    except (profiles.ProfileError, paths.PathError) as err:
+        selections, selections_error = None, str(err)
+    return ProfileState(
+        parsed=parsed,
+        error=None,
+        sources=dict(resolved.profile_sources),
+        shadowed=dict(resolved.profile_shadowed),
+        selections=selections,
+        selections_error=selections_error,
+        committed=dict(resolved.profile_committed),
+        now=now,
+    )
 
 
 def load_timer_state() -> str:
@@ -920,6 +1341,9 @@ def production_env() -> Env:
     dep_results, deps_error = load_dep_results()
     prompts_invalid, prompts_stale, prompts_error = load_prompts_state()
     disk_pressure = load_disk_pressure(resolved)
+    resource_readings = load_resource_readings(
+        resolved, list_fn=production_list_fn, run=production_run
+    )
     board_sites, board_error = load_board_sites(settings_error)
     project_problems = load_project_problems()
     timer_state = load_timer_state()
@@ -927,6 +1351,7 @@ def production_env() -> Env:
     hub_token = read_hub_token() if hub_url else None
     hub_auth = load_hub_auth(hub_url)
     hub_probe = load_hub_probe(hub_url, hub_token)
+    profile_state = load_profile_state(resolved, settings_error)
     return Env(
         dep_results=dep_results,
         deps_error=deps_error,
@@ -944,6 +1369,7 @@ def production_env() -> Env:
         prompts_stale=prompts_stale,
         prompts_error=prompts_error,
         disk=disk_pressure,
+        resource_readings=resource_readings,
         board_sites=board_sites,
         board_fetch=production_board_fetch,
         board_open_store=store.open_store,
@@ -953,6 +1379,7 @@ def production_env() -> Env:
         hub_url=hub_url or None,
         hub_auth=hub_auth,
         hub_probe=hub_probe,
+        profile_state=profile_state,
     )
 
 

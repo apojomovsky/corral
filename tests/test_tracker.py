@@ -5,7 +5,7 @@ import json
 import unittest
 from typing import Any
 
-from corral import board, tracker
+from corral import board, hold, settings, tracker
 from corral.github import gh as ghmod
 from corral.github import tracker as ghtracker
 
@@ -69,7 +69,7 @@ class FakeRun:
 class FakeTracker:
     """An in-memory tracker double. Tests preload items and program failures."""
 
-    def __init__(self, items=()):
+    def __init__(self, items=(), *, labels=(), refused=(), ensure_error=None):
         self.by_key = {(item.repo, item.number): item for item in items}
         self.changes_error = None
         self.item_errors = {}
@@ -77,6 +77,9 @@ class FakeTracker:
         self.write_errors = {}
         self.comment_errors = {}
         self.label_errors = {}
+        self.repo_labels = {repo: set(names) for repo, names in labels}
+        self.refused = set(refused)
+        self.ensure_error = ensure_error
         self.calls = []
 
     def add(self, item):
@@ -134,6 +137,23 @@ class FakeTracker:
         self.calls.append(("add_label", repo, number, label))
         if (repo, number) in self.label_errors:
             raise self.label_errors[(repo, number)]
+
+    def ensure_labels(self, repo):
+        """Idempotent in-memory bootstrap: create, keep, or refuse."""
+        self.calls.append(("ensure_labels", repo))
+        if self.ensure_error is not None:
+            raise self.ensure_error
+        have = self.repo_labels.setdefault(repo, set())
+        created, kept, refused = [], [], []
+        for wanted in tracker.BOOTSTRAP_LABELS:
+            if wanted.name in have:
+                kept.append(wanted.name)
+            elif wanted.name in self.refused:
+                refused.append(wanted.name)
+            else:
+                have.add(wanted.name)
+                created.append(wanted.name)
+        return tracker.LabelReport(tuple(created), tuple(kept), tuple(refused))
 
 
 def reading(repo="acme/app", number=7, **over: Any):
@@ -322,6 +342,300 @@ class SharedVocabularyTest(unittest.TestCase):
 
     def test_the_decision_label_is_the_shared_one(self):
         self.assertIs(ghtracker.NEEDS_DECISION, tracker.NEEDS_DECISION)
+
+
+class LabelApi:
+    """A `gh` double for the labels endpoints: paged lists, recorded posts.
+
+    The list endpoint pages like the adapter requests it
+    (`?per_page=N&page=M`); an unpaged list call is rejected so a test
+    that misses pagination fails instead of passing on one short page.
+    `conflict` names labels whose create answers 422 already-exists
+    (the concurrent-setup shape) and then reads back, like a label the
+    other setup just created; `fail_single` names labels whose
+    single-label read fails, for the fail-closed re-read path.
+    """
+
+    PATH = "repos/acme/app/labels"
+
+    def __init__(
+        self,
+        have=(),
+        refuse=(),
+        fail_list=None,
+        fail_names=(),
+        fail_single=(),
+        conflict=(),
+        list_payload: object = None,
+    ):
+        self.have = dict(have)
+        self.refuse = set(refuse)
+        self.fail_list = fail_list
+        self.fail_names = set(fail_names)
+        self.fail_single = set(fail_single)
+        self.conflict = set(conflict)
+        self.list_payload = list_payload
+        self.calls = []
+        self.posted = []
+
+    def _page(self, query):
+        params = dict(pair.split("=", 1) for pair in query.split("&") if "=" in pair)
+        per_page = int(params.get("per_page", "100"))
+        page = int(params.get("page", "1"))
+        names = list(self.have)
+        start = (page - 1) * per_page
+        return [
+            {"name": name, "color": color, "description": desc}
+            for name, (color, desc) in [(n, self.have[n]) for n in names[start : start + per_page]]
+        ]
+
+    def __call__(self, args):
+        self.calls.append(list(args))
+        if list(args[:2]) == ["api", self.PATH]:
+            raise AssertionError(f"unpaged labels list {args!r}: request per_page and pages")
+        if len(args) == 2 and args[0] == "api" and args[1].startswith(self.PATH + "?"):
+            if self.fail_list is not None:
+                raise self.fail_list
+            if self.list_payload is not None:
+                return json.dumps(self.list_payload)
+            _, _, query = args[1].partition("?")
+            return json.dumps(self._page(query))
+        if (
+            len(args) == 2
+            and args[0] == "api"
+            and args[1].startswith(self.PATH + "/")
+            and "?" not in args[1]
+        ):
+            name = args[1][len(self.PATH) + 1 :]
+            if name in self.fail_single:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            try:
+                color, desc = self.have[name]
+            except KeyError:
+                raise RuntimeError("gh: Not Found (HTTP 404)") from None
+            return json.dumps({"name": name, "color": color, "description": desc})
+        if list(args[:4]) == ["api", "--method", "POST", self.PATH]:
+            fields = {}
+            for flag, value in zip(args[4::2], args[5::2]):
+                self.assert_flag(flag)
+                key, _, val = value.partition("=")
+                fields[key] = val
+            name = fields.get("name")
+            if name in self.fail_names:
+                raise RuntimeError("gh: connection reset")
+            if name in self.refuse:
+                raise RuntimeError("gh: Resource not accessible by token (HTTP 403)")
+            if name in self.conflict:
+                self.have[name] = (fields.get("color"), fields.get("description"))
+                raise RuntimeError(
+                    'gh: Validation Failed: {"resource": "Label",'
+                    ' "code": "already_exists"} (HTTP 422)'
+                )
+            self.posted.append(fields)
+            self.have[name] = (fields.get("color"), fields.get("description"))
+            return json.dumps({"name": name})
+        raise AssertionError(f"unexpected gh call {args!r}")
+
+    @staticmethod
+    def assert_flag(flag):
+        assert flag == "-f", f"unexpected flag {flag!r}"
+
+
+class BootstrapLabelsTest(unittest.TestCase):
+    """The bootstrap set is exactly the labels the rest of corral reads."""
+
+    def test_names_follow_the_rank_order(self):
+        self.assertEqual(
+            [label.name for label in tracker.BOOTSTRAP_LABELS],
+            [
+                "ready",
+                "needs-triage",
+                "needs-decision",
+                "hold",
+                "priority:urgent",
+                "priority:high",
+                "priority:normal",
+                "priority:low",
+                "priority:backlog",
+            ],
+        )
+
+    def test_names_agree_with_the_readers(self):
+        names = [label.name for label in tracker.BOOTSTRAP_LABELS]
+        self.assertIn(settings.REGISTRY["board.ready"].default, names)
+        self.assertIn(hold.HOLD_LABEL, names)
+        self.assertIn(tracker.NEEDS_DECISION, names)
+        for priority in tracker.PRIORITIES:
+            self.assertIn(f"{tracker.PRIORITY_PREFIX}{priority}", names)
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_the_adapter_colors_cover_the_set(self):
+        self.assertEqual(
+            set(ghtracker._BOOTSTRAP_COLORS), {label.name for label in tracker.BOOTSTRAP_LABELS}
+        )
+
+
+class RenderEnsureTest(unittest.TestCase):
+    def test_created_kept_and_refused_render_on_their_own_lines(self):
+        report = tracker.LabelReport(
+            created=("ready",), kept=("hold", "needs-triage"), refused=("priority:high",)
+        )
+        self.assertEqual(
+            tracker.render_ensure("acme/app", report),
+            "created label ready on acme/app\n"
+            "kept 2 labels on acme/app\n"
+            "refused label priority:high on acme/app: ask an owner to create it,"
+            " or move the board to the ops side\n",
+        )
+
+    def test_an_empty_report_renders_nothing(self):
+        report = tracker.LabelReport(created=(), kept=(), refused=())
+        self.assertEqual(tracker.render_ensure("acme/app", report), "")
+
+
+class FakeEnsureTest(unittest.TestCase):
+    def test_a_fresh_repo_creates_everything(self):
+        fake = FakeTracker()
+        report = fake.ensure_labels("acme/app")
+        self.assertEqual(report.created, tuple(label.name for label in tracker.BOOTSTRAP_LABELS))
+        self.assertEqual(report.kept, ())
+        self.assertEqual(report.refused, ())
+        self.assertEqual(fake.calls, [("ensure_labels", "acme/app")])
+
+    def test_a_second_run_keeps_everything(self):
+        fake = FakeTracker()
+        first = fake.ensure_labels("acme/app")
+        second = fake.ensure_labels("acme/app")
+        self.assertEqual(second.created, ())
+        self.assertEqual(second.kept, first.created)
+        self.assertEqual(second.refused, ())
+
+    def test_refused_labels_are_reported_and_the_rest_is_created(self):
+        fake = FakeTracker(refused={"hold"})
+        report = fake.ensure_labels("acme/app")
+        self.assertEqual(report.refused, ("hold",))
+        self.assertNotIn("hold", report.created)
+        self.assertIn("ready", report.created)
+
+    def test_a_programmed_failure_raises(self):
+        fake = FakeTracker(ensure_error=tracker.TrackerError("down"))
+        with self.assertRaises(tracker.TrackerError):
+            fake.ensure_labels("acme/app")
+
+
+class EnsureLabelsTest(unittest.TestCase):
+    def setUp(self):
+        self.api = LabelApi()
+        self.adapter = ghtracker.GithubTracker(self.api)
+
+    def names(self):
+        return [label.name for label in tracker.BOOTSTRAP_LABELS]
+
+    def test_an_empty_repo_creates_everything(self):
+        report = self.adapter.ensure_labels("acme/app")
+        self.assertEqual(report.created, tuple(self.names()))
+        self.assertEqual(report.kept, ())
+        self.assertEqual(report.refused, ())
+        self.assertEqual([posted["name"] for posted in self.api.posted], self.names())
+
+    def test_the_create_names_name_color_and_description(self):
+        self.adapter.ensure_labels("acme/app")
+        posted = self.api.posted[0]
+        self.assertEqual(posted["name"], "ready")
+        self.assertEqual(posted["color"], ghtracker._BOOTSTRAP_COLORS["ready"])
+        self.assertEqual(
+            posted["description"],
+            next(label.description for label in tracker.BOOTSTRAP_LABELS if label.name == "ready"),
+        )
+
+    def test_existing_labels_are_kept_byte_identical(self):
+        self.api = LabelApi(have={"ready": ("ff0000", "a human-edited description")})
+        adapter = ghtracker.GithubTracker(self.api)
+        report = adapter.ensure_labels("acme/app")
+        self.assertIn("ready", report.kept)
+        self.assertEqual(
+            [posted["name"] for posted in self.api.posted],
+            [name for name in self.names() if name != "ready"],
+        )
+
+    def test_a_rerun_posts_nothing(self):
+        self.adapter.ensure_labels("acme/app")
+        self.api.posted.clear()
+        report = self.adapter.ensure_labels("acme/app")
+        self.assertEqual(report.created, ())
+        self.assertEqual(report.kept, tuple(self.names()))
+        self.assertEqual(self.api.posted, [])
+
+    def test_a_refused_label_is_reported_and_the_pass_continues(self):
+        self.api = LabelApi(refuse={"hold"})
+        report = ghtracker.GithubTracker(self.api).ensure_labels("acme/app")
+        self.assertEqual(report.refused, ("hold",))
+        self.assertNotIn("hold", report.created)
+        self.assertIn("ready", report.created)
+
+    def test_a_failing_create_is_a_tracker_error(self):
+        self.api = LabelApi(fail_names={"ready"})
+        with self.assertRaises(tracker.TrackerError):
+            ghtracker.GithubTracker(self.api).ensure_labels("acme/app")
+
+    def test_a_rate_limited_create_stays_rate_limited(self):
+        self.api = LabelApi()
+        original = self.api
+
+        def limited(args):
+            if list(args[:4]) == ["api", "--method", "POST", LabelApi.PATH]:
+                raise RuntimeError("gh: API rate limit exceeded (HTTP 403)")
+            return original(args)
+
+        with self.assertRaises(tracker.TrackerRateLimited):
+            ghtracker.GithubTracker(limited).ensure_labels("acme/app")
+
+    def test_a_failing_list_is_a_tracker_error(self):
+        self.api = LabelApi(fail_list=RuntimeError("gh failed"))
+        with self.assertRaises(tracker.TrackerError):
+            ghtracker.GithubTracker(self.api).ensure_labels("acme/app")
+
+    def test_a_malformed_list_is_a_tracker_error(self):
+        for payload in ({"name": "ready"}, [{"title": "ready"}]):
+            with self.subTest(payload=payload):
+                api = LabelApi(list_payload=payload)
+                with self.assertRaises(tracker.TrackerError):
+                    ghtracker.GithubTracker(api).ensure_labels("acme/app")
+
+    def test_a_wanted_label_on_a_later_page_is_kept_not_created(self):
+        old_per_page = ghtracker.PER_PAGE
+        ghtracker.PER_PAGE = 2
+        self.addCleanup(setattr, ghtracker, "PER_PAGE", old_per_page)
+        extra = {f"extra-{index:02d}": ("cccccc", "unrelated") for index in range(36)}
+        have = dict(extra)
+        for name in self.names():
+            have[name] = ("0e8a16", "board label")
+        api = LabelApi(have=have)
+        report = ghtracker.GithubTracker(api).ensure_labels("acme/app")
+        self.assertEqual(report.created, ())
+        self.assertEqual(set(report.kept), set(self.names()))
+        self.assertEqual(api.posted, [])
+        self.assertTrue(
+            any(call == ["api", f"{LabelApi.PATH}?per_page=2&page=2"] for call in api.calls),
+            f"no second page requested in {api.calls!r}",
+        )
+
+    def test_a_422_on_create_is_kept_after_a_reread(self):
+        api = LabelApi(conflict={"ready"})
+        report = ghtracker.GithubTracker(api).ensure_labels("acme/app")
+        self.assertIn("ready", report.kept)
+        self.assertNotIn("ready", report.created)
+        self.assertEqual(report.refused, ())
+        self.assertEqual(
+            [posted["name"] for posted in api.posted],
+            [name for name in self.names() if name != "ready"],
+        )
+        self.assertIn(["api", f"{LabelApi.PATH}/ready"], api.calls)
+
+    def test_a_422_followed_by_a_missing_label_fails_closed(self):
+        api = LabelApi(conflict={"ready"}, fail_single={"ready"})
+        with self.assertRaises(tracker.TrackerError):
+            ghtracker.GithubTracker(api).ensure_labels("acme/app")
 
 
 class PaginationTest(unittest.TestCase):

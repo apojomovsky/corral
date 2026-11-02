@@ -14,6 +14,7 @@ from corral import (
     doctor,
     drive,
     gccli,
+    githubcli,
     hubcli,
     init,
     launch,
@@ -22,6 +23,7 @@ from corral import (
     mirrorcli,
     new,
     paths,
+    profilecli,
     projects,
     promptscli,
     quotacli,
@@ -237,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewcli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
+    githubcli.add_parser(sub)
     quotacli.add_parser(sub)
     serve.add_parser(sub)
     snapshot.add_parser(sub)
@@ -245,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     takeoffcli.add_parser(sub)
     mirrorcli.add_parser(sub)
     new.add_parser(sub)
+    profilecli.add_parser(sub, profilecli.production_seams())
     promptscli.add_parser(sub)
     launchcli.add_parser(sub, launchcli.production_seams())
     doctor.add_parser(sub, doctor.production_env)

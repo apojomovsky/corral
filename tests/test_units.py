@@ -787,6 +787,8 @@ class SealTest(unittest.TestCase):
                 ("drive.py", "systemctl", "timer_state"),
                 ("drive.py", "systemctl", "_timer_systemctl"),
                 ("doctor.py", "systemctl", "_check_drive_timer"),
+                ("resourcedoctor.py", "systemctl", "load_slice_actual"),
+                ("resourcedoctor.py", "systemctl", "_check_slices"),
             },
         )
 
