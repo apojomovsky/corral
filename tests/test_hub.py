@@ -1,0 +1,655 @@
+"""The hub skeleton: hosts, the claims table, atomic grants. Fakes and loopback only.
+
+Covers ticket H1 of docs/08-hub-multihost.md section 10: the SQLite
+store behind one transaction, the Bearer token check, the loopback
+HTTP service with grant and conflict paths, `corral hub add-host`,
+the `hub.*` settings, and the non-private bind warning. Every server
+test binds 127.0.0.1 on an ephemeral port and speaks to it in-process;
+no test touches the network, a real state dir, or another project.
+"""
+
+import http.client
+import json
+import logging
+import os
+import re
+import sqlite3
+import tempfile
+import threading
+import unittest
+
+from corral import hub, paths, settings
+
+
+def temp_db():
+    tmp = tempfile.TemporaryDirectory(prefix="corral-hub-")
+    return tmp, os.path.join(tmp.name, "hub.sqlite")
+
+
+class StoreCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp, self.db = temp_db()
+        self.addCleanup(self.tmp.cleanup)
+        self.store = hub.open_db(self.db)
+        self.addCleanup(self.store.close)
+
+    def add_host(self, host_id="host-1"):
+        token = hub.add_host(self.store, host_id)
+        return token
+
+
+class OpenDbTest(StoreCase):
+    def test_creates_wal_database_owner_only(self):
+        mode = oct(os.stat(self.db).st_mode & 0o777)
+        self.assertEqual(mode, "0o600")
+        journal = self.store.execute("PRAGMA journal_mode").fetchone()[0]
+        self.assertEqual(journal.lower(), "wal")
+
+    def test_schema_has_hosts_claims_and_meta(self):
+        names = {
+            row[0]
+            for row in self.store.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        self.assertEqual(names, {"hosts", "claims", "meta"})
+        epoch = self.store.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
+        self.assertEqual(tuple(epoch), (0,))
+
+    def test_reopen_keeps_hosts_and_epochs(self):
+        token = self.add_host()
+        receipt = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        self.store.close()
+        reopened = hub.open_db(self.db)
+        self.addCleanup(reopened.close)
+        self.assertEqual(hub.verify_token(reopened, token), "host-1")
+        row = reopened.execute(
+            "SELECT agent, epoch FROM claims WHERE repo=? AND number=?", ("app", 7)
+        ).fetchone()
+        self.assertEqual((row[0], row[1]), ("drive-aaa", receipt.epoch))
+
+    def test_newer_schema_fails_closed(self):
+        self.store.execute("PRAGMA user_version=9999")
+        self.store.close()
+        with self.assertRaises(hub.HubError):
+            hub.open_db(self.db)
+
+    def test_preexisting_file_from_a_lost_create_race_opens(self):
+        self.store.close()
+        with open(self.db, "wb") as handle:
+            handle.write(b"")
+        reopened = hub.open_db(self.db)
+        self.addCleanup(reopened.close)
+        epoch = reopened.execute("SELECT value FROM meta WHERE key='membership_epoch'").fetchone()
+        self.assertEqual(tuple(epoch), (0,))
+
+    def test_unwritable_state_parent_is_hub_error(self):
+        self.store.close()
+        parent = os.path.join(self.tmp.name, "noperm")
+        os.mkdir(parent)
+        os.chmod(parent, 0o555)
+        self.addCleanup(os.chmod, parent, 0o755)
+        with self.assertRaises(hub.HubError):
+            hub.open_db(os.path.join(parent, "nested", "hub.sqlite"))
+
+
+class AddHostTest(StoreCase):
+    def test_mint_stores_a_salted_hash_never_the_token(self):
+        token = self.add_host()
+        self.assertTrue(token)
+        row = self.store.execute(
+            "SELECT token_salt, token_hash FROM hosts WHERE host_id=?", ("host-1",)
+        ).fetchone()
+        self.assertTrue(row[0])
+        self.assertTrue(row[1])
+        dump = "\n".join(
+            str(value)
+            for (table,) in self.store.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+            for value in self.store.execute(f"SELECT * FROM {table}").fetchall()
+        )
+        self.assertNotIn(token, dump)
+        self.assertEqual(hub.verify_token(self.store, token), "host-1")
+
+    def test_two_hosts_get_different_tokens(self):
+        first = self.add_host("host-1")
+        second = self.add_host("host-2")
+        self.assertNotEqual(first, second)
+        self.assertEqual(hub.verify_token(self.store, second), "host-2")
+
+    def test_duplicate_id_is_refused(self):
+        self.add_host()
+        with self.assertRaises(hub.HubError):
+            hub.add_host(self.store, "host-1")
+
+    def test_bad_ids_are_refused(self):
+        for bad in ("", "host 1", "host/1", "-host", "host!1", "../x"):
+            with self.subTest(bad=bad), self.assertRaises(hub.HubError):
+                hub.add_host(self.store, bad)
+
+    def test_wrong_or_missing_token_verifies_to_nobody(self):
+        token = self.add_host()
+        self.assertIsNone(hub.verify_token(self.store, token + "x"))
+        self.assertIsNone(hub.verify_token(self.store, ""))
+        self.assertIsNone(hub.verify_token(self.store, None))
+
+
+class GrantTest(StoreCase):
+    def setUp(self):
+        super().setUp()
+        self.add_host()
+
+    def test_first_grant_mints_epoch_one_with_a_lease(self):
+        receipt = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 1)
+        self.assertEqual(receipt.lease_expires, 1090.0)
+
+    def test_second_claimant_gets_409_naming_the_holder(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        with self.assertRaises(hub.Conflict) as caught:
+            hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1001.0, lease_ttl_s=90)
+        self.assertIn("drive-aaa", str(caught.exception))
+        self.assertIn("host-1", str(caught.exception))
+        self.assertEqual(caught.exception.holder["agent"], "drive-aaa")
+
+    def test_same_agent_reproposing_is_idempotent(self):
+        first = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        second = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1001.0, lease_ttl_s=90)
+        self.assertEqual((second.epoch, second.lease_expires), (first.epoch, first.lease_expires))
+
+    def test_lapsed_lease_regrants_with_a_bumped_epoch(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        receipt = hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1091.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 2)
+
+    def test_lapsed_lease_regrant_bumps_even_for_the_same_agent(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        receipt = hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1091.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 2)
+
+    def test_propose_at_exact_expiry_regrants_with_a_bumped_epoch(self):
+        hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        with self.assertRaises(hub.Conflict):
+            hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1089.0, lease_ttl_s=90)
+        receipt = hub.grant(self.store, "app", 7, "drive-bbb", "host-2", now=1090.0, lease_ttl_s=90)
+        self.assertEqual(receipt.epoch, 2)
+
+    def test_bad_shapes_are_refused(self):
+        with self.assertRaises(hub.HubError):
+            hub.grant(self.store, "", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        with self.assertRaises(hub.HubError):
+            hub.grant(self.store, "app", 0, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
+        with self.assertRaises(hub.HubError):
+            hub.grant(self.store, "app", 7, "", "host-1", now=1000.0, lease_ttl_s=90)
+
+
+class ServerCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp, self.db = temp_db()
+        self.addCleanup(self.tmp.cleanup)
+        store = hub.open_db(self.db)
+        self.token_a = hub.add_host(store, "host-1")
+        self.token_b = hub.add_host(store, "host-2")
+        store.close()
+        self.clock = [1000.0]
+        self.server = hub.make_server("127.0.0.1", 0, self.db, clock=lambda: self.clock[0])
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.addCleanup(self.shutdown)
+        self.port = self.server.server_address[1]
+
+    def shutdown(self):
+        self.server.shutdown()
+        self.thread.join(timeout=10)
+        self.server.server_close()
+
+    def call(self, method, path, body=None, token="unset"):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {}
+        if token != "unset":
+            headers["Authorization"] = f"Bearer {token}" if token else ""
+        if body is not None:
+            raw = json.dumps(body)
+            headers["Content-Type"] = "application/json"
+            conn.request(method, path, body=raw, headers=headers)
+        else:
+            conn.request(method, path, headers=headers)
+        response = conn.getresponse()
+        raw = response.read()
+        conn.close()
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else None
+        except ValueError:
+            payload = None
+        return response.status, payload
+
+    def propose(self, agent="drive-aaa", host="host-1", token=None, **over):
+        body = {"repo": "app", "number": 7, "agent": agent, "host_id": host}
+        body.update(over)
+        return self.call("POST", "/v1/claims", body, token=self.token_a if token is None else token)
+
+    def raw_call(self, raw, token=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        headers = {"Authorization": f"Bearer {self.token_a if token is None else token}"}
+        conn.request("POST", "/v1/claims", body=raw, headers=headers)
+        response = conn.getresponse()
+        payload = response.read()
+        conn.close()
+        try:
+            body = json.loads(payload.decode("utf-8")) if payload else None
+        except ValueError:
+            body = None
+        return response.status, body
+
+
+class ClaimRouteTest(ServerCase):
+    def test_grant_returns_the_receipt_with_epoch_one(self):
+        status, payload = self.propose()
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            (payload["agent"], payload["host_id"], payload["epoch"]), ("drive-aaa", "host-1", 1)
+        )
+        self.assertEqual(payload["lease_expires"], 1090.0)
+
+    def test_conflict_names_the_holder(self):
+        self.propose()
+        status, payload = self.propose(agent="drive-bbb", host="host-2", token=self.token_b)
+        self.assertEqual(status, 409)
+        self.assertIn("drive-aaa", payload["error"])
+        self.assertEqual(payload["holder"]["agent"], "drive-aaa")
+        self.assertEqual(payload["holder"]["host_id"], "host-1")
+
+    def test_racing_proposes_grant_exactly_one_epoch_one(self):
+        barrier = threading.Barrier(8)
+        results = []
+        lock = threading.Lock()
+
+        def race(index):
+            barrier.wait()
+            status, payload = self.call(
+                "POST",
+                "/v1/claims",
+                {"repo": "app", "number": 7, "agent": f"drive-{index}", "host_id": "host-1"},
+                token=self.token_a,
+            )
+            with lock:
+                results.append((status, payload))
+
+        threads = [threading.Thread(target=race, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=30)
+        self.assertEqual(len(results), 8)
+        winners = [payload for status, payload in results if status == 200]
+        losers = [(status, payload) for status, payload in results if status != 200]
+        self.assertEqual(len(winners), 1)
+        self.assertEqual(winners[0]["epoch"], 1)
+        self.assertEqual(len(losers), 7)
+        for status, payload in losers:
+            self.assertEqual(status, 409)
+            self.assertIn(winners[0]["agent"], payload["error"])
+
+    def test_missing_or_wrong_token_is_401_without_a_leak(self):
+        status, payload = self.call("POST", "/v1/claims", {"repo": "app"}, token=None)
+        self.assertEqual(status, 401)
+        status, payload = self.call("POST", "/v1/claims", {"repo": "app"}, token="wrong")
+        self.assertEqual(status, 401)
+        self.assertEqual(payload, {"error": payload["error"]})
+        with self.assertLogs("corral.hub", level="WARNING") as logs:
+            self.call("POST", "/v1/claims", {"repo": "app"}, token="s3cret-token")
+        self.assertTrue(any("401" in line or "rejected" in line for line in logs.output))
+        self.assertFalse(any("s3cret-token" in line for line in logs.output))
+
+    def test_token_for_another_host_is_refused(self):
+        status, _ = self.propose(host="host-2", token=self.token_a)
+        self.assertEqual(status, 401)
+
+    def test_unknown_host_is_refused(self):
+        status, _ = self.call(
+            "POST",
+            "/v1/claims",
+            {"repo": "app", "number": 7, "agent": "drive-aaa", "host_id": "host-9"},
+            token=self.token_a,
+        )
+        self.assertEqual(status, 401)
+
+    def test_bad_body_is_400(self):
+        status, payload = self.call(
+            "POST",
+            "/v1/claims",
+            {"repo": "app", "number": 0, "agent": "drive-aaa", "host_id": "host-1"},
+            token=self.token_a,
+        )
+        self.assertEqual(status, 400)
+        self.assertTrue(payload["error"])
+
+    def test_malformed_bodies_are_400(self):
+        cases = {
+            "empty": b"",
+            "non-json": b"this is not json",
+            "oversize": b"x" * (hub._MAX_BODY + 1),
+            "non-dict": b"[1, 2]",
+        }
+        for name, raw in cases.items():
+            with self.subTest(name=name):
+                status, payload = self.raw_call(raw)
+                self.assertEqual(status, 400)
+                self.assertTrue(payload["error"])
+
+    def test_unknown_path_is_404_and_wrong_method_is_405(self):
+        status, _ = self.call("GET", "/v1/nope", token=self.token_a)
+        self.assertEqual(status, 404)
+        status, _ = self.call("GET", "/v1/claims", token=self.token_a)
+        self.assertEqual(status, 405)
+
+    def test_version_is_open_and_names_both_versions(self):
+        status, payload = self.call("GET", "/v1/version")
+        self.assertEqual(status, 200)
+        self.assertEqual(payload, {"api": hub.HUB_API, "schema_version": hub.SCHEMA_VERSION})
+
+
+class BindWarningTest(unittest.TestCase):
+    def test_loopback_and_private_binds_stay_quiet(self):
+        for bind in ("127.0.0.1", "127.0.0.2", "::1", "localhost", "10.0.0.5", "192.168.1.9"):
+            with self.subTest(bind=bind):
+                self.assertIsNone(hub.bind_warning(bind))
+
+    def test_wildcard_and_multicast_binds_warn_and_keep_serving(self):
+        for bind in ("0.0.0.0", "::", "224.0.0.1", "ff02::1"):
+            with self.subTest(bind=bind):
+                warning = hub.bind_warning(bind)
+                self.assertTrue(warning)
+                self.assertIn(bind, str(warning))
+
+    def test_public_bind_warns(self):
+        warning = hub.bind_warning("8.8.8.8")
+        self.assertTrue(warning)
+        self.assertIn("8.8.8.8", str(warning))
+
+    def test_unresolvable_name_warns_without_dns(self):
+        warning = hub.bind_warning("hub-1.example.com")
+        self.assertTrue(warning)
+        self.assertIn("hub-1.example.com", str(warning))
+
+
+class ServerFamilyTest(unittest.TestCase):
+    def test_ipv6_literals_select_the_ipv6_family(self):
+        import socket as socket_module
+
+        for bind in ("::1", "::"):
+            with self.subTest(bind=bind):
+                self.assertEqual(hub.server_family(bind), socket_module.AF_INET6)
+
+    def test_ipv4_literals_and_names_stay_on_ipv4(self):
+        import socket as socket_module
+
+        for bind in ("127.0.0.1", "0.0.0.0", "10.0.0.5", "localhost", "hub-1.example.com"):
+            with self.subTest(bind=bind):
+                self.assertEqual(hub.server_family(bind), socket_module.AF_INET)
+
+
+class IPv6LoopbackTest(unittest.TestCase):
+    def test_ipv6_loopback_serves_the_version_route(self):
+        import socket as socket_module
+
+        if not socket_module.has_ipv6:
+            self.skipTest("this host has no IPv6")
+        tmp = tempfile.TemporaryDirectory(prefix="corral-hub-ipv6-")
+        self.addCleanup(tmp.cleanup)
+        db = os.path.join(tmp.name, "hub.sqlite")
+        store = hub.open_db(db)
+        hub.add_host(store, "host-1")
+        store.close()
+        try:
+            server = hub.make_server("::1", 0, db)
+        except OSError as err:
+            self.skipTest(f"this host cannot bind ::1: {err}")
+        port = server.server_address[1]
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(thread.join, 10)
+        self.addCleanup(server.server_close)
+        conn = http.client.HTTPConnection("::1", port, timeout=10)
+        try:
+            conn.request("GET", "/v1/version")
+            response = conn.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
+        finally:
+            conn.close()
+        self.assertEqual(response.status, 200)
+        self.assertEqual(payload, {"api": hub.HUB_API, "schema_version": hub.SCHEMA_VERSION})
+
+
+class HubPathsTest(unittest.TestCase):
+    def test_defaults_follow_the_state_and_config_dirs(self):
+        env = {}
+        self.assertEqual(
+            paths.hub_db_path(env),
+            os.path.join(paths.state_dir(env), "hub", "hub.sqlite"),
+        )
+        self.assertEqual(
+            paths.hub_token_path(env), os.path.join(paths.config_dir(env), "hub-token")
+        )
+
+    def test_hub_state_override_wins(self):
+        env = {"CORRAL_HUB_STATE": "/o/hub"}
+        self.assertEqual(paths.hub_db_path(env), os.path.join("/o/hub", "hub.sqlite"))
+
+    def test_a_relative_hub_state_is_refused(self):
+        with self.assertRaises(paths.PathError):
+            paths.hub_db_path({"CORRAL_HUB_STATE": "relative/hub"})
+
+    def test_no_second_resolver_for_the_file_name(self):
+        self.assertFalse(hasattr(hub, "DB_NAME"))
+
+
+class HubSettingsTest(unittest.TestCase):
+    def test_defaults_follow_the_decided_heartbeat_and_lease(self):
+        resolved = settings.resolve(project={}, env={})
+        self.assertEqual(resolved["hub.url"], "")
+        self.assertEqual(resolved["hub.heartbeat_s"], 30)
+        self.assertEqual(resolved["hub.lease_ttl_s"], 90)
+        self.assertEqual(resolved["hub.lease_ttl_s"], 3 * resolved["hub.heartbeat_s"])
+
+    def test_env_overrides_and_provider_is_listed(self):
+        resolved = settings.resolve(project={}, env={"CORRAL_HUB_URL": "http://host-1:8080"})
+        self.assertEqual(resolved["hub.url"], "http://host-1:8080")
+        self.assertIn("corral.hub", settings.PROVIDERS)
+
+
+class AddHostCommandTest(unittest.TestCase):
+    def run_hub(self, *argv):
+        from unittest import mock
+
+        from corral import cli
+
+        args = cli.build_parser().parse_args(["hub", *argv])
+        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                return args.func(args), state
+
+    def test_add_host_mints_and_prints_the_token_once(self):
+        from unittest import mock
+
+        from corral import cli
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                args = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
+                self.assertEqual(args.func(args), 0)
+                store = hub.open_db(paths.hub_db_path())
+                try:
+                    row = store.execute(
+                        "SELECT host_id FROM hosts WHERE host_id=?", ("host-1",)
+                    ).fetchone()
+                finally:
+                    store.close()
+                self.assertEqual(tuple(row), ("host-1",))
+
+    def test_add_host_twice_is_a_usage_error(self):
+        from unittest import mock
+
+        from corral import cli
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                first = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
+                self.assertEqual(first.func(first), 0)
+                second = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
+                self.assertEqual(second.func(second), 4)
+
+    def test_add_host_with_a_bad_id_is_a_usage_error(self):
+        code, _ = self.run_hub("add-host", "--id", "host 1")
+        self.assertEqual(code, 4)
+
+    def test_printed_token_authenticates(self):
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+
+        from corral import cli
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                args = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
+                out = io.StringIO()
+                with redirect_stdout(out):
+                    self.assertEqual(args.func(args), 0)
+                token = out.getvalue().strip()
+                self.assertTrue(token)
+                store = hub.open_db(paths.hub_db_path({"CORRAL_HUB_STATE": state}))
+                try:
+                    self.assertEqual(hub.verify_token(store, token), "host-1")
+                finally:
+                    store.close()
+
+
+class ServeCommandTest(unittest.TestCase):
+    def parse(self, *argv):
+        from corral import cli
+
+        return cli.build_parser().parse_args(["hub", "serve", *argv])
+
+    def test_bad_port_is_a_usage_error(self):
+        for port in ("-1", "70000"):
+            with self.subTest(port=port):
+                args = self.parse("--port", port)
+                self.assertEqual(args.func(args), 4)
+
+    def test_held_loopback_port_is_a_race(self):
+        import socket
+        from unittest import mock
+
+        from corral import settings
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with mock.patch.object(settings, "load", return_value={"hub.lease_ttl_s": 90}):
+                    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    try:
+                        holder.bind(("127.0.0.1", 0))
+                        holder.listen(1)
+                        port = holder.getsockname()[1]
+                        args = self.parse("--bind", "127.0.0.1", "--port", str(port))
+                        self.assertEqual(args.func(args), 2)
+                    finally:
+                        holder.close()
+
+    def test_bind_warning_goes_to_stderr_and_listening_to_stdout(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest import mock
+
+        from corral import hub as hub_module
+        from corral import settings
+
+        class FakeServer:
+            server_address = ("0.0.0.0", 4321)
+
+            def __init__(self):
+                self.served = False
+
+            def serve_forever(self):
+                self.served = True
+
+            def server_close(self):
+                pass
+
+        fake = FakeServer()
+        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with mock.patch.object(settings, "load", return_value={"hub.lease_ttl_s": 90}):
+                    with mock.patch.object(hub_module, "make_server", return_value=fake) as made:
+                        args = self.parse("--bind", "0.0.0.0", "--port", "4321")
+                        out, err = io.StringIO(), io.StringIO()
+                        with redirect_stdout(out), redirect_stderr(err):
+                            self.assertEqual(args.func(args), 0)
+        made.assert_called_once()
+        self.assertIn("0.0.0.0", err.getvalue())
+        self.assertIn("listening on 0.0.0.0:4321", out.getvalue())
+        self.assertTrue(fake.served)
+
+    def test_corrupt_store_is_a_usage_error_without_a_traceback(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import paths
+        from corral import settings
+
+        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+            db_path = paths.hub_db_path({"CORRAL_HUB_STATE": state})
+            os.makedirs(os.path.dirname(db_path), exist_ok=True)
+            with open(db_path, "wb") as handle:
+                handle.write(b"this is not a database")
+            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with mock.patch.object(settings, "load", return_value={"hub.lease_ttl_s": 90}):
+                    args = self.parse("--bind", "127.0.0.1", "--port", "0")
+                    err = io.StringIO()
+                    with redirect_stderr(err):
+                        self.assertEqual(args.func(args), 4)
+        self.assertIn("corral:", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_nonpositive_lease_ttl_is_a_usage_error_naming_the_setting(self):
+        import io
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        from corral import hub as hub_module
+        from corral import settings
+
+        for ttl in (0, -5):
+            with self.subTest(ttl=ttl):
+                with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
+                    with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                        with mock.patch.object(
+                            settings, "load", return_value={"hub.lease_ttl_s": ttl}
+                        ):
+                            with mock.patch.object(hub_module, "make_server") as made:
+                                args = self.parse()
+                                err = io.StringIO()
+                                with redirect_stderr(err):
+                                    self.assertEqual(args.func(args), 4)
+                                self.assertIn("hub.lease_ttl_s", err.getvalue())
+                made.assert_not_called()
+
+
+class ImportClosureTest(unittest.TestCase):
+    def test_hub_reaches_no_live_seam(self):
+        with open(hub.__file__, encoding="utf-8") as handle:
+            source = handle.read()
+        imports = set()
+        for line in source.splitlines():
+            match = re.match(r"\s*(?:import|from)\s+([a-z0-9_.]+)", line)
+            if match:
+                imports.add(match.group(1).split(".")[0])
+        for banned in ("subprocess", "gh", "tracker", "forge", "systemd", "docker"):
+            self.assertNotIn(banned, imports)
+
+
+if __name__ == "__main__":
+    unittest.main()
