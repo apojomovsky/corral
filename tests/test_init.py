@@ -262,6 +262,7 @@ TAIL = """# Defaults: uncomment to override.
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
+# hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [prompts]
@@ -370,6 +371,7 @@ commits.conventional = false
 # [hub]
 # hub.heartbeat_s = 30  # seconds between hub heartbeats
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
+# hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
 #
 # [prompts]
