@@ -153,6 +153,32 @@ class LoadTest(HostCase):
             projects.load_all()
         self.assertIn(path, str(ctx.exception))
 
+    def test_an_unknown_top_level_key_names_the_file_and_key(self):
+        path = self.write_project(
+            "project-a",
+            raw='name = "project-a"\nunit_prefix = "project-a-agent"\n'
+            'root = "/srv/ops/a"\nflor = 2\n',
+        )
+        with self.assertRaises(projects.ProjectsError) as ctx:
+            projects.load_all()
+        self.assertIn(path, str(ctx.exception))
+        self.assertIn("flor", str(ctx.exception))
+        self.assertIn("floor", str(ctx.exception))
+
+    def test_a_misspelled_share_header_does_not_load_silently(self):
+        for raw in (
+            'name = "project-a"\nunit_prefix = "project-a-agent"\n'
+            'root = "/srv/ops/a"\n[resource]\nweight = 1\n',
+            'name = "project-a"\nunit_prefix = "project-a-agent"\n'
+            'root = "/srv/ops/a"\n[resources.project]\nweight = 1\n',
+        ):
+            with self.subTest(raw=raw):
+                path = self.write_project("project-a", raw=raw)
+                with self.assertRaises(projects.ProjectsError) as ctx:
+                    projects.load_all()
+                self.assertIn(path, str(ctx.exception))
+                os.remove(path)
+
     def test_a_duplicate_unit_prefix_names_the_second_file(self):
         self.write_project("project-a")
         second = self.write_project("project-b", unit_prefix="project-a-agent")
