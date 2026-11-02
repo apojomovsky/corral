@@ -63,6 +63,7 @@ def healthy_doc():
         [],
         lambda *args: None,
         live_by_owner={"proj-a": ["a1"]},
+        project_names={"proj-a"},
     )
     return snapshot.build(
         T0,
@@ -240,6 +241,15 @@ class HealthRoute(ServeCase):
         payload = json.loads(body)
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["degraded"], ["disk", "quota"])
+
+    def test_health_lists_a_resources_error_as_degraded(self):
+        doc = healthy_doc()
+        doc["resources"] = {"error": "budget unreadable"}
+        server, _ = self.start_server(FakeBuilder(doc))
+        _, _, body = self.fetch(server, "GET", "/v1/health")
+        payload = json.loads(body)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["degraded"], ["resources"])
 
     def test_health_clock_moves_now_and_uptime(self):
         server, now = self.start_server(FakeBuilder(healthy_doc()))

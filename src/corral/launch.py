@@ -258,18 +258,16 @@ def _charged_usage(key, own_prefix, registered, list_fn, roles, cfg, now):
 
     Live means listed by the manager under a registered prefix: an entry
     whose unit is gone holds no share, so a crash frees the pool at
-    once. The sum itself is `resources.charge_live_units`, the same
-    function the snapshot reads, so the gate and the report agree.
+    once. The listing comes from `resources.live_units_by_owner` and
+    the sum itself is `resources.charge_live_units`, the same helpers
+    the snapshot reads, so the gate and the report agree.
     """
-    prefixes = {project.name: project.unit_prefix for project in registered}
-    prefixes.setdefault(key, own_prefix)
-    live_by_owner = {}
-    for owner, prefix in prefixes.items():
-        live_by_owner[owner] = [
-            name
-            for name, active, _sub in list_fn(prefix)
-            if active in units.LIVE_STATES and units.parse_unit(prefix, name)
-        ]
+    live_by_owner = resources.live_units_by_owner(
+        [(project.name, project.unit_prefix) for project in registered],
+        key,
+        own_prefix,
+        list_fn,
+    )
     names = {project.name for project in registered}
     charged, _per_unit = resources.charge_live_units(
         registry.visible(now, cfg), live_by_owner, names, roles

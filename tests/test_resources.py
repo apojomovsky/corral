@@ -760,6 +760,84 @@ class ChargeLiveUnits(unittest.TestCase):
         )
         self.assertEqual(charged.total, R.Usage(1000, 2048, 100))
 
+    def test_a_tuple_listing_charges_like_a_list(self):
+        rows = [({"id": "pa-lib-5", "role": "worker", "ticket": None}, "live")]
+        charged, _per_unit = R.charge_live_units(
+            rows, {"proj-a": ("pa-lib-5",)}, {"proj-a"}, self.ROLES
+        )
+        self.assertEqual(charged.total, R.Usage(1000, 2048, 100))
+
+    def test_a_non_sequence_listing_is_a_limits_error(self):
+        rows = [({"id": "pa-lib-5", "role": "worker", "ticket": None}, "live")]
+        for bad in (None, 5, "pa-lib-5", ["pa-lib-5", 7], ("pa-lib-5", None)):
+            with self.subTest(listing=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.charge_live_units(rows, {"proj-a": bad}, {"proj-a"}, self.ROLES)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_non_mapping_roles_are_a_limits_error(self):
+        rows = [({"id": "pa-lib-5", "role": "worker", "ticket": None}, "live")]
+        for bad in (None, [], "worker", [("worker", dict(WORKER))]):
+            with self.subTest(roles=bad):
+                with self.assertRaises(R.LimitsError):
+                    R.charge_live_units(rows, {"proj-a": ["pa-lib-5"]}, {"proj-a"}, bad)
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+
+class LiveUnitsByOwner(unittest.TestCase):
+    """The one listing the gate and the snapshot intersect the registry with."""
+
+    PREFIX_A = "pa-"
+    PREFIX_B = "pb-"
+
+    def list_fn(self, table):
+        def fake(prefix):
+            return table.get(prefix, [])
+
+        return fake
+
+    def test_lists_live_well_formed_units_per_owner(self):
+        table = {
+            self.PREFIX_A: [
+                ("pa-lib-5", "active", "running"),
+                ("pa-db-7", "failed", "failed"),
+                ("pa-noise", "active", "running"),
+            ],
+            self.PREFIX_B: [("pb-web-3", "activating", "start")],
+        }
+        self.assertEqual(
+            R.live_units_by_owner(
+                [("proj-a", self.PREFIX_A), ("proj-b", self.PREFIX_B)],
+                "proj-a",
+                self.PREFIX_A,
+                self.list_fn(table),
+            ),
+            {"proj-a": ["pa-lib-5"], "proj-b": ["pb-web-3"]},
+        )
+
+    def test_every_registered_project_gets_a_key(self):
+        self.assertEqual(
+            R.live_units_by_owner(
+                [("proj-a", self.PREFIX_A), ("proj-b", self.PREFIX_B)],
+                "proj-a",
+                self.PREFIX_A,
+                self.list_fn({}),
+            ),
+            {"proj-a": [], "proj-b": []},
+        )
+
+    def test_an_unregistered_fallback_is_keyed_by_project_name(self):
+        table = {self.PREFIX_B: [("pb-web-3", "active", "running")]}
+        self.assertEqual(
+            R.live_units_by_owner(
+                [("proj-a", self.PREFIX_A)],
+                "other",
+                self.PREFIX_B,
+                self.list_fn(table),
+            ),
+            {"proj-a": [], "other": ["pb-web-3"]},
+        )
+
 
 class RequestDefaults(unittest.TestCase):
     def test_a_role_less_request_is_priced_as_the_default_role(self):
@@ -776,7 +854,7 @@ class RequestDefaults(unittest.TestCase):
 
 class CapacityReportShape(unittest.TestCase):
     def test_a_non_mapping_by_project_is_a_limits_error(self):
-        bad_inputs: tuple[Any, ...] = (["proj-a"], "proj-a", 5)
+        bad_inputs: tuple[Any, ...] = (["proj-a"], "proj-a", 5, 0, "", [], False, None)
         for bad in bad_inputs:
             with self.subTest(by_project=bad):
                 with self.assertRaises(R.LimitsError):
@@ -795,6 +873,13 @@ class CapacityReportShape(unittest.TestCase):
                         pressure=R.Pressure(),
                     )
         self.assertEqual(R.LimitsError.exit_code, 4)
+
+    def test_a_missing_by_project_reads_empty(self):
+        report = R.capacity_report(
+            host_budget=None, charged={"total": triple()}, pressure=R.Pressure()
+        )
+        self.assertEqual(report["by_project"], {})
+        self.assertEqual(report["charged"], triple())
 
     def test_a_non_boolean_saturated_is_a_limits_error(self):
         bad_inputs: tuple[Any, ...] = ("false", "true", 0, 1, None)

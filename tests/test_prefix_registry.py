@@ -17,7 +17,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import agentcli, cli, launch, projects, prompts, registry, settings, units
+from corral import agentcli, cli, launch, projects, prompts, registry, resources, settings, units
 from corral.runtimes import muse
 from tests.test_launch import OpsCase, roomy
 from tests.test_prompts import FULL
@@ -179,6 +179,11 @@ class SnapshotCapTest(PrefixOps):
                 mock.patch("corral.accounts.providers", return_value=[]),
                 mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
                 mock.patch("corral.units.list_units", side_effect=self.units_for),
+                mock.patch(
+                    "corral.resources.read_pressure",
+                    return_value=(resources.Pressure(), []),
+                ),
+                mock.patch("corral.snapshot.default_measured", return_value=None),
                 redirect_stdout(out),
             ):
                 self.assertEqual(cli.main(["snapshot", "--json"]), 0)
@@ -396,6 +401,11 @@ class SnapshotOutsideTreeTest(PrefixOps):
                 mock.patch("corral.accounts.providers", return_value=[]),
                 mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
                 mock.patch("corral.units.list_units", side_effect=self.units_for),
+                mock.patch(
+                    "corral.resources.read_pressure",
+                    return_value=(resources.Pressure(), []),
+                ),
+                mock.patch("corral.snapshot.default_measured", return_value=None),
                 redirect_stdout(out),
             ):
                 self.assertEqual(cli.main(["snapshot", "--json"]), 0)

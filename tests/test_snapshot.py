@@ -147,6 +147,17 @@ def live_listing(rows):
     return live
 
 
+def names_of(rows):
+    """The ticket projects named in `rows`: the registered names for the test."""
+    names = set()
+    for row_entry, _state in rows:
+        ticket = row_entry.get("ticket") if isinstance(row_entry, dict) else None
+        project = ticket.get("project") if isinstance(ticket, dict) else None
+        if isinstance(project, str) and project:
+            names.add(project)
+    return names
+
+
 def doc_of(**overrides):
     rows = overrides.pop("registry_view", None)
     if rows is None:
@@ -164,6 +175,7 @@ def doc_of(**overrides):
                 [],
                 lambda scope, name, project=None: None,
                 live_by_owner=live_listing(rows),
+                project_names=names_of(rows),
             )
         )
     params = {
@@ -520,6 +532,7 @@ def golden_section():
         [],
         fake,
         live_by_owner={"proj-a": ["a1", "a2"]},
+        project_names={"proj-a", "proj-b"},
     )
 
 
@@ -553,6 +566,7 @@ class ResourcesSection(unittest.TestCase):
             ["note: /proc/loadavg unreadable"],
             None,
             live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
         )
         self.assertIsNone(section["host_budget"])
         self.assertEqual(section["charged"], {"cpu_m": 1, "memory_mb": 1, "pids": 1})
@@ -572,6 +586,7 @@ class ResourcesSection(unittest.TestCase):
             [],
             None,
             live_by_owner={"proj-a": ["w1", "x1"]},
+            project_names={"proj-a"},
         )
         charged = {row["id"]: row["charged"] for row in section["agents"]}
         self.assertEqual(charged["w1"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
@@ -589,6 +604,7 @@ class ResourcesSection(unittest.TestCase):
             [],
             boom,
             live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
         )
         self.assertIsNone(section["agents"][0]["measured"])
         self.assertIsNone(section["measured_by_project"]["proj-a"])
@@ -608,6 +624,7 @@ class ResourcesSection(unittest.TestCase):
             [],
             fake,
             live_by_owner={"proj-b": ["solo"]},
+            project_names={"proj-b"},
         )
         self.assertEqual(section["charged"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
         self.assertEqual(section["by_project"], {"proj-b": section["charged"]})
@@ -705,6 +722,7 @@ class ChargedMatchesGate(unittest.TestCase):
             [],
             None,
             live_by_owner={"proj-a": [self.UNIT_A], "proj-b": [self.UNIT_B]},
+            project_names={"proj-a", "proj-b"},
         )
         self.assertEqual(section["charged"], {"cpu_m": 1500, "memory_mb": 3072, "pids": 150})
 
@@ -719,6 +737,7 @@ class ChargedMatchesGate(unittest.TestCase):
             [],
             None,
             live_by_owner={"proj-a": [self.UNIT_A], "proj-b": [self.UNIT_B]},
+            project_names={"proj-a", "proj-b"},
         )
         self.assertEqual(section["charged"], R.usage_dict(charged.total))
         self.assertEqual(
@@ -730,6 +749,135 @@ class ChargedMatchesGate(unittest.TestCase):
             {"proj-a": dict(self.WORKER), "proj-b": dict(self.REVIEWER)},
         )
         self.assertNotIn("", section["by_project"])
+
+    def test_no_projects_ticketless_unit_keys_match(self):
+        """Gate and snapshot key an unregistered ticketless unit the same way."""
+        from corral import launch
+
+        unit = "corral-agent-lib-5"
+        rows = [({"id": unit, "role": None, "ticket": None, "host": HOST}, "live")]
+
+        def list_fn(prefix):
+            self.assertEqual(prefix, "corral-agent-")
+            return [(unit, "active", "running")]
+
+        with mock.patch("corral.registry.visible", return_value=list(rows)):
+            charged = launch._charged_usage(
+                "corral-agent-",
+                "corral-agent-",
+                [],
+                list_fn,
+                dict(self.ROLES),
+                None,
+                T0,
+            )
+        section = snapshot.resources_section(
+            rows,
+            HOST,
+            doc_limits(),
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"corral-agent-": [unit]},
+            project_names=[],
+        )
+        self.assertEqual(set(charged.by_project), set(section["by_project"]))
+        self.assertEqual(set(section["by_project"]), {"corral-agent-"})
+        self.assertNotIn("", section["by_project"])
+
+
+class MappingLimitsBranch(unittest.TestCase):
+    def test_mapping_limits_charge_like_objects(self):
+        section = snapshot.resources_section(
+            view((entry("a1", role="worker"), "live")),
+            HOST,
+            {
+                "host": {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096},
+                "roles": {
+                    "worker": {"cpu_m": 1000, "memory_mb": 2048, "pids": 100},
+                    "reviewer": {"cpu_m": 500, "memory_mb": 1024, "pids": 50},
+                },
+            },
+            doc_pressure(),
+            [],
+            None,
+            live_by_owner={"proj-a": ["a1"]},
+            project_names={"proj-a"},
+        )
+        self.assertEqual(section["charged"], {"cpu_m": 1000, "memory_mb": 2048, "pids": 100})
+        self.assertEqual(section["host_budget"], {"cpu_m": 8000, "memory_mb": 16000, "pids": 4096})
+
+    def test_non_limits_and_a_non_mapping_listing_raise(self):
+        rows = view((entry("a1", role="worker"), "live"))
+        for bad in (42, "limits", ["host"]):
+            with self.subTest(limits=bad):
+                with self.assertRaises(R.LimitsError):
+                    snapshot.resources_section(
+                        rows,
+                        HOST,
+                        bad,
+                        doc_pressure(),
+                        [],
+                        None,
+                        live_by_owner={"proj-a": ["a1"]},
+                        project_names={"proj-a"},
+                    )
+        for bad in (["a1"], "proj-a", 5, None):
+            with self.subTest(live_by_owner=bad):
+                with self.assertRaises(R.LimitsError):
+                    snapshot.resources_section(
+                        rows,
+                        HOST,
+                        doc_limits(),
+                        doc_pressure(),
+                        [],
+                        None,
+                        live_by_owner=bad,
+                        project_names={"proj-a"},
+                    )
+        self.assertEqual(R.LimitsError.exit_code, 4)
+
+
+class DefaultMeasured(unittest.TestCase):
+    def test_agent_scope_reads_the_leaf(self):
+        from corral import units
+
+        measured = R.Measured(cpu_usage_usec=5000, memory_mb=12.5, pids=8)
+        with mock.patch("corral.resources.read_slice_use", return_value=(measured, [])) as reader:
+            got = snapshot.default_measured("agent", "corral-agent-lib-5", "proj-a")
+        self.assertEqual(got, measured)
+        (directory,), _ = reader.call_args
+        self.assertEqual(directory, units.agent_cgroup("proj-a", "corral-agent-lib-5"))
+
+    def test_project_scope_reads_the_slice(self):
+        from corral import units
+
+        measured = R.Measured(cpu_usage_usec=6000, memory_mb=20.0, pids=12)
+        with mock.patch("corral.resources.read_slice_use", return_value=(measured, [])) as reader:
+            got = snapshot.default_measured("project", "proj-a")
+        self.assertEqual(got, measured)
+        (directory,), _ = reader.call_args
+        self.assertEqual(directory, units.project_cgroup("proj-a"))
+
+    def test_scopes_without_a_subject_read_null_without_reading(self):
+        with mock.patch(
+            "corral.resources.read_slice_use",
+            side_effect=AssertionError("must not read"),
+        ):
+            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", None))
+            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", ""))
+            self.assertIsNone(snapshot.default_measured("project", None))
+            self.assertIsNone(snapshot.default_measured("project", ""))
+            self.assertIsNone(snapshot.default_measured("bogus", "x", "proj-a"))
+
+    def test_an_unreadable_leaf_and_a_bad_unit_read_null(self):
+        with mock.patch("corral.resources.read_slice_use", side_effect=OSError("slice gone")):
+            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", "proj-a"))
+        with mock.patch(
+            "corral.resources.read_slice_use",
+            side_effect=AssertionError("must not read"),
+        ):
+            self.assertIsNone(snapshot.default_measured("agent", "not a unit!", "proj-a"))
 
 
 class HubPathNeverWritesTheLedger(unittest.TestCase):

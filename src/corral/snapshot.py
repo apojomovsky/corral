@@ -182,7 +182,15 @@ def default_measured(scope, name, project=None):
 
 
 def resources_section(
-    registry_view, host, limits, pressure, pressure_notes=(), measured_fn=None, *, live_by_owner
+    registry_view,
+    host,
+    limits,
+    pressure,
+    pressure_notes=(),
+    measured_fn=None,
+    *,
+    live_by_owner,
+    project_names,
 ):
     """The `resources` snapshot section from plain data.
 
@@ -195,10 +203,11 @@ def resources_section(
     every entry of another state; only listed units charge. A missing
     role reads as the default role, and an unpriced role reads as
     zero. `live_by_owner` maps an owning project to its live unit
-    names (the collector filters to live states and well-formed
-    names); its keys are the registered project names. `host` scopes
-    nothing in the sum, the listing already does, and stays for the
-    callers that pass the host they listed on.
+    names as `resources.live_units_by_owner` builds it; `project_names`
+    holds the registered project names, passed explicitly rather than
+    derived from the listing keys. `host` scopes nothing in the sum,
+    the listing already does, and stays for the callers that pass the
+    host they listed on.
 
     Measured use comes from `measured_fn(scope, name, project)`: one
     call per charged agent under its owning project, one per charged
@@ -226,7 +235,7 @@ def resources_section(
         raise resources.LimitsError(
             f"live units must be a mapping of owner to unit names, not {live_by_owner!r}"
         )
-    names = set(live_by_owner)
+    names = set(project_names)
     charged, per_unit = resources.charge_live_units(registry_view, live_by_owner, names, roles)
     zeros = resources.Usage()
     rows = []
@@ -554,32 +563,6 @@ def _below(path, parent):
         return False
 
 
-def live_by_owner(registered, own_prefix):
-    """`{owner: [live unit names]}` for every registered project prefix.
-
-    The listing the charged sum intersects the registry with: only
-    live, well-formed units count, the same filter the launch gate
-    applies. Owners are project names; every registered project gets
-    a key even with no live units, so its name stays attributable. A
-    default prefix no registration uses is listed too under the
-    prefix itself as owner, the launch gate's single-project key, so
-    an unregistered host charges the same under both.
-    """
-    from corral import units
-
-    prefixes = {project.name: project.unit_prefix for project in registered}
-    if own_prefix not in prefixes.values():
-        prefixes[own_prefix] = own_prefix
-    out = {}
-    for owner, prefix in prefixes.items():
-        out[owner] = [
-            name
-            for name, active, _sub in units.list_units(prefix)
-            if active in units.LIVE_STATES and units.parse_unit(prefix, name)
-        ]
-    return out
-
-
 def collect_kwargs() -> dict:
     """Keyword arguments for `build` from the host's local readers.
 
@@ -601,6 +584,7 @@ def collect_kwargs() -> dict:
         registry,
         resources,
         settings,
+        units,
     )
 
     resolved = settings.load(root=_settings_root(os.getcwd()))
@@ -645,8 +629,14 @@ def collect_kwargs() -> dict:
     except Exception as exc:  # noqa: BLE001 - without names nothing is attributable
         resources_view = exc
     else:
+        own_prefix = resolved["agents.unit_prefix"]
         try:
-            listing = live_by_owner(registered, resolved["agents.unit_prefix"])
+            listing = resources.live_units_by_owner(
+                [(entry.name, entry.unit_prefix) for entry in registered],
+                own_prefix,
+                own_prefix,
+                units.list_units,
+            )
         except Exception as exc:  # noqa: BLE001 - an unread listing charges nothing, noted
             notes.append(f"units listing unreadable: {error_text(exc)}")
             listing = {}
@@ -659,6 +649,7 @@ def collect_kwargs() -> dict:
                 notes,
                 default_measured,
                 live_by_owner=listing,
+                project_names=[entry.name for entry in registered],
             )
         except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
             resources_view = exc

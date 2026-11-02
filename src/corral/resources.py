@@ -1012,6 +1012,33 @@ def measured_dict(value):
     }
 
 
+def live_units_by_owner(entries, key, own_prefix, list_fn):
+    """`{owner: [live unit names]}`, keyed by project name.
+
+    The one listing the charged sum intersects the registry with, for
+    the launch gate and the snapshot both: only live, well-formed
+    units count. `entries` is `[(name, prefix)]` for every registered
+    project, so every registered project gets a key even with no live
+    units and its name stays attributable. `key` is the project asking
+    (the gate) or the launching prefix itself (the snapshot's
+    single-project key): when no registration owns `own_prefix`, the
+    fallback lists under `key`, never an empty name. `list_fn(prefix)`
+    is the injected manager seam.
+    """
+    from corral import units
+
+    prefixes = dict(entries)
+    prefixes.setdefault(key, own_prefix)
+    return {
+        owner: [
+            name
+            for name, active, _sub in list_fn(prefix)
+            if active in units.LIVE_STATES and units.parse_unit(prefix, name)
+        ]
+        for owner, prefix in prefixes.items()
+    }
+
+
 def charge_live_units(view, live_by_owner, names, roles):
     """`(Charged, charge_by_unit)`: the charged usage of the live units.
 
@@ -1019,9 +1046,10 @@ def charge_live_units(view, live_by_owner, names, roles):
     totals and per-project attribution are identical. `view` is
     `[(entry, state)]` as `registry.visible` returns, of any state:
     live means listed by the manager in `live_by_owner`, which maps an
-    owning project to its live unit names (the caller filters to live
-    states and well-formed names first). `names` holds the registered
-    project names, and `roles` maps role names to charges.
+    owning project to its live unit names as `live_units_by_owner`
+    builds it. `names` holds the registered project names, passed
+    explicitly rather than derived from the listing keys, and `roles`
+    maps role names to charges.
 
     A unit counts for the project its registry ticket names when that
     project is registered, else the project whose listing owns it: an
@@ -1039,17 +1067,25 @@ def charge_live_units(view, live_by_owner, names, roles):
         raise LimitsError(
             f"live units must be a mapping of owner to unit names, not {live_by_owner!r}"
         )
+    if not isinstance(roles, Mapping):
+        raise LimitsError(f"roles must be a mapping of role names to charges, not {roles!r}")
     total = Usage()
     by_project: dict = {}
     per_unit: dict = {}
     for owner, unit_names in live_by_owner.items():
-        for unit in unit_names or ():
+        if not isinstance(unit_names, (list, tuple)) or any(
+            not isinstance(unit, str) for unit in unit_names
+        ):
+            raise LimitsError(
+                f"live units for {owner!r} must be a list of unit names, not {unit_names!r}"
+            )
+        for unit in unit_names:
             entry = entries.get(unit) or {}
             role = entry.get("role") or prompts.DEFAULT_ROLE
             ticket = entry.get("ticket") or {}
             named = ticket.get("project") if isinstance(ticket, dict) else None
             charged_for = named if isinstance(named, str) and named in names else owner
-            found = roles.get(role) if isinstance(roles, Mapping) else None
+            found = roles.get(role)
             cost = _usage(found if found is not None else Usage(), f"role {role}")
             total = Usage(
                 cpu_m=total.cpu_m + cost.cpu_m,
@@ -1077,7 +1113,10 @@ def capacity_report(*, host_budget, charged, pressure):
     """
     if not isinstance(charged, Charged):
         if isinstance(charged, Mapping):
-            projects = charged.get("by_project") or {}
+            if "by_project" in charged:
+                projects = charged["by_project"]
+            else:
+                projects = {}
             if not isinstance(projects, Mapping):
                 raise LimitsError(f"charged by_project must be a mapping, not {projects!r}")
             charged = Charged(
