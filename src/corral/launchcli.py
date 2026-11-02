@@ -22,11 +22,13 @@ from corral import (
     admission,
     disk,
     hold,
+    host_ledger,
     launch,
     models,
     paths,
     projects,
     prompts,
+    resources,
     runtimes,
     settings,
     units,
@@ -58,6 +60,9 @@ class Seams(NamedTuple):
     list_fn: Callable[[str], list]
     run: Callable[..., object]
     stop_fn: Callable[[str], object]
+    #: The ensured host ledger dict. Required: the default is the
+    #: production ledger, and tests must never reach it.
+    host_ledger_fn: Callable[[], dict]
     #: The board store's item for `(repo, number)`, or None. Read-only; tests pass a fake.
     board_fn: Callable | None = None
     #: The live label read `labels_fn(kind, repo, number) -> list[str]`,
@@ -92,6 +97,7 @@ def production_seams() -> Seams:
         list_fn=lambda prefix: units.list_units(prefix, run=units.default_run),
         run=units.default_run,
         stop_fn=units.systemctl_stop,
+        host_ledger_fn=host_ledger.ensure,
         labels_fn=labels_fn,
         usage=disk.production_usage,
     )
@@ -105,6 +111,9 @@ KNOWN = (
     models.Exhausted,
     projects.ProjectsError,
     prompts.PromptsError,
+    resources.LimitsError,
+    host_ledger.LedgerError,
+    host_ledger.LedgerLocked,
     units.UnitsError,
     worktrees.WorktreeError,
     runtimes.UnknownRuntime,
@@ -123,6 +132,9 @@ def _exit_code(err):
             models.Exhausted,
             projects.ProjectsError,
             prompts.PromptsError,
+            resources.LimitsError,
+            host_ledger.LedgerError,
+            host_ledger.LedgerLocked,
             units.UnitsError,
             iface.TrackerError,
         ),
@@ -279,6 +291,7 @@ def cmd_launch(args, seams: Seams) -> int:
         list_fn=seams.list_fn,
         run=seams.run,
         usage=seams.usage or disk.production_usage,
+        host_ledger_fn=seams.host_ledger_fn,
         store=seams.store,
         tracker=tracker,
     )
@@ -318,6 +331,7 @@ def cmd_resume(args, seams: Seams) -> int:
         list_fn=seams.list_fn,
         run=seams.run,
         usage=seams.usage or disk.production_usage,
+        host_ledger_fn=seams.host_ledger_fn,
         store=seams.store,
         tracker=_profile_tracker(seams, args, tgt),
     )

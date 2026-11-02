@@ -27,6 +27,7 @@ from corral import (
     quotacli,
     registry,
     reviewcli,
+    serve,
     settings,
     snapshot,
     syncli,
@@ -232,6 +233,7 @@ def build_parser() -> argparse.ArgumentParser:
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
     quotacli.add_parser(sub)
+    serve.add_parser(sub)
     snapshot.add_parser(sub)
     syncli.add_parser(sub)
     leakcli.add_parser(sub)

@@ -26,10 +26,20 @@ def _err(text):
     print(f"corral snapshot: {text}", file=sys.stderr)
 
 
+def error_text(exc):
+    """`str(exc)`, or `repr(exc)` when the message is empty."""
+    text = str(exc)
+    return text if text else repr(exc)
+
+
+def is_error_section(value):
+    """Whether a built section is a `{"error": ...}` failure body."""
+    return isinstance(value, dict) and set(value) == {"error"}
+
+
 def _section_error(exc):
     """A failed section: `{"error": text}`, never an empty message."""
-    text = str(exc) if str(exc) else repr(exc)
-    return {"error": text}
+    return {"error": error_text(exc)}
 
 
 def _agent_row(entry, state):
@@ -136,7 +146,7 @@ def _disk(usage_fn):
         try:
             total, used, free = usage_fn(name)
         except Exception as exc:  # noqa: BLE001 - per-path failure, not a section failure
-            out.append({"path": name, "error": str(exc) if str(exc) else repr(exc)})
+            out.append({"path": name, "error": error_text(exc)})
         else:
             out.append({"path": name, "total": total, "used": used, "free": free})
     return {"paths": out}
@@ -205,7 +215,7 @@ def build(now, host, registry_view, quota_view, settings, usage_fn=None, drive_v
 def _all_failed(doc):
     """Whether every readable section failed: nothing at all could be read."""
     return all(
-        isinstance(doc.get(section), dict) and set(doc[section]) == {"error"}
+        is_error_section(doc.get(section))
         for section in ("agents", "quota", "capacity", "disk", "drive")
     )
 

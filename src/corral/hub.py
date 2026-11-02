@@ -28,7 +28,6 @@ import logging
 import os
 import re
 import secrets
-import socket
 import sqlite3
 import time
 import urllib.parse
@@ -37,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from corral import paths, settings
+from corral.netbind import server_family
 
 #: API major served at `/v1/*`. Hosts compare it on every call; a
 #: breaking change is a new path major with a cutover.
@@ -944,19 +944,6 @@ def bind_warning(bind: str) -> str | None:
             " serve it only over a private network"
         )
     return None
-
-
-def server_family(bind: str) -> socket.AddressFamily:
-    """The socket family for a hub bind: IPv6 for IPv6 literals, else IPv4.
-
-    Names stay on IPv4: they resolve at bind time, and the default
-    family keeps today's behavior for them.
-    """
-    try:
-        address = ipaddress.ip_address(str(bind or ""))
-    except ValueError:
-        return socket.AF_INET
-    return socket.AF_INET6 if address.version == 6 else socket.AF_INET
 
 
 class HubServer(http.server.ThreadingHTTPServer):

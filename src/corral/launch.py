@@ -31,9 +31,9 @@ import sys
 import time
 from dataclasses import dataclass, replace
 
-from corral import accounts, admission, board, disk, models, paths, profiles
-from corral import projects, prompts, quota, quota_ledger
-from corral import prompts, registry, runtimes, settings, units, worktrees
+from corral import accounts, admission, board, disk, host_ledger, models, paths, profiles
+from corral import projects, prompts, quota, quota_ledger, registry, resources, runtimes
+from corral import settings, units, worktrees
 from corral.runtimes import muse
 from corral.runtimes import tail as runtime_tail
 
@@ -73,6 +73,22 @@ class HeldError(LaunchError):
     """The ticket carries the hold label, or its labels are unreadable: no resume (exit 1)."""
 
     exit_code = 1
+
+
+@dataclass(frozen=True)
+class Budget:
+    """The budget context one admit decided from: host, share and project.
+
+    `host` is the machine total and `share` this project's fair share of
+    it now; the launch wires both into slices. The launch never
+    recomputes them. When no host budget is configured `host` and
+    `share` are None while `project` still names the key: the gate
+    passes everything and the launch sets no slice or limit properties.
+    """
+
+    host: resources.Usage | None
+    share: resources.Usage | None
+    project: str
 
 
 @dataclass(frozen=True)
@@ -237,18 +253,135 @@ def project_live_counts(registered, list_fn, cfg):
     return counts
 
 
-def admit(tgt, number, *, list_fn, usage):
-    """Refuse a ticket that is already live, a critically low disk, or a host with no free slot.
+def _add_usage(first, second):
+    """The summed usage of two triples."""
+    return resources.Usage(
+        cpu_m=first.cpu_m + second.cpu_m,
+        memory_mb=first.memory_mb + second.memory_mb,
+        pids=first.pids + second.pids,
+    )
 
-    The decision comes from `admission.admit`: the project key is the
-    registered name of the ops root, else the unit prefix on a host with
-    no registration, and the limits are the registered floors and
-    ceilings (a lone project's ceiling is its `agents.cap`). Raises
-    units.UnitExists (exit 2) for the ticket, CapFull (exit 75) carrying
-    the verdict's reason when the host is full, or the disk refusal when
-    the pressure is critical (`low` and `unknown` never block, and a
-    forced start does not bypass the disk gate). `usage(path)` is the
-    required disk seam (no default).
+
+def _charged_usage(key, own_prefix, registered, list_fn, roles, cfg, now):
+    """Charged usage: the summed role costs of live agents, total and per project.
+
+    Live means listed by the manager under a registered prefix: an entry
+    whose unit is gone holds no share, so a crash frees the pool at
+    once. Roles come from the registry entry, worker when the unit was
+    never registered. A unit counts for the project its registry ticket
+    names, else the project whose prefix lists it.
+    """
+    names = {project.name for project in registered}
+    entries = {}
+    for entry, _state in registry.visible(now, cfg):
+        entries.setdefault(entry.get("id"), entry)
+    by_project: dict[str, resources.Usage] = {}
+    total = resources.Usage()
+    prefixes = {project.name: project.unit_prefix for project in registered}
+    prefixes.setdefault(key, own_prefix)
+    for owner, prefix in prefixes.items():
+        for name, active, _sub in list_fn(prefix):
+            if active not in units.LIVE_STATES or not units.parse_unit(prefix, name):
+                continue
+            entry = entries.get(name) or {}
+            role = entry.get("role") or prompts.DEFAULT_ROLE
+            ticket = entry.get("ticket") or {}
+            named = ticket.get("project") if isinstance(ticket, dict) else None
+            charged_for = named if isinstance(named, str) and named in names else owner
+            cost = roles.get(role) or resources.Usage()
+            total = _add_usage(total, cost)
+            by_project[charged_for] = _add_usage(
+                by_project.get(charged_for, resources.Usage()), cost
+            )
+    return resources.Charged(total=total, by_project=by_project)
+
+
+def _slice_props(decided, roles, role, controllers_read):
+    """The `unit_argv` slice and limit keywords for a decided budget.
+
+    {} when no host budget is configured: the launch then runs exactly
+    as before, with no slice and no limit property. Otherwise the
+    delegated controllers are read (refusing when a required one is
+    missing) and the role's charge prices the limits.
+    """
+    if decided.host is None:
+        return {}
+    available = units.delegated_controllers(read=controllers_read)
+    charge = roles.get(role or prompts.DEFAULT_ROLE) or resources.Usage()
+    return {
+        "slice": units.project_slice(decided.project),
+        "memory_max": charge.memory_mb,
+        "cpu_quota": charge.cpu_m,
+        "tasks_max": charge.pids,
+        "controllers": available,
+    }
+
+
+def _ensure_slices(decided, run):
+    """Create the host slice then the project slice with their limits, in order.
+
+    Nothing is created when no host budget is configured. An existing
+    slice reads as created; parents always precede their children.
+    """
+    if decided.host is None:
+        return
+    units.ensure_slice(
+        units.HOST_SLICE,
+        memory_max=decided.host.memory_mb,
+        cpu_quota=decided.host.cpu_m,
+        run=run,
+    )
+    assert decided.share is not None
+    units.ensure_slice(
+        units.project_slice(decided.project),
+        parent=units.HOST_SLICE,
+        memory_max=decided.share.memory_mb,
+        cpu_quota=decided.share.cpu_m,
+        run=run,
+    )
+
+
+def _require_role_price(tgt, role, where):
+    """Refuse an unpriced role while a host budget is set (exit 4).
+
+    With a host budget every launch is charged by role: a role with no
+    ``[resources.role.<name>]`` table would run free and set no per-agent
+    limits, so the launch refuses instead, naming the role, the missing
+    table and the host config file. With no host budget the gate passes
+    everything and unpriced roles launch untouched. Unknown roles are
+    not priced either, but they stay a ``LimitsError`` from the budget
+    gate: no table could exist for them.
+    """
+    name = role or prompts.DEFAULT_ROLE
+    if name not in prompts.ROLES:
+        return
+    tables = tgt.resolved.resources
+    if tables is None or name not in tables.roles:
+        raise LaunchError(
+            f"role {name!r} has no [resources.role.{name}] price in {where}: "
+            "the host budget is set, so every launch is charged; "
+            "add the table to price this role"
+        )
+
+
+def admit(tgt, number, *, list_fn, usage, host_ledger_fn, role=None, now_fn=None):
+    """Refuse a ticket that is already live, a pressured host, or a host with no free slot.
+
+    Gates run in this order and the first refusal wins: disk pressure,
+    agent count, resource budget, provider quota (the quota gate runs in
+    `launch`, after this returns). The count decision comes from
+    `admission.admit` and the budget one from `resources.admit`: the
+    project key is the registered name of the ops root, else the unit
+    prefix on a host with no registration. Raises units.UnitExists
+    (exit 2) for the ticket, CapFull (exit 75) carrying the verdict's
+    reason when a gate refuses, or the disk refusal when the pressure is
+    critical (`low` and `unknown` never block, and a forced start does
+    not bypass the disk gate). Config errors in any layer raise exit 4
+    and are evaluated before any gate. `usage(path)` is the required
+    disk seam and `host_ledger_fn()` the required host ledger seam (the
+    ensured ledger dict): neither has a default. `role` is the prompt
+    role being launched, None reading as worker: the budget prices its
+    charge. Returns the decided `Budget`.
     """
     registered = projects.load_all()
     cfg = registry.config(tgt.resolved)
@@ -263,6 +396,16 @@ def admit(tgt, number, *, list_fn, usage):
         raise units.UnitExists(
             f"#{number} of {tgt.repo} already has a live agent {REGISTERED_NOTE}"
         )
+    base = resources.config(tgt.resolved)
+    ledger = host_ledger_fn()
+    limits = None
+    now = None
+    where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
+    if base.host is not None:
+        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        limits = resources.join(base, shares, ledger.get("foreign", []), where=where)
+        now = (now_fn or time.time)()
+        _require_role_price(tgt, role, where)
     refusal = disk.refusal_text(tgt.resolved, usage=usage)
     if refusal is not None:
         raise CapFull(refusal)
@@ -293,6 +436,18 @@ def admit(tgt, number, *, list_fn, usage):
                 f"ceiling {project.ceiling}; the ceiling wins)"
             )
         raise CapFull(verdict.reason + note)
+    if limits is None or now is None:
+        return Budget(host=None, share=None, project=key)
+    charged = _charged_usage(key, own_prefix, registered, list_fn, limits.roles, cfg, now)
+    budget = resources.admit(
+        resources.Request(project=key, role=role or prompts.DEFAULT_ROLE),
+        charged,
+        limits,
+        now,
+    )
+    if not budget.allowed:
+        raise CapFull(budget.reason)
+    return Budget(host=limits.host, share=resources.share_cap(limits, key, now), project=key)
 
 
 def _ticket_root(tgt, number):
@@ -586,6 +741,7 @@ def launch(
     list_fn,
     run,
     usage,
+    host_ledger_fn,
     git=worktrees.git,
     pool_fn=None,
     ledger_fn=None,
@@ -593,6 +749,7 @@ def launch(
     selections=None,
     store=None,
     tracker=None,
+    controllers_read=None,
 ):
     """Start a new agent for ticket `number`. Returns `(unit, workdir)`.
 
@@ -654,16 +811,31 @@ def launch(
     )
     if selection is None:
         adapter = _adapter(tgt.runtime)
-        chains = _model_chains(tgt, pool, ledger, moment)
         session_runtime = tgt.runtime
     else:
         adapter = _adapter(selection.runtime)
-        chains = selection.chains
         session_runtime = selection.runtime
     _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn, usage=usage)
+        decided = admit(
+            tgt,
+            number,
+            list_fn=list_fn,
+            usage=usage,
+            host_ledger_fn=host_ledger_fn,
+            role=role,
+            now_fn=now_fn,
+        )
+        if selection is None:
+            chains = _model_chains(
+                tgt,
+                pool,
+                (ledger_fn or quota_ledger.load)(),
+                (now_fn or time.time)(),
+            )
+        else:
+            chains = selection.chains
         workdir, branch = worktrees.ensure_worktree(
             tgt.clone,
             number,
@@ -678,7 +850,15 @@ def launch(
             _check_text(prompt, "prompt")
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn, usage=usage)
+        decided = admit(
+            tgt,
+            number,
+            list_fn=list_fn,
+            usage=usage,
+            host_ledger_fn=host_ledger_fn,
+            role=role,
+            now_fn=now_fn,
+        )
         prompt = prompts.with_heartbeat(prompt)
         leaves = _leaves(tgt, number)
         try:
@@ -720,7 +900,18 @@ def launch(
             except ValueError as err:
                 raise LaunchError(str(err)) from None
             argv = units.unit_argv(
-                unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
+                unit,
+                workdir,
+                session,
+                command,
+                _env(adapter, session, unit),
+                RUNTIME_MAX_S,
+                **_slice_props(
+                    decided,
+                    resources.config(tgt.resolved).roles,
+                    role,
+                    controllers_read,
+                ),
             )
         except Exception:
             if session_id is not None:
@@ -728,6 +919,7 @@ def launch(
             raise
         _register_started(tgt, unit, number, model, role, runtime=session_runtime)
         try:
+            _ensure_slices(decided, run)
             units.start(argv, session, unit, run=run)
         except Exception:
             if session_id is not None:
@@ -819,6 +1011,7 @@ def resume(
     list_fn,
     run,
     usage,
+    host_ledger_fn,
     git=worktrees.git,
     pool_fn=None,
     ledger_fn=None,
@@ -826,6 +1019,7 @@ def resume(
     selections=None,
     store=None,
     tracker=None,
+    controllers_read=None,
 ):
     """Resume ticket `number`'s newest session of `role` in a new unit.
 
@@ -893,7 +1087,15 @@ def resume(
     _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn, usage=usage)
+        admit(
+            tgt,
+            number,
+            list_fn=list_fn,
+            usage=usage,
+            host_ledger_fn=host_ledger_fn,
+            role=role,
+            now_fn=now_fn,
+        )
         workdir, _branch = worktrees.ensure_worktree(
             tgt.clone,
             number,
@@ -904,7 +1106,15 @@ def resume(
         )
 
     with units.spawn_lock():
-        admit(tgt, number, list_fn=list_fn, usage=usage)
+        decided = admit(
+            tgt,
+            number,
+            list_fn=list_fn,
+            usage=usage,
+            host_ledger_fn=host_ledger_fn,
+            role=role,
+            now_fn=now_fn,
+        )
         # A concurrent launch of this ticket may have added a newer
         # generation between the pre-lock read and this lock: resolve
         # the newest session again here, so the mode started is the
@@ -956,7 +1166,18 @@ def resume(
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(
-            unit, workdir, session, command, _env(adapter, session, unit), RUNTIME_MAX_S
+            unit,
+            workdir,
+            session,
+            command,
+            _env(adapter, session, unit),
+            RUNTIME_MAX_S,
+            **_slice_props(
+                decided,
+                resources.config(tgt.resolved).roles,
+                role,
+                controllers_read,
+            ),
         )
         _register_started(
             tgt,
@@ -967,6 +1188,7 @@ def resume(
             runtime=selection.runtime if selection is not None else runtime,
         )
         try:
+            _ensure_slices(decided, run)
             units.start(argv, session, unit, run=run)
         except Exception:
             _close_never_started(unit)

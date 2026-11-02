@@ -326,6 +326,14 @@ TAIL = """# Defaults: uncomment to override.
 # [review]
 # review.required = true  # takeoff needs an approving review record for the head
 #
+# [serve]
+# serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
+# serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
+# serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
+# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
+# serve.tail_max = 200  # maximum activity lines one tail read returns
+#
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
 # tracker.repo = ""  # tracker repository as owner/name (default: the clone's origin)
@@ -437,6 +445,14 @@ commits.conventional = false
 #
 # [review]
 # review.required = true  # takeoff needs an approving review record for the head
+#
+# [serve]
+# serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
+# serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
+# serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
+# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
+# serve.tail_max = 200  # maximum activity lines one tail read returns
 #
 # [tracker]
 # tracker.operators = []  # tracker logins treated as operators (default: the repository owner only)
