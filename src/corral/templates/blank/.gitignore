@@ -1,0 +1,4 @@
+.worktrees/
+*~
+*.swp
+.DS_Store
