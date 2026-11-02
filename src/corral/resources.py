@@ -22,6 +22,8 @@ import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from corral import prompts, settings
+
 #: Verdict codes. Stable strings: callers branch on them.
 OK = "ok"
 HOST_FULL = "host-full"
@@ -31,6 +33,13 @@ ROLE_COST = "role-cost"
 
 #: Seconds a foreign claim counts against the pool after it is declared.
 DEFAULT_GONE_S = 600.0
+
+settings.register(
+    "resources.gone_s",
+    int,
+    int(DEFAULT_GONE_S),
+    "seconds a foreign claim counts against the pool",
+)
 
 #: The resource dimensions, in verdict and reason order.
 DIMS = ("cpu_m", "memory_mb", "pids")
@@ -495,4 +504,112 @@ def admit(request, charged, limits, now):
         total,
         used,
         cost,
+    )
+
+
+@dataclass(frozen=True)
+class Tables:
+    """The ``[resources]`` tables exactly as the host config sets them.
+
+    ``host`` is the ``[resources.host]`` machine total, None when the
+    file sets no budget: no enforcement, the gate passes everything.
+    ``roles`` holds only the roles with a ``[resources.role.<name>]``
+    table; ``config`` prices every other known role at zero. Tables never
+    come from the project file or a repo entry: the host budget is one
+    machine fact, and those layers read as unknown settings instead.
+    """
+
+    host: Usage | None
+    roles: dict = field(default_factory=dict)
+
+
+def _checked_amount(value, what, where):
+    """A whole amount of zero or more, else a SettingsError naming it."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise settings.SettingsError(
+            f"{where}: {what} must be an int of zero or more, not {value!r}"
+        )
+    return value
+
+
+def _checked_triple(raw, what, where, *, complete):
+    """A Usage from a settings table: strict keys, missing dims read as zero.
+
+    A complete triple (the host budget) needs every dimension; a missing
+    one is a typo, not a zero. Unknown keys are errors, never ignored.
+    """
+    if not isinstance(raw, dict):
+        raise settings.SettingsError(f"{where}: {what} must be a table")
+    if not raw:
+        raise settings.SettingsError(f"{where}: {what} is an empty table")
+    for key in raw:
+        if key not in DIMS:
+            raise settings.SettingsError(f"{where}: {what} has no key {key!r}")
+    if complete:
+        for key in DIMS:
+            if key not in raw:
+                raise settings.SettingsError(f"{where}: {what} needs {key!r}")
+    return Usage(
+        cpu_m=_checked_amount(raw.get("cpu_m", 0), f"{what} cpu_m", where),
+        memory_mb=_checked_amount(raw.get("memory_mb", 0), f"{what} memory_mb", where),
+        pids=_checked_amount(raw.get("pids", 0), f"{what} pids", where),
+    )
+
+
+def check_tables(raw, where):
+    """The host config's ``[resources]`` value as Tables, None when absent.
+
+    Strict on the ``[models]`` precedent: unknown tables (there is no
+    project or instance layer at host level), unknown keys, unknown role
+    names, and partial host triples are SettingsError naming the file
+    and the key. A missing role table prices that role at zero later.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise settings.SettingsError(f"{where}: [resources] must be a table")
+    if not raw:
+        raise settings.SettingsError(f"{where}: [resources] is an empty table")
+    for key in raw:
+        if key not in ("host", "role"):
+            raise settings.SettingsError(f"{where}: [resources] has no table {key!r}")
+    host = None
+    if "host" in raw:
+        host = _checked_triple(raw["host"], "[resources.host]", where, complete=True)
+    entries = raw.get("role", {})
+    if not isinstance(entries, dict):
+        raise settings.SettingsError(
+            f"{where}: [resources.role] must be a table of per-role charges"
+        )
+    roles = {}
+    for name, table in entries.items():
+        if name not in prompts.ROLES:
+            raise settings.SettingsError(
+                f"{where}: [resources.role] unknown role {name!r}: "
+                f"expected one of {', '.join(prompts.ROLES)}"
+            )
+        roles[name] = _checked_triple(table, f"[resources.role.{name}]", where, complete=False)
+    return Tables(host=host, roles=roles)
+
+
+def config(resolved=None):
+    """The effective host-level budget as Limits: the budget or None, every role's charge.
+
+    Unpriced roles cost nothing. Project shares come from the project
+    registry and foreign claims from the ledger ticket; this is the host
+    part only. Raises SettingsError when ``resources.gone_s`` is out of
+    range.
+    """
+    resolved = resolved if resolved is not None else settings.load()
+    tables = resolved.resources
+    gone_s = resolved["resources.gone_s"]
+    if isinstance(gone_s, bool) or not isinstance(gone_s, int) or gone_s < 0:
+        raise settings.SettingsError(f"resources.gone_s {gone_s!r} must be zero or more")
+    roles = {name: Usage() for name in prompts.ROLES}
+    if tables is not None:
+        roles.update(tables.roles)
+    return Limits(
+        host=tables.host if tables is not None else None,
+        roles=dict(roles),
+        gone_s=gone_s,
     )
