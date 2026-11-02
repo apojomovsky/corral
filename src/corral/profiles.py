@@ -500,7 +500,12 @@ def ticket_assignment(
         )
     names: list[str] = []
     for label in labels:
-        if not isinstance(label, str) or not label.startswith(LABEL_PREFIX):
+        if not isinstance(label, str):
+            raise ProfileError(
+                f"ticket {repo}#{number}: label {label!r} must be a string, "
+                "not a hand-corrupted row: repair the store row"
+            )
+        if not label.startswith(LABEL_PREFIX):
             continue
         name = label[len(LABEL_PREFIX) :]
         if not name:
@@ -564,8 +569,11 @@ def load_tracker_assignment(store, tracker, *, repo, number, now, stale_after):
     so the cached row stands. Returns (None, "", reason) when the store
     holds no row: the ticket is withdrawn and the launch skips it. A
     stale row with an unreachable tracker raises `TrackerError` (exit 3),
-    an unreadable store raises `StoreError` (exit 4), and a corrupt shared
-    value raises `ProfileError` (exit 4): none of them skip.
+    corrupt store content raises `StoreError` (exit 4), and a corrupt
+    shared value raises `ProfileError` (exit 4): none of them skip. A
+    truncated database raises a bare `sqlite3.Error` instead: the launch
+    caller maps both store failures to exit 4, mirroring
+    `drive.refresh_row`.
     """
     found, fresh = store.item(repo, number, now=now, max_age=stale_after)
     if found is None:

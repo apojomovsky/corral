@@ -31,6 +31,7 @@ from corral import (
     settings,
     units,
 )
+from corral import tracker as iface
 from corral import worktrees
 
 
@@ -67,6 +68,13 @@ class Seams(NamedTuple):
     #: `usage(path) -> (total, used, free)` for the disk gate. None means
     #: the production reader. Tests pass a fake.
     usage: Callable | None = None
+    #: The board store for the ticket's profile assignment (an object with
+    #: `.item`), or None to open the real store. Tests pass a fake.
+    store: object | None = None
+    #: The tracker for live re-reads of a stale ticket row, or None to
+    #: trust the cached row (the CLI builds the production tracker only
+    #: when a profile may resolve). Tests pass a fake.
+    tracker: object | None = None
 
 
 def production_seams() -> Seams:
@@ -102,6 +110,7 @@ KNOWN = (
     runtimes.UnknownRuntime,
     settings.SettingsError,
     paths.PathError,
+    iface.TrackerError,
 )
 
 
@@ -115,6 +124,7 @@ def _exit_code(err):
             projects.ProjectsError,
             prompts.PromptsError,
             units.UnitsError,
+            iface.TrackerError,
         ),
     ):
         return err.exit_code
@@ -177,6 +187,26 @@ def _board_title(args, tgt, seams):
     return title
 
 
+def _profile_tracker(seams, args, tgt):
+    """The tracker for the ticket's profile assignment, or None.
+
+    The injected fake wins; otherwise the production tracker builds only
+    when a profile may resolve (a declaration exists or `--profile` names
+    one), and a build failure is exit 4. With no profiles configured the
+    launch runs the pre-profiles path and never touches a tracker.
+    """
+    if seams.tracker is not None:
+        return seams.tracker
+    if not tgt.resolved.profiles and not args.profile:
+        return None
+    from corral import trackers
+
+    mapping, problem = trackers.production_trackers(tgt.root, [tgt.repo], git=worktrees.git)
+    if problem is not None:
+        raise launch.LaunchError(problem)
+    return mapping[tgt.repo].tracker
+
+
 def _overlay_text(tgt):
     """The ops root's `agents.overlay.md`, or "" when it is absent."""
     if not tgt.root:
@@ -231,6 +261,7 @@ def cmd_launch(args, seams: Seams) -> int:
     config = _read_config(args.runtime_config)
     flags = {"agents.runtime": args.runtime} if args.runtime else None
     tgt = _target(args, flags)
+    tracker = _profile_tracker(seams, args, tgt)
     if args.role:
         prompt, title = _role_prompt(args, tgt, seams)
     else:
@@ -243,9 +274,13 @@ def cmd_launch(args, seams: Seams) -> int:
         model=args.model,
         runtime_config=config,
         role=args.role,
+        profile=args.profile,
+        runtime=args.runtime,
         list_fn=seams.list_fn,
         run=seams.run,
         usage=seams.usage or disk.production_usage,
+        store=seams.store,
+        tracker=tracker,
     )
     print(f"launched {unit} in {workdir}")
     return OK
@@ -278,9 +313,13 @@ def cmd_resume(args, seams: Seams) -> int:
         hold_reason_fn=hold_reason_fn,
         role=args.role,
         model=args.model,
+        profile=args.profile,
+        runtime=args.runtime,
         list_fn=seams.list_fn,
         run=seams.run,
         usage=seams.usage or disk.production_usage,
+        store=seams.store,
+        tracker=_profile_tracker(seams, args, tgt),
     )
     print(f"resumed as {unit} in {workdir}")
     return OK
@@ -347,6 +386,7 @@ def add_parser(sub, seams: Seams) -> None:
     p.add_argument("--title", default=None, help="the ticket title, to name a new branch")
     p.add_argument("--model", default=None, help="the model the runtime should use")
     p.add_argument("--runtime", default=None, help="the runtime (default: agents.runtime)")
+    p.add_argument("--profile", default=None, help="the agent profile for this launch only")
     p.add_argument("--runtime-config", default=None, help="a JSON object file, the runtime config")
     p.set_defaults(func=_verb(cmd_launch, seams))
 
@@ -354,6 +394,8 @@ def add_parser(sub, seams: Seams) -> None:
     _common(p)
     p.add_argument("--message", required=True, help="what the resumed agent is told")
     p.add_argument("--model", default=None, help="the model the runtime should use")
+    p.add_argument("--runtime", default=None, help="the runtime for this resume only")
+    p.add_argument("--profile", default=None, help="the agent profile for this resume only")
     p.add_argument(
         "--role",
         default=prompts.DEFAULT_ROLE,

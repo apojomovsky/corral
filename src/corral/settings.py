@@ -165,6 +165,18 @@ class Resolved:
     #: config. Project files and repo entries cannot set it: the host
     #: budget is one machine fact, and it reads as unknown there.
     resources: "Tables | None" = None
+    #: Raw ``[profiles.<name>]`` tables, the host config shadowing the
+    #: project file per name. The launch path validates them through
+    #: ``profiles.validate``; this stays unchecked here so the shape and
+    #: pool errors name the profile in one place.
+    profiles: dict = field(default_factory=dict)
+    #: The committed profile defaults: ``{"default": name | None, "repos":
+    #: {repo: name}, "roles": {role: name}}`` from ``[profile]``,
+    #: ``[[repo]] profile`` and ``[role.<name>]`` in the project file.
+    #: The launch path feeds this to ``profiles.resolve`` as ``committed``.
+    #: Committed means committed: the host config cannot set these, and a
+    #: host ``[profile]`` or ``[role]`` table reads as unknown.
+    profile_committed: dict = field(default_factory=dict)
 
     def __getitem__(self, key):
         return self.values[key].value
@@ -223,6 +235,48 @@ def _check_models(raw, where):
                 )
         chains[role] = list(chain)
     return chains
+
+
+def _check_profile_tables(raw, where):
+    """Raw ``[profiles.<name>]`` tables: a table of tables, carried unchecked.
+
+    Values are validated later by ``profiles.validate`` (the one owner);
+    this only refuses a non-table, so a typo like ``profiles = "x"``
+    fails here naming the file.
+    """
+    if not isinstance(raw, dict):
+        raise SettingsError(f"{where}: [profiles] must be a table of profiles")
+    return dict(raw)
+
+
+def _check_profile_default(raw, where):
+    """The ``[profile]`` table as the committed global default name or None."""
+    if not isinstance(raw, dict):
+        raise SettingsError(f"{where}: [profile] must be a table with a default")
+    for key in raw:
+        if key != "default":
+            raise SettingsError(f"{where}: [profile] has no key {key!r}: want default")
+    default = raw.get("default")
+    if default is not None and (not isinstance(default, str) or not default):
+        raise SettingsError(f"{where}: [profile] default must be a non-empty string")
+    return default
+
+
+def _check_role_profiles(raw, where):
+    """The ``[role.<name>]`` tables as ``{role: profile name}``."""
+    if not isinstance(raw, dict):
+        raise SettingsError(f"{where}: [role] must be a table of roles")
+    out = {}
+    for role, table in raw.items():
+        if not isinstance(role, str) or not role:
+            raise SettingsError(f"{where}: [role] names must be non-empty strings")
+        if not isinstance(table, dict) or set(table) != {"profile"}:
+            raise SettingsError(f"{where}: [role.{role}] must hold exactly a profile name")
+        name = table["profile"]
+        if not isinstance(name, str) or not name:
+            raise SettingsError(f"{where}: [role.{role}] profile must be a non-empty string")
+        out[role] = name
+    return out
 
 
 def _check_private(raw, where):
@@ -392,13 +446,15 @@ def _check_variant(value, where):
 
 
 def _repo_entries(repos, project_name):
-    """``({name: {dotted key: checked value}}, {name: BoardConfig | None})``
-    for each ``[[repo]]`` entry, in file order. The one validation of entry
-    names and keys, including every entry's ``[board]`` table."""
+    """``({name: {dotted key: checked value}}, {name: BoardConfig | None},
+    {name: profile name})`` for each ``[[repo]]`` entry, in file order.
+    The one validation of entry names and keys, including every entry's
+    ``[board]`` table and ``profile`` pin."""
     if not isinstance(repos, list) or not all(isinstance(r, dict) for r in repos):
         raise SettingsError(f"{project_name}: [[repo]] must be an array of tables")
     entries: dict = {}
     boards: dict = {}
+    repo_profiles: dict = {}
     for index, raw in enumerate(repos, 1):
         entry = dict(raw)
         name = entry.pop("name", None)
@@ -407,6 +463,9 @@ def _repo_entries(repos, project_name):
         if name in entries:
             raise SettingsError(f"{project_name}: [[repo]] {name!r} appears twice")
         where = f"{project_name} [[repo]] {name}"
+        profile = entry.pop("profile", None)
+        if profile is not None and (not isinstance(profile, str) or not profile):
+            raise SettingsError(f"{where}: profile must be a non-empty string")
         scalars, concepts = _split_board(entry.pop("board", None), where)
         for key, value in scalars.items():
             dotted = f"board.{key}"
@@ -415,11 +474,13 @@ def _repo_entries(repos, project_name):
             entry[dotted] = value
         boards[name] = _check_board(concepts or None, where)
         entries[name] = {k: _check(k, v, where) for k, v in _flatten(entry, where).items()}
+        if profile is not None:
+            repo_profiles[name] = profile
         _check_variant(
             entries[name].get("tracker.variant", REGISTRY["tracker.variant"].default),
             where,
         )
-    return entries, boards
+    return entries, boards, repo_profiles
 
 
 def repo_names(root):
@@ -430,7 +491,7 @@ def repo_names(root):
         return []
     project_path = os.path.join(root, PROJECT_FILE)
     project = _load(project_path)
-    entries, _ = _repo_entries(project.get("repo", []), project_path)
+    entries, _, _ = _repo_entries(project.get("repo", []), project_path)
     return list(entries)
 
 
@@ -447,7 +508,7 @@ def covering_repo(root, clone):
     if not root:
         return None
     project_path = os.path.join(root, PROJECT_FILE)
-    entries, _ = _repo_entries(_load(project_path).get("repo", []), project_path)
+    entries, _, _ = _repo_entries(_load(project_path).get("repo", []), project_path)
     want = os.path.realpath(clone)
     matched = []
     for name, values in entries.items():
@@ -508,6 +569,7 @@ def resolve(
 
     limits = host.pop("limits", {})
     resource_tables = host.pop("resources", None)
+    host_profiles = _check_profile_tables(host.pop("profiles", {}), host_name)
     if not isinstance(limits, dict):
         raise SettingsError(f"{host_name}: [limits] must be a table")
     nested_gone = None
@@ -529,9 +591,12 @@ def resolve(
     repos = project.pop("repo", [])
     chains = _check_models(project.pop("models", {}), project_name)
     private = _check_private(project.pop("private", {}), project_name)
+    project_profiles = _check_profile_tables(project.pop("profiles", {}), project_name)
+    profile_default = _check_profile_default(project.pop("profile", {}), project_name)
+    role_profiles = _check_role_profiles(project.pop("role", {}), project_name)
     for key, value in _flatten(project, project_name).items():
         result[key] = Value(_check(key, value, project_name), PROJECT)
-    entries, boards = _repo_entries(repos, project_name)
+    entries, boards, repo_profiles = _repo_entries(repos, project_name)
     if repo is not None:
         if repo not in entries:
             raise SettingsError(f"{project_name}: no [[repo]] named {repo!r}")
@@ -563,7 +628,17 @@ def resolve(
 
     board = boards[repo] if repo is not None else None
     return Resolved(
-        result, chains, private, board, resources.check_tables(resource_tables, host_name)
+        result,
+        chains,
+        private,
+        board,
+        resources.check_tables(resource_tables, host_name),
+        profiles={**project_profiles, **host_profiles},
+        profile_committed={
+            "default": profile_default,
+            "repos": repo_profiles,
+            "roles": role_profiles,
+        },
     )
 
 

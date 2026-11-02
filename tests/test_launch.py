@@ -13,6 +13,7 @@ import dataclasses
 import io
 import json
 import os
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -25,7 +26,9 @@ from contextlib import redirect_stdout
 from corral import accounts, cli, hold, launch, launchcli, models, paths, registry, runtimes
 from corral import settings, units
 from corral.runtimes import muse, omp, opencode
+from tests.test_profiles_launch import FakeStore
 from tests.test_reviewrecord import git_in
+from tests.test_tracker import FakeTracker
 
 REPOS = ("lib", "my-repo")
 
@@ -1600,6 +1603,179 @@ class RoleSessionIsolationTest(OpsCase):
             run=self.system.run,
         )
         self.assertEqual(resumed, "corral-agent-lib-5-r1")
+
+
+class ProfileLaunchCliTest(OpsCase):
+    """`launch`/`resume --profile` through the CLI, with fake store and tracker."""
+
+    PROFILES_TOML = """\
+[profiles.fast]
+runtime = "muse"
+"""
+
+    def write_profiles(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text + self.PROFILES_TOML)
+
+    def write_tracker_repo(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            'name = "lib"\nclone = { path = "clones/lib" }',
+            'name = "lib"\nclone = { path = "clones/lib" }\ntracker.repo = "example/lib"',
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def seams(self, store=None, tracker=None):
+        return launchcli.Seams(
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            stop_fn=self.system.stop_fn,
+            labels_fn=lambda kind, repo, number: [],
+            usage=roomy,
+            store=store,
+            tracker=tracker,
+        )
+
+    def verb(self, *argv, **seams_kw):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            code = launchcli.run_verb([*argv, "--root", self.root], self.seams(**seams_kw))
+        return code, out.getvalue(), err.getvalue()
+
+    def registered_runtime(self, unit):
+        (found,) = [e for e in registry.load_all() if e["id"] == unit]
+        return found["runtime"]
+
+    def test_launch_with_profile_runs_the_profile_runtime(self):
+        self.write_profiles()
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        unit = out.split()[1]
+        self.assertEqual(self.registered_runtime(unit), "muse")
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "runtime"), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "muse\n")
+
+    def test_launch_with_unknown_profile_is_exit_4(self):
+        self.write_profiles()
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "nope",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("nope", err)
+
+    def test_launch_with_a_truncated_store_is_exit_4(self):
+        self.write_profiles()
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            store=store,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("profile assignment", err)
+
+    def test_launch_with_a_dead_tracker_is_exit_3(self):
+        self.write_profiles()
+        store = FakeStore(found=SimpleNamespace(labels=["ready"], extra={}), fresh=False)
+        tracker = FakeTracker([])
+        tracker.item_errors[("lib", 5)] = "down"
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            store=store,
+            tracker=tracker,
+        )
+        self.assertEqual(code, 3)
+
+    def test_resume_with_profile_runs_the_profile_runtime(self):
+        self.write_profiles()
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.registered_runtime(out.split()[2]), "muse")
+
+    def test_resume_with_model_alone_keeps_the_old_path(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        with open(os.path.join(paths.newest_session("lib", 5, "worker"), "chat.jsonl"), "w") as h:
+            h.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--model",
+            "m",
+        )
+        self.assertEqual((code, err), (0, ""))
 
 
 if __name__ == "__main__":
