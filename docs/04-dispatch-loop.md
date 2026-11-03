@@ -332,7 +332,11 @@ ignores them. A `finished` entry is neither `live` nor `stale` under
 `registry.status`, so it already counts as "no live or stale entry"
 for the section 4 orphan rule; reconciliation runs first, so a
 finished worker always takes this completion path, never the orphan
-one.
+one. Completion needs no pull request: the finished entry proves the
+worker's turn ended, so the reviewer is scheduled on the branch
+whether or not a PR was opened. Without any registry entry for the
+holder, a clean exit is indistinguishable from a crash: the claim
+stays held and the stuck handling below applies.
 
 Stuck agents: each pass compares claimed tickets against registry
 liveness and unit liveness. Only managed holders ever reach here;
@@ -344,6 +348,21 @@ foreign claims were skipped at gate step 2.
   and epoch, reusing the identical agent id: `Store.claim` is
   idempotent only for the same agent, and a fresh id on a still-held
   row gets `Claimed`).
+- Eligibility of restarts: a restart re-checks the row-state subset
+  of the section 3 gate before spending any budget. A non-open or
+  externally owned row, a held row, a row waiting on a human, or a
+  row no project requested this pass is not restarted: the loop
+  releases its claim (the epoch is kept, so the next claim fences
+  correctly) and logs why. No budget stamp is written and no give-up
+  is posted. Unreadable hold labels fail closed instead: the claim
+  is kept for a later pass.
+- Operator stops: `corral stop` marks the unit's registry entry done,
+  so the ticket takes the completion path above and is never
+  restarted. Stopping the unit directly (for example with
+  `systemctl stop`) leaves the registry entry as it was, which the
+  loop reads as a crash and restarts within budget. The restart
+  logbook line names `corral stop`, so an operator who stopped the
+  unit learns the lasting way to keep it stopped.
 - Restart budget: at most 3 automatic restarts per ticket in any
   sliding 24 hour window, counted as timestamps in a small state
   file: a restart is allowed only when fewer than 3 stored timestamps

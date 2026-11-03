@@ -14,6 +14,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 
 from corral import board, drive, registry
 from corral import tracker as iface
@@ -63,6 +64,22 @@ def stuck_pass(store, lock_path, out, err, **fields):
     }
     values.update(fields)
     return drive_pass(store, lock_path, out, err, **values)
+
+
+def wants(policy_dir, *tickets):
+    """The `found`/`policy_dir` kwargs requesting `tickets` as starts.
+
+    A stuck claim the fleet still wants stays restart-eligible, so
+    every full-pass stuck test that expects a restart, a give-up or a
+    cap verdict requests its claimed tickets this way, mirroring a
+    project policy that keeps asking for its in-flight tickets. `start`
+    on a claimed row is a gate no-op ("already claimed"), so the claim
+    path never launches under these tests.
+    """
+    return {
+        "found": [("blue", [(repo, number, "start") for repo, number in tickets])],
+        "policy_dir": policy_dir,
+    }
 
 
 def live_holder(agent=AGENT, *, seen=OLD):
@@ -255,6 +272,8 @@ class RestartPassTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def test_a_gone_agent_with_a_dead_unit_restarts_reusing_its_agent_id(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -267,6 +286,7 @@ class RestartPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -367,6 +387,7 @@ class RestartPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -393,6 +414,7 @@ class RestartPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -415,6 +437,7 @@ class RestartPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=None,
             restarter=FakeLauncher(),
@@ -436,6 +459,7 @@ class RestartPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=FakeLauncher(),
@@ -459,6 +483,7 @@ class RestartPassTest(unittest.TestCase):
                 self.lock,
                 out,
                 err,
+                **wants(self.policies, ("app", 7)),
                 agent_states={},
                 stop_unit=FakeStop(),
                 restarter=FakeLauncher(),
@@ -477,6 +502,8 @@ class GiveUpPassTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def over_budget(self):
         drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
@@ -494,6 +521,7 @@ class GiveUpPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -524,6 +552,7 @@ class GiveUpPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
@@ -548,6 +577,7 @@ class GiveUpPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
@@ -570,6 +600,7 @@ class GiveUpPassTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
@@ -820,6 +851,8 @@ class RefreshRegressionTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def test_repeated_restarts_reach_the_budget_then_give_up_never_orphaned(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -835,6 +868,7 @@ class RefreshRegressionTest(unittest.TestCase):
                 self.lock,
                 out,
                 err,
+                **wants(self.policies, ("app", 7)),
                 agent_states={},
                 stop_unit=stop,
                 restarter=launcher,
@@ -874,6 +908,7 @@ class RefreshRegressionTest(unittest.TestCase):
                 self.lock,
                 out,
                 err,
+                **wants(self.policies, ("app", 7)),
                 agent_states={},
                 stop_unit=stop,
                 restarter=launcher,
@@ -906,6 +941,7 @@ class RefreshRegressionTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -926,6 +962,8 @@ class BudgetSaveTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def test_a_failing_save_aborts_the_restart_and_keeps_the_claim(self):
         from unittest import mock
@@ -941,6 +979,7 @@ class BudgetSaveTest(unittest.TestCase):
                 self.lock,
                 out,
                 err,
+                **wants(self.policies, ("app", 7)),
                 agent_states={},
                 stop_unit=stop,
                 restarter=launcher,
@@ -969,6 +1008,7 @@ class BudgetSaveTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=launcher,
@@ -984,6 +1024,7 @@ class BudgetSaveTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=launcher,
@@ -1008,6 +1049,7 @@ class BudgetSaveTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=FakeLauncher(),
@@ -1045,6 +1087,7 @@ class BudgetSaveTest(unittest.TestCase):
                 self.lock,
                 out,
                 err,
+                **wants(self.policies, ("app", 7)),
                 agent_states={},
                 stop_unit=stop,
                 restarter=FakeLauncher(),
@@ -1097,6 +1140,7 @@ class BudgetSaveTest(unittest.TestCase):
                 self.lock,
                 out,
                 err,
+                **wants(self.policies, ("app", 7)),
                 agent_states={},
                 stop_unit=stop,
                 restarter=FakeLauncher(),
@@ -1120,6 +1164,8 @@ class GiveUpOrderTest(unittest.TestCase):
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
         drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def run_give_up(self, store, fake):
         out, err = io.StringIO(), io.StringIO()
@@ -1128,6 +1174,7 @@ class GiveUpOrderTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
@@ -1184,6 +1231,7 @@ class GiveUpOrderTest(unittest.TestCase):
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
             restarts_path=self.budget,
+            **wants(self.policies, ("app", 7)),
             fake_tracker=fake,
             now=NOW + 10.0,
         )
@@ -1212,6 +1260,7 @@ class GiveUpOrderTest(unittest.TestCase):
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
             restarts_path=self.budget,
+            **wants(self.policies, ("app", 7)),
             fake_tracker=None,
             tracker_factory=missing,
             now=NOW + 10.0,
@@ -1231,6 +1280,8 @@ class StuckErrorBranchTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def run_stuck(self, store, **over):
         values = {
@@ -1238,6 +1289,7 @@ class StuckErrorBranchTest(unittest.TestCase):
             "stop_unit": FakeStop(),
             "restarter": FakeLauncher(),
             "restarts_path": self.budget,
+            **wants(self.policies, ("app", 7), ("app", 9)),
         }
         values.update(over)
         stop, launcher = values["stop_unit"], values["restarter"]
@@ -1456,6 +1508,8 @@ class StuckJournalTest(unittest.TestCase):
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
         self.journal = os.path.join(self.tmp.name, "drive", "journal.jsonl")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def journal_entries(self):
         with open(self.journal, encoding="utf-8") as handle:
@@ -1471,6 +1525,7 @@ class StuckJournalTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
@@ -1498,6 +1553,7 @@ class StuckJournalTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=FakeStop(),
             restarter=FakeLauncher(),
@@ -1553,6 +1609,7 @@ class StuckDayCapTest(unittest.TestCase):
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
+            **wants(self.policies, ("app", 7)),
             restarts_path=self.budget,
             day_path=self.day,
             max_starts=1,
@@ -1577,6 +1634,7 @@ class StuckDayCapTest(unittest.TestCase):
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
+            **wants(self.policies, ("app", 7)),
             restarts_path=self.budget,
             day_path=self.day,
             max_starts=1,
@@ -1605,7 +1663,7 @@ class StuckDayCapTest(unittest.TestCase):
             self.lock,
             out,
             err,
-            found=[("blue", [("app", 7, "start")])],
+            found=[("blue", [("app", 7, "start"), ("app", 9, "start")])],
             policy_dir=self.policies,
             fake_tracker=fake,
             launcher=launcher,
@@ -1645,6 +1703,7 @@ class StuckDayCapTest(unittest.TestCase):
             agent_states={},
             stop_unit=stop,
             restarter=restarter,
+            **wants(self.policies, ("app", 7)),
             restarts_path=self.budget,
             fake_tracker=fake,
             day_path=self.day,
@@ -1676,6 +1735,7 @@ class StuckDayCapTest(unittest.TestCase):
             agent_states={},
             stop_unit=stop,
             restarter=restarter,
+            **wants(self.policies, ("app", 7), ("app", 8)),
             restarts_path=self.budget,
             day_path=self.day,
             max_starts=1,
@@ -1695,6 +1755,8 @@ class HubEpochStuckTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
     def run_hub_stuck(self, store, *, hub_epoch_of, **fields):
         stop, launcher = FakeStop(), FakeLauncher()
@@ -1704,6 +1766,7 @@ class HubEpochStuckTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -1800,6 +1863,7 @@ class HubEpochStuckTest(unittest.TestCase):
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={},
             stop_unit=stop,
             restarter=launcher,
@@ -1918,6 +1982,228 @@ class DropStaleTest(unittest.TestCase):
         assert found is not None
         self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
         self.assertIn("left held", out.getvalue())
+
+
+class RestartEligibilityTest(unittest.TestCase):
+    """The stuck sweep consults row eligibility before restarting. Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-restart-eligibility-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+
+    def sweep(self, store, **over):
+        values = {
+            "agent_states": {},
+            "stale_s": STALE_S,
+            "gone_s": GONE_S,
+            "live_units": frozenset(),
+            "now": NOW,
+            "host": HOST,
+            "stuck_project": lambda repo, number: "blue",
+            "stop_unit": FakeStop(),
+            "restarter": FakeLauncher(),
+            "tracker_factory": None,
+            "restarts_path": self.budget,
+            "read_labels": lambda kind, repo, number: [],
+            "hold_label": "hold",
+            "requested": {("app", 7)},
+        }
+        values.update(over)
+        stop, launcher = values["stop_unit"], values["restarter"]
+        out, err = io.StringIO(), io.StringIO()
+        result = drive.handle_stuck(store, out=out, err=err, **values)
+        return result, out.getvalue(), err.getvalue(), stop, launcher
+
+    def test_a_held_ticket_is_released_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        (restarted, capped), text, _, stop, launcher = self.sweep(
+            store, read_labels=lambda kind, repo, number: ["hold"]
+        )
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("held for a human", text)
+        self.assertIn("not restarted", text)
+        self.assertIn("claim released", text)
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_a_closed_ticket_is_released_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        row, _ = store.item("app", 7, now=NOW)
+        store.upsert_item(replace(row, state="closed"), operators=["operator"], now=NOW)
+        (restarted, capped), text, _, stop, launcher = self.sweep(store)
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("not open", text)
+        self.assertIn("not restarted", text)
+        self.assertIn("claim released", text)
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_a_withdrawn_ticket_is_released_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        (restarted, capped), text, _, stop, launcher = self.sweep(store, requested=frozenset())
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("withdrawn by this pass's eligibility", text)
+        self.assertIn("not restarted", text)
+        self.assertIn("claim released", text)
+        self.assertIsNone(store.claim_of("app", 7))
+        self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_a_ticket_waiting_on_a_human_is_released_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        row, _ = store.item("app", 7, now=NOW)
+        store.upsert_item(replace(row, labels=[NEEDS_DECISION]), operators=["operator"], now=NOW)
+        (restarted, capped), text, _, stop, launcher = self.sweep(store)
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("waiting on a human", text)
+        self.assertIn("not restarted", text)
+        self.assertIn("claim released", text)
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_requested_ticket_still_restarts(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        (restarted, capped), text, _, stop, launcher = self.sweep(store)
+        self.assertEqual((restarted, capped), (1, False))
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertIn("restarted", text)
+
+    def test_a_restart_names_the_stop_verb_for_a_lasting_stop(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        (_, _), text, _, _, _ = self.sweep(store)
+        self.assertIn("app#7", text)
+        self.assertIn("restarted", text)
+        self.assertIn("corral stop", text)
+
+    def test_unreadable_labels_keep_the_claim_without_a_restart(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+
+        def failing(kind, repo, number):
+            raise RuntimeError("labels away")
+
+        (restarted, capped), text, _, stop, launcher = self.sweep(store, read_labels=failing)
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("unreadable", text)
+        self.assertIn("claim kept", text)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, AGENT)
+
+    def test_a_release_race_on_an_ineligible_row_is_left_held(self):
+        from unittest import mock
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+
+        def raced(repo, number, agent, epoch, *, now):
+            raise board.Claimed("item app#7 is held by somebody-else")
+
+        with mock.patch.object(store, "release", side_effect=raced):
+            (restarted, capped), text, _, stop, launcher = self.sweep(store, requested=frozenset())
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("withdrawn", text)
+        self.assertIn("left held", text)
+
+
+class FinishedWorkerReviewTest(unittest.TestCase):
+    """A finished worker without a PR is reviewed, never restarted. Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-finished-review-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_finished_worker_without_a_pr_is_reviewed_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher, stop = FakeLauncher(), FakeStop()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "review")])],
+            policy_dir=self.policies,
+            fake_tracker=fake,
+            launcher=launcher,
+            agent_states={AGENT: (registry.FINISHED, OLD + 10.0)},
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=FakeLauncher(),
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "review")
+        self.assertEqual(launcher.calls[0][6], AGENT)
+        self.assertEqual(stop.calls, [])
+        self.assertIn("released finished worker", out.getvalue())
+        self.assertNotIn("restart", out.getvalue())
+
+    def test_a_full_pass_releases_a_withdrawn_stuck_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 9, "start")])],
+            policy_dir=self.policies,
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("withdrawn by this pass's eligibility", out.getvalue())
+        self.assertIn("claim released", out.getvalue())
+        self.assertIsNone(store.claim_of("app", 7))
 
 
 if __name__ == "__main__":
