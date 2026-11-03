@@ -15,6 +15,7 @@
 | [`10-agent-profiles.md`](10-agent-profiles.md) | agent profiles: one selectable setup (runtime, model chains, options) with local, project and per-ticket scope, and the tickets to build it |
 | [`11-board-standard.md`](11-board-standard.md) | the standard project board: its fields and options, idempotent provisioning, the `corral.toml` mapping write, adoption, doctor checks, and the tickets to build it |
 | [`12-web-dashboard.md`](12-web-dashboard.md) | design for the web dashboard: a read-only browser UI over `corral serve` and the hub, the stack choice, token handling on arbitrary devices, and the tickets to build it |
+| [`13-agent-ergonomics.md`](13-agent-ergonomics.md) | agent ergonomics: wait, events, the review-report reader, merge, and the gate |
 | [`adr/`](adr/) | decision records |
 
 `00-design.md` and `02-accounts-quota.md` are designs: how the system works and what each slice builds. `01-onboarding.md` records decisions (the R1 to R7 requirements and what each one settled) alongside the flow they shape. New decision records go in `adr/`.
