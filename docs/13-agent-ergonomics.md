@@ -140,8 +140,9 @@ no GitHub calls. The wakeup primitive; filtering and dispatch stay
 in the caller's shell.
 
 Arguments: `[--project NAME] [--timeout SECS] [--json]`.
-`--timeout` waits at most that long; omitted waits forever; a
-non-positive value times out at once when the queue is empty.
+`--timeout` waits at most that long; omitted waits forever; zero
+times out at once when the queue is empty, and a negative value
+is exit 4.
 
 JSON shape (`--json`): the unresolved batch as an array, or `[]`
 on timeout.
@@ -166,9 +167,9 @@ state the loop will act on.
 
 Arguments: `[--project NAME] [--all] [--follow] [--json]`.
 `--all` includes resolved rows; default is unresolved only.
-`--follow` prints each new unresolved row as it arrives and runs
-until killed; it does not pair with `--timeout` (timeouts belong
-to `wait`).
+`--follow` first dumps the current selection (honoring `--all`),
+then prints arrivals by unseen id, and runs until killed; it
+does not pair with `--timeout` (timeouts belong to `wait`).
 
 JSON shape (`--json`): a document, not a bare array, so later
 fields do not break callers:
@@ -232,8 +233,10 @@ inherited across a clean merge-up, else null. `approves()` treats
 `approve` and `approve-with-findings` as passing.)
 
 Exit codes: 0 the record approves, 1 no record, a blocking
-verdict, a head mismatch, or a base absent from the clone, 3 the
-forge is unreachable, 4 usage.
+verdict, a head mismatch, a base absent from the clone, or a
+missing `--pr` or unresolvable `--forge-repo` (the code returns
+1 there today; making that case exit 4 is a later code change),
+3 the forge is unreachable, 4 usage.
 
 State read: the ticket's `reviews/` dir under the session root
 (via `reviewrecord` and `paths.ticket_session_dir`), plus one
