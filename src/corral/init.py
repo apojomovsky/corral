@@ -209,6 +209,8 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
     the clone's absolute path in the split layout.
     """
     settings._load_providers()
+    if runtime in runtimes.REMOVED:
+        raise InitError(f"--runtime {runtime!r}: {runtimes.REMOVED_MESSAGE}")
     if runtime is not None and runtime not in runtimes.NAMES:
         raise InitError(f"--runtime {runtime!r}: want one of {', '.join(runtimes.NAMES)}")
     root = resolve_root(path, git)

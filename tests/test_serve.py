@@ -390,7 +390,7 @@ class ImportClosure(unittest.TestCase):
             "systemd",
             "docker",
             "omp",
-            "opencode",
+            "muse",
             "claude",
             "requests",
         }

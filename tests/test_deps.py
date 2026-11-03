@@ -46,11 +46,11 @@ class Check(unittest.TestCase):
         self.assertTrue(r.ok)
 
     def test_a_major_at_the_bound_fails(self):
-        r = deps.check(dep(name="opencode", below="2"), fake({"opencode": "2.0.1"}))
+        r = deps.check(dep(name="muse", below="2"), fake({"muse": "2.0.1"}))
         self.assertEqual(r.problem, "version 2.0.1, needs below 2")
 
     def test_below_the_bound_passes(self):
-        r = deps.check(dep(name="opencode", below="2"), fake({"opencode": "1.18.32"}))
+        r = deps.check(dep(name="muse", below="2"), fake({"muse": "1.18.32"}))
         self.assertTrue(r.ok)
 
     def test_a_pattern_without_a_version_is_a_yes_no_check(self):
@@ -157,35 +157,6 @@ class OmpTripwire(unittest.TestCase):
         entry = self.entry()
         ref = re.search(r"--(?:ref|version)\s+v?(\d+)", entry.install or "")
         self.assertIsNotNone(ref, "the omp installer names no versioned ref")
-        assert ref is not None
-        self.assertEqual(int(ref.group(1)) + 1, int(entry.below))
-
-
-class OpencodeTripwire(unittest.TestCase):
-    """The shipped opencode entry pins major 1: canned 1.x passes, 2.x fails."""
-
-    def entry(self):
-        return next(d for d in deps.load() if d.name == "opencode")
-
-    def test_corral_deps_reports_opencode(self):
-        self.assertEqual(self.entry().probe, ("opencode", "--version"))
-
-    def test_canned_1x_output_passes(self):
-        r = deps.check(self.entry(), fake({"opencode": "opencode 1.18.32\n"}))
-        self.assertTrue(r.ok)
-
-    def test_canned_2x_output_fails_with_the_cutover_hint(self):
-        entry = self.entry()
-        self.assertEqual(entry.below, "2")
-        self.assertIn("cutover", entry.why)
-        r = deps.check(entry, fake({"opencode": "opencode 2.0.1\n"}))
-        self.assertFalse(r.ok)
-        self.assertIn("below 2", r.problem or "")
-
-    def test_the_installer_ref_matches_the_below_bound(self):
-        entry = self.entry()
-        ref = re.search(r"--(?:ref|version)\s+v?(\d+)", entry.install or "")
-        self.assertIsNotNone(ref, "the opencode installer names no versioned ref")
         assert ref is not None
         self.assertEqual(int(ref.group(1)) + 1, int(entry.below))
 

@@ -15,7 +15,7 @@ home runtime config is read by the runtime itself and never written.
 
 from corral import quota, settings
 
-#: The role an opencode launch runs as: opencode takes one model, not a table.
+#: The default role: a single-model launch runs its head.
 DEFAULT_ROLE = "default"
 
 
@@ -39,8 +39,11 @@ def validate(chains, providers) -> None:
 
     An entry must be a non-empty model id that does not start with ``-``,
     and its provider (the part before ``provider/model``) must be in the
-    pool. Raises ``ModelsError`` naming the role and the entry.
+    pool. A removed runtime's provider is refused even when the pool
+    names it. Raises ``ModelsError`` naming the role and the entry.
     """
+    from corral import runtimes
+
     known = _pool_names(providers)
     for role, chain in (chains or {}).items():
         for entry in chain or ():
@@ -50,6 +53,8 @@ def validate(chains, providers) -> None:
                     "that does not start with '-'"
                 )
             provider = quota.chain_provider(entry)
+            if provider in runtimes.REMOVED:
+                raise ModelsError(f"role {role!r}: model {entry!r}: {runtimes.REMOVED_MESSAGE}")
             if provider not in known:
                 raise ModelsError(
                     f"role {role!r}: model {entry!r} names unknown provider {provider!r}"

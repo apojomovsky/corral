@@ -280,7 +280,6 @@ class AdapterSchemas(unittest.TestCase):
     def test_each_real_schema_accepts_its_own_keys_with_the_right_types(self):
         good = {
             "omp": {"auto_approve": False},
-            "opencode": {"bash_timeout_ms": 60000},
             "muse": {"reasoning_effort": "high", "parallel_tool_calls": True},
         }
         for name, options in good.items():
@@ -293,7 +292,6 @@ class AdapterSchemas(unittest.TestCase):
     def test_each_real_schema_refuses_a_wrong_option_type(self):
         bad = {
             "omp": {"auto_approve": "yes"},
-            "opencode": {"bash_timeout_ms": True},
             "muse": {"reasoning_effort": 2},
         }
         for name, options in bad.items():

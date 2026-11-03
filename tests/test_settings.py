@@ -45,8 +45,8 @@ class Layers(unittest.TestCase):
                 self.assertEqual((item.value, item.origin), (value, origin))
 
     def test_a_repo_entry_applies_only_to_its_repo(self):
-        project = {"repo": [{"name": "app", "agents": {"runtime": "opencode"}}, {"name": "lib"}]}
-        self.assertEqual(resolve(project=project, repo="app")["agents.runtime"], "opencode")
+        project = {"repo": [{"name": "app", "agents": {"runtime": "muse"}}, {"name": "lib"}]}
+        self.assertEqual(resolve(project=project, repo="app")["agents.runtime"], "muse")
         self.assertEqual(resolve(project=project, repo="lib")["agents.runtime"], "omp")
         self.assertEqual(resolve(project=project)["agents.runtime"], "omp")
 

@@ -136,12 +136,10 @@ class RuntimeBinaries(unittest.TestCase):
         self.assertIn(install, failed.fix)
 
     def test_an_unreferenced_missing_runtime_is_not_a_profile_failure(self):
-        checks = check(
-            state(parsed=declared()), [dep("muse"), dep("omp"), dep("opencode", "missing")]
-        )
+        checks = check(state(parsed=declared()), [dep("muse"), dep("omp"), dep("ghost", "missing")])
         rows = by_name(checks)
         self.assertEqual(rows["profile-runtimes"].status, "ok")
-        self.assertNotIn("profile-runtimes:opencode", rows)
+        self.assertNotIn("profile-runtimes:ghost", rows)
 
     def test_a_runtime_with_no_probe_fails_naming_it(self):
         checks = check(state(parsed=declared()), [dep("muse")])

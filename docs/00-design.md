@@ -20,7 +20,7 @@ The test: **if a second project would need it unchanged, it belongs in corral.**
 
 ### corral owns
 
-1. **Runtimes.** One adapter per headless agent runtime (omp, opencode, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors. A reviewer launch asks the runtime for its read-only mode (muse adds `--disable-write`); adapters with no read-only flag accept the request and rely on the reviewer prompt's read-only rule.
+1. **Runtimes.** One adapter per headless agent runtime (omp, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors. A reviewer launch asks the runtime for its read-only mode (muse adds `--disable-write`); adapters with no read-only flag accept the request and rely on the reviewer prompt's read-only rule.
 2. **Units.** Transient `systemd --user` units: spawn lock, liveness, stop, naming. The unit prefix is set per project.
 3. **Sessions.** One session root per host, one directory per `<project>/<ticket>`, with one leaf per role generation (`<role>-<n>`) below it, so a reviewer launch never overwrites the worker's record. Resume and tail read the newest leaf of a role; a legacy single-directory session reads as generation 0.
 4. **Accounts and models.** One accounts file per host lists providers, accounts and their quota readers. Each project declares its own models (roles, fallback chains, sub-agent overrides), naming only providers from that pool. The user's home runtime config is never edited.
@@ -89,7 +89,7 @@ corral is a uv project. On a host, `uv tool install` puts the CLI in its own env
 ## 3. Milestone 1: one host
 
 1. Ground rules: skeleton, hooks, `make bootstrap`, `corral deps`, the API versioning rule.
-2. Runtimes, units, sessions. Exit: a fake project launches, resumes, tails and stops an omp, an opencode and a muse agent in tests, through fake seams.
+2. Runtimes, units, sessions. Exit: a fake project launches, resumes, tails and stops an omp and a muse agent in tests, through fake seams.
 3. Accounts, models, quota. Exit: `corral quota` shows one view, and a launch whose chain is exhausted is refused or re-routed.
 4. Admission. Exit: with the total cap reached by one project, another gets only its floor.
 5. Host hygiene, run first in plan-only mode next to whatever it replaces.
