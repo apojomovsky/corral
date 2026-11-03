@@ -938,6 +938,118 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["checks.suite_lock_timeout_s"].default, 3600)
         self.assertIn("corral.takeoff", settings.PROVIDERS)
 
+    def test_each_policy_check_names_its_flag_skip(self):
+        for name in ("commits", "em-dash", "body", "leak", "review", "checks"):
+            with self.subTest(skip=name):
+                result = self.gate(skips=[name])
+                found = [c for c in result.checks if c.name == name][0]
+                self.assertEqual(found.status, "skipped")
+                self.assertEqual(found.skipped_by, "flag")
+                self.assertEqual(found.detail, f"skipped by --skip {name}")
+                for check in result.checks:
+                    if check.name != name:
+                        self.assertEqual(check.status, "ok", check.name)
+                self.assertEqual(result.exit_code, 0)
+
+    def test_skipped_checks_command_never_runs(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[checks]\n"
+            'takeoff = ["make test"]\n'
+        )
+        result = self.gate(body_file=None, skips=["checks"])
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "skipped")
+        self.assertEqual(found.skipped_by, "flag")
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_skipped_review_passes_without_a_record(self):
+        shutil.rmtree(os.environ["CORRAL_SESSIONS"], ignore_errors=True)
+        result = self.gate(skips=["review"])
+        found = [c for c in result.checks if c.name == "review"][0]
+        self.assertEqual(found.status, "skipped")
+        self.assertEqual(found.skipped_by, "flag")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_config_off_skips_report_config(self):
+        self.write("bad.txt", "bad\n", root=self.work)
+        self.git("add", "-A", cwd=self.work)
+        self.commit("added a thing", cwd=self.work)
+        bad = self.rev("HEAD", cwd=self.work)
+        self.write_record(bad, verdict="approve")
+        self.write("dash.txt", "one \u2014 two\n", root=self.work)
+        self.git("add", "-A", cwd=self.work)
+        self.commit("docs(thing): note the dash", cwd=self.work)
+        head = self.rev("HEAD", cwd=self.work)
+        self.write_record(head, verdict="approve")
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[git.commits]\n"
+            "conventional = false\n"
+            "[checks]\n"
+            "no_em_dash = false\n"
+            "[review]\n"
+            "required = false\n"
+        )
+        result = self.gate(body_file=None)
+        for name, detail in (
+            ("commits", "git.commits.conventional is false"),
+            ("em-dash", "checks.no_em_dash is false"),
+            ("review", "review.required is false"),
+        ):
+            with self.subTest(check=name):
+                found = [c for c in result.checks if c.name == name][0]
+                self.assertEqual(found.status, "skipped")
+                self.assertEqual(found.skipped_by, "config")
+                self.assertEqual(found.detail, detail)
+
+    def test_body_without_a_file_reports_a_config_skip(self):
+        result = self.gate(body_file=None)
+        found = [c for c in result.checks if c.name == "body"][0]
+        self.assertEqual(found.status, "skipped")
+        self.assertEqual(found.skipped_by, "config")
+        self.assertEqual(found.detail, "no --body file given")
+
+    def test_passing_rows_carry_no_skip_provenance(self):
+        result = self.gate()
+        for check in result.checks:
+            self.assertIsNone(check.skipped_by, check.name)
+
+    def test_an_unknown_skip_is_a_usage_error_naming_it(self):
+        with self.assertRaisesRegex(takeoff.TakeoffError, "bogus"):
+            self.gate(skips=["bogus"])
+
+    def test_identity_checks_refuse_a_flag_skip(self):
+        for name in ("base", "worktree"):
+            with self.subTest(skip=name):
+                with self.assertRaisesRegex(takeoff.TakeoffError, name):
+                    self.gate(skips=[name])
+
+    def test_a_flag_skip_wins_over_a_config_off_skip(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[review]\n"
+            "required = false\n"
+        )
+        result = self.gate(body_file=None, skips=["review"])
+        found = [c for c in result.checks if c.name == "review"][0]
+        self.assertEqual(found.status, "skipped")
+        self.assertEqual(found.skipped_by, "flag")
+        self.assertEqual(found.detail, "skipped by --skip review")
+
 
 class TakeoffCliCase(unittest.TestCase):
     def setUp(self):
@@ -1060,6 +1172,97 @@ class TakeoffCliCase(unittest.TestCase):
         parser = cli.build_parser()
         args = parser.parse_args(["takeoff"])
         self.assertEqual(args.command, "takeoff")
+
+    def test_cli_skip_flag_skips_a_check(self):
+        from corral import takeoffcli
+        import argparse
+
+        shutil.rmtree(os.environ["CORRAL_SESSIONS"], ignore_errors=True)
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(
+            [
+                "takeoff",
+                "--ops",
+                self.case.ops,
+                "--body",
+                self.case.body,
+                "--skip",
+                "review",
+                self.case.work,
+            ]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 0)
+        self.assertIn("takeoff review: skipped - skipped by --skip review", out.getvalue())
+
+    def test_cli_json_reports_skip_provenance(self):
+        from corral import takeoffcli
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(
+            [
+                "takeoff",
+                "--ops",
+                self.case.ops,
+                "--body",
+                self.case.body,
+                "--json",
+                "--skip",
+                "review",
+                self.case.work,
+            ]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 0)
+        doc = json.loads(out.getvalue())
+        rows = {c["name"]: c for c in doc["checks"]}
+        self.assertEqual(rows["review"]["status"], "skipped")
+        self.assertEqual(rows["review"]["skipped_by"], "flag")
+        for name, row in rows.items():
+            if name != "review":
+                self.assertIsNone(row["skipped_by"], name)
+            self.assertIn("skipped_by", row, name)
+
+    def test_cli_unknown_skip_exits_4(self):
+        from corral import takeoffcli
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(
+            ["takeoff", "--ops", self.case.ops, "--skip", "bogus", self.case.work]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 4)
+        self.assertIn("bogus", err.getvalue())
+
+    def test_cli_identity_skip_exits_4(self):
+        from corral import takeoffcli
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(
+            ["takeoff", "--ops", self.case.ops, "--skip", "base", self.case.work]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 4)
+        self.assertIn("base", err.getvalue())
 
 
 class NoEmDashInCodeCase(unittest.TestCase):
