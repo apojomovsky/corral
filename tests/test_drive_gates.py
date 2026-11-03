@@ -61,8 +61,13 @@ def entry(project="blue", req=None, row_=None, number=7, kind="start", wait=1000
 
 class ManagedAgentTest(unittest.TestCase):
     def test_drive_prefix_is_managed(self):
-        self.assertTrue(drive.is_managed_agent("drive-host-1-1700000000-app--7"))
+        self.assertTrue(
+            drive.is_managed_agent(drive.mint_agent("acme/app", 7, host="host-1", now=2000.0))
+        )
         self.assertTrue(drive.is_managed_agent("drive-"))
+
+    def test_a_previously_minted_shape_stays_managed(self):
+        self.assertTrue(drive.is_managed_agent("drive-host-1-1700000000-app--7"))
 
     def test_anything_else_is_foreign(self):
         self.assertFalse(drive.is_managed_agent("agent-1"))
