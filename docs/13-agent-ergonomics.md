@@ -104,13 +104,12 @@ and re-emits. Malformed lines are dropped by readers, never fatal.
 ### 4.2 Location: one fact, one place
 
 The file is `<state>/projects/<project>/coord/events.jsonl`,
-resolved ONLY by `coordevents.events_path()` (PROPOSED: move the
-two-line join into that function explicit form and keep it the
-single resolver; it builds on `coord.project_root()`, which builds
-on `paths.state_dir()`, so the chain stays single). No other
-module joins the path. `wait`, the new `events` verb and the serve
-stream all read through it. Anyone can still `cat` the file or
-query it with `jq`: nothing is hidden behind an API.
+resolved ONLY by `coordevents.events_path()`. It builds on
+`coord.project_root()`, which builds on `paths.state_dir()`, so
+the chain stays single. No other module joins the path. `wait`,
+the new `events` verb and the serve stream all read through it.
+Anyone can still `cat` the file or query it with `jq`: nothing is
+hidden behind an API.
 
 ### 4.3 Retention
 
@@ -179,19 +178,26 @@ fields do not break callers:
  "events": [{"id": "3f9a1c2e", "kind": "held-merge", "ref": "atlas#12",
    "evidence": "PR 34: checks failing", "state": "6:abc123checks failing",
    "first_seen": "2026-10-30T08:12:00+00:00",
-   "resolved_at": null, "resolved_by": null}]}
+   "resolved_at": null}]}
 ```
+
+(An open row carries no `resolved_by` key until it resolves, as
+`record()` writes; a resolved row adds `resolved_at` and
+`resolved_by`.)
 
 Without `--json`, one line per event, the same terse form `wait`
 prints: `id kind ref evidence` on one line. `--follow --json`
-prints one document per new row (JSON lines), flushing every row
+prints one document per new row (JSON lines) in the same
+envelope with a single-element `events` array, flushing every row
 so `events --follow --json | jq` works through a pipe.
 
 Exit codes: 0 always on a successful read (an empty queue is an
-empty list, not a failure), 4 on usage. `--follow` runs until
-terminated; it has no terminal success of its own, so scripts that
-need an exit code use `wait` in a loop and reserve `--follow` for
-watching and shipping.
+empty list, not a failure), 4 on usage. `events` takes no
+`--timeout` flag; passing one, with or without `--follow`, is
+exit 4 (timeouts belong to `wait`). `--follow` runs until
+terminated; it has no terminal success of its own, so scripts
+that need an exit code use `wait` in a loop and reserve
+`--follow` for watching and shipping.
 
 State read: the event log (section 4), shared lock, local poll
 only. Never the tracker, never the forge.
@@ -251,9 +257,12 @@ Arguments: `REPO PR --head SHA [--method squash] [--skip CHECK]
 number. `--head` is required: the exact head SHA the caller
 approved. `--method` takes one value today, `squash`; anything
 else is exit 4, so the flag exists for later extension without
-breaking callers. `--skip` names a merge precondition to waive,
-with the same recording rule as the gate (section 6); the default
-is no skips.
+breaking callers. `--skip` names only `checks`, with the same
+recording rule as the gate (section 6); the default is no skips.
+Naming `lock`, `open`, `head`, `review` or `fork` is exit 4:
+those checks establish what is being merged, and skipping
+identity is not a policy choice (mirroring takeoff, section
+5.5).
 
 JSON shape (`--json`): the precondition verdict plus the outcome:
 
@@ -419,15 +428,16 @@ here.
 
 ### 7.1 Serialization
 
-Merges to one repository serialize on a per-repo lock under the
-state dir (`<state>/merges/<owner>+<repo>.lock`, PROPOSED; the
-exact filename is set at implementation, the rule is one lock per
-forge repo). The verb acquires the lock, re-reads the PR live,
-merges, verifies, and releases. A second merger exits 2 while the
-lock is held: race lost, try later. `--plan` never takes the
-lock. The lock is per repo, not per host: two unrelated projects
-never block each other, and two PRs to the same repo never merge
-concurrently.
+Merges to one repository serialize on a per-repo lock
+(`<state>/merges/<owner>+<repo>.lock`, PROPOSED), resolved ONLY
+by `merge.lock_path(repo)`, which builds on `paths.state_dir()`.
+The exact filename is set at implementation; the rule is one
+lock per forge repo, one resolver for its path. The verb acquires
+the lock, re-reads the PR live, merges, verifies, and releases.
+A second merger exits 2 while the lock is held: race lost, try
+later. `--plan` never takes the lock. The lock is per repo, not
+per host: two unrelated projects never block each other, and two
+PRs to the same repo never merge concurrently.
 
 ### 7.2 The checks, in order
 
@@ -442,16 +452,21 @@ concurrently.
    inherited across a clean merge-up. A block or a missing record
    refuses. This is the same reader takeoff uses, so the merge
    gate and the takeoff gate cannot disagree.
-5. `checks`: the forge's check statuses on the head are green.
-   `--skip checks` waives this row and records the skip.
+5. `checks`: the forge's check statuses on the head are green
+   (read from the fresh `pull_request()`, extended per section
+   8). `--skip checks` waives this row and records the skip; it
+   is the only waivable merge check (section 5.4).
 6. `fork`: the PR is not from a fork. Fork merges refuse with
    exit 1; a maintainer merges those by hand (AGENTS.md: external
    contributions are for maintainers).
 
 After the merge call, the verb verifies: re-read the PR and
-require state `merged` with the merge commit's second parent
-equal to the pinned head. A mismatch fails closed with exit 1
-(the merge happened but is unverified; the row says so).
+require state `merged` plus the merge commit SHA the forge
+reports tied to the pinned head (section 8). A mismatch fails
+closed with exit 1 (the merge happened but is unverified; the
+row says so). A parent check on the merge commit is reserved for
+a future non-squash method; squash produces a single-parent
+commit, so no parent check applies here.
 
 ### 7.3 How it refuses, and what it never does
 
@@ -472,7 +487,25 @@ verb never:
 
 ## 8. The forge seam for merge
 
-`forge.py` gains one method (PROPOSED):
+`pull_request()` today returns no check statuses and no
+merge-commit SHA, but sections 5.4 and 7.2 read both. PROPOSED:
+extend `PullRequest` with two fields, read from the same fresh
+PR fetch, so the merge gate needs no second seam:
+
+- `checks_state: str`: `"passing"`, `"failing"` or `"pending"`,
+  summarizing the forge's check statuses on the head SHA;
+- `merge_sha: str | None`: the merge commit SHA once the PR
+  state is `merged`, else None. The verify step ties this SHA to
+  the pinned head.
+
+Only the adapters know the provider shape (the GitHub adapter
+parses both from the same `gh api` PR fetch it already
+performs); everything else takes the `Forge` object. The
+alternative (a separate `checks()` seam method) is rejected: two
+reads can disagree about a moving PR, while one fresh read keeps
+state, head, checks and merge SHA consistent.
+
+`forge.py` gains one more method (PROPOSED):
 
 ```python
 def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
@@ -485,7 +518,7 @@ def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
     """
 ```
 
-Only the GitHub adapter implements it (`gh pr merge --squash`
+Only the GitHub adapter implements it (a `gh api` merge call
 against the pinned head, verified as in section 7.2). Everything
 else takes a `Forge`, per the rule that nothing outside the two
 adapters calls `gh`. Coordinators calling `gh pr merge` directly
@@ -601,9 +634,11 @@ state dirs, per AGENTS.md).
 1. `coord events` list verb: `--all`, `--json`, text form; pure
    reader over `coordevents`. Tests: row filtering, empty queue,
    malformed lines dropped.
-2. `coord events --follow`: follow mode with per-row flush;
-   injectable clock and sleep like `wait_for_events`. Tests:
-   arrival batching, kill handling, no tracker or forge calls.
+2. `coord events --follow`: follow mode with per-row flush in
+   the single-element envelope; injectable clock and sleep like
+   `wait_for_events`. Tests: arrival batching, envelope shape
+   per row, `--timeout` rejected with exit 4, kill handling, no
+   tracker or forge calls.
 3. `takeoff --skip NAME`: named skips for the six policy checks,
    `skipped_by` in JSON and text, exit 4 on unknown or identity
    names. Tests: each skip, config-off rows unchanged, refusal
@@ -612,15 +647,21 @@ state dirs, per AGENTS.md).
    commands reported as `planned`. Tests: no command executed
    (fake runner asserts zero calls), exit codes mirror resolved
    rows.
-5. `Forge.merge` seam plus the GitHub adapter: pin `--head`,
-   squash, post-merge verify (state `merged`, second parent is
-   the pinned head). Tests: adapter against a fake runner, seam
-   refusal shapes.
-6. `corral merge` verb: per-repo lock, ordered preconditions
-   (section 7.2), `--plan`, `--json`, exit codes 0/1/2/3/4.
-   Tests: lock race is exit 2, moved head refuses, fork refuses,
-   verify-mismatch fails closed. README Commands table gains its
-   row here (user-visible verb).
+5. `Forge.merge` seam plus the `PullRequest` extension
+   (`checks_state`, `merge_sha`) and the GitHub adapter: parse
+   both fields from the existing `gh api` PR fetch, pin
+   `--head`, squash, post-merge verify (state `merged` plus the
+   reported merge SHA tied to the pinned head). Tests: adapter
+   against a fake runner (both fields parsed, missing PR raises
+   `ForgeError`), fake-forge coverage of each `checks_state`
+   value, seam refusal shapes.
+6. `corral merge` verb: per-repo lock via the single resolver
+   `merge.lock_path(repo)`, ordered preconditions (section 7.2),
+   `--plan`, `--json`, exit codes 0/1/2/3/4, `--skip` of
+   anything but `checks` exits 4. Tests: lock race is exit 2,
+   moved head refuses, fork refuses, verify-mismatch fails
+   closed, non-`checks` skip is exit 4. README Commands table
+   gains its row here (user-visible verb).
 7. Coordinator skill file at `skills/coordinator.md` plus the
    parser-conformance test. No CLI change; README unchanged
    (no user-visible surface moves).
