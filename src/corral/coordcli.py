@@ -245,6 +245,29 @@ def cmd_coord(args: argparse.Namespace) -> int:
                     f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
                 )
         return OK
+    if verb == "events":
+        from corral import coordevents as events
+
+        rows = events.list_events(root=root, include_resolved=args.all)
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "schema_version": events.SCHEMA_VERSION,
+                        "project": os.path.basename(root),
+                        "events": rows,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+        else:
+            for event in rows:
+                evidence = " ".join(str(event.get("evidence") or "").split())
+                print(
+                    f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
+                )
+        return OK
     if verb == "ack":
         from corral import coordevents as events
 
@@ -314,6 +337,11 @@ def add_parser(sub) -> None:
     p.add_argument("--entries", default="30", help="last N logbook entries (default 30)")
     p = verbs.add_parser("wait", parents=[project], help="block until a coordinator event exists")
     p.add_argument("--timeout", default=None, help="seconds to wait (default: forever)")
+    p.add_argument("--json", action="store_true", help="machine-readable output")
+    p = verbs.add_parser(
+        "events", parents=[project], help="list coordinator events (unresolved unless --all)"
+    )
+    p.add_argument("--all", action="store_true", help="include resolved rows")
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p = verbs.add_parser("ack", parents=[project], help="resolve one coordinator event")
     p.add_argument("event_id", help="event id from wait")

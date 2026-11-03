@@ -746,6 +746,54 @@ class AttentionMappingTest(unittest.TestCase):
         self.assertIsNone(by_id["aaaabbbb"]["resolved_at"])
 
 
+class ListEventsTest(unittest.TestCase):
+    """`list_events`: the pure reader behind `coord events`."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def test_empty_queue_lists_nothing(self):
+        self.assertEqual(events.list_events(root=self.root), [])
+        self.assertEqual(events.list_events(root=self.root, include_resolved=True), [])
+
+    def test_default_lists_unresolved_only_oldest_first(self):
+        events.record(
+            [
+                {"kind": "held-merge", "ref": "lib#1", "evidence": "H"},
+                {"kind": "supply", "ref": "fleet", "evidence": "S"},
+            ],
+            root=self.root,
+            now=1000.0,
+            event_id_fn=ids("aaaabbbb", "ccccdddd"),
+        )
+        events.ack("aaaabbbb", root=self.root, now=1001.0)
+        rows = events.list_events(root=self.root)
+        self.assertEqual([row["id"] for row in rows], ["ccccdddd"])
+        rows = events.list_events(root=self.root, include_resolved=True)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb", "ccccdddd"])
+
+    def test_malformed_lines_dropped(self):
+        path = events.events_path(root=self.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        good = {
+            "id": "aaaabbbb",
+            "kind": "supply",
+            "ref": "fleet",
+            "evidence": "S",
+            "first_seen": "t",
+            "resolved_at": None,
+        }
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("not json\n")
+            handle.write("[1, 2]\n")
+            handle.write("\n")
+            handle.write(json.dumps(good) + "\n")
+            handle.write("{unterminated\n")
+        self.assertEqual(events.list_events(root=self.root), [good])
+
+
 class CoordEventsCliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -803,6 +851,92 @@ class CoordEventsCliTest(unittest.TestCase):
         code, _, err = self._run(["coord", "ack", "deadbeef"])
         self.assertEqual(code, cli.NO)
         self.assertIn("deadbeef", err)
+
+    def test_events_empty_queue_is_an_empty_text_list(self):
+        code, out, _ = self._run(["coord", "events"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "")
+
+    def test_events_empty_queue_json_envelope(self):
+        code, out, _ = self._run(["coord", "events", "--json"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(
+            json.loads(out),
+            {"schema_version": 1, "project": "demo", "events": []},
+        )
+
+    def test_events_text_lists_unresolved_only(self):
+        from corral import coordevents as live
+
+        live.record(
+            [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD: baseline"}],
+            now=1000.0,
+            event_id_fn=lambda: "aaaabbbb",
+        )
+        live.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "slots free"}],
+            now=1001.0,
+            event_id_fn=lambda: "ccccdddd",
+        )
+        live.ack("aaaabbbb", now=1002.0)
+        code, out, _ = self._run(["coord", "events"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "ccccdddd supply fleet slots free\n")
+
+    def test_events_all_includes_resolved(self):
+        from corral import coordevents as live
+
+        live.record(
+            [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD: baseline"}],
+            now=1000.0,
+            event_id_fn=lambda: "aaaabbbb",
+        )
+        live.ack("aaaabbbb", now=1001.0)
+        code, out, _ = self._run(["coord", "events", "--all"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "aaaabbbb held-merge lib#1 HOLD: baseline\n")
+
+    def test_events_json_envelope_carries_schema_and_project(self):
+        from corral import coordevents as live
+
+        live.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "slots free"}],
+            now=1000.0,
+            event_id_fn=lambda: "aaaabbbb",
+        )
+        code, out, _ = self._run(["coord", "events", "--json"])
+        self.assertEqual(code, cli.OK)
+        data = json.loads(out)
+        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual(data["project"], "demo")
+        self.assertEqual(
+            [(row["id"], row["kind"], row["ref"]) for row in data["events"]],
+            [("aaaabbbb", "supply", "fleet")],
+        )
+
+    def test_events_drops_malformed_lines(self):
+        from corral import coordevents as live
+
+        path = live.events_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("not json\n")
+            handle.write(
+                json.dumps(
+                    {
+                        "id": "aaaabbbb",
+                        "kind": "supply",
+                        "ref": "fleet",
+                        "evidence": "slots free",
+                        "first_seen": "t",
+                        "resolved_at": None,
+                    }
+                )
+                + "\n"
+            )
+        code, out, _ = self._run(["coord", "events"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "aaaabbbb supply fleet slots free\n")
 
     def test_brief_carries_events_section(self):
         from corral import coordevents as live

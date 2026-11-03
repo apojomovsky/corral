@@ -52,6 +52,9 @@ EVENTS_LOCK_NAME = "events.lock"
 #: Resolved rows older than this are pruned on the next write.
 RESOLVED_KEEP_DAYS = 14
 
+#: Shape version of the `coord events --json` document.
+SCHEMA_VERSION = 1
+
 #: `wait` poll interval: a short local poll of the queue file, no
 #: GitHub calls. stdlib has no inotify; the poll is the mechanism.
 WAIT_POLL_S = 0.2
@@ -213,6 +216,19 @@ def read_events(root=None):
 def unresolved(root=None):
     """Unresolved queue rows, oldest first."""
     return [row for row in read_events(root) if not row.get("resolved_at")]
+
+
+def list_events(root=None, include_resolved=False):
+    """Queue rows for `coord events`, oldest first.
+
+    Unresolved rows by default; `include_resolved` (`--all`) keeps
+    resolved rows too. A pure reader: shared lock, no pruning, and
+    malformed lines drop out in `read_events`, never fatal.
+    """
+    rows = read_events(root)
+    if include_resolved:
+        return rows
+    return [row for row in rows if not row.get("resolved_at")]
 
 
 def new_event_id():
