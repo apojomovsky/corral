@@ -70,7 +70,7 @@ from collections.abc import Callable
 from importlib import resources
 from typing import NamedTuple
 
-from corral import detect, gc, paths, projects, runtimes, settings, worktrees
+from corral import detect, gc, paths, projects, runtimes, settings, tracker, worktrees
 
 OK, NOTHING, USAGE = 0, 1, 4
 
@@ -782,6 +782,226 @@ def _split_toml_change(toml_target, inputs):
     else:
         sep = "\n\n"
     return current + sep + block, False
+
+
+#: A `[[repo]]` header line, however spaced: the entry-block scanner's
+#: only anchor. Anything else (an inline `repo = [{...}]` table, a
+#: quoted variant) is unscannable and reported as exit 4.
+_REPO_HEADER = re.compile(r"^\s*\[\[\s*repo\s*\]\]\s*(?:#.*)?$")
+
+#: The board table header exactly: never the `priority_map` subtable.
+_BOARD_HEADER = re.compile(r"^\s*\[repo\.board\]\s*(?:#.*)?$")
+
+
+def _ordered_board_map(mapping):
+    """`(option_id, rank)` pairs with known ranks in rank order first."""
+
+    def key(item):
+        option_id, rank = item
+        try:
+            return (0, tracker.PRIORITIES.index(rank), option_id)
+        except ValueError:
+            return (1, rank, option_id)
+
+    return sorted(mapping.items(), key=key)
+
+
+def render_board_table(spec, provision):
+    """The `[repo.board]` table text for one provisioned board.
+
+    Names come from `provision.fields` (the live names after the final
+    read-back), never re-derived from defaults, so a remapped field or
+    a kept keep-only Area renders as found. A concept the provision
+    refused renders nothing, never an empty string. The number is
+    written, not the node id; only when the provision carries no number
+    (a later adapter) is the node id written instead. Option display
+    names ride as comments only; an empty priority map omits the
+    subtable. A provision with no owner or no address is an internal
+    error, never a half table.
+    """
+    if not isinstance(provision.owner, str) or not provision.owner:
+        raise InitError("internal: the board provision names no owner")
+    if provision.number is None and not provision.project_id:
+        raise InitError("internal: the board provision names no board address")
+    live = {field.concept: field.name for field in provision.fields}
+    asked = {field.concept for field in spec.fields}
+    lines = ["[repo.board]"]
+    lines.append(
+        f"project_owner = {_toml(provision.owner)}  # board owner, written by corral github setup"
+    )
+    if provision.number is not None:
+        lines.append(f"project_number = {provision.number}")
+    else:
+        lines.append(f"project_id = {_toml(provision.project_id)}")
+    for concept, attr in tracker.BOARD_CONCEPT_ATTRS:
+        name = live.get(concept)
+        if concept in asked and name:
+            lines.append(f"{attr} = {_toml(name)}")
+    if provision.priority_map:
+        lines.append("")
+        lines.append("[repo.board.priority_map]  # live option id to rank; names are comments only")
+        for option_id, rank in _ordered_board_map(provision.priority_map):
+            comment = rank.title() if rank in tracker.PRIORITIES else rank
+            lines.append(f"{_toml(option_id)} = {_toml(rank)}  # {comment}")
+    return "\n".join(lines) + "\n"
+
+
+def _repo_block_index(lines, entry_name):
+    """The `[[repo]]` header line for `entry_name`, else None.
+
+    Each candidate block is parsed on its own and the name is read from
+    the parse, so quoting variants still match; zero or several matches
+    are both unscannable.
+    """
+    starts = [i for i, line in enumerate(lines) if _REPO_HEADER.match(line)]
+    found = None
+    for rank, start in enumerate(starts):
+        end = starts[rank + 1] if rank + 1 < len(starts) else len(lines)
+        try:
+            parsed = tomllib.loads("".join(lines[start:end]))
+        except tomllib.TOMLDecodeError:
+            continue
+        repos = parsed.get("repo")
+        if isinstance(repos, list) and any(
+            isinstance(entry, dict) and entry.get("name") == entry_name for entry in repos
+        ):
+            if found is not None:
+                return None
+            found = start
+    return found
+
+
+def _expected_board_table(spec, provision):
+    """The parsed `[repo.board]` table the provision should render."""
+    live = {field.concept: field.name for field in provision.fields}
+    asked = {field.concept for field in spec.fields}
+    expected = {"project_owner": provision.owner}
+    if provision.number is not None:
+        expected["project_number"] = provision.number
+    else:
+        expected["project_id"] = provision.project_id
+    for concept, attr in tracker.BOARD_CONCEPT_ATTRS:
+        if concept in asked and live.get(concept):
+            expected[attr] = live[concept]
+    if provision.priority_map:
+        expected["priority_map"] = dict(provision.priority_map)
+    return expected
+
+
+def _canonical_board_table(raw):
+    """The comparable half of a parsed `[repo.board]` table.
+
+    Missing and empty are the same fact: an omitted concept reads as
+    `""` through `settings`, and an empty map table holds no ranks.
+    The compared keys are the board address plus one key per board
+    concept, derived from `tracker.BOARD_CONCEPT_ATTRS` like the
+    renderer, so a concept added there is never silently dropped from
+    the comparison.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    keys = ("project_owner", "project_number", "project_id") + tuple(
+        attr for _, attr in tracker.BOARD_CONCEPT_ATTRS
+    )
+    out = {}
+    for key in keys:
+        value = raw.get(key)
+        if value == "" or value is None:
+            continue
+        out[key] = value
+    mapping = raw.get("priority_map")
+    if isinstance(mapping, dict) and mapping:
+        out["priority_map"] = dict(mapping)
+    return out
+
+
+def _board_block_text(lines, start):
+    """The existing `[repo.board]` table text from `start`, or ""."""
+    begin = None
+    for i in range(start, len(lines)):
+        if _BOARD_HEADER.match(lines[i]):
+            begin = i
+            break
+        if _REPO_HEADER.match(lines[i]):
+            break
+    if begin is None:
+        return ""
+    end = len(lines)
+    for i in range(begin + 1, len(lines)):
+        stripped = lines[i].strip()
+        if stripped.startswith("[") and not stripped.startswith("[repo.board"):
+            end = i
+            break
+    return "".join(lines[begin:end])
+
+
+def board_table_change(toml_target, entry_name, spec, provision):
+    """`(new_text, is_noop)` writing the provisioned mapping into `toml_target`.
+
+    The table is inserted immediately after the named entry's own block
+    (after its last `[repo.*]` subtable, before the next `[[repo]]`
+    header or end of file); every other byte is preserved. An identical
+    table is a no-op `(None, True)`. A different table refuses with the
+    diff and "edit it by hand", `--force` included: setup created or
+    verified the board, but it never rewrites a table a person may have
+    remapped. A file whose entry block cannot be located textually
+    prints the rendered table for the person to paste and is exit 4, so
+    the ids still never travel by hand-copying.
+
+    The caller provisions the board first and writes after: a crash
+    between the two leaves a board no config names yet, and the re-run
+    finds it by title; the reverse order could strand a config naming a
+    board that was never created.
+    """
+    table = render_board_table(spec, provision)
+    current = _read_text(toml_target)
+    if current is None:
+        raise InitError(
+            f"{toml_target}: no corral.toml to attach the board table to: run `corral init` first"
+        )
+    try:
+        data = tomllib.loads(current)
+    except tomllib.TOMLDecodeError as err:
+        sys.stdout.write(table)
+        raise InitError(f"{toml_target}: cannot parse the ops corral.toml: {err}") from None
+    entries = data.get("repo")
+    if not isinstance(entries, list):
+        sys.stdout.write(table)
+        raise InitError(f"{toml_target}: the file must hold a [[repo]] list to attach the table to")
+    matches = [e for e in entries if isinstance(e, dict) and e.get("name") == entry_name]
+    if not matches:
+        sys.stdout.write(table)
+        raise InitError(
+            f"{toml_target}: no [[repo]] entry for {entry_name!r}:"
+            " paste the table above into the right entry by hand"
+        )
+    lines = current.splitlines(keepends=True)
+    at = _repo_block_index(lines, entry_name)
+    if len(matches) == 1 and "board" in matches[0]:
+        if _canonical_board_table(matches[0].get("board")) == _expected_board_table(
+            spec, provision
+        ):
+            return None, True
+        old = _board_block_text(lines, at or 0)
+        sys.stdout.write(plan_diff(old, table, os.path.basename(toml_target)))
+        raise InitError(
+            f"{toml_target} already holds a [repo.board] table for {entry_name!r}"
+            " with different values: edit it by hand"
+        )
+    if at is None or len(matches) != 1:
+        sys.stdout.write(table)
+        raise InitError(
+            f"{toml_target}: cannot locate the [[repo]] entry for {entry_name!r}"
+            " in the file text: paste the table above into the right entry by hand"
+        )
+    starts = [i for i, line in enumerate(lines) if _REPO_HEADER.match(line)]
+    rank = starts.index(at)
+    end = starts[rank + 1] if rank + 1 < len(starts) else len(lines)
+    head = "".join(lines[:end]).rstrip("\n") + "\n\n"
+    tail = "".join(lines[end:])
+    if tail:
+        return head + table + "\n" + tail.lstrip("\n"), False
+    return head + table, False
 
 
 def apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops_fresh=False):
