@@ -1,15 +1,14 @@
 """Agent runtime adapters: how corral launches, resumes and reads each runtime.
 
 One adapter per runtime, and corral supports one major version of each at a
-time (AGENTS.md, "One version of each runtime"). `omp`, `opencode` and `muse`
-are the three adapters; `get` returns one by name, and `record`/`recorded`
+time (AGENTS.md, "One version of each runtime"). `omp` and `muse`
+are the two adapters; `get` returns one by name, and `record`/`recorded`
 keep the runtime a session started on, so a resume uses the same runtime.
 
 Every adapter writes only into the session directory it is given. It never
-writes a user's home config (`~/.omp/`, `~/.config/opencode/`,
-`~/.config/muse/`); it reads the muse session logs under
-`~/.local/share/muse/sessions/`; each launch gets a full per-launch
-overlay instead.
+writes a user's home config (`~/.omp/`, `~/.config/muse/`); it reads the
+muse session logs under `~/.local/share/muse/sessions/`; each launch gets
+a full per-launch overlay instead.
 
 Binaries: each adapter resolves its binary once per process, from PATH, and
 falls back to its usual install location under the home directory when PATH
@@ -25,7 +24,12 @@ from corral import paths, settings
 RUNTIME_FILE = "runtime"
 #: A session with no recorded runtime was launched on omp.
 DEFAULT_RUNTIME = "omp"
-NAMES = ("omp", "opencode", "muse")
+NAMES = ("omp", "muse")
+#: Runtimes corral no longer ships. Naming one in any config is a
+#: configuration error (exit 4) with REMOVED_MESSAGE; re-adding one is
+#: a new adapter ticket.
+REMOVED = ("opencode",)
+REMOVED_MESSAGE = "opencode support was removed; re-adding it is a new adapter ticket"
 #: The run time limit handed to a runtime that takes one.
 DEFAULT_MAX_TIME = "3h"
 
@@ -91,9 +95,11 @@ class Runtime(Protocol):
 
 def get(name: str) -> Runtime:
     """The adapter for `name`; UnknownRuntime for anything else."""
-    from corral.runtimes import muse, omp, opencode
+    from corral.runtimes import muse, omp
 
-    adapters = {"omp": omp.RUNTIME, "opencode": opencode.RUNTIME, "muse": muse.RUNTIME}
+    if name in REMOVED:
+        raise UnknownRuntime(REMOVED_MESSAGE)
+    adapters = {"omp": omp.RUNTIME, "muse": muse.RUNTIME}
     if name not in adapters:
         raise UnknownRuntime(f"unknown runtime {name!r}: want one of {', '.join(NAMES)}")
     return adapters[name]

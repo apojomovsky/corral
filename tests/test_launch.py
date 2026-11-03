@@ -28,7 +28,7 @@ from contextlib import redirect_stdout
 from corral import accounts, cli, hold, host_ledger, launch, launchcli, models, paths
 from corral import pressure, profiles, registry, resources, runtimes
 from corral import settings, units
-from corral.runtimes import muse, omp, opencode
+from corral.runtimes import muse, omp
 from tests.test_profiles_launch import FakeStore
 from tests.test_reviewrecord import git_in
 from tests.test_tracker import FakeTracker
@@ -135,7 +135,7 @@ class OpsCase(unittest.TestCase):
         )
         self.enterContext(mock.patch.dict(os.environ, env, clear=True))
         self.enterContext(mock.patch.object(omp, "binary", return_value="/fake/omp"))
-        self.enterContext(mock.patch.object(opencode, "binary", return_value="/fake/opencode"))
+        self.enterContext(mock.patch.object(muse, "binary", return_value="/fake/muse"))
         self.system = FakeSystem()
 
     def make_clone(self, name):
@@ -186,7 +186,7 @@ class TargetTest(OpsCase):
         self.assertEqual(tgt.worktrees_root, ".worktrees/")
 
     def test_the_runtime_flag_overrides_the_setting(self):
-        self.assertEqual(self.target("lib", runtime="opencode").runtime, "opencode")
+        self.assertEqual(self.target("lib", runtime="muse").runtime, "muse")
 
     def test_a_repo_without_a_clone_path_is_a_configuration_error(self):
         with self.assertRaises(launch.LaunchError) as ctx:
@@ -889,28 +889,33 @@ class LaunchTest(OpsCase):
             [],
         )
 
-    def test_launch_resume_tail_and_stop_an_opencode_agent(self):
-        session = self.check_full_path("opencode")
-        self.assertTrue(os.path.exists(os.path.join(session, "opencode.json")))
+    def test_launch_resume_tail_and_stop_a_muse_agent(self):
+        unit, workdir = self.start("muse", model="provider-a/model-1")
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertTrue(os.path.isdir(workdir))
+        session = self.leaf("lib", 5)
+        self.assertTrue(os.path.exists(os.path.join(session, "muse.json")))
+        self.assertEqual(runtimes.recorded(session), "muse")
         self.assertEqual(self.system.started[-1][0], "systemd-run")
+        with open(os.path.join(session, "muse_session_id"), encoding="utf-8") as h:
+            recorded = h.read().strip()
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--session-id") + 1], recorded)
 
-        self.system.finish("corral-agent-lib-5")
+        self.system.finish(unit)
         with open(os.path.join(session, "out.log"), "w", encoding="utf-8") as h:
             h.write(
                 json.dumps(
                     {
-                        "type": "tool_use",
-                        "sessionID": "ses_1",
-                        "part": {
-                            "tool": "bash",
-                            "state": {"input": {"description": "run the tests"}},
-                        },
+                        "payload_type": "run.output.delta",
+                        "payload": {"text": "run the tests"},
+                        "sequence": 1,
                     }
                 )
                 + "\n"
             )
 
-        unit, _ = launch.resume(
+        resumed, _ = launch.resume(
             self.target("lib"),
             5,
             "keep going",
@@ -920,9 +925,9 @@ class LaunchTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.assertEqual(unit, "corral-agent-lib-5-r1")
+        self.assertEqual(resumed, "corral-agent-lib-5-r1")
         argv = self.system.started[-1]
-        self.assertEqual(argv[argv.index("--session") + 1], "ses_1")
+        self.assertEqual(argv[argv.index("--session-id") + 1], recorded)
 
         out = io.StringIO()
         launch.tail(self.target("lib"), 5, out=out)
@@ -936,8 +941,8 @@ class LaunchTest(OpsCase):
         )
 
     def test_the_runtime_config_is_written_into_the_session(self):
-        self.start("opencode", runtime_config={"model": "provider-a/model-1"})
-        with open(os.path.join(self.leaf("lib", 5), "opencode.json"), encoding="utf-8") as h:
+        self.start("muse", runtime_config={"model": "provider-a/model-1"})
+        with open(os.path.join(self.leaf("lib", 5), "muse.json"), encoding="utf-8") as h:
             self.assertEqual(json.load(h), {"model": "provider-a/model-1"})
 
     def test_a_bad_model_in_the_runtime_config_is_a_configuration_error(self):
@@ -1942,7 +1947,7 @@ class RaceTest(OpsCase):
 
         with self.assertRaises(units.UnitExists):
             launch.launch(
-                self.target("lib", "opencode"),
+                self.target("lib", "muse"),
                 5,
                 "second prompt",
                 title="feat: add the thing",
@@ -1955,7 +1960,7 @@ class RaceTest(OpsCase):
         self.assertEqual(runtimes.recorded(session), "omp")
         for name, text in before.items():
             self.assertEqual(_read(os.path.join(session, name)), text, name)
-        self.assertFalse(os.path.exists(os.path.join(session, "opencode.json")))
+        self.assertFalse(os.path.exists(os.path.join(session, "muse.json")))
         self.assertEqual(len(self.system.started), started)
 
     def test_two_sequential_resumes_take_generations_one_and_two(self):
@@ -2619,13 +2624,13 @@ runtime = "muse"
         session = paths.newest_session("lib", 5, "worker")
         with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
             handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
-        with open(os.path.join(session, "out.log"), "w", encoding="utf-8") as handle:
-            handle.write(json.dumps({"sessionID": "session-1"}) + "\n")
+        with open(os.path.join(session, "muse_session_id"), "w", encoding="utf-8") as handle:
+            handle.write("12345678-1234-5678-1234-567812345678\n")
         code, out, err = self.verb(
-            "resume", "lib", "5", "--message", "keep going", "--runtime", "opencode"
+            "resume", "lib", "5", "--message", "keep going", "--runtime", "muse"
         )
         self.assertEqual((code, err), (0, ""))
-        self.assertEqual(self.registered_runtime(out.split()[2]), "opencode")
+        self.assertEqual(self.registered_runtime(out.split()[2]), "muse")
 
     def test_resume_with_an_unknown_runtime_alone_is_exit_4(self):
         self.write_tracker_repo()

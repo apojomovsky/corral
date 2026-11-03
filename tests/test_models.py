@@ -4,7 +4,7 @@ import os
 import unittest
 
 from corral import accounts, launch, launchcli, models, quota, settings
-from corral.runtimes import omp, opencode
+from corral.runtimes import omp
 from tests.test_launch import TOML, OpsCase, roomy
 
 T0 = 1_800_000_000.0
@@ -211,15 +211,14 @@ class OmpModels(unittest.TestCase):
         self.assertEqual(omp.with_models({}, {"default": []}), {})
 
 
-class OpencodeModels(unittest.TestCase):
-    def test_the_default_head_becomes_the_model(self):
-        config = opencode.with_models({"share": "never"}, {"default": ["a/x", "b/y"]})
-        self.assertEqual(config, {"share": "never", "model": "a/x"})
+class RemovedProvider(unittest.TestCase):
+    """A chain entry on a removed runtime is refused, even when the pool names it."""
 
-    def test_without_a_default_role_or_entry_there_is_no_model(self):
-        for chains in ({"other": ["a/x"]}, {"default": []}):
-            with self.subTest(chains=chains), self.assertRaises(models.ModelsError):
-                opencode.with_models({}, chains)
+    def test_an_opencode_entry_is_refused_naming_the_removal(self):
+        for pool in (["provider-a"], ["provider-a", "opencode"]):
+            with self.subTest(pool=pool), self.assertRaises(models.ModelsError) as ctx:
+                models.validate({"default": ["opencode/model-x"]}, pool)
+            self.assertIn("opencode support was removed", str(ctx.exception))
 
 
 class ChainProvider(unittest.TestCase):
