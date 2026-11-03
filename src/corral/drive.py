@@ -1997,39 +1997,36 @@ def cap_label(day_cap) -> str:
     return f"({day_cap}/day)" if day_cap is not None else "(day cap)"
 
 
-def restart_refusal(item, *, read_labels, hold_label, requested):
+def restart_refusal(item, *, read_labels, hold_label, requested, linked=()):
     """Why a stuck row must not restart: (reason, keep) or None. Pure reads.
 
     The row-state subset of the section 3 gate, re-checked at restart
-    time: a non-open or externally owned row, a held row, a row waiting
-    on a human, or a row no project requested this pass is not
-    restarted. `requested` is the set of (repo, number) any project
-    requested this pass, or None when unknown (then the withdrawn check
-    is skipped). `read_labels` is the injected label seam, or None
-    (then the hold check is skipped). The label read mirrors the
-    discipline of `hold.reason` (a failure or a misshapen answer fails
-    closed) but carries restart wording and the keep/release verdict
-    the sweep needs: unreadable labels keep the claim, every other
-    refusal releases it.
+    time through the same `hold.reason` resolver the gate uses: a
+    non-open or externally owned row, a held row, a row waiting on a
+    human, or a row no project requested this pass is not restarted.
+    `requested` is the set of (repo, number) any project requested this
+    pass, or None when unknown (then the withdrawn check is skipped).
+    `linked` holds the (repo, number) pairs of the pull requests the
+    restart acts on, threaded into the hold re-check the way the gate
+    threads the row's linked pulls. `read_labels` is the injected label
+    seam and is required: with no reader the hold cannot be re-checked,
+    so the restart is deferred with the claim kept. `hold.reason` fails
+    closed on an unreadable read (the claim is kept) and names a hold
+    otherwise (the claim is released); the restart wording appended
+    here keeps every refusal greppable for "not restarted".
     """
     ref = f"{item.repo}#{item.number}"
     if item.state != "open":
         return f"{ref}: state is {item.state}, not open, not restarted", False
     if item.external:
         return f"{ref}: externally owned, not restarted", False
-    if read_labels is not None:
-        try:
-            labels = read_labels("issue", item.repo, item.number)
-        except Exception as err:
-            return f"{ref}: hold labels unreadable ({err}), restart deferred, claim kept", True
-        if not isinstance(labels, list) or any(not isinstance(name, str) for name in labels):
-            return (
-                f"{ref}: hold labels unreadable (labels returned {labels!r}), "
-                "restart deferred, claim kept",
-                True,
-            )
-        if hold.labels_held(labels, hold_label):
-            return f"{ref}: carries {hold_label}, held for a human, not restarted", False
+    if read_labels is None:
+        return f"{ref}: hold labels unreadable (no label reader), restart deferred", True
+    held = hold.reason(read_labels, (item.repo, item.number), linked, hold_label=hold_label)
+    if held is not None:
+        if "unreadable" in held:
+            return f"{held}, restart deferred", True
+        return f"{held}, not restarted", False
     if iface.NEEDS_DECISION in (item.labels or ()):
         return f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, not restarted", False
     if requested is not None and (item.repo, item.number) not in requested:
@@ -2067,8 +2064,9 @@ def handle_stuck(
     never restarts, watches or gives up on what it just claimed, and
     foreign claims are never touched. Before any budget is spent, each
     restart verdict re-checks row eligibility (`restart_refusal` over
-    the row state, the hold label and the needs-decision label, plus
-    the `requested` set for withdrawals): an ineligible row is not
+    the row state, the ticket and linked pull hold labels and the
+    needs-decision label, plus the `requested` set for withdrawals): an
+    ineligible row is not
     restarted and its claim is released (the epoch is kept, so the next
     claim fences correctly), except unreadable labels, which fail
     closed with the claim kept. In hub mode `hub_epoch_of` maps
@@ -2157,7 +2155,11 @@ def handle_stuck(
             print(f"{ref}: {observed}, watching once more", file=out)
             continue
         refusal = restart_refusal(
-            item, read_labels=read_labels, hold_label=hold_label, requested=requested
+            item,
+            read_labels=read_labels,
+            hold_label=hold_label,
+            requested=requested,
+            linked=[(item.repo, pull.number) for pull in getattr(item, "pulls", None) or ()],
         )
         if refusal is not None:
             reason, keep = refusal

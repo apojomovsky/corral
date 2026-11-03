@@ -87,6 +87,15 @@ clock or settings access inside. Corral supplies everything as
 arguments, including `now`. That keeps project policy testable with
 plain rows and keeps every side effect behind corral's seams.
 
+Keep requesting the in-flight tickets the project still wants,
+claimed or not. The stuck sweep restarts only tickets some project
+requested this pass: a policy that drops a still-claimed ticket (for
+example by requesting unclaimed rows only) turns that ticket's
+restart into a release with a "withdrawn by this pass's eligibility"
+logbook line. A `start` request on an already-claimed row is a gate
+no-op ("already claimed"), so requesting in-flight rows changes no
+start verdict; it only keeps the restart path open for them.
+
 Why not the alternatives:
 
 - A subprocess command adds serialization, version skew between corral

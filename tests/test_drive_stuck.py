@@ -1394,6 +1394,7 @@ class StuckErrorBranchTest(unittest.TestCase):
             "restarter": FakeLauncher(),
             "tracker_factory": None,
             "restarts_path": self.budget,
+            "read_labels": lambda kind, repo, number: [],
         }
         values.update(over)
         stop, launcher = values["stop_unit"], values["restarter"]
@@ -2137,6 +2138,128 @@ class RestartEligibilityTest(unittest.TestCase):
         self.assertEqual(launcher.calls, [])
         self.assertIn("withdrawn", text)
         self.assertIn("left held", text)
+
+    def test_a_hold_on_a_linked_pull_is_released_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        row, _ = store.item("app", 7, now=NOW)
+
+        def labels(kind, repo, number):
+            if kind == "pr":
+                return ["hold"]
+            return []
+
+        refusal = drive.restart_refusal(
+            row,
+            read_labels=labels,
+            hold_label="hold",
+            requested={("app", 7)},
+            linked=[("app", 8)],
+        )
+        self.assertIsNotNone(refusal)
+        assert refusal is not None
+        reason, keep = refusal
+        self.assertFalse(keep)
+        self.assertIn("app#7", reason)
+        self.assertIn("held for a human", reason)
+        self.assertIn("not restarted", reason)
+
+    def test_an_externally_owned_row_is_released_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        row, _ = store.item("app", 7, now=NOW)
+        store.upsert_item(replace(row, author="mallory"), operators=["operator"], now=NOW)
+        (restarted, capped), text, _, stop, launcher = self.sweep(store)
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("externally owned", text)
+        self.assertIn("not restarted", text)
+        self.assertIn("claim released", text)
+        self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_misshapen_label_payload_keeps_the_claim_without_a_restart(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        (restarted, capped), text, _, stop, launcher = self.sweep(
+            store, read_labels=lambda kind, repo, number: "hold"
+        )
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("unreadable", text)
+        self.assertIn("claim kept", text)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, AGENT)
+
+    def test_a_release_store_error_on_an_ineligible_row_is_left_held(self):
+        from unittest import mock
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+
+        def broken(repo, number, agent, epoch, *, now):
+            raise board.StoreError("unknown item app#7")
+
+        with mock.patch.object(store, "release", side_effect=broken):
+            (restarted, capped), text, _, stop, launcher = self.sweep(store, requested=frozenset())
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("withdrawn", text)
+        self.assertIn("release refused", text)
+        self.assertIn("left held", text)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+
+    def test_without_a_label_reader_the_restart_is_deferred_and_the_claim_is_kept(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        (restarted, capped), text, _, stop, launcher = self.sweep(store, read_labels=None)
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("unreadable", text)
+        self.assertIn("claim kept", text)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, AGENT)
+
+    def test_a_held_row_past_its_budget_is_released_with_no_give_up_write(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stamps = [NOW - 100.0, NOW - 200.0, NOW - 300.0]
+        drive.save_restarts(self.budget, {"app#7": stamps})
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        (restarted, capped), text, _, stop, launcher = self.sweep(
+            store,
+            read_labels=lambda kind, repo, number: ["hold"],
+            tracker_factory=lambda repo: fake,
+        )
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("held for a human", text)
+        self.assertIn("claim released", text)
+        self.assertNotIn("gave up", text)
+        self.assertNotIn(NEEDS_DECISION, text)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {"app#7": stamps})
+        self.assertIsNone(store.claim_of("app", 7))
 
 
 class FinishedWorkerReviewTest(unittest.TestCase):
