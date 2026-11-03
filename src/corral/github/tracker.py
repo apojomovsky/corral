@@ -34,10 +34,14 @@ _BOOTSTRAP_COLORS = {
 #: A label create the account may not perform, in the provider's shape.
 _REFUSED_RE = re.compile(r"\(HTTP 403\)", re.IGNORECASE)
 
-#: A label create that lost a race to an existing label, in the
-#: provider's shape: the 422 status plus the already-exists wording.
-#: Both must match, so a 422 for a malformed create never reads as kept.
-_ALREADY_EXISTS_STATUS_RE = re.compile(r"\(HTTP 422\)", re.IGNORECASE)
+#: The provider's validation status, in the provider's shape. One
+#: pattern serves both classifiers: a label create that lost a race to
+#: an existing label (the status plus the already-exists wording) reads
+#: as kept, while any other 422 is a validation rejection. The tracker
+#: answered either way, so neither is an unreachable tracker, and the
+#: already-exists shape is matched first by its own callers, so it
+#: never reaches the rejection mapping.
+_HTTP_422_RE = re.compile(r"\(HTTP 422\)", re.IGNORECASE)
 _ALREADY_EXISTS_PHRASE_RE = re.compile(r"already[_-]?exists", re.IGNORECASE)
 
 #: Corral-owned fields live on the tracker as labels. One label per field
@@ -147,8 +151,7 @@ def _is_already_exists(err):
     """
     text = str(err)
     return (
-        _ALREADY_EXISTS_STATUS_RE.search(text) is not None
-        and _ALREADY_EXISTS_PHRASE_RE.search(text) is not None
+        _HTTP_422_RE.search(text) is not None and _ALREADY_EXISTS_PHRASE_RE.search(text) is not None
     )
 
 
@@ -164,7 +167,7 @@ class GithubTracker:
         try:
             return self._run(["api", path])
         except Exception as err:
-            raise iface.TrackerError(f"tracker unreachable: {err}") from err
+            raise self._write_error(err) from err
 
     def _from_fork(self, repo, number) -> bool:
         """Whether PR ``number`` comes from a fork, cached per tracker.
@@ -320,13 +323,16 @@ class GithubTracker:
             yield self._parse(repo, entry)
 
     def _write_error(self, err: Exception) -> iface.TrackerError:
-        """One failed label or comment call as the tracker's error. Rate-limit text
+        """One failed tracker call as the tracker's error. Rate-limit text
         maps to ``TrackerRateLimited`` through the shared classifier, so
-        the mirror pass stops; anything else fails closed as
-        ``TrackerError``."""
+        the mirror pass stops; a validation rejection maps to
+        ``TrackerRejected``, so callers report rejected, never
+        unreachable; anything else fails closed as ``TrackerError``."""
         text = str(err) or repr(err)
         if is_rate_limited(text):
             return iface.TrackerRateLimited(text, retry_after_s(text))
+        if _HTTP_422_RE.search(text) is not None:
+            return iface.TrackerRejected(f"tracker rejected: {text}")
         return iface.TrackerError(f"tracker unreachable: {text}")
 
     def _label_names(self, repo: str, number: int) -> tuple[str, ...]:

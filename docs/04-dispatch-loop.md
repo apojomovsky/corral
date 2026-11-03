@@ -199,19 +199,25 @@ The loop claims through the board store transaction
 (`Store.claim(repo, number, agent, host, now)`), then enqueues the
 `agent` and `status` writes to the outbox for the mirror pass. This is
 the existing rule that claims need zero tracker calls. The agent id is opaque to every reader except debugging, for
-example `drive-<host>-<start-seconds>-<owner>--<name>-<number>`
-(the repo segment encodes `owner/name` with a double dash so the id
-itself contains no `/`; `start-seconds` is a wall-clock timestamp,
-not a fencing token). Fencing uses only `Claim.epoch`; the host
+example `drive-<hash8>-<number>`: the hash covers the host segment,
+the repo and the epoch seconds, and the suffix is the ticket number,
+so the id carries no path or name and stays short enough for a
+tracker label (`agent:<id>` fits 32 characters for ticket numbers up
+to 11 digits). Fencing uses only `Claim.epoch`; the host
 field and the epoch are the tokens a future multi-host loop needs.
+Minted only by `drive.mint_agent`, parsed only (for the `drive-`
+prefix) by `drive.is_managed_agent`: one minter, one parser, one
+prefix. Ids minted under an older shape stay valid: nothing parses
+them beyond the prefix.
 
-Decision: the `<host>` segment never carries the raw hostname. The
+Decision: the hash input never carries the raw hostname. The
 claim `agent` value is mirrored to the tracker as a label, so on a
-public tracker it would publish the deployment hostname. The segment
-comes from the `drive.agent_host` setting, resolved once per pass: a
-configured display name is used verbatim (with `/` replaced by `-`),
-and the default is a short stable hash of the hostname rather than
-the hostname itself. The id stays opaque and slash-free either way.
+public tracker it would publish the deployment hostname. The host
+segment comes from the `drive.agent_host` setting, resolved once per
+pass: a configured display name is used verbatim (with `/` replaced
+by `-`), and the default is a short stable hash of the hostname
+rather than the hostname itself. The id stays opaque and slash-free
+either way.
 
 - Lost race (exit 2, `Claimed`): re-read the row live. If another agent
   now holds it, record "race lost to `<agent>`" and continue with the

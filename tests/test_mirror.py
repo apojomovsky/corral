@@ -210,6 +210,28 @@ class LabelDerivationTest(unittest.TestCase):
         self.assertEqual(found.agent, "alpha")
         self.assertEqual(found.status, "a")
 
+    def test_a_422_on_a_read_is_a_rejection(self):
+        self.gh.fail(
+            "repos/acme/app/issues/7",
+            RuntimeError(
+                'gh: Validation Failed: {"resource": "Label", "code": "custom"} (HTTP 422)'
+            ),
+        )
+        with self.assertRaises(tracker.TrackerRejected) as ctx:
+            self.adapter.item("acme/app", 7)
+        self.assertIn("rejected", str(ctx.exception))
+        self.assertNotIn("unreachable", str(ctx.exception))
+        self.assertNotEqual(ctx.exception.exit_code, 3)
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
+
+    def test_a_timeout_on_a_read_stays_unreachable(self):
+        self.gh.fail("repos/acme/app/issues/7", TimeoutError("gh: request timed out after 30s"))
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.item("acme/app", 7)
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRejected)
+        self.assertIn("unreachable", str(ctx.exception))
+        self.assertEqual(ctx.exception.exit_code, 3)
+
 
 class LabelRun:
     """A `gh` seam double for the issues-labels endpoint: answers the GET
@@ -287,6 +309,25 @@ class AdapterWriteTest(unittest.TestCase):
         with self.assertRaises(tracker.TrackerRateLimited) as ctx:
             self.adapter.write("acme/app", 7, "agent", "agent-1")
         self.assertEqual(ctx.exception.retry_after, 62.0)
+
+    def test_validation_failure_is_its_own_rejection(self):
+        self.gh.error = RuntimeError(
+            'gh: Validation Failed: {"resource": "Label", "code": "custom"} (HTTP 422)'
+        )
+        with self.assertRaises(tracker.TrackerRejected) as ctx:
+            self.adapter.write("acme/app", 7, "agent", "agent-1")
+        self.assertIn("rejected", str(ctx.exception))
+        self.assertNotIn("unreachable", str(ctx.exception))
+        self.assertNotEqual(ctx.exception.exit_code, 3)
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
+
+    def test_a_timeout_stays_unreachable(self):
+        self.gh.error = TimeoutError("gh: request timed out after 30s")
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.write("acme/app", 7, "agent", "agent-1")
+        self.assertNotIsInstance(ctx.exception, tracker.TrackerRejected)
+        self.assertIn("unreachable", str(ctx.exception))
+        self.assertEqual(ctx.exception.exit_code, 3)
 
 
 class PushTest(unittest.TestCase):
@@ -400,6 +441,25 @@ class PushTest(unittest.TestCase):
         self.assertEqual(len(result.errors), 1)
         queued = {row.number: row for row in store.queued_writes()}
         self.assertEqual(set(queued), {7})
+        self.assertEqual(queued[7].attempts, 1)
+
+    def test_rejected_write_stays_queued_with_the_real_reason(self):
+        store = self.open(number=7)
+        store.enqueue("app", 7, "agent", "agent-1", now=1500.0)
+        fake = MirrorTracker()
+        fake.write_errors[("app", 7)] = tracker.TrackerRejected(
+            "tracker rejected: gh: Validation Failed (HTTP 422)"
+        )
+        result = mirror.push(store, fake, operators=["alice"], now=1600.0)
+        self.assertEqual(result.sent, 0)
+        self.assertEqual(result.dirty, 1)
+        self.assertEqual(len(result.errors), 1)
+        self.assertIn("rejected", result.errors[0])
+        self.assertNotIn("unreachable", result.errors[0])
+        queued = {row.number: row for row in store.queued_writes()}
+        self.assertEqual(set(queued), {7})
+        self.assertIn("rejected", queued[7].reason)
+        self.assertNotIn("unreachable", queued[7].reason)
         self.assertEqual(queued[7].attempts, 1)
 
     def test_rate_limit_stops_pass_with_rest_queued(self):
