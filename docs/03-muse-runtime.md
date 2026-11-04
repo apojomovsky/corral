@@ -1,7 +1,7 @@
 # 03: the muse runtime adapter
 
-Status: design, not built. This doc fixes the third adapter, `muse`
-(the Muse Code CLI), next to `omp` and `opencode` in
+Status: design, not built. This doc fixes the second adapter, `muse`
+(the Muse Code CLI), next to `omp` in
 `src/corral/runtimes/`. Nothing here changes the launch, resume, tail or
 stop flow in `src/corral/launch.py`, the unit model, the registry,
 admission, exit codes, or any CLI verb. T9 names the muse runtime in
@@ -27,10 +27,10 @@ helpers this runtime needs: `resolve(session_id)` (session id to
 session file) and `classify(returncode, stderr_text, stream_text)`
 (provider error classification, section 5). `activity_file(session)`
 returns the unit's `out.log` path when present and `None` otherwise,
-exactly like the opencode adapter, because `launch.py` tail calls it
-unconditionally; without it a muse session would crash `corral tail`.
+because `launch.py` tail calls it unconditionally; without it a muse
+session would crash `corral tail`.
 `runtimes/__init__.py` gains the name:
-`NAMES` becomes `("omp", "opencode", "muse")`, `get("muse")` returns the
+`NAMES` becomes `("omp", "muse")`, `get("muse")` returns the
 adapter, and `agents.runtime` accepts `muse`. `DEFAULT_RUNTIME` stays
 `omp`; `record`/`recorded` are unchanged. `settings.PROVIDERS` already
 lists `corral.runtimes`, and this design adds no new setting (section
@@ -71,8 +71,8 @@ What each flag is, and the evidence:
 
 - `--json`: fixed. Stdout is the JSONL event stream, one record per
   line with `payload_type`, `payload`, `sequence`. The unit's `out.log`
-  captures it, so tail reads `out.log` exactly like the opencode
-  adapter does. Notices (`muse: ...`) go to stderr, never stdout.
+  captures it, so tail reads `out.log`. Notices (`muse: ...`) go to
+  stderr, never stdout.
   Observed on every echo run.
 - `--prompt-file <session>/prompt.md`: fixed. The prompt file is the
   one `_write_session` already writes. Observed: `--prompt-file` with a
@@ -82,7 +82,7 @@ What each flag is, and the evidence:
   `-` would read as a flag.
 - `--model <id>`: from the models declaration. `with_models` lays the
   live chains over the per-launch config and the adapter passes the
-  default role's head (via `models.primary`, as opencode does), with
+  default role's head (via `models.primary`), with
   the `muse/` provider prefix stripped through `models.bare_id`.
   A `model=` override takes the same path: `muse/other` and a bare
   `other` both yield `--model other`. Observed: `--model` is refused
@@ -120,9 +120,8 @@ What each flag is, and the evidence:
 - `max_time`: accepted by the protocol, ignored by the adapter. The
   exec help shows no time flag (only `--max-model-steps` and
   `--max-tool-output-bytes`, which this design leaves at defaults), so
-  like the opencode adapter the muse adapter takes `max_time` and sets
-  nothing from it. The unit's `RuntimeMaxSec` (`RUNTIME_MAX_S`) still
-  bounds the run.
+  the muse adapter takes `max_time` and sets nothing from it. The
+  unit's `RuntimeMaxSec` (`RUNTIME_MAX_S`) still bounds the run.
 
 Settings versus fixed, in one line: the models declaration picks the
 model; every flag is fixed. No new `corral.toml` setting.
@@ -139,10 +138,9 @@ an unknown key (`-c bogus.key=1`) refuses the run with exit 2
 in corral's session dir with the existing atomic helper, as an audit
 record. `argv` derives the run from it: `config["model"]` becomes
 `--model`, every other entry becomes `-c KEY=<json>`. `env` returns no
-home-pointing entries (there is no `OPENCODE_CONFIG` equivalent; `-c`
+home-pointing entries (there is no config-pointer equivalent; `-c`
 needs no pointer). `with_models` sets `config["model"]` to the default
-role's head and keeps every other key, mirroring
-`opencode.with_models`.
+role's head and keeps every other key.
 
 Proof it never writes the home config: by construction the argv
 contains no path under `~/.config/muse/` or `~/.local/share/muse/`
@@ -219,7 +217,7 @@ worker run through `corral launch` (echo had shown a subset):
   `edit_facts` summary. Every observed outcome was `success`; one
   interim record carried no `correlation_facts` (the command was still
   running). Rendered `-> <tool_name> | <outcome>`, width-capped,
-  collapsing the rest and mirroring the omp/opencode one-line tool
+  collapsing the rest and mirroring the omp one-line tool
   format: verified. No failed command appeared in the observed run, so
   the failure outcome string stays UNVERIFIED.
 - `task.lifecycle.*` (`accepted`, `proposed`, `scheduled`,
@@ -327,8 +325,8 @@ mark.
 
 ## 7. The single-version rule
 
-Doctor pins the supported muse major exactly the way the opencode
-entry pins major 1: a `system_deps.toml` entry with probe
+Doctor pins the supported muse major exactly the way the omp
+entry pins its major: a `system_deps.toml` entry with probe
 `["muse", "--version"]`, the default version pattern, a `min` on the
 observed 1.x line, `below = "2"`, a fallback path in the generic
 install shape (`~/.local/bin/muse`, same stand-in style as the omp
@@ -435,7 +433,7 @@ public interface beyond `agents.runtime: muse`.
   section 3 and its tests, with `tool.result` asserting skip until
   T8 lands its fixture. Acceptance: the tail tests pass, fed through
   `activity_file` (a missing file raises the no-activity
-  `LaunchError`); omp and opencode rendering unchanged.
+  `LaunchError`); omp rendering unchanged.
 - T5: error classification. Build `classify` with the verified exit-2
   usage rules and the `unknown` default, plus fixtures cut from the
   observed stderr lines. Acceptance: usage fixtures classify; every
@@ -458,8 +456,8 @@ public interface beyond `agents.runtime: muse`.
   sections 1 to 5 is replaced by a fixture and a test, or restated
   with the blocking reason; no other code changes.
 - T9: README and docs name the muse runtime. List muse next to omp
-  and opencode in `README.md` (kept in step with `runtimes.NAMES` by
+  in `README.md` (kept in step with `runtimes.NAMES` by
   a test in `tests/test_readme.py`) and fix the same stale statement
-  in `docs/`. Acceptance: README and docs name all three runtimes;
+  in `docs/`. Acceptance: README and docs name both runtimes;
   the new test fails when `NAMES` gains a runtime the README does
   not mention; gates green. No runtime code changes.

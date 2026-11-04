@@ -5,8 +5,8 @@ Status: design, awaiting maintainer approval. No code ships with this doc.
 Decided by the maintainer (do not reopen):
 
 1. corral lets the operator change not only the model backend (provider
-   and model) but also the program that runs the agent: muse, omp or
-   opencode. corral knows how to set each program up (per-launch
+   and model) but also the program that runs the agent: muse or omp.
+   corral knows how to set each program up (per-launch
    overlay; it never edits a home config, per AGENTS.md).
 2. There is a default profile, the most used setup, and it can change
    over time.
@@ -33,7 +33,7 @@ the narrower `models use` idea (section 5), adapter setup requirements
 fallback decision (section 8), a one-cutover migration (section 9), and
 ordered implementation tickets (section 10).
 
-Non-goals: a new runtime (muse, omp and opencode stay the three, per
+Non-goals: a new runtime (muse and omp stay the two, per
 `runtimes.NAMES`); a second provider (GitHub only, per `00-design.md`
 section 2); prompt changes; dashboard writes (the snapshot stays
 read-only, gaining one recorded field); any change to what an exit code
@@ -70,7 +70,7 @@ Fields:
 - `name`: the table key. Lowercase `[a-z0-9-]`, non-empty. The charset
   is label-safe on purpose, so a ticket label can carry a profile name
   verbatim (section 3).
-- `runtime`: exactly one of `runtimes.NAMES` (`omp`, `opencode`,
+- `runtime`: exactly one of `runtimes.NAMES` (`omp`,
   `muse`). Anything else is a configuration error (exit 4).
 - `models`: role to chain lists, the same shape `[models.<role>]`
   carries today. Every chain entry is validated against the accounts
@@ -439,8 +439,8 @@ network, or state dirs; `suiteguard.py` keeps refusing them).
    `--json` shapes; `set --ticket` with `--temp` / `--until` fails
    exit 4 naming layer 2 and the fix; README gains its Commands row in
    this ticket.
-7. Adapter schemas and setup checks. Real `options_schema()` for omp,
-   opencode and muse, home-proof tests, `system_deps.toml` probe tests.
+7. Adapter schemas and setup checks. Real `options_schema()` for omp
+   and muse, home-proof tests, `system_deps.toml` probe tests.
    Criteria: the section-6 checklist passes per runtime; an unknown
    option key fails validation.
 8. Migration cutover. Move `[models.*]`/`agents.runtime` under

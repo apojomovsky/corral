@@ -148,6 +148,11 @@ def push(
                 stopped = err.retry_after
                 halted = True
                 break
+            except iface.TrackerRejected as err:
+                store.mark_dirty(row.id, str(err))
+                dirty += 1
+                errors.append(f"{repo}#{number}: {err}")
+                break
             except iface.TrackerError as err:
                 store.mark_dirty(row.id, str(err))
                 dirty += 1

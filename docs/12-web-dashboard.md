@@ -290,9 +290,10 @@ offered, and the log view does not free-type project names
 into the API.
 
 **Navigation and routing.** Hash routing only:
-`#/` overview, `#/agent/<row-key>` with the keying of the agent
-detail above, `#/board`, `#/log`, `#/hosts`, the overview and
-log optionally carrying `?project=<name>`. The server
+`#/` overview, `#/agent?id=<id>` or
+`#/agent?repo=<repo>&number=<number>[&role=<role>]` with the
+keying of the agent detail above, `#/board`, `#/log`, `#/hosts`,
+the overview and log optionally carrying `?project=<name>`. The server
 therefore needs exactly one document route (`GET /`) and never a
 fallback handler, a refresh can never 404, and no route table
 grows in Python. The cost is uglier URLs, accepted. Unknown
@@ -1006,7 +1007,20 @@ stale, never dropping; upgrade the server under an open tab
 (the section 7 module-mix caveat); 200% text zoom and keyboard-
 only navigation; tail follow disengaging on scroll-up; CSP
 console clean (zero violations, which also settles the SVG-
-attribute chart approach of section 1 empirically). Browser
+attribute chart approach of section 1 empirically). Host-mode
+polish checks that need a real browser (no runner covers the
+JS): open an agent detail from a row and reload the
+`#/agent?id=` and `#/agent?repo=&number=&role=` links
+directly; pause the tail, stop the snapshot route, resume and
+watch the tail poll re-arm; switch the journal kind filter
+with identical results and watch the highlight follow; fail
+the older journal page with the snapshot healthy and watch
+the journal card retry text with no disconnected banner;
+add journal entries between the newest-window probe and its
+fetch and watch the range stay honest; navigate away
+mid-poll and watch the retired loop draw nothing; page the
+board past the last page and watch the pager clamp instead
+of inverting. Browser
 facts this design could not verify (storage behavior in
 private modes, `sessionStorage` tab-discard behavior, module
 graph caching, paste flows per tablet browser) are all

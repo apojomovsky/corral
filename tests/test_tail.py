@@ -1,4 +1,4 @@
-"""Activity lines for all three runtime event formats, and `show` over a file.
+"""Activity lines for both runtime event formats, and `show` over a file.
 
 Offline: every session file is a temp file written by the test.
 """
@@ -66,34 +66,6 @@ class RenderOmp(unittest.TestCase):
         self.assertLessEqual(len(tail.render(entry("assistant", long))[0]), 3 + tail.WIDTH)
 
 
-def event(kind, part):
-    return json.dumps({"type": kind, "sessionID": "ses_1", "part": part})
-
-
-class RenderOpencode(unittest.TestCase):
-    def test_a_tool_use_shows_its_description_or_its_name(self):
-        bash = {
-            "tool": "bash",
-            "state": {"input": {"command": "make test", "description": "Running the suite"}},
-        }
-        self.assertEqual(
-            tail.render(event("tool_use", bash)),
-            ['-> Running the suite | {"command": "make test", "description": "Running the suite"}'],
-        )
-        bare = {"tool": "read", "state": {"input": {"filePath": "a"}}}
-        self.assertEqual(tail.render(event("tool_use", bare)), ['-> read | {"filePath": "a"}'])
-
-    def test_a_tool_use_with_no_state_still_renders(self):
-        self.assertEqual(
-            tail.render(event("tool_use", {"tool": "glob", "state": "odd"})), ["-> glob | {}"]
-        )
-
-    def test_text_is_one_line_and_steps_are_left_out(self):
-        self.assertEqual(tail.render(event("text", {"text": "All\ngreen."})), ["   All green."])
-        self.assertEqual(tail.render(event("step_start", {})), [])
-        self.assertEqual(tail.render(event("step_finish", {"reason": "stop"})), [])
-
-
 class Show(unittest.TestCase):
     def path(self, *lines, tail_text=""):
         handle = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False, encoding="utf-8")
@@ -136,10 +108,13 @@ class Show(unittest.TestCase):
         self.assertEqual(out.getvalue(), "   one\n   two\n")
 
     def test_both_formats_can_be_read_from_one_file(self):
-        path = self.path(self.said("omp says"), event("text", {"text": "opencode says"}))
+        path = self.path(
+            self.said("omp says"),
+            mline("run.output.delta", {"text": "muse says"}),
+        )
         out = io.StringIO()
         tail.show(path, out=out)
-        self.assertEqual(out.getvalue(), "   omp says\n   opencode says\n")
+        self.assertEqual(out.getvalue(), "   omp says\n   muse says\n")
 
 
 def mline(payload_type, payload=None, sequence=1):
@@ -317,19 +292,18 @@ class ShowMuse(unittest.TestCase):
         self.addCleanup(os.unlink, handle.name)
         return handle.name
 
-    def test_muse_lines_read_through_one_file_with_the_other_formats(self):
+    def test_muse_lines_read_through_one_file_with_the_other_format(self):
         path = self.path(
             mline("run.lifecycle.started", {"prompt": "Do the thing."}),
             mline("run.output.delta", {"text": "Working on it."}),
             entry("assistant", {"type": "text", "text": "omp says"}),
-            event("text", {"text": "opencode says"}),
             mline("run.terminal.completed", {"terminal": "completed", "text": "Done."}),
         )
         out = io.StringIO()
         tail.show(path, out=out)
         self.assertEqual(
             out.getvalue(),
-            "   Do the thing.\n   Working on it.\n   omp says\n   opencode says\n   Done.\n",
+            "   Do the thing.\n   Working on it.\n   omp says\n   Done.\n",
         )
 
 
@@ -344,10 +318,11 @@ class NonStringText(unittest.TestCase):
                 line = entry("assistant", {"type": "text", "text": value})
                 self.assertEqual(tail.render(line), [])
 
-    def test_opencode_shape(self):
+    def test_muse_shape(self):
         for value in self.VALUES:
             with self.subTest(value=value):
-                self.assertEqual(tail.render(event("text", {"text": value})), [])
+                line = mline("run.output.delta", {"text": value})
+                self.assertEqual(tail.render(line), [])
 
 
 if __name__ == "__main__":

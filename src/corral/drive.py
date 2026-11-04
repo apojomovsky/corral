@@ -119,16 +119,19 @@ def mint_agent(repo, number, *, host, now) -> str:
     """One fresh agent id for (`repo`, `number`). Pure.
 
     Opaque to every reader except debugging: only `is_managed_agent`
-    parses it, and only for the prefix. The repo slash becomes a double
-    dash so the id itself never contains one, and a host slash becomes a
-    dash. `Claim.epoch` stays the fencing token, never this id. `host`
-    is the display segment from `agent_host_segment`, never the raw
-    hostname: the claim is mirrored to the tracker, so a raw hostname
-    here would publish the deployment.
+    parses it, and only for the prefix. The id is `drive-<hash8>-<n>`
+    where the hash covers the host segment, the repo and the epoch
+    seconds and `n` is the ticket number, so it carries no path or
+    name and stays short enough for a tracker label: `agent:<id>` fits
+    32 characters for ticket numbers up to 11 digits. `Claim.epoch`
+    stays the fencing token, never this id. `host` is the display
+    segment from
+    `agent_host_segment`, never the raw hostname: the claim is mirrored
+    to the tracker, so a raw hostname here would publish the
+    deployment.
     """
-    owner = str(host).replace("/", "-") if host else "host"
-    ticket = str(repo).replace("/", "--")
-    return f"{MANAGED_PREFIX}{owner}-{int(now)}-{ticket}-{number}"
+    digest = hashlib.sha256(f"{host}\0{repo}\0{int(now)}".encode("utf-8")).hexdigest()[:8]
+    return f"{MANAGED_PREFIX}{digest}-{int(number)}"
 
 
 def priority_rank(priority) -> int:
@@ -1146,9 +1149,10 @@ def _gate_all(
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
-    Returns (gated_rows, problems): one `Gated` per candidate in section
-    3 order, and one error line per project whose policy or quota
-    settings failed. A project with no eligibility entry prints its
+    Returns (gated_rows, problems, requested): one `Gated` per candidate in section
+    3 order, one error line per project whose policy or quota
+    settings failed, and the set of (repo, number) any project requested
+    this pass, which the stuck sweep reads for withdrawals. A project with no eligibility entry prints its
     logbook line to `out`. `released` ({(repo, number): worker id}
     released this pass) simulates the post-release rows, so a plan over
     still-claimed rows gates what the real pass would gate after the
@@ -1246,7 +1250,7 @@ def _gate_all(
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
-    return gated_rows, problems
+    return gated_rows, problems, set(requested_keys)
 
 
 def _pass(
@@ -1306,7 +1310,7 @@ def _pass(
     ) = ctx
     released = _capture_finished_holders(store, agent_states=agent_states, err=err)
     finished = resolve_finished(finished_for, released)
-    gated_rows, problems = _gate_all(
+    gated_rows, problems, _ = _gate_all(
         items,
         registered,
         out,
@@ -1460,6 +1464,8 @@ def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_a
         return None, f"{ref}: no tracker for this repo, claim refused"
     try:
         live = tracker.item(repo, number)
+    except iface.TrackerRejected as err:
+        return None, f"{ref}: tracker rejected the read, row stale, claim refused ({err})"
     except iface.TrackerError as err:
         return None, f"{ref}: tracker unreachable, row stale, claim refused ({err})"
     try:
@@ -1787,7 +1793,8 @@ def give_up_body(repo, number, *, observed, restarts):
 
     Pure. The body carries the tail of what the pass observed, so the
     human taking over sees why the loop walked away. It never names the
-    agent id: the id carries the host segment (a hash or a display name) and this body is posted to
+    agent id: the id is opaque (a hash over the host segment, the repo
+    and the epoch seconds) and this body is posted to
     the tracker, so it stays out of every give-up comment.
     """
     ref = f"{repo}#{number}"
@@ -1990,6 +1997,43 @@ def cap_label(day_cap) -> str:
     return f"({day_cap}/day)" if day_cap is not None else "(day cap)"
 
 
+def restart_refusal(item, *, read_labels, hold_label, requested, linked=()):
+    """Why a stuck row must not restart: (reason, keep) or None. Pure reads.
+
+    The row-state subset of the section 3 gate, re-checked at restart
+    time through the same `hold.reason` resolver the gate uses: a
+    non-open or externally owned row, a held row, a row waiting on a
+    human, or a row no project requested this pass is not restarted.
+    `requested` is the set of (repo, number) any project requested this
+    pass, or None when unknown (then the withdrawn check is skipped).
+    `linked` holds the (repo, number) pairs of the pull requests the
+    restart acts on, threaded into the hold re-check the way the gate
+    threads the row's linked pulls. `read_labels` is the injected label
+    seam and is required: with no reader the hold cannot be re-checked,
+    so the restart is deferred with the claim kept. `hold.reason` fails
+    closed on an unreadable read (the claim is kept) and names a hold
+    otherwise (the claim is released); the restart wording appended
+    here keeps every refusal greppable for "not restarted".
+    """
+    ref = f"{item.repo}#{item.number}"
+    if item.state != "open":
+        return f"{ref}: state is {item.state}, not open, not restarted", False
+    if item.external:
+        return f"{ref}: externally owned, not restarted", False
+    if read_labels is None:
+        return f"{ref}: hold labels unreadable (no label reader), restart deferred", True
+    held = hold.reason(read_labels, (item.repo, item.number), linked, hold_label=hold_label)
+    if held is not None:
+        if "unreadable" in held:
+            return f"{held}, restart deferred", True
+        return f"{held}, not restarted", False
+    if iface.NEEDS_DECISION in (item.labels or ()):
+        return f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, not restarted", False
+    if requested is not None and (item.repo, item.number) not in requested:
+        return f"{ref}: withdrawn by this pass's eligibility, not restarted", False
+    return None
+
+
 def handle_stuck(
     store,
     *,
@@ -2010,12 +2054,22 @@ def handle_stuck(
     start_budget=None,
     day_cap=None,
     hub_epoch_of=None,
+    read_labels=None,
+    hold_label=hold.HOLD_LABEL,
+    requested=None,
 ):
     """Restart or give up on stuck managed claims. Returns (restarted, capped).
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
-    foreign claims are never touched. In hub mode `hub_epoch_of` maps
+    foreign claims are never touched. Before any budget is spent, each
+    restart verdict re-checks row eligibility (`restart_refusal` over
+    the row state, the ticket and linked pull hold labels and the
+    needs-decision label, plus the `requested` set for withdrawals): an
+    ineligible row is not
+    restarted and its claim is released (the epoch is kept, so the next
+    claim fences correctly), except unreadable labels, which fail
+    closed with the claim kept. In hub mode `hub_epoch_of` maps
     (repo, number) to the hub row's fencing epoch (None when the hub
     shows no row); a local epoch the hub superseded skips instead of
     restarting, and an unreadable hub epoch skips without stopping, so
@@ -2099,6 +2153,30 @@ def handle_stuck(
             continue
         if verdict == "watch":
             print(f"{ref}: {observed}, watching once more", file=out)
+            continue
+        refusal = restart_refusal(
+            item,
+            read_labels=read_labels,
+            hold_label=hold_label,
+            requested=requested,
+            linked=[(item.repo, pull.number) for pull in getattr(item, "pulls", None) or ()],
+        )
+        if refusal is not None:
+            reason, keep = refusal
+            if keep:
+                print(f"{reason}, claim kept", file=out)
+                continue
+            try:
+                store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
+            except board.Claimed:
+                print(f"{reason}, release raced a re-claim, left held", file=out)
+                continue
+            except (board.StoreError, sqlite3.Error) as problem:
+                print(f"{reason}, release refused ({problem}), left held", file=out)
+                continue
+            print(f"{reason}, claim released", file=out)
+            if events is not None:
+                events.append({"event": "release", "at": now, "ticket": ref, "agent": claim.agent})
             continue
         key = f"{claim.repo}#{claim.number}"
         stamps = budgets.get(key, [])
@@ -2206,7 +2284,8 @@ def handle_stuck(
             continue
         print(
             f"{ref}: restarted {unit} with the same agent id"
-            f" (restart {len(budgets[key])} of {RESTART_BUDGET} in 24h)",
+            f" (restart {len(budgets[key])} of {RESTART_BUDGET} in 24h);"
+            " to keep it stopped, use `corral stop`, never stop the unit directly",
             file=out,
         )
         if events is not None:
@@ -2447,6 +2526,34 @@ def _fresh_claim(store, gated, *, tracker_factory, operators, host, now, stale_a
     return agent, title, None
 
 
+def _release_own_claim(store, repo, number, agent, *, now, role) -> str:
+    """The `; ...` suffix releasing the claim this pass minted.
+
+    A claim minted seconds ago that no launch will use must not strand:
+    a claimed row is skipped by the gate until the stuck or orphan
+    sweeps reclaim it. Releases only the claim this pass minted (a
+    matching agent) through the existing release path, which keeps the
+    epoch so the next claim fences correctly. Anything else is kept
+    with a suffix saying so: a failed release never raises,
+    fail-closed.
+    """
+    try:
+        current = store.claim_of(repo, number)
+    except (board.StoreError, sqlite3.Error) as err:
+        return f"; {role} release unreadable ({err}), claim kept"
+    if current is None:
+        return f"; {role} claim already gone, row open for a later pass"
+    if current.agent != agent:
+        return f"; {role} claim changed under the pass, left held"
+    try:
+        store.release(repo, number, agent, current.epoch, now=now)
+    except board.Claimed:
+        return f"; {role} release raced a re-claim, left held"
+    except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
+        return f"; {role} release refused ({err}), claim kept"
+    return f"; {role} claim released, row open for a later pass"
+
+
 def _release_reviewer_claim(store, repo, number, agent, *, now) -> str:
     """The `; ...` suffix releasing our reviewer claim after a failed launch.
 
@@ -2457,41 +2564,29 @@ def _release_reviewer_claim(store, repo, number, agent, *, now) -> str:
     it again. Anything else is kept with a suffix saying so: a failed
     release never raises, fail-closed.
     """
-    try:
-        current = store.claim_of(repo, number)
-    except (board.StoreError, sqlite3.Error) as err:
-        return f"; reviewer release unreadable ({err}), claim kept"
-    if current is None:
-        return "; reviewer claim already gone, row open for a later pass"
-    if current.agent != agent:
-        return "; reviewer claim changed under the pass, left held"
-    try:
-        store.release(repo, number, agent, current.epoch, now=now)
-    except board.Claimed:
-        return "; reviewer release raced a re-claim, left held"
-    except (board.ExternalItem, board.StoreError, sqlite3.Error) as err:
-        return f"; reviewer release refused ({err}), claim kept"
-    return "; reviewer claim released, row open for a later pass"
+    return _release_own_claim(store, repo, number, agent, now=now, role="reviewer")
 
 
 def _start_unit(launcher, *, project, repo, number, kind, agent, title, now, author=None):
-    """`(unit, note, code, blocked)` for one launch-handoff attempt.
+    """`(unit, note, code, blocked, race)` for one launch-handoff attempt.
 
     `unit` is None when the launch failed; `note` appends to the gate
-    reason, `code` is `""` on success else `"launch"`, and `blocked` is
-    True only when the service manager was unreachable. Every launcher
-    call carries the author (None except for reviewers), so the seam
-    stays one shape for every kind.
+    reason, `code` is `""` on success else `"launch"`, `blocked` is
+    True only when the service manager was unreachable, and `race` is
+    True only when a live unit already holds the ticket (a lost race,
+    not a refusal: another party may own the ticket, so the caller
+    keeps the claim). Every launcher call carries the author (None
+    except for reviewers), so the seam stays one shape for every kind.
     """
     try:
         unit = launcher(project, repo, number, kind, agent, title, now=now, author=author)
     except units.UnitExists as err:
-        return None, f"race lost, already live ({err})", "launch", False
+        return None, f"race lost, already live ({err})", "launch", False, True
     except units.Unreachable as err:
-        return None, f"not started: {err}", "launch", True
+        return None, f"not started: {err}", "launch", True, False
     except Exception as err:
-        return None, f"not started: {err}", "launch", False
-    return unit, f"started {unit}", "", False
+        return None, f"not started: {err}", "launch", False, False
+    return unit, f"started {unit}", "", False, False
 
 
 def _claim_and_launch(
@@ -2550,7 +2645,11 @@ def _claim_and_launch(
     budget warnings and journal entries. A lost race (exit 2 from the
     store) becomes a skip naming the holder and the pass moves on; a
     launch through `launcher` appends the unit or the failure to the
-    row's reason. `released` ({(repo, number): worker id} released
+    row's reason. A failed fresh `start` launch releases the fresh
+    claim in the same pass (except a lost race to a live unit, which
+    keeps it) and appends the release to the row's reason, so the
+    ticket is pickable again with the epoch kept. `released`
+    ({(repo, number): worker id} released
     this pass) and `finished` (the newest finished entry per ticket)
     feed the reviewer author. With no `launcher` the pass stops after
     claiming and records that, releasing a reviewer claim again like a
@@ -2635,7 +2734,7 @@ def _claim_and_launch(
                     )
                 )
                 continue
-            unit, note, code, unreachable = _start_unit(
+            unit, note, code, unreachable, _ = _start_unit(
                 launcher,
                 project=gated.project,
                 repo=gated.repo,
@@ -2944,7 +3043,7 @@ def _claim_and_launch(
                     )
                 )
                 continue
-            unit, note, code, unreachable = _start_unit(
+            unit, note, code, unreachable, race = _start_unit(
                 launcher,
                 project=gated.project,
                 repo=gated.repo,
@@ -2956,8 +3055,20 @@ def _claim_and_launch(
             )
             blocked = blocked or unreachable
             if unit is None:
+                suffix = ""
                 if unrecord is not None:
+                    # A fix round minted a fresh claim above: a refusal
+                    # after it (admission, quota, a launch error)
+                    # releases the fresh claim in the same pass, like a
+                    # fresh start claim, so the ticket is pickable again
+                    # with the epoch kept. A lost race keeps it: a live
+                    # unit may own the ticket. A resume failure mints
+                    # nothing, so its claim stays held.
                     unrecord()
+                    if not race:
+                        suffix = _release_own_claim(
+                            store, gated.repo, gated.number, agent, now=now, role="fresh"
+                        )
                 rows.append(
                     Gated(
                         project=gated.project,
@@ -2965,7 +3076,7 @@ def _claim_and_launch(
                         number=gated.number,
                         kind=effective,
                         verdict="skip",
-                        reason=f"{gated.reason}; {note}",
+                        reason=f"{gated.reason}; {note}{suffix}",
                         code=code,
                     )
                 )
@@ -3026,7 +3137,7 @@ def _claim_and_launch(
                 )
             )
             continue
-        unit, note, code, unreachable = _start_unit(
+        unit, note, code, unreachable, race = _start_unit(
             launcher,
             project=gated.project,
             repo=gated.repo,
@@ -3038,6 +3149,18 @@ def _claim_and_launch(
         )
         blocked = blocked or unreachable
         if unit is None:
+            # A refusal after the claim (admission, quota, a launch
+            # error) releases the fresh claim in the same pass, so the
+            # ticket is pickable again; the release keeps the epoch so
+            # the next claim fences correctly. A lost race keeps it: a
+            # live unit may own the ticket.
+            suffix = (
+                ""
+                if race
+                else _release_own_claim(
+                    store, gated.repo, gated.number, agent, now=now, role="fresh"
+                )
+            )
             rows.append(
                 Gated(
                     project=gated.project,
@@ -3045,7 +3168,7 @@ def _claim_and_launch(
                     number=gated.number,
                     kind=gated.kind,
                     verdict="skip",
-                    reason=f"{gated.reason}; {note}",
+                    reason=f"{gated.reason}; {note}{suffix}",
                     code=code,
                 )
             )
@@ -3344,7 +3467,10 @@ def _launching_pass(
     stays queued for the next healthy pass. A pass that synced nothing
     at all exits 3 on tracker failures, and 4 when only corrupt stored
     rows failed; a pass that launched nothing because the service
-    manager was unreachable exits 3 too. When `journal_path` is set, the
+    manager was unreachable exits 3 too. The stuck sweep re-checks
+    row eligibility before restarting (a held, closed, externally owned,
+    needs-decision or withdrawn row is released, never restarted).
+    When `journal_path` is set, the
     pass appends its start, every start, skip, release, restart and
     give-up, and its end with verdict counts; a journal write failure
     warns and the pass continues. When `day_path` and `max_starts` are
@@ -3513,7 +3639,7 @@ def _launching_pass(
         except sqlite3.Error as problem:
             print(f"corral drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
-    gated_rows, problems = _gate_all(
+    gated_rows, problems, eligible_keys = _gate_all(
         _items,
         registered,
         out,
@@ -3596,6 +3722,9 @@ def _launching_pass(
                 start_budget=stuck_budget,
                 day_cap=max_starts,
                 hub_epoch_of=hub_epoch_of,
+                read_labels=read_labels,
+                hold_label=hold_label,
+                requested=eligible_keys,
             )
             started += stuck_restarted
         except (board.StoreError, sqlite3.Error) as problem:

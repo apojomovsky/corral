@@ -87,6 +87,15 @@ clock or settings access inside. Corral supplies everything as
 arguments, including `now`. That keeps project policy testable with
 plain rows and keeps every side effect behind corral's seams.
 
+Keep requesting the in-flight tickets the project still wants,
+claimed or not. The stuck sweep restarts only tickets some project
+requested this pass: a policy that drops a still-claimed ticket (for
+example by requesting unclaimed rows only) turns that ticket's
+restart into a release with a "withdrawn by this pass's eligibility"
+logbook line. A `start` request on an already-claimed row is a gate
+no-op ("already claimed"), so requesting in-flight rows changes no
+start verdict; it only keeps the restart path open for them.
+
 Why not the alternatives:
 
 - A subprocess command adds serialization, version skew between corral
@@ -199,19 +208,25 @@ The loop claims through the board store transaction
 (`Store.claim(repo, number, agent, host, now)`), then enqueues the
 `agent` and `status` writes to the outbox for the mirror pass. This is
 the existing rule that claims need zero tracker calls. The agent id is opaque to every reader except debugging, for
-example `drive-<host>-<start-seconds>-<owner>--<name>-<number>`
-(the repo segment encodes `owner/name` with a double dash so the id
-itself contains no `/`; `start-seconds` is a wall-clock timestamp,
-not a fencing token). Fencing uses only `Claim.epoch`; the host
+example `drive-<hash8>-<number>`: the hash covers the host segment,
+the repo and the epoch seconds, and the suffix is the ticket number,
+so the id carries no path or name and stays short enough for a
+tracker label (`agent:<id>` fits 32 characters for ticket numbers up
+to 11 digits). Fencing uses only `Claim.epoch`; the host
 field and the epoch are the tokens a future multi-host loop needs.
+Minted only by `drive.mint_agent`, parsed only (for the `drive-`
+prefix) by `drive.is_managed_agent`: one minter, one parser, one
+prefix. Ids minted under an older shape stay valid: nothing parses
+them beyond the prefix.
 
-Decision: the `<host>` segment never carries the raw hostname. The
+Decision: the hash input never carries the raw hostname. The
 claim `agent` value is mirrored to the tracker as a label, so on a
-public tracker it would publish the deployment hostname. The segment
-comes from the `drive.agent_host` setting, resolved once per pass: a
-configured display name is used verbatim (with `/` replaced by `-`),
-and the default is a short stable hash of the hostname rather than
-the hostname itself. The id stays opaque and slash-free either way.
+public tracker it would publish the deployment hostname. The host
+segment comes from the `drive.agent_host` setting, resolved once per
+pass: a configured display name is used verbatim (with `/` replaced
+by `-`), and the default is a short stable hash of the hostname
+rather than the hostname itself. The id stays opaque and slash-free
+either way.
 
 - Lost race (exit 2, `Claimed`): re-read the row live. If another agent
   now holds it, record "race lost to `<agent>`" and continue with the
@@ -326,7 +341,11 @@ ignores them. A `finished` entry is neither `live` nor `stale` under
 `registry.status`, so it already counts as "no live or stale entry"
 for the section 4 orphan rule; reconciliation runs first, so a
 finished worker always takes this completion path, never the orphan
-one.
+one. Completion needs no pull request: the finished entry proves the
+worker's turn ended, so the reviewer is scheduled on the branch
+whether or not a PR was opened. Without any registry entry for the
+holder, a clean exit is indistinguishable from a crash: the claim
+stays held and the stuck handling below applies.
 
 Stuck agents: each pass compares claimed tickets against registry
 liveness and unit liveness. Only managed holders ever reach here;
@@ -338,6 +357,21 @@ foreign claims were skipped at gate step 2.
   and epoch, reusing the identical agent id: `Store.claim` is
   idempotent only for the same agent, and a fresh id on a still-held
   row gets `Claimed`).
+- Eligibility of restarts: a restart re-checks the row-state subset
+  of the section 3 gate before spending any budget. A non-open or
+  externally owned row, a held row, a row waiting on a human, or a
+  row no project requested this pass is not restarted: the loop
+  releases its claim (the epoch is kept, so the next claim fences
+  correctly) and logs why. No budget stamp is written and no give-up
+  is posted. Unreadable hold labels fail closed instead: the claim
+  is kept for a later pass.
+- Operator stops: `corral stop` marks the unit's registry entry done,
+  so the ticket takes the completion path above and is never
+  restarted. Stopping the unit directly (for example with
+  `systemctl stop`) leaves the registry entry as it was, which the
+  loop reads as a crash and restarts within budget. The restart
+  logbook line names `corral stop`, so an operator who stopped the
+  unit learns the lasting way to keep it stopped.
 - Restart budget: at most 3 automatic restarts per ticket in any
   sliding 24 hour window, counted as timestamps in a small state
   file: a restart is allowed only when fewer than 3 stored timestamps

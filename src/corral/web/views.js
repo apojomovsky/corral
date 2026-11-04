@@ -999,13 +999,16 @@ export function renderBoardRows(payload, { limit, offset, nowMs }) {
       list.appendChild(boardRow(row, nowMs));
     }
   }
-  const first = total === 0 ? 0 : offset + 1;
-  const last = Math.min(offset + rows.length, total);
+  // A stale offset past the end (rows deleted under an open page)
+  // never inverts the count: the range clamps into [0, total].
+  const clampedOffset = Math.max(0, Math.min(offset, total));
+  const first = total === 0 || rows.length === 0 ? 0 : clampedOffset + 1;
+  const last = Math.min(clampedOffset + rows.length, total);
   const count = document.getElementById("board-count");
   count.textContent = "";
   count.appendChild(document.createTextNode(first + "-" + last + " of " + total));
-  document.getElementById("board-prev").disabled = offset <= 0;
-  document.getElementById("board-next").disabled = offset + page >= total;
+  document.getElementById("board-prev").disabled = clampedOffset <= 0;
+  document.getElementById("board-next").disabled = clampedOffset + page >= total;
 }
 
 function claimText(claim) {

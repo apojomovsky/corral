@@ -99,16 +99,10 @@ class BoardSchema(NamedTuple):
     fields: dict  # concept -> FieldDef
 
 
-#: Board config attribute per concept, in poll order.
-_CONCEPT_ATTRS = (
-    ("agent", "agent_field"),
-    ("status", "status_field"),
-    ("board_status", "status_column"),
-    ("priority", "priority_column"),
-    ("area", "area_column"),
-    ("pool", "pool_column"),
-    ("blocked_by", "blocked_by_column"),
-)
+#: Board config attribute per concept, in poll order. The one mapping
+#: lives in ``corral.tracker`` beside the planner that shares it; this
+#: module only names the reader's kind contract below.
+_CONCEPT_ATTRS = iface.BOARD_CONCEPT_ATTRS
 
 #: Concepts carried as option display names.
 _SELECT_CONCEPTS = frozenset({"board_status", "priority", "area", "pool"})

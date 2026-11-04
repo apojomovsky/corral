@@ -612,7 +612,7 @@ class OnboardRun(unittest.TestCase):
             path=self.parent,
             git=fake,
             test_cmd="make check",
-            runtime="opencode",
+            runtime="muse",
             cap=3,
             sets=("board.ready=triage",),
         )
@@ -620,7 +620,7 @@ class OnboardRun(unittest.TestCase):
         text = self.toml()
         self.assertIn('test = "make check"', text)
         self.assertIn("cap = 3", text)
-        self.assertIn('runtime = "opencode"', text)
+        self.assertIn('runtime = "muse"', text)
         self.assertIn('ready = "triage"', text)
 
     def test_unknown_set_key_is_exit_4(self):

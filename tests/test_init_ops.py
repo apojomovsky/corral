@@ -457,7 +457,7 @@ class OpsErrorsCase(OpsFixture):
                 "--test-cmd",
                 "make check",
                 "--runtime",
-                "opencode",
+                "muse",
                 "--no-register",
                 self.clone,
             )[0],

@@ -78,14 +78,6 @@ paths = ["~/.local/bin/omp"]
 install = "curl -fsSL https://omp.sh/install | sh -s -- --binary --ref v18.12.6"
 
 [[dep]]
-name = "opencode"
-why = "agent runtime (major 1 until the cutover to 2)"
-probe = ["opencode", "--version"]
-below = "2"
-paths = ["~/.opencode/bin/opencode"]
-install = "curl -fsSL https://opencode.ai/install | bash -s -- --version 1.18.32"
-
-[[dep]]
 name = "muse"
 why = "agent runtime (major 1 until the cutover to 2)"
 probe = ["muse", "--version"]

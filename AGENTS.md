@@ -18,7 +18,7 @@ corral is public. Nothing in it identifies a person, a host or an account, and t
 - private repositories, their tickets, or the projects of a particular user;
 - providers, accounts, quota numbers or incidents tied to a real deployment.
 
-Use generic stand-ins: `example.com`, `suite@corral.invalid`, `~/.config/corral/`, "a project", `host-1`. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
+Use generic stand-ins: `example.com`, `suite@corral.invalid`, `~/.config/corral/`, "a project", `host-1`. The only named person in the repository is the copyright holder in `LICENSE`; everything else stays generic. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
 
 ## Layout
 
@@ -48,11 +48,11 @@ The rules the design rests on:
 
 - **One fact, one place.** Each setting, path or state is resolved by exactly one helper, and every reader goes through it. A second resolver for the same fact is a bug, even when the two agree today. When a fact must be repeated (the uv installer in the Makefile, before uv exists), a test asserts the copies agree.
 - **Exit codes are a public interface.** Projects and agents branch on them, so changing what one means is a breaking change: `0` success, `1` nothing to do or a gate said no, `2` race lost or already running, `3` GitHub, systemd or a host unreachable, `4` configuration or usage error, `75` no free slot (try later).
-- **Pure cores, thin seams.** Decisions (admission, the quota gate, pacing, GC verdicts) are pure functions over plain data. Every subprocess (`gh`, `git`, `omp`, `opencode`, `systemd-run`, `systemctl`, `docker`) and every network call goes through one injectable seam per tool. Tests inject fakes there.
+- **Pure cores, thin seams.** Decisions (admission, the quota gate, pacing, GC verdicts) are pure functions over plain data. Every subprocess (`gh`, `git`, `omp`, `muse`, `systemd-run`, `systemctl`, `docker`) and every network call goes through one injectable seam per tool. Tests inject fakes there.
 - **GitHub stays behind the tracker and forge interfaces.** Tickets and claims go through the tracker; branches, PRs and merges go through the forge (design, section 2). Only their GitHub adapters call `gh` or know GitHub's URLs, issue-reference syntax or API shapes. Everything else takes a tracker or forge object.
-- **No test touches the outside world.** That means GitHub, systemd, docker, omp, opencode, claude, a non-loopback address, a real clone of another project, or the real state and session dirs. `tests/suiteguard.py`, installed from `tests/__init__.py`, puts failing shims first on PATH and refuses external sockets and network git. A run that recorded any call fails and names the test. Inject a fake at the production seam; never rely on the guard to catch a leak.
+- **No test touches the outside world.** That means GitHub, systemd, docker, omp, muse, claude, a non-loopback address, a real clone of another project, or the real state and session dirs. `tests/suiteguard.py`, installed from `tests/__init__.py`, puts failing shims first on PATH and refuses external sockets and network git. A run that recorded any call fails and names the test. Inject a fake at the production seam; never rely on the guard to catch a leak.
 - **Destructive seams have no default.** A seam that stops, kills, pauses or deletes (units, processes, worktrees, sessions, images) takes its implementation as a required argument. It never falls back to the real one when a caller passes nothing; it fails closed instead. A guard test asserts that no test reaches a real kill. A missed fake in a stop path does not fail one test: it stops every live agent on the host.
-- **Never edit a user's home config.** Every agent launch gets a full per-launch overlay. corral reads `~/.omp/` and `~/.config/opencode/`; it never writes them.
+- **Never edit a user's home config.** Every agent launch gets a full per-launch overlay. corral reads `~/.omp/` and `~/.local/share/muse/sessions/`; it never writes them.
 - **Proof before removal.** Anything corral deletes unattended (a branch, a worktree, a cache, an image, a session) needs a proof that nothing is lost, and lies inside a declared root.
 - **One version of each runtime.** corral supports one major version of each agent runtime at a time. A new major is a cutover: one PR ports and deletes the old support. No side-by-side dialects.
 
@@ -124,7 +124,7 @@ Dispatched agents run headless. When the turn ends, the process exits, and any b
 
 ## Boundaries
 
-- **Third-party repositories.** Never write to a repository corral's maintainers do not own: no issue, PR, comment, review or fork, and no contact with an upstream maintainer, unless a maintainer explicitly tells you to in your own session, naming the specific post. A bug in a third-party tool (omp, opencode) gets a workaround here.
+- **Third-party repositories.** Never write to a repository corral's maintainers do not own: no issue, PR, comment, review or fork, and no contact with an upstream maintainer, unless a maintainer explicitly tells you to in your own session, naming the specific post. A bug in a third-party tool (omp, muse) gets a workaround here.
 - **External contributions are for maintainers.** An agent never merges, reviews, comments on, labels, closes or works on a PR or issue from outside the maintainers, or any fork PR. Tell a maintainer and stop.
 - **Secrets.** Tokens and account metadata (runtime logins, the GitHub token, provider API keys, corral's API token) are read at call time and never stored or logged. The same goes for quota payloads beyond their usage numbers.
 - **Report only what you ran.** Every claim about a command's result comes from a command you actually ran. Never invent output.

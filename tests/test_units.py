@@ -225,7 +225,7 @@ class UnitArgvTest(unittest.TestCase):
                 "/work/lib",
                 "/sessions/lib-5",
                 ["omp", "-p", "hi"],
-                ["OPENCODE_CONFIG=/s/opencode.json", "AGENT_ID=a1"],
+                ["SESSION_CONFIG=/s/session.json", "AGENT_ID=a1"],
                 3600,
             )
         home = os.path.expanduser("~")
@@ -243,7 +243,7 @@ class UnitArgvTest(unittest.TestCase):
                 "--working-directory=/work/lib",
                 "--setenv=PATH=/p/bin",
                 f"--setenv=HOME={home}",
-                "--setenv=OPENCODE_CONFIG=/s/opencode.json",
+                "--setenv=SESSION_CONFIG=/s/session.json",
                 "--setenv=AGENT_ID=a1",
                 "omp",
                 "-p",
