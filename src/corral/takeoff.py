@@ -25,7 +25,9 @@ with no commands to run never takes the lock.
 
 Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
 is unreachable, 4 usage or configuration, 75 the suite lock stayed held
-past the wait.
+past the wait. `--skip NAME` waives one policy check and records the
+skip; an unknown name or an identity check (`base`, `worktree`) is
+exit 4.
 """
 
 import contextlib
@@ -88,12 +90,50 @@ class LsRemoteError(Exception):
 
 
 class Check(NamedTuple):
-    """One gate row: the check name, its status, and detail plus fix lines."""
+    """One gate row: the check name, its status, detail plus fix lines,
+    and where a skip came from (None when the check ran)."""
 
     name: str
     status: str
     detail: str
     fix: str
+    skipped_by: str | None = None
+
+
+#: The policy checks `--skip NAME` may waive, in gate order.
+SKIPPABLE_CHECKS = ("commits", "em-dash", "body", "leak", "review", "checks")
+
+#: The identity checks no flag may waive: they establish what is gated.
+IDENTITY_CHECKS = ("base", "worktree")
+
+#: Where a skip came from: named on the command line, or off by default.
+SKIPPED_BY_FLAG = "flag"
+SKIPPED_BY_CONFIG = "config"
+
+
+def _flag_skip(name):
+    """The recorded row for `--skip NAME`: an explicit skip, never quiet."""
+    return Check(name, SKIPPED, f"skipped by --skip {name}", "", SKIPPED_BY_FLAG)
+
+
+def _resolve_skips(skips):
+    """`skips` as a set, or raise TakeoffError naming the refused name.
+
+    Unknown names and the identity checks (`base`, `worktree`) are
+    refused: skipping identity is not a policy choice.
+    """
+    names = list(skips or [])
+    unknown = [name for name in names if name not in SKIPPABLE_CHECKS + IDENTITY_CHECKS]
+    if unknown:
+        wanted = ", ".join(SKIPPABLE_CHECKS)
+        raise TakeoffError(f"unknown check {unknown[0]!r}: skippable checks are {wanted}")
+    refused = [name for name in names if name in IDENTITY_CHECKS]
+    if refused:
+        raise TakeoffError(
+            f"cannot skip the {refused[0]} check: "
+            "it establishes what is being gated, not a policy choice"
+        )
+    return frozenset(names)
 
 
 class Result(NamedTuple):
@@ -312,7 +352,7 @@ def _scrub(detail, terms):
 def _check_commits(rules, conventional, toplevel, base, scrub):
     """Every commit in `<base>..HEAD` passes the commit-msg rules."""
     if not conventional:
-        return Check("commits", SKIPPED, "git.commits.conventional is false", "")
+        return Check("commits", SKIPPED, "git.commits.conventional is false", "", SKIPPED_BY_CONFIG)
     log = _git(["log", "--format=%H%x00%B%x01", f"{base}..HEAD"], toplevel)
     if log.returncode != 0:
         raise TakeoffError(f"cannot list {base}..HEAD: {(log.stderr or '').strip()}")
@@ -349,7 +389,7 @@ def _added_lines_with(base, toplevel, needle):
 def _check_em_dash(enabled, toplevel, base, body_text, scrub):
     """No added line and no PR body carries an em-dash."""
     if not enabled:
-        return Check("em-dash", SKIPPED, "checks.no_em_dash is false", "")
+        return Check("em-dash", SKIPPED, "checks.no_em_dash is false", "", SKIPPED_BY_CONFIG)
     found = [
         f"em-dash in an added line: {excerpt!r}"
         for excerpt in _added_lines_with(base, toplevel, EM_DASH)
@@ -419,7 +459,7 @@ def _check_leak(toplevel, base, body_file, found_terms):
 def _check_review(required, repo, number, toplevel, base):
     """The head commit carries an approving review record."""
     if not required:
-        return Check("review", SKIPPED, "review.required is false", "")
+        return Check("review", SKIPPED, "review.required is false", "", SKIPPED_BY_CONFIG)
     if number is None:
         return Check(
             "review",
@@ -602,18 +642,23 @@ def _check_commands(
     return Check("checks", OK, "; ".join(f"`{c}`" for c in wanted) if wanted else "", "")
 
 
-def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remote, run_cmd):
+def run_takeoff(
+    path, *, body_file=None, with_test=False, ops_dir=None, skips=(), ls_remote, run_cmd
+):
     """Run the takeoff gate over `path`; returns a Result.
 
     `ls_remote(branch, cwd)` returns the remote base SHA or raises
     LsRemoteError; `run_cmd(cmd, cwd)` runs one takeoff command. Both are
     required: no default may silently answer for the remote or the suite.
-    Usage and configuration problems raise TakeoffError (exit 4). Exit 3
-    returns before any check row, when the remote is unreadable; exit 75
-    returns the rows so far with the suite wait as the failing checks row.
+    `skips` names policy checks `--skip` waives; an unknown or identity
+    name raises TakeoffError before anything runs. Usage and configuration
+    problems raise TakeoffError (exit 4). Exit 3 returns before any check
+    row, when the remote is unreadable; exit 75 returns the rows so far
+    with the suite wait as the failing checks row.
     """
     if ls_remote is None or run_cmd is None:
         raise TypeError("run_takeoff needs ls_remote and run_cmd seams")
+    skip_set = _resolve_skips(skips)
     if not path or not os.path.isdir(path):
         raise TakeoffError(f"{path}: not a directory")
     toplevel_proc = _git(["rev-parse", "--show-toplevel"], os.path.realpath(path))
@@ -653,9 +698,12 @@ def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remot
     def scrub(detail):
         return _scrub(detail, found_terms)
 
-    checks.append(
-        _check_commits(rules, resolved["git.commits.conventional"], toplevel, base, scrub)
-    )
+    if "commits" in skip_set:
+        checks.append(_flag_skip("commits"))
+    else:
+        checks.append(
+            _check_commits(rules, resolved["git.commits.conventional"], toplevel, base, scrub)
+        )
     if body_file is not None:
         try:
             with open(body_file, encoding="utf-8") as handle:
@@ -664,13 +712,26 @@ def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remot
             raise TakeoffError(f"cannot read body file {body_file}: {err}") from None
     else:
         body_text = None
-    checks.append(_check_em_dash(resolved["checks.no_em_dash"], toplevel, base, body_text, scrub))
-    if body_text is None:
-        checks.append(Check("body", SKIPPED, "no --body file given", ""))
+    if "em-dash" in skip_set:
+        checks.append(_flag_skip("em-dash"))
+    else:
+        checks.append(
+            _check_em_dash(resolved["checks.no_em_dash"], toplevel, base, body_text, scrub)
+        )
+    if "body" in skip_set:
+        checks.append(_flag_skip("body"))
+    elif body_text is None:
+        checks.append(Check("body", SKIPPED, "no --body file given", "", SKIPPED_BY_CONFIG))
     else:
         checks.append(_check_body(body_text, number))
-    checks.append(_check_leak(toplevel, base, body_file, found_terms))
-    checks.append(_check_review(resolved["review.required"], repo, number, toplevel, base))
+    if "leak" in skip_set:
+        checks.append(_flag_skip("leak"))
+    else:
+        checks.append(_check_leak(toplevel, base, body_file, found_terms))
+    if "review" in skip_set:
+        checks.append(_flag_skip("review"))
+    else:
+        checks.append(_check_review(resolved["review.required"], repo, number, toplevel, base))
     timeout_s = resolved["checks.timeout_s"]
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
         raise TakeoffError("checks.timeout_s must be a positive number of seconds")
@@ -681,32 +742,36 @@ def run_takeoff(path, *, body_file=None, with_test=False, ops_dir=None, ls_remot
         or lock_timeout_s <= 0
     ):
         raise TakeoffError("checks.suite_lock_timeout_s must be a positive number of seconds")
-    if run_cmd is production_run_cmd:
-        run_cmd = functools.partial(production_run_cmd, timeout=timeout_s)
-    try:
-        checks.append(
-            _check_commands(
-                resolved["checks.takeoff"],
-                resolved["checks.test"],
-                with_test,
-                toplevel,
-                run_cmd,
-                scrub,
-                timeout_s,
-                lock_path=suite_lock_path(),
-                lock_timeout_s=lock_timeout_s,
+    if "checks" in skip_set:
+        # A waived group runs nothing and takes no lock.
+        checks.append(_flag_skip("checks"))
+    else:
+        if run_cmd is production_run_cmd:
+            run_cmd = functools.partial(production_run_cmd, timeout=timeout_s)
+        try:
+            checks.append(
+                _check_commands(
+                    resolved["checks.takeoff"],
+                    resolved["checks.test"],
+                    with_test,
+                    toplevel,
+                    run_cmd,
+                    scrub,
+                    timeout_s,
+                    lock_path=suite_lock_path(),
+                    lock_timeout_s=lock_timeout_s,
+                )
             )
-        )
-    except SuiteBusy as busy:
-        checks.append(
-            Check(
-                "checks",
-                FAIL,
-                scrub(str(busy)),
-                "wait for the other takeoff to finish, then run takeoff again",
+        except SuiteBusy as busy:
+            checks.append(
+                Check(
+                    "checks",
+                    FAIL,
+                    scrub(str(busy)),
+                    "wait for the other takeoff to finish, then run takeoff again",
+                )
             )
-        )
-        return Result(base, checks, 75)
+            return Result(base, checks, 75)
     if any(check.status == FAIL for check in checks):
         return Result(base, checks, 1)
     return Result(base, checks, 0)
