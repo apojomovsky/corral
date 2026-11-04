@@ -18,7 +18,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, forge as iface, init, new, settings
+from corral import cli, forge as iface, gc, init, new, settings
 from corral import tracker as tracker_iface
 from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
@@ -142,6 +142,60 @@ if __name__ == "__main__":
 )
 
 
+class FakeProvisioner:
+    """A board provisioner double: one programmed report, no board contact."""
+
+    def __init__(self, provision=None, ensure_error=None):
+        self.calls = []
+        self.provision = provision
+        self.ensure_error = ensure_error
+
+    def ensure_board(self, spec):
+        self.calls.append(("ensure_board", spec))
+        if self.ensure_error is not None:
+            raise self.ensure_error
+        return self.provision
+
+
+def kept_provision(**over):
+    """An all-kept board report with the standard live field names."""
+    params = {
+        "owner": "operator",
+        "number": 7,
+        "project_id": "PVT_1",
+        "fields": (
+            tracker_iface.FieldSpec("agent", "Agent", "text", ()),
+            tracker_iface.FieldSpec("status", "Agent state", "text", ()),
+            tracker_iface.FieldSpec(
+                "board_status", "Status", "single_select", ("Todo", "In Progress", "Done")
+            ),
+            tracker_iface.FieldSpec(
+                "priority",
+                "Priority",
+                "single_select",
+                ("Urgent", "High", "Normal", "Low", "Backlog"),
+            ),
+            tracker_iface.FieldSpec("blocked_by", "Blocked by", "text", ()),
+        ),
+        "created": (),
+        "kept": ("project",),
+        "refused": (),
+        "priority_map": {"opt-1": "urgent"},
+    }
+    params.update(over)
+    return tracker_iface.BoardProvision(**params)
+
+
+def counting_factory(provisioner, builds):
+    """A provisioner factory double that records every build."""
+
+    def get():
+        builds.append("build")
+        return provisioner
+
+    return get
+
+
 def run_new(
     *,
     name=FIXTURE,
@@ -164,6 +218,7 @@ def run_new(
     owner=None,
     resume=False,
     tracker=None,
+    provisioner_factory=None,
 ):
     """`new.run` with captured output: `(code, stdout, stderr)`."""
     opts = new.Options(
@@ -187,12 +242,20 @@ def run_new(
     )
     out, err = io.StringIO(), io.StringIO()
     with redirect_stdout(out), redirect_stderr(err):
-        if git is None and forge is None and tracker is None:
+        if git is None and forge is None and tracker is None and provisioner_factory is None:
             code = new.run(opts)
         else:
             if tracker is None and forge is not None:
                 tracker = FakeTracker()
-            code = new.run(opts, git=git or FakeGit(root=path), forge=forge, tracker=tracker)
+            if provisioner_factory is None:
+                provisioner_factory = lambda: FakeProvisioner(provision=kept_provision())
+            code = new.run(
+                opts,
+                git=git or FakeGit(root=path),
+                forge=forge,
+                tracker=tracker,
+                provisioner_factory=provisioner_factory,
+            )
     return code, out.getvalue(), err.getvalue()
 
 
@@ -204,6 +267,19 @@ def isolated_config(test):
     patcher.start()
     test.addCleanup(patcher.stop)
     return cfg
+
+
+def isolated_git_identity(test):
+    """A throwaway XDG config giving real git a commit identity."""
+    xdg = tempfile.mkdtemp(prefix="corral-xdg-")
+    test.addCleanup(shutil.rmtree, xdg, True)
+    os.makedirs(os.path.join(xdg, "git"))
+    with open(os.path.join(xdg, "git", "config"), "w", encoding="utf-8") as handle:
+        handle.write("[user]\n\tname = Suite\n\temail = suite@corral.invalid\n")
+    patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg})
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return xdg
 
 
 class TemplateNames(unittest.TestCase):
@@ -1214,6 +1290,239 @@ class LabelBootstrap(unittest.TestCase):
         self.assertEqual(tracker.calls, [])
 
 
+class BoardEnsure(unittest.TestCase):
+    """Ticket 7: `--create-remote` provisions the board and writes its mapping."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.parent = tmp.name
+        isolated_config(self)
+        isolated_git_identity(self)
+
+    def target(self):
+        return os.path.join(self.parent, FIXTURE)
+
+    def toml_text(self):
+        with open(os.path.join(self.target(), "corral.toml"), encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_create_remote_provisions_the_board_once_and_writes_the_inert_table(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        made = kept_provision(created=("project", "link:operator/demo"), kept=())
+        provisioner = FakeProvisioner(provision=made)
+        builds = []
+        code, out, err = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=counting_factory(provisioner, builds),
+            create_remote=True,
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(builds, ["build"])
+        self.assertEqual(len(provisioner.calls), 1)
+        kind, spec = provisioner.calls[0]
+        self.assertEqual(kind, "ensure_board")
+        self.assertEqual(spec.repo, f"operator/{FIXTURE}")
+        self.assertEqual(spec.owner, "operator")
+        self.assertEqual(spec.title, f"{FIXTURE} board")
+        self.assertIsNone(spec.number)
+        self.assertIsNone(spec.project_id)
+        self.assertEqual(
+            {field.concept for field in spec.fields},
+            {"agent", "status", "board_status", "priority", "blocked_by"},
+        )
+        self.assertLess(out.index("created label ready"), out.index("created project"))
+        text = self.toml_text()
+        self.assertIn("[repo.board]", text)
+        self.assertIn('project_owner = "operator"', text)
+        self.assertIn("project_number = 7", text)
+        self.assertIn('agent_field = "Agent"', text)
+        self.assertNotIn("area_column", text)
+        self.assertNotIn('tracker.variant = "board"', text)
+        self.assertIn("next: corral doctor", out)
+
+    def test_refused_board_is_exit_1_with_the_setup_next_step(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        provisioner = FakeProvisioner(
+            provision=kept_provision(refused=("add the High option by hand",))
+        )
+        code, out, err = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: provisioner,
+            create_remote=True,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertEqual(len(provisioner.calls), 1)
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+
+    def test_unreachable_board_is_exit_3_with_the_setup_next_step(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        provisioner = FakeProvisioner(
+            provision=kept_provision(),
+            ensure_error=tracker_iface.TrackerError("board down"),
+        )
+        code, out, _ = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: provisioner,
+            create_remote=True,
+        )
+        self.assertEqual(code, 3)
+        self.assertEqual(len(provisioner.calls), 1)
+        self.assertIn(f"board on operator/{FIXTURE} not bootstrapped", out)
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+
+    def test_board_value_error_is_exit_4(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        provisioner = FakeProvisioner(
+            provision=kept_provision(),
+            ensure_error=ValueError("unknown owner 'operator'"),
+        )
+        code, _, err = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: provisioner,
+            create_remote=True,
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(len(provisioner.calls), 1)
+        self.assertIn("unknown owner", err)
+
+    def test_board_factory_value_error_is_exit_4(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+
+        def boom():
+            raise ValueError("no provisioner for this adapter")
+
+        code, _, err = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=boom,
+            create_remote=True,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("no provisioner for this adapter", err)
+
+    def test_board_provisioner_without_ensure_is_exit_4(self):
+        class NotCallable:
+            ensure_board = "yes"
+
+        for bad in (object(), NotCallable()):
+            with self.subTest(bad=type(bad).__name__):
+                parent = tempfile.mkdtemp(prefix="corral-new-")
+                self.addCleanup(shutil.rmtree, parent, True)
+                cfg = tempfile.mkdtemp(prefix="corral-config-")
+                self.addCleanup(shutil.rmtree, cfg, True)
+                patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+                patcher.start()
+                self.addCleanup(patcher.stop)
+                code, _, err = run_new(
+                    path=parent,
+                    git=FakeGit(root=parent, status="?? README.md\n"),
+                    forge=FakeForge(user="operator"),
+                    tracker=FakeTracker(),
+                    provisioner_factory=lambda bad=bad: bad,
+                    create_remote=True,
+                )
+                self.assertEqual(code, 4)
+                self.assertIn("this tracker does not provision boards", err)
+
+    def test_successful_create_remote_commits_the_mapping_and_leaves_a_clean_tree(self):
+        forge = FakeForge(user="operator")
+        made = kept_provision(created=("project", "link:operator/demo"), kept=())
+        code, out, err = run_new(
+            path=self.parent,
+            git=gc.git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: FakeProvisioner(provision=made),
+            create_remote=True,
+        )
+        self.assertEqual((code, err), (0, ""))
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout.strip(), "")
+        show = subprocess.run(
+            ["git", "show", "HEAD:corral.toml"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertIn("[repo.board]", show.stdout)
+        self.assertIn("next: corral doctor", out)
+
+    def test_refused_board_leaves_a_clean_tree_with_no_mapping(self):
+        forge = FakeForge(user="operator")
+        provisioner = FakeProvisioner(
+            provision=kept_provision(refused=("add the High option by hand",))
+        )
+        code, out, err = run_new(
+            path=self.parent,
+            git=gc.git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: provisioner,
+            create_remote=True,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+        self.assertNotIn("[repo.board]", self.toml_text())
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout.strip(), "")
+        show = subprocess.run(
+            ["git", "show", "HEAD:corral.toml"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertNotIn("[repo.board]", show.stdout)
+
+    def test_without_create_remote_never_builds_a_provisioner(self):
+        git = FakeGit(root=self.parent)
+        forge = FakeForge()
+
+        def refuse():
+            raise AssertionError("provisioner must not be built without --create-remote")
+
+        code, out, err = run_new(path=self.parent, git=git, forge=forge, provisioner_factory=refuse)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn(f"gh repo create {FIXTURE} --private", out)
+        self.assertNotIn("board", out)
+
+
 class RemotePlan(unittest.TestCase):
     """`--plan` prints the outward command and writes nothing."""
 
@@ -1262,6 +1571,7 @@ class RemotePlan(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"would run gh repo create operator/{FIXTURE} --private", out)
         self.assertIn(f"would ensure labels on operator/{FIXTURE}", out)
+        self.assertIn(f"would ensure board on operator/{FIXTURE}", out)
         self.assertFalse(os.path.exists(self.target()))
 
     def test_plan_with_resume_notes_adoption(self):
@@ -1283,6 +1593,7 @@ class RemotePlan(unittest.TestCase):
         self.assertIn(f"would adopt operator/{FIXTURE} when empty", out)
         self.assertNotIn("would run gh repo create", out)
         self.assertIn(f"would ensure labels on operator/{FIXTURE}", out)
+        self.assertIn(f"would ensure board on operator/{FIXTURE}", out)
         self.assertFalse(os.path.exists(self.target()))
 
 
