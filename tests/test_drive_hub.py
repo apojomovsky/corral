@@ -870,9 +870,18 @@ class CmdDrivePlanTest(unittest.TestCase):
             variant="labels",
             tracker=fake_tracker,
         )
+        modes = []
+        real_mode = drivehub.HubMode
+
+        class RecordingMode(real_mode):
+            def __init__(self, client, mode_host_id):
+                super().__init__(client, mode_host_id)
+                modes.append(self)
+
         out, err = io.StringIO(), io.StringIO()
         with (
             mock.patch.object(drivehub.hubmod, "HubClient", RecordingHub),
+            mock.patch.object(drivehub, "HubMode", RecordingMode),
             mock.patch.object(
                 drive, "production_operators", return_value=({"app": ["operator"]}, None)
             ),
@@ -888,8 +897,11 @@ class CmdDrivePlanTest(unittest.TestCase):
         self.assertEqual(
             RecordingHub.built, [(url, host_id, os.path.join(self.config, "hub-token"))]
         )
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0].host_id, host_id)
         hub_fake = RecordingHub.instance
         assert hub_fake is not None
+        self.assertIs(modes[0].client, hub_fake)
         proposes = [call for call in hub_fake.calls if call[0] == "propose"]
         self.assertEqual(len(proposes), 1)
         agent = proposes[0][3]
@@ -906,6 +918,24 @@ class CmdDrivePlanTest(unittest.TestCase):
             [call for call in fake_tracker.calls if call[0] == "write"],
             [("write", "app", 7, "agent", agent)],
         )
+
+    def test_non_plan_with_hub_url_but_no_host_id_is_a_usage_error(self):
+        with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[hub]\nurl = "http://host-1:8000"\n')
+
+        class BombClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("no client without a host id")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drivehub.hubmod, "HubClient", BombClient),
+            mock.patch.object(drive.sys, "stdout", out),
+            mock.patch.object(drive.sys, "stderr", err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        self.assertEqual(code, 4)
+        self.assertIn("host_id", err.getvalue())
 
 
 class HubVersionMappingTest(unittest.TestCase):
