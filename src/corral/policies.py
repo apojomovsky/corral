@@ -9,6 +9,10 @@ The policy follows the eligibility contract in `docs/04-dispatch-loop.md`
 section 2: it is pure, reading only the rows and `now` it is given, and
 returns one `StartRequest` of kind `start` per startable ticket. Weight
 carries the board priority rank so the drive loop orders heaviest first.
+A claimed row the project still wants is requested too: a `start`
+request on an already-claimed row is a gate no-op, so requesting
+in-flight rows changes no start verdict and only keeps the restart path
+open for them.
 """
 
 import re
@@ -19,12 +23,14 @@ from corral import eligibility, tracker
 #: Labels that hold a ticket for a human. A row carrying any of them is
 #: never selected. Module constants on purpose: one place, and no
 #: configuration surface in version one.
-HOLD_LABELS = ("hold", "needs-decision", "needs-triage")
+HOLD_LABELS = ("hold", tracker.NEEDS_DECISION, "needs-triage")
+"""Labels that hold a ticket for a human; a row carrying any is never selected."""
 
 #: Standalone title word that holds a ticket for a human. The match is a
 #: whole word and case sensitive: a title such as "cutover (HOLD for
 #: approval)" is held, while "holding pattern" is not.
 HOLD_TITLE_WORD = "HOLD"
+"""Standalone title word that holds a ticket for a human; matched whole-word."""
 
 _HOLD_TITLE_RE = re.compile(r"\b" + re.escape(HOLD_TITLE_WORD) + r"\b")
 
@@ -44,8 +50,8 @@ def _weight(priority: str) -> int:
 def _selectable(row: eligibility.TicketRow) -> bool:
     """Whether basic returns a start request for this row. Pure.
 
-    Open, unclaimed, unheld, unblocked, with no open linked pull: a
-    missing or non-string title reads as empty and a non-tuple labels
+    Open, unheld, unblocked, with no open linked pull, claimed or not:
+    a missing or non-string title reads as empty and a non-tuple labels
     value reads as none, so odd data selects or skips without raising.
     """
     if row.state != "open":
@@ -57,8 +63,6 @@ def _selectable(row: eligibility.TicketRow) -> bool:
         return False
     title = row.title if isinstance(row.title, str) else ""
     if _HOLD_TITLE_RE.search(title):
-        return False
-    if row.agent:
         return False
     extra = row.extra if isinstance(row.extra, dict) else {}
     if extra.get("blocked_by"):
