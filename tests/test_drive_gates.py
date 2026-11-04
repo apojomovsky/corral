@@ -329,6 +329,73 @@ class ClaimRoutingTest(unittest.TestCase):
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
         self.assertIn("fresh start", gated.reason)
 
+    def test_a_start_on_a_finished_holder_is_taken_over_by_a_reviewer(self):
+        gated = gate(
+            entry(row_=row(agent="drive-w-1")),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+        self.assertIn("takes over", gated.reason)
+        self.assertIn("drive-w-1", gated.reason)
+
+    def test_a_start_on_a_finished_holder_with_an_unknown_role_is_taken_over(self):
+        gated = gate(
+            entry(row_=row(agent="drive-w-1")),
+            finished={("app", 7): ("drive-w-1", None)},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+        self.assertIn("takes over", gated.reason)
+
+    def test_a_review_on_a_finished_holder_is_taken_over_by_a_reviewer(self):
+        gated = gate(
+            entry(kind="review", row_=row(agent="drive-w-1")),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+        self.assertIn("takes over", gated.reason)
+
+    def test_a_start_on_a_live_holder_is_still_already_claimed(self):
+        gated = gate(
+            entry(row_=row(agent="drive-w-1")),
+            finished={("app", 7): ("drive-w-9", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertIn("already claimed by `drive-w-1`", gated.reason)
+
+    def test_a_takeover_needs_the_finished_entry_to_name_the_holder(self):
+        gated = gate(
+            entry(row_=row(agent="drive-w-2")),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertIn("already claimed by `drive-w-2`", gated.reason)
+
+    def test_a_finished_reviewer_holder_is_never_taken_over(self):
+        for kind in ("start", "review"):
+            gated = gate(
+                entry(kind=kind, row_=row(agent="drive-r-1")),
+                finished={("app", 7): ("drive-r-1", "reviewer")},
+            )
+            self.assertEqual(gated.verdict, "skip")
+            self.assertNotIn("takes over", gated.reason)
+
+    def test_a_takeover_never_touches_a_foreign_holder(self):
+        gated = gate(
+            entry(kind="review", row_=row(agent="operator-hand")),
+            finished={("app", 7): ("operator-hand", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertNotIn("takes over", gated.reason)
+
+    def test_a_takeover_still_gates_on_hold_labels(self):
+        gated = gate(
+            entry(row_=row(agent="drive-w-1")),
+            finished={("app", 7): ("drive-w-1", "worker")},
+            read_labels=labels_for({("issue", "app", 7): ["hold"]}),
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "hold"))
+        self.assertNotIn("takes over", gated.reason)
+
 
 class HoldGateTest(unittest.TestCase):
     def test_a_hold_label_on_the_ticket_skips(self):

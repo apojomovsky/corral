@@ -84,8 +84,13 @@ class FakeSystem:
         self.started.append(list(argv))
         if self.fail:
             return subprocess.CompletedProcess(argv, 1, "", self.fail)
-        unit = next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--unit="))
-        self.units[unit] = "active"
+        if argv[:3] == ["systemctl", "--user", "start"]:
+            self.units[argv[3]] = "active"
+        elif argv[:3] == ["systemctl", "--user", "set-property"]:
+            pass
+        else:
+            unit = next(arg.split("=", 1)[1] for arg in argv if arg.startswith("--unit="))
+            self.units[unit] = "active"
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     def stop_fn(self, unit):
@@ -460,6 +465,13 @@ class BudgetWiringTest(OpsCase):
         self.assertIn("auditor", str(caught.exception))
         self.assertEqual(caught.exception.exit_code, 4)
 
+    def test_an_empty_role_reaches_the_gate_as_unknown(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaises(resources.LimitsError) as caught:
+            self.admit(role="")
+        self.assertIn("unknown role ''", str(caught.exception))
+        self.assertEqual(caught.exception.exit_code, 4)
+
     def test_an_unpriced_role_under_a_host_budget_is_refused_with_4(self):
         self.host_config(HOST_BUDGET + WORKER_PRICE)
         with self.assertRaisesRegex(launch.LaunchError, "reviewer") as caught:
@@ -595,15 +607,34 @@ class BudgetWiringTest(OpsCase):
             controllers_read=lambda path: "cpu memory pids",
         )
         self.assertEqual(unit, "corral-agent-lib-5")
-        self.assertEqual(len(self.system.started), 3)
-        host_slice, project_slice, agent = self.system.started
-        self.assertIn("--unit=corral.slice", host_slice)
-        self.assertIn("--property=MemoryMax=16000M", host_slice)
-        self.assertIn("--property=CPUQuota=800%", host_slice)
-        self.assertIn("--unit=corral-web.slice", project_slice)
-        self.assertIn("--slice=corral.slice", project_slice)
-        self.assertIn("--property=MemoryMax=16000M", project_slice)
-        self.assertIn("--property=CPUQuota=800%", project_slice)
+        self.assertEqual(len(self.system.started), 5)
+        host_start, host_props, project_start, project_props, agent = self.system.started
+        self.assertEqual(host_start, ["systemctl", "--user", "start", "corral.slice"])
+        self.assertEqual(
+            host_props,
+            [
+                "systemctl",
+                "--user",
+                "set-property",
+                "--runtime",
+                "corral.slice",
+                "MemoryMax=16000M",
+                "CPUQuota=800%",
+            ],
+        )
+        self.assertEqual(project_start, ["systemctl", "--user", "start", "corral-web.slice"])
+        self.assertEqual(
+            project_props,
+            [
+                "systemctl",
+                "--user",
+                "set-property",
+                "--runtime",
+                "corral-web.slice",
+                "MemoryMax=16000M",
+                "CPUQuota=800%",
+            ],
+        )
         self.assertIn("--unit=corral-agent-lib-5", agent)
         self.assertIn("--property=Slice=corral-web.slice", agent)
         self.assertIn("--property=MemoryMax=2048M", agent)
