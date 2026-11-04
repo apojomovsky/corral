@@ -1533,36 +1533,64 @@ def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_a
     return found, None
 
 
-def is_orphan(claim, *, now, gone_s, present_agents, live_units) -> bool:
+def is_orphan(
+    claim,
+    *,
+    now,
+    gone_s,
+    present_agents=None,
+    live_units=None,
+    agent_states=None,
+    agent_tickets=None,
+) -> bool:
     """Whether `claim` is provably dead under the section 4 rule. Pure.
 
     Dead means the store names a managed holder (an id this loop
-    minted), the registry shows no live or stale entry for that id, no
-    live unit exists for the ticket, and the claim is older than twice
-    `gone_s`. `present_agents` is the ids with a live or stale registry
-    entry; `live_units` is the (repo, number) pairs with a live unit.
-    Anything less certain (a present agent, a live unit, a young claim)
-    is left for stuck handling, and a foreign holder is never an
-    orphan: the loop never touches a foreign claim.
+    minted), the registry shows no live or stale entry for the
+    ticket, no live unit exists for the ticket, and the claim is older
+    than twice `gone_s`. Presence resolves through the one resolver
+    (`entry_for_claim`, by ticket with `agent_tickets`, never by holder
+    id): a live or stale entry for the ticket leaves the claim alone.
+    `present_agents` is the legacy same-namespace set (ids with a live
+    or stale entry) kept for callers without a ticket index; a holder
+    found there is also left alone. `live_units` is the (repo, number)
+    pairs with a live unit. Anything less certain (a present agent, a
+    live unit, a young claim) is left for stuck handling, and a foreign
+    holder is never an orphan: the loop never touches a foreign claim.
     """
     if claim is None or not claim.agent:
         return False
     if not is_managed_agent(claim.agent):
         return False
-    if claim.agent in present_agents:
+    present = present_agents if present_agents is not None else frozenset()
+    if claim.agent in present:
         return False
-    if (claim.repo, claim.number) in live_units:
+    live = live_units if live_units is not None else frozenset()
+    if (claim.repo, claim.number) in live:
         return False
+    if agent_states is not None:
+        seen = entry_for_claim(claim, agent_states=agent_states, agent_tickets=agent_tickets)
+        if seen is not None and seen[1] in (registry.LIVE, registry.STALE):
+            return False
     return now - claim.claimed_at > 2 * gone_s
 
 
-def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
+def _orphan_claims(
+    store,
+    *,
+    now,
+    gone_s,
+    present_agents=None,
+    live_units=None,
+    agent_states=None,
+    agent_tickets=None,
+):
     """The provably-dead claims, in store order. Pure reads.
 
     The scan half of `release_orphans`: each store row whose claim the
-    orphan rule calls dead. Runs through the shared retry policy; a
-    persistent failure propagates for the caller to skip the step with
-    every claim kept.
+    orphan rule calls dead, resolved through the one resolver. Runs
+    through the shared retry policy; a persistent failure propagates
+    for the caller to skip the step with every claim kept.
     """
 
     def scan():
@@ -1575,6 +1603,8 @@ def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
                 gone_s=gone_s,
                 present_agents=present_agents,
                 live_units=live_units,
+                agent_states=agent_states,
+                agent_tickets=agent_tickets,
             ):
                 continue
             found.append(claim)
@@ -1583,7 +1613,18 @@ def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
     return _retry_scan(scan)
 
 
-def release_orphans(store, *, now, gone_s, present_agents, live_units, out, events=None) -> int:
+def release_orphans(
+    store,
+    *,
+    now,
+    gone_s,
+    present_agents=None,
+    live_units=None,
+    out,
+    events=None,
+    agent_states=None,
+    agent_tickets=None,
+) -> int:
     """Release every provably-dead claim, one logbook line each.
 
     Returns the released count. The scan runs first, through the
@@ -1607,6 +1648,8 @@ def release_orphans(store, *, now, gone_s, present_agents, live_units, out, even
         gone_s=gone_s,
         present_agents=present_agents,
         live_units=live_units,
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
     )
     released = 0
     for claim in orphans:
@@ -3931,6 +3974,8 @@ def _launching_pass(
                 live_units=live_units,
                 out=out,
                 events=events if journal_path is not None else None,
+                agent_states=agent_states,
+                agent_tickets=agent_tickets,
             )
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"corral drive: orphan recovery skipped ({problem})", file=err)
