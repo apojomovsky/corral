@@ -7,6 +7,7 @@ only read the test process's own ``/proc`` entries.
 """
 
 import datetime
+import inspect
 import io
 import json
 import os
@@ -18,6 +19,7 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from corral import cli
 from corral import coord
+from corral import tracker
 
 T0 = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
 
@@ -454,7 +456,13 @@ class PerProjectSeparationTest(_ProjectCase):
 
 class HumanPrTest(unittest.TestCase):
     def test_only_labels_make_a_pr_wait_on_a_human(self):
-        self.assertTrue(coord.is_human_pr({"labels": [{"name": "needs-decision"}]}))
+        self.assertTrue(coord.is_human_pr({"labels": [{"name": tracker.NEEDS_DECISION}]}))
         self.assertTrue(coord.is_human_pr({"labels": ["needs-human"]}))
         self.assertFalse(coord.is_human_pr({"labels": [], "body": "Baseline delta: HOLD"}))
         self.assertFalse(coord.is_human_pr({}))
+
+    def test_human_pr_labels_follow_the_tracker_decision_label(self):
+        self.assertIn(tracker.NEEDS_DECISION, coord.HUMAN_PR_LABELS)
+        self.assertIn("needs-human", coord.HUMAN_PR_LABELS)
+        source = inspect.getsource(coord)
+        self.assertIn("tracker.NEEDS_DECISION", source)
