@@ -1149,9 +1149,10 @@ def _gate_all(
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
-    Returns (gated_rows, problems): one `Gated` per candidate in section
-    3 order, and one error line per project whose policy or quota
-    settings failed. A project with no eligibility entry prints its
+    Returns (gated_rows, problems, requested): one `Gated` per candidate in section
+    3 order, one error line per project whose policy or quota
+    settings failed, and the set of (repo, number) any project requested
+    this pass, which the stuck sweep reads for withdrawals. A project with no eligibility entry prints its
     logbook line to `out`. `released` ({(repo, number): worker id}
     released this pass) simulates the post-release rows, so a plan over
     still-claimed rows gates what the real pass would gate after the
@@ -1249,7 +1250,7 @@ def _gate_all(
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
-    return gated_rows, problems
+    return gated_rows, problems, set(requested_keys)
 
 
 def _pass(
@@ -1309,7 +1310,7 @@ def _pass(
     ) = ctx
     released = _capture_finished_holders(store, agent_states=agent_states, err=err)
     finished = resolve_finished(finished_for, released)
-    gated_rows, problems = _gate_all(
+    gated_rows, problems, _ = _gate_all(
         items,
         registered,
         out,
@@ -1996,6 +1997,43 @@ def cap_label(day_cap) -> str:
     return f"({day_cap}/day)" if day_cap is not None else "(day cap)"
 
 
+def restart_refusal(item, *, read_labels, hold_label, requested, linked=()):
+    """Why a stuck row must not restart: (reason, keep) or None. Pure reads.
+
+    The row-state subset of the section 3 gate, re-checked at restart
+    time through the same `hold.reason` resolver the gate uses: a
+    non-open or externally owned row, a held row, a row waiting on a
+    human, or a row no project requested this pass is not restarted.
+    `requested` is the set of (repo, number) any project requested this
+    pass, or None when unknown (then the withdrawn check is skipped).
+    `linked` holds the (repo, number) pairs of the pull requests the
+    restart acts on, threaded into the hold re-check the way the gate
+    threads the row's linked pulls. `read_labels` is the injected label
+    seam and is required: with no reader the hold cannot be re-checked,
+    so the restart is deferred with the claim kept. `hold.reason` fails
+    closed on an unreadable read (the claim is kept) and names a hold
+    otherwise (the claim is released); the restart wording appended
+    here keeps every refusal greppable for "not restarted".
+    """
+    ref = f"{item.repo}#{item.number}"
+    if item.state != "open":
+        return f"{ref}: state is {item.state}, not open, not restarted", False
+    if item.external:
+        return f"{ref}: externally owned, not restarted", False
+    if read_labels is None:
+        return f"{ref}: hold labels unreadable (no label reader), restart deferred", True
+    held = hold.reason(read_labels, (item.repo, item.number), linked, hold_label=hold_label)
+    if held is not None:
+        if "unreadable" in held:
+            return f"{held}, restart deferred", True
+        return f"{held}, not restarted", False
+    if iface.NEEDS_DECISION in (item.labels or ()):
+        return f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, not restarted", False
+    if requested is not None and (item.repo, item.number) not in requested:
+        return f"{ref}: withdrawn by this pass's eligibility, not restarted", False
+    return None
+
+
 def handle_stuck(
     store,
     *,
@@ -2016,12 +2054,22 @@ def handle_stuck(
     start_budget=None,
     day_cap=None,
     hub_epoch_of=None,
+    read_labels=None,
+    hold_label=hold.HOLD_LABEL,
+    requested=None,
 ):
     """Restart or give up on stuck managed claims. Returns (restarted, capped).
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
-    foreign claims are never touched. In hub mode `hub_epoch_of` maps
+    foreign claims are never touched. Before any budget is spent, each
+    restart verdict re-checks row eligibility (`restart_refusal` over
+    the row state, the ticket and linked pull hold labels and the
+    needs-decision label, plus the `requested` set for withdrawals): an
+    ineligible row is not
+    restarted and its claim is released (the epoch is kept, so the next
+    claim fences correctly), except unreadable labels, which fail
+    closed with the claim kept. In hub mode `hub_epoch_of` maps
     (repo, number) to the hub row's fencing epoch (None when the hub
     shows no row); a local epoch the hub superseded skips instead of
     restarting, and an unreadable hub epoch skips without stopping, so
@@ -2105,6 +2153,30 @@ def handle_stuck(
             continue
         if verdict == "watch":
             print(f"{ref}: {observed}, watching once more", file=out)
+            continue
+        refusal = restart_refusal(
+            item,
+            read_labels=read_labels,
+            hold_label=hold_label,
+            requested=requested,
+            linked=[(item.repo, pull.number) for pull in getattr(item, "pulls", None) or ()],
+        )
+        if refusal is not None:
+            reason, keep = refusal
+            if keep:
+                print(f"{reason}, claim kept", file=out)
+                continue
+            try:
+                store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
+            except board.Claimed:
+                print(f"{reason}, release raced a re-claim, left held", file=out)
+                continue
+            except (board.StoreError, sqlite3.Error) as problem:
+                print(f"{reason}, release refused ({problem}), left held", file=out)
+                continue
+            print(f"{reason}, claim released", file=out)
+            if events is not None:
+                events.append({"event": "release", "at": now, "ticket": ref, "agent": claim.agent})
             continue
         key = f"{claim.repo}#{claim.number}"
         stamps = budgets.get(key, [])
@@ -2212,7 +2284,8 @@ def handle_stuck(
             continue
         print(
             f"{ref}: restarted {unit} with the same agent id"
-            f" (restart {len(budgets[key])} of {RESTART_BUDGET} in 24h)",
+            f" (restart {len(budgets[key])} of {RESTART_BUDGET} in 24h);"
+            " to keep it stopped, use `corral stop`, never stop the unit directly",
             file=out,
         )
         if events is not None:
@@ -3394,7 +3467,10 @@ def _launching_pass(
     stays queued for the next healthy pass. A pass that synced nothing
     at all exits 3 on tracker failures, and 4 when only corrupt stored
     rows failed; a pass that launched nothing because the service
-    manager was unreachable exits 3 too. When `journal_path` is set, the
+    manager was unreachable exits 3 too. The stuck sweep re-checks
+    row eligibility before restarting (a held, closed, externally owned,
+    needs-decision or withdrawn row is released, never restarted).
+    When `journal_path` is set, the
     pass appends its start, every start, skip, release, restart and
     give-up, and its end with verdict counts; a journal write failure
     warns and the pass continues. When `day_path` and `max_starts` are
@@ -3563,7 +3639,7 @@ def _launching_pass(
         except sqlite3.Error as problem:
             print(f"corral drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
-    gated_rows, problems = _gate_all(
+    gated_rows, problems, eligible_keys = _gate_all(
         _items,
         registered,
         out,
@@ -3646,6 +3722,9 @@ def _launching_pass(
                 start_budget=stuck_budget,
                 day_cap=max_starts,
                 hub_epoch_of=hub_epoch_of,
+                read_labels=read_labels,
+                hold_label=hold_label,
+                requested=eligible_keys,
             )
             started += stuck_restarted
         except (board.StoreError, sqlite3.Error) as problem:
