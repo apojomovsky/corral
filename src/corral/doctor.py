@@ -140,12 +140,15 @@ class Env(NamedTuple):
     #: caller has no reading, and then the report carries no resources row.
     resource_readings: resourcedoctor.ResourceReadings | None = None
     #: Repos in board mode to check, with the seams that check them:
-    #: `board_fetch` resolves one board config to its live schema and
-    #: `board_open_store` opens the store parity rows come from. Empty
+    #: `board_fetch` resolves one board config to its live snapshot
+    #: (raw fields, title, owner boards), `board_open_store` opens the
+    #: store parity rows come from, and `board_items` lists the board's
+    #: `(repo, number)` pairs for the missing-from-board row. Empty
     #: means no board repos, and then the report carries no board row.
     board_sites: Sequence[boarddoctor.BoardSite] = ()
     board_fetch: Callable[[settings.BoardConfig], object] | None = None
     board_open_store: Callable[[], store.Store] | None = None
+    board_items: Callable[[settings.BoardConfig], object] | None = None
     #: The board assembly itself failed: one failing `board` row.
     board_error: str | None = None
     #: Projects whose remote-dependent rows are checked. Empty means the
@@ -464,7 +467,10 @@ def _check_boards(env: Env) -> list[Check]:
     return [
         Check(row.name, row.status, row.detail, row.fix)
         for row in boarddoctor.check_sites(
-            env.board_sites, fetch=env.board_fetch, open_store=env.board_open_store
+            env.board_sites,
+            fetch=env.board_fetch,
+            open_store=env.board_open_store,
+            board_items=env.board_items,
         )
     ]
 
@@ -939,7 +945,7 @@ def production_tracker_factory(tracker_repo: str):
 
 
 def production_board_fetch(board_config: settings.BoardConfig) -> object:
-    """The live board schema fetch. Only the CLI builds it; tests never call this.
+    """The live board snapshot fetch. Only the CLI builds it; tests never call this.
 
     Routed through the one tracker factory, so the doctor reads the
     board through the same construction as sync, mirror and drive.
@@ -947,7 +953,20 @@ def production_board_fetch(board_config: settings.BoardConfig) -> object:
     from corral import trackers
     from corral.github import gh
 
-    return trackers.board_schema_for(board_config, run=gh.run)
+    return trackers.board_snapshot_for(board_config, run=gh.run)
+
+
+def production_board_issue_refs(board_config: settings.BoardConfig) -> object:
+    """The live board membership fetch. Only the CLI builds it; tests never call this.
+
+    Membership only, through the same construction: no field values
+    and no REST reads. The doctor diffs it against the store's open
+    rows for the missing-from-board row.
+    """
+    from corral import trackers
+    from corral.github import gh
+
+    return trackers.board_issue_refs_for(board_config, run=gh.run)
 
 
 def load_board_sites(settings_error: str | None) -> tuple[tuple, str | None]:
@@ -1593,6 +1612,7 @@ def production_env() -> Env:
         board_sites=board_sites,
         board_fetch=production_board_fetch,
         board_open_store=store.open_store,
+        board_items=production_board_issue_refs,
         board_error=board_error,
         repo_sites=repo_sites,
         project_problems=project_problems,

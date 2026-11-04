@@ -103,7 +103,15 @@ def rate_limit_kind(text: str | None) -> str | None:
     return "rest"
 
 
-def _classify(stderr: str) -> str:
+def classify_error(stderr: str) -> str:
+    """One bucket for a ``gh`` failure: ``"unavailable"``, ``"scope"`` or ``"other"``.
+
+    Pure over the diagnosis text: rate-limit wording is retryable
+    (``"unavailable"``), a missing-token-scope wording is a login the
+    operator must refresh (``"scope"``), and anything else is a usage
+    or configuration error (``"other"``). The doctor's scope row keys
+    on this one classifier, never on a second matcher.
+    """
     if is_rate_limited(stderr):
         return "unavailable"
     low = stderr.lower()
@@ -208,7 +216,9 @@ def run(args: list[str], timeout: float | None = GH_TIMEOUT_S, paced: bool = Fal
             _active_procs.discard(proc)
     if proc.returncode != 0:
         err = (stderr or "").strip()
-        raise GhError(_classify(err), err or f"gh exited {proc.returncode}", output=stdout or "")
+        raise GhError(
+            classify_error(err), err or f"gh exited {proc.returncode}", output=stdout or ""
+        )
     return stdout
 
 
