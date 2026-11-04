@@ -1843,9 +1843,11 @@ def release_finished(store, *, agent_states, now, out, events=None):
     to mint, which fences the finished holder; the branch and PR stay
     untouched for a later review. A `Claimed` there means the row
     changed under the pass, so it is left held with a logbook line,
-    never retried in the same pass. When `events` is a list, each
+    never retried in the same pass. A failed write is likewise left
+    held with a logbook line while the rest of the sweep moves on, so
+    one bad row never blocks the others. When `events` is a list, each
     release appends its journal entry. Foreign holders never reach
-    here. Store errors propagate to the caller, like orphans.
+    here.
     """
     released = 0
     for claim in _finished_claims(store, agent_states):
@@ -1854,6 +1856,9 @@ def release_finished(store, *, agent_states, now, out, events=None):
             store.release(claim.repo, claim.number, claim.agent, claim.epoch, now=now)
         except board.Claimed:
             print(f"{ref}: finished release raced a re-claim, left held", file=out)
+            continue
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"{ref}: finished release refused ({problem}), left held", file=out)
             continue
         print(
             f"{ref}: released finished worker `{claim.agent}`, branch and PR left for review",
@@ -2021,11 +2026,14 @@ def restart_refusal(item, *, read_labels, hold_label, requested, linked=()):
     if item.external:
         return f"{ref}: externally owned, not restarted", False
     if read_labels is None:
-        return f"{ref}: hold labels unreadable (no label reader), restart deferred", True
+        return (
+            f"{ref}: hold labels unreadable (no label reader), restart deferred, not restarted",
+            True,
+        )
     held = hold.reason(read_labels, (item.repo, item.number), linked, hold_label=hold_label)
     if held is not None:
         if "unreadable" in held:
-            return f"{held}, restart deferred", True
+            return f"{held}, restart deferred, not restarted", True
         return f"{held}, not restarted", False
     if iface.NEEDS_DECISION in (item.labels or ()):
         return f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, not restarted", False
@@ -2062,7 +2070,10 @@ def handle_stuck(
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
-    foreign claims are never touched. Before any budget is spent, each
+    foreign claims are never touched. A holder whose registry entry
+    reads finished is skipped with the claim kept: a finished worker
+    always takes the completion path, never a restart. Before any budget
+    is spent, each
     restart verdict re-checks row eligibility (`restart_refusal` over
     the row state, the ticket and linked pull hold labels and the
     needs-decision label, plus the `requested` set for withdrawals): an
@@ -2138,6 +2149,12 @@ def handle_stuck(
                 )
                 continue
         seen = agent_states.get(claim.agent)
+        if seen is not None and seen[0] == registry.FINISHED:
+            print(
+                f"{ref}: finished worker `{claim.agent}`, restart skipped, claim kept",
+                file=out,
+            )
+            continue
         if seen is None or not isinstance(seen[1], (int, float)):
             known, age = False, float("inf")
             observed = "no registry entry for the holder"
