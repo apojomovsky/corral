@@ -570,3 +570,31 @@ def wait_for_events(timeout=None, root=None, poll_s=WAIT_POLL_S, now_fn=None, sl
         if timeout is not None and clock() - start >= timeout:
             return None
         sleep(poll_s)
+
+
+def follow_events(
+    root=None, include_resolved=False, poll_s=WAIT_POLL_S, now_fn=None, sleep_fn=None
+):
+    """Yield queue rows as they arrive: the dump first, then arrivals.
+
+    The first poll yields the current selection (honoring
+    `include_resolved`, the `--all` flag); later polls yield rows with
+    unseen ids, oldest first, so each event prints once however many
+    polls see it. Runs until the caller stops it; the CLI turns the
+    kill into exit 0. Reads only the queue file under the shared lock;
+    never the tracker or the forge.
+
+    The clock and sleep seams mirror `wait_for_events` so tests drive
+    the loop without waiting; the loop reads no deadline, so only the
+    sleep seam advances it.
+    """
+    sleep = sleep_fn or time.sleep
+    seen = set()
+    while True:
+        for row in list_events(root=root, include_resolved=include_resolved):
+            key = row.get("id")
+            if key in seen:
+                continue
+            seen.add(key)
+            yield row
+        sleep(poll_s)

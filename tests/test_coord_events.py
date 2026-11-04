@@ -1011,5 +1011,255 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertIn("events: none waiting", coord.render_brief_text(data))
 
 
+class FollowEventsTest(unittest.TestCase):
+    """`follow_events`: dump the selection, then arrivals by unseen id."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def _collect(self, **kwargs):
+        kwargs.setdefault("root", self.root)
+        rows = []
+        try:
+            for row in events.follow_events(**kwargs):
+                rows.append(row)
+        except KeyboardInterrupt:
+            pass
+        return rows
+
+    def test_follow_dumps_current_then_arrivals_by_unseen_id(self):
+        events.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "first"}],
+            root=self.root,
+            now=1000.0,
+            event_id_fn=ids("aaaabbbb"),
+        )
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            if len(calls) == 1:
+                events.record(
+                    [{"kind": "supply", "ref": "fleet2", "evidence": "second"}],
+                    root=self.root,
+                    now=1001.0,
+                    event_id_fn=ids("ccccdddd"),
+                )
+            else:
+                raise KeyboardInterrupt
+
+        rows = self._collect(sleep_fn=sleep)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb", "ccccdddd"])
+        self.assertEqual([row["evidence"] for row in rows], ["first", "second"])
+
+    def test_follow_batches_every_arrival_between_polls(self):
+        events.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "first"}],
+            root=self.root,
+            now=1000.0,
+            event_id_fn=ids("aaaabbbb"),
+        )
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            if len(calls) == 1:
+                events.record(
+                    [
+                        {"kind": "supply", "ref": "fleet2", "evidence": "second"},
+                        {"kind": "held-merge", "ref": "lib#1", "evidence": "third"},
+                    ],
+                    root=self.root,
+                    now=1001.0,
+                    event_id_fn=ids("ccccdddd", "eeeeffff"),
+                )
+            else:
+                raise KeyboardInterrupt
+
+        rows = self._collect(sleep_fn=sleep)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb", "ccccdddd", "eeeeffff"])
+
+    def test_follow_dump_honors_include_resolved(self):
+        events.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "old"}],
+            root=self.root,
+            now=1000.0,
+            event_id_fn=ids("aaaabbbb"),
+        )
+        events.ack("aaaabbbb", root=self.root, now=1001.0)
+
+        def stop_at_once(s):
+            raise KeyboardInterrupt
+
+        self.assertEqual(self._collect(sleep_fn=stop_at_once), [])
+        rows = self._collect(sleep_fn=stop_at_once, include_resolved=True)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb"])
+
+    def test_follow_never_reprints_a_seen_id(self):
+        events.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "S"}],
+            root=self.root,
+            now=1000.0,
+            event_id_fn=ids("aaaabbbb"),
+        )
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            if len(calls) == 1:
+                events.ack("aaaabbbb", root=self.root, now=1001.0)
+            else:
+                raise KeyboardInterrupt
+
+        rows = self._collect(sleep_fn=sleep)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb"])
+
+    def test_follow_polls_on_the_given_interval(self):
+        seen = []
+
+        def sleep(s):
+            seen.append(s)
+            raise KeyboardInterrupt
+
+        self.assertEqual(self._collect(sleep_fn=sleep), [])
+        self.assertEqual(seen, [events.WAIT_POLL_S])
+        seen.clear()
+        self.assertEqual(self._collect(sleep_fn=sleep, poll_s=0.05), [])
+        self.assertEqual(seen, [0.05])
+
+    def test_follow_accepts_an_injected_clock(self):
+        events.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "S"}],
+            root=self.root,
+            now=1000.0,
+            event_id_fn=ids("aaaabbbb"),
+        )
+
+        def sleep(s):
+            raise KeyboardInterrupt
+
+        rows = self._collect(sleep_fn=sleep, now_fn=lambda: 1234.0)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb"])
+
+
+class FollowCliTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name, "CORRAL_PROJECT": "demo"})
+        env.start()
+        self.addCleanup(env.stop)
+        for name, fake in (("_coord_snapshot", lambda: {}), ("_coord_human_prs", lambda: [])):
+            patcher = mock.patch.object(coordcli, name, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _run(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            try:
+                code = cli.main(list(argv))
+            except SystemExit as exit_:
+                code = exit_.code
+        return code, out.getvalue(), err.getvalue()
+
+    def _fake_follow(self, rows, captured):
+        def fake(*args, **kwargs):
+            captured.append((args, kwargs))
+            yield from rows
+            raise KeyboardInterrupt
+
+        return fake
+
+    def test_follow_text_dumps_one_row_per_line(self):
+        rows = [
+            {"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "slots free"},
+            {"id": "ccccdddd", "kind": "held-merge", "ref": "lib#1", "evidence": "HOLD"},
+        ]
+        captured = []
+        with mock.patch.object(events, "follow_events", self._fake_follow(rows, captured)):
+            code, out, err = self._run(["coord", "events", "--follow"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "aaaabbbb supply fleet slots free\nccccdddd held-merge lib#1 HOLD\n")
+        self.assertEqual(err, "")
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][1].get("include_resolved"), False)
+
+    def test_follow_all_selects_resolved_rows(self):
+        captured = []
+        with mock.patch.object(events, "follow_events", self._fake_follow([], captured)):
+            code, _, _ = self._run(["coord", "events", "--follow", "--all"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(captured[0][1].get("include_resolved"), True)
+
+    def test_follow_json_prints_one_single_element_envelope_per_row(self):
+        rows = [
+            {
+                "id": "aaaabbbb",
+                "kind": "supply",
+                "ref": "fleet",
+                "evidence": "slots free",
+                "first_seen": "1970-01-01T00:16:40+00:00",
+                "resolved_at": None,
+            },
+            {
+                "id": "ccccdddd",
+                "kind": "held-merge",
+                "ref": "lib#1",
+                "evidence": "HOLD",
+                "first_seen": "1970-01-01T00:16:41+00:00",
+                "resolved_at": None,
+            },
+        ]
+        captured = []
+        with mock.patch.object(events, "follow_events", self._fake_follow(rows, captured)):
+            code, out, err = self._run(["coord", "events", "--follow", "--json"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(err, "")
+        docs = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual(len(docs), 2)
+        for doc, row in zip(docs, rows):
+            self.assertEqual(doc, {"schema_version": 1, "project": "demo", "events": [row]})
+
+    def test_follow_kill_exits_zero_without_output(self):
+        def dying(*args, **kwargs):
+            raise KeyboardInterrupt
+            yield
+
+        with mock.patch.object(events, "follow_events", dying):
+            code, out, err = self._run(["coord", "events", "--follow"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "")
+        self.assertEqual(err, "")
+
+    def test_follow_timeout_is_exit_4(self):
+        code, _, err = self._run(["coord", "events", "--follow", "--timeout", "5"])
+        self.assertEqual(code, cli.USAGE)
+        self.assertIn("wait", err)
+
+    def test_events_timeout_is_exit_4_without_follow(self):
+        code, _, err = self._run(["coord", "events", "--timeout", "5"])
+        self.assertEqual(code, cli.USAGE)
+        self.assertIn("wait", err)
+
+    def test_follow_makes_no_tracker_or_forge_calls(self):
+        import sys
+
+        class _Boom:
+            def __getattr__(self, name):
+                raise AssertionError(f"unexpected tracker/forge use: {name}")
+
+        boom = _Boom()
+        rows = [{"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "slots free"}]
+        captured = []
+        with mock.patch.dict(sys.modules, {"corral.tracker": boom, "corral.forge": boom}):
+            with mock.patch.object(events, "follow_events", self._fake_follow(rows, captured)):
+                code, out, _ = self._run(["coord", "events", "--follow"])
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(out, "aaaabbbb supply fleet slots free\n")
+
+
 if __name__ == "__main__":
     unittest.main()
