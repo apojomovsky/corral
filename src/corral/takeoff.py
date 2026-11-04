@@ -63,7 +63,9 @@ from corral.github import gh
 SCHEMA_VERSION = 1
 
 #: Statuses a check reports: passed, failed, not applicable, or planned.
-OK, FAIL, SKIPPED, PLANNED = "ok", "fail", "skipped", "planned"
+#: The one place the set is defined; OK/FAIL/SKIPPED/PLANNED unpack it.
+STATUSES = ("ok", "fail", "skipped", "planned")
+OK, FAIL, SKIPPED, PLANNED = STATUSES
 
 #: Never written literally: the commit-msg hook refuses it anywhere.
 EM_DASH = chr(0x2014)
