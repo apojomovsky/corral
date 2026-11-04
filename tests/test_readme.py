@@ -14,7 +14,7 @@ import re
 import unittest
 from pathlib import Path
 
-from corral import cli, host_ledger, pressure, prompts, resources, runtimes, snapshot
+from corral import cli, host_ledger, pressure, prompts, resources, runtimes, snapshot, takeoff
 
 SPAN_RE = re.compile(r"`([^`]*)`")
 COMMAND_RE = re.compile(r"\bcorral ([a-z][a-z0-9-]*)")
@@ -209,6 +209,23 @@ class ResourceSettings(unittest.TestCase):
             params["min_mem_available_pct"].default,
             pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
         )
+
+
+class TakeoffStatuses(unittest.TestCase):
+    """The README takeoff paragraph names every status the gate reports."""
+
+    def test_takeoff_status_list_names_every_status(self):
+        text = readme_text()
+        start = text.index("Each check reports")
+        sentence = text[start:].split(";", 1)[0]
+        display = {
+            takeoff.OK: "`ok`",
+            takeoff.FAIL: "`FAIL`",
+            takeoff.SKIPPED: "`skipped`",
+            takeoff.PLANNED: "`planned`",
+        }
+        for status in (takeoff.OK, takeoff.FAIL, takeoff.SKIPPED, takeoff.PLANNED):
+            self.assertIn(display[status], sentence, f"README takeoff status list omits {status}")
 
 
 if __name__ == "__main__":
