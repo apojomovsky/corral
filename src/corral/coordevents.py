@@ -225,10 +225,9 @@ def list_events(root=None, include_resolved=False):
     resolved rows too. A pure reader: shared lock, no pruning, and
     malformed lines drop out in `read_events`, never fatal.
     """
-    rows = read_events(root)
     if include_resolved:
-        return rows
-    return [row for row in rows if not row.get("resolved_at")]
+        return read_events(root)
+    return unresolved(root)
 
 
 def new_event_id():

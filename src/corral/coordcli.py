@@ -86,6 +86,18 @@ def _entry_generation(coord, generation, root):
         return 0
 
 
+def _format_event_row(event):
+    """One terse text line per event row: `id kind ref evidence`.
+
+    The single renderer behind the `wait` and `events` text forms,
+    so both verbs print the same line for the same row. Evidence
+    collapses to one line; a missing id, kind, ref or evidence
+    reads as an empty field.
+    """
+    evidence = " ".join(str(event.get("evidence") or "").split())
+    return f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
+
+
 def cmd_coord(args: argparse.Namespace) -> int:
     from corral import coord
 
@@ -240,10 +252,7 @@ def cmd_coord(args: argparse.Namespace) -> int:
             print(json.dumps(batch, indent=2, sort_keys=True))
         else:
             for event in batch:
-                evidence = " ".join(str(event.get("evidence") or "").split())
-                print(
-                    f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
-                )
+                print(_format_event_row(event))
         return OK
     if verb == "events":
         from corral import coordevents as events
@@ -263,10 +272,7 @@ def cmd_coord(args: argparse.Namespace) -> int:
             )
         else:
             for event in rows:
-                evidence = " ".join(str(event.get("evidence") or "").split())
-                print(
-                    f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
-                )
+                print(_format_event_row(event))
         return OK
     if verb == "ack":
         from corral import coordevents as events

@@ -938,6 +938,54 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertEqual(code, cli.OK)
         self.assertEqual(out, "aaaabbbb supply fleet slots free\n")
 
+    def test_wait_and_events_share_one_row_format(self):
+        from corral import coordevents as live
+
+        row = {
+            "id": "aaaabbbb",
+            "kind": "supply",
+            "ref": "fleet",
+            "evidence": "slots  free\nqueue empty",
+        }
+        self.assertEqual(
+            coordcli._format_event_row(row), "aaaabbbb supply fleet slots free queue empty"
+        )
+        live.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "slots  free\nqueue empty"}],
+            now=1000.0,
+            event_id_fn=lambda: "aaaabbbb",
+        )
+        wait_code, wait_out, _ = self._run(["coord", "wait", "--timeout", "5"])
+        events_code, events_out, _ = self._run(["coord", "events"])
+        self.assertEqual(wait_code, cli.OK)
+        self.assertEqual(events_code, cli.OK)
+        self.assertEqual(wait_out, events_out)
+
+    def test_events_all_json_carries_open_and_resolved(self):
+        from corral import coordevents as live
+
+        live.record(
+            [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD: baseline"}],
+            now=1000.0,
+            event_id_fn=lambda: "aaaabbbb",
+        )
+        live.record(
+            [{"kind": "supply", "ref": "fleet", "evidence": "slots free"}],
+            now=1001.0,
+            event_id_fn=lambda: "ccccdddd",
+        )
+        live.ack("aaaabbbb", now=1002.0)
+        code, out, _ = self._run(["coord", "events", "--all", "--json"])
+        self.assertEqual(code, cli.OK)
+        data = json.loads(out)
+        self.assertEqual(data["schema_version"], 1)
+        self.assertEqual(data["project"], "demo")
+        by_id = {row["id"]: row for row in data["events"]}
+        self.assertEqual(sorted(by_id), ["aaaabbbb", "ccccdddd"])
+        self.assertIsNotNone(by_id["aaaabbbb"]["resolved_at"])
+        self.assertEqual(by_id["aaaabbbb"]["resolved_by"], "ack")
+        self.assertIsNone(by_id["ccccdddd"]["resolved_at"])
+
     def test_brief_carries_events_section(self):
         from corral import coordevents as live
 
