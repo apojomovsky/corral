@@ -1,9 +1,9 @@
 """`corral takeoff`: the project-level gate before a PR.
 
-Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
-could not be read, 4 usage or configuration error (including an unknown
-or identity `--skip` name), 75 another takeoff held the full-suite lock
-past the wait.
+Exit codes: 0 every check ok, skipped or planned, 1 a check failed,
+3 the remote could not be read, 4 usage or configuration error
+(including an unknown or identity `--skip` name), 75 another takeoff
+held the full-suite lock past the wait (`--plan` never takes the lock).
 """
 
 import argparse
@@ -29,6 +29,7 @@ def cmd_takeoff(args, *, ls_remote=None, run_cmd=None):
             with_test=args.test,
             ops_dir=args.ops,
             skips=args.skip or [],
+            plan=args.plan,
             ls_remote=ls_remote,
             run_cmd=run_cmd,
         )
@@ -76,11 +77,17 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
         description="Run the takeoff ritual over a worktree: the remote base, "
         "the ticket branch, the commit rules, the PR body, the leak guard, "
         "the review record and the configured takeoff commands. Exit 0 when "
-        "every check is ok or skipped, 1 when one failed, 3 when the remote "
-        "could not be read, 4 on usage or configuration error, 75 when "
-        "another takeoff holds the full-suite lock past the wait. "
+        "every check is ok, skipped or planned, 1 when one failed, 3 when "
+        "the remote could not be read, 4 on usage or configuration error, "
+        "75 when another takeoff holds the full-suite lock past the wait. "
         "A repeatable --skip NAME waives one policy check and records it; "
         "an unknown name or an identity check is exit 4.",
+    )
+    p.add_argument(
+        "--plan",
+        action="store_true",
+        help="resolve the checks without running anything: each configured "
+        "command is reported as planned, the suite lock is never taken",
     )
     p.add_argument("--body", default=None, metavar="FILE", help="the PR body file")
     p.add_argument(

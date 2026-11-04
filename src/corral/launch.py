@@ -286,7 +286,7 @@ def _slice_props(decided, roles, role, controllers_read):
     if decided.host is None:
         return {}
     available = units.delegated_controllers(read=controllers_read)
-    charge = roles.get(role or prompts.DEFAULT_ROLE) or resources.Usage()
+    charge = roles.get(prompts.DEFAULT_ROLE if role is None else role) or resources.Usage()
     return {
         "slice": units.project_slice(decided.project),
         "memory_max": charge.memory_mb,
@@ -313,7 +313,6 @@ def _ensure_slices(decided, run):
     assert decided.share is not None
     units.ensure_slice(
         units.project_slice(decided.project),
-        parent=units.HOST_SLICE,
         memory_max=decided.share.memory_mb,
         cpu_quota=decided.share.cpu_m,
         run=run,
@@ -331,7 +330,7 @@ def _require_role_price(tgt, role, where):
     not priced either, but they stay a ``LimitsError`` from the budget
     gate: no table could exist for them.
     """
-    name = role or prompts.DEFAULT_ROLE
+    name = prompts.DEFAULT_ROLE if role is None else role
     if name not in prompts.ROLES:
         return
     tables = tgt.resolved.resources
@@ -438,7 +437,7 @@ def admit(
         return Budget(host=None, share=None, project=key)
     charged = _charged_usage(key, own_prefix, registered, list_fn, limits.roles, cfg, now)
     budget = resources.admit(
-        resources.Request(project=key, role=role or prompts.DEFAULT_ROLE),
+        resources.Request(project=key, role=prompts.DEFAULT_ROLE if role is None else role),
         charged,
         limits,
         now,
@@ -788,7 +787,7 @@ def launch(
         _check_text(prompt, "prompt")
     role = _check_role(role)
     reviewer = role == "reviewer"
-    session_role = role or prompts.DEFAULT_ROLE
+    session_role = prompts.DEFAULT_ROLE if role is None else role
     model = _check_model(model)
     if title is not None and not isinstance(title, str):
         raise LaunchError("title must be a string")

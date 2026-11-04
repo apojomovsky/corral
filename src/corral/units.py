@@ -236,16 +236,28 @@ def _limit(value, name):
     return value
 
 
+def _memory_assignment(value):
+    return f"MemoryMax={value:g}M"
+
+
+def _cpu_assignment(value):
+    return f"CPUQuota={value / 10:g}%"
+
+
+def _tasks_assignment(value):
+    return f"TasksMax={value:g}"
+
+
 def _memory_prop(value):
-    return f"--property=MemoryMax={value:g}M"
+    return f"--property={_memory_assignment(value)}"
 
 
 def _cpu_prop(value):
-    return f"--property=CPUQuota={value / 10:g}%"
+    return f"--property={_cpu_assignment(value)}"
 
 
 def _tasks_prop(value):
-    return f"--property=TasksMax={value:g}"
+    return f"--property={_tasks_assignment(value)}"
 
 
 def _limit_props(memory_max, cpu_quota, tasks_max):
@@ -430,45 +442,69 @@ def delegated_controllers(path=None, *, read=None):
     return available
 
 
-def slice_argv(name, parent=None, *, memory_max=None, cpu_quota=None, tasks_max=None):
-    """The `systemd-run --user` argv creating one slice with its limits.
-
-    `/bin/true` exits at once and `--remain-after-exit` keeps the slice,
-    with its limits, around. Parents come first: the host slice, then
-    each project slice under it, then the agent unit. A name that is not
-    a `.slice` unit is refused, as is a bad limit.
-    """
+def _check_slice_name(name):
     if not isinstance(name, str) or not name.endswith(".slice") or name == ".slice":
         raise UnitsError(f"slice name {name!r} is not a well-formed slice unit name")
-    argv = ["systemd-run", "--user", "--quiet", f"--unit={name}"]
-    if parent is not None:
-        argv.append(f"--slice={parent}")
-    argv.extend(prop for _controller, prop in _limit_props(memory_max, cpu_quota, tasks_max))
-    return [*argv, "--remain-after-exit", "/bin/true"]
+    return name
 
 
-def ensure_slice(name, *, parent=None, memory_max=None, cpu_quota=None, tasks_max=None, run):
+def slice_start_argv(name):
+    """The `systemctl --user start` argv creating (or reusing) one slice.
+
+    Starting an already-active slice is success. A name with dashes
+    nests by itself: `corral-web.slice` starts under `corral.slice`
+    with no extra flag.
+    """
+    _check_slice_name(name)
+    return ["systemctl", "--user", "start", name]
+
+
+def slice_set_property_argv(name, *, memory_max=None, cpu_quota=None):
+    """The `systemctl --user set-property --runtime` argv for slice limits.
+
+    None when no limit is set: assigning nothing is refused by the
+    manager, so the caller skips the call. Tasks never ride on slices:
+    the launch sets TasksMax on the agent unit inside the slice.
+    """
+    _check_slice_name(name)
+    props = []
+    for value, render, label in (
+        (memory_max, _memory_assignment, "memory_max"),
+        (cpu_quota, _cpu_assignment, "cpu_quota"),
+    ):
+        limit = _limit(value, label)
+        if limit is not None:
+            props.append(render(limit))
+    if not props:
+        return None
+    return ["systemctl", "--user", "set-property", "--runtime", name, *props]
+
+
+def ensure_slice(name, *, memory_max=None, cpu_quota=None, run):
     """Create one slice with its limits; an existing slice reads as created.
 
-    Parent slices are shared by every launch, so a slice that is already
-    loaded is success, not a race. Other failures map like `start`: an
-    unreachable bus is Unreachable (exit 3), and anything else, manager
-    text naming a refused property included, is UnitsError (exit 4).
-    `run` is required: slice creation is a write seam.
+    Start is idempotent, so a slice that is already loaded is success,
+    not a race. Limits apply as runtime properties, reconciled on every
+    launch. Other failures map like `start`: an unreachable bus is
+    Unreachable (exit 3), and anything else, manager text naming a
+    refused property included, is UnitsError (exit 4). `run` is
+    required: slice creation is a write seam.
     """
-    argv = slice_argv(name, parent, memory_max=memory_max, cpu_quota=cpu_quota, tasks_max=tasks_max)
-    try:
-        proc = run(argv, timeout=START_TIMEOUT_S)
-    except OSError as err:
-        raise UnitsError(f"cannot create slice {name}: {err}") from err
-    if proc.returncode != 0:
-        tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
-        bucket = _classify(tail)
-        if bucket == "exists":
-            return
-        if bucket == "unreachable":
-            raise Unreachable(f"cannot create slice {name}: {tail}")
-        raise UnitsError(f"cannot create slice {name}: {tail}")
+    start = slice_start_argv(name)
+    props = slice_set_property_argv(name, memory_max=memory_max, cpu_quota=cpu_quota)
+    for argv in [start, *([props] if props is not None else [])]:
+        try:
+            proc = run(argv, timeout=START_TIMEOUT_S)
+        except OSError as err:
+            raise UnitsError(f"cannot create slice {name}: {err}") from err
+        if proc.returncode != 0:
+            tail = ((proc.stderr or "").strip().splitlines() or ["failed"])[-1]
+            bucket = _classify(tail)
+            if bucket == "exists":
+                continue
+            if bucket == "unreachable":
+                raise Unreachable(f"cannot create slice {name}: {tail}")
+            raise UnitsError(f"cannot create slice {name}: {tail}")
 
 
 def start(argv, session_dir, unit, run=default_run):
