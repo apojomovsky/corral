@@ -19,12 +19,14 @@ from corral import eligibility, tracker
 #: Labels that hold a ticket for a human. A row carrying any of them is
 #: never selected. Module constants on purpose: one place, and no
 #: configuration surface in version one.
-HOLD_LABELS = ("hold", "needs-decision", "needs-triage")
+HOLD_LABELS = ("hold", tracker.NEEDS_DECISION, "needs-triage")
+"""Labels that hold a ticket for a human; a row carrying any is never selected."""
 
 #: Standalone title word that holds a ticket for a human. The match is a
 #: whole word and case sensitive: a title such as "cutover (HOLD for
 #: approval)" is held, while "holding pattern" is not.
 HOLD_TITLE_WORD = "HOLD"
+"""Standalone title word that holds a ticket for a human; matched whole-word."""
 
 _HOLD_TITLE_RE = re.compile(r"\b" + re.escape(HOLD_TITLE_WORD) + r"\b")
 

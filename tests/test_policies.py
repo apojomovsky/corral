@@ -5,6 +5,7 @@ subprocess, or a real state dir. The purity test fails when the policy
 module touches the clock, the environment, or the settings layer.
 """
 
+import ast
 import inspect
 import os
 import sys
@@ -201,6 +202,40 @@ class PurityTest(unittest.TestCase):
             "clock",
         ):
             self.assertNotIn(token, source)
+
+
+class ConstantsTest(unittest.TestCase):
+    def test_hold_labels_match_tracker_needs_decision(self):
+        self.assertEqual(
+            policies.HOLD_LABELS,
+            ("hold", tracker.NEEDS_DECISION, "needs-triage"),
+        )
+
+    def test_hold_labels_reference_tracker_constant(self):
+        source = inspect.getsource(policies)
+        self.assertIn("tracker.NEEDS_DECISION", source)
+
+    def test_constants_have_docstrings(self):
+        source = inspect.getsource(policies)
+        tree = ast.parse(source)
+        names = ("HOLD_LABELS", "HOLD_TITLE_WORD")
+        for index, node in enumerate(tree.body):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in names for target in node.targets
+            ):
+                follower = tree.body[index + 1]
+                assert isinstance(follower, ast.Expr)
+                value = follower.value
+                assert isinstance(value, ast.Constant)
+                assert isinstance(value.value, str)
+                self.assertTrue(value.value.strip())
+                names = tuple(
+                    name
+                    for name in names
+                    if name
+                    not in (target.id for target in node.targets if isinstance(target, ast.Name))
+                )
+        self.assertEqual(names, ())
 
 
 class ResolveTest(unittest.TestCase):
