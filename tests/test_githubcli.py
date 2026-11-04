@@ -97,6 +97,16 @@ class ExitCodeTest(SetupRootCase):
         self.assertIn("acme/app", self.err.getvalue())
         self.assertEqual(self.out.getvalue(), "")
 
+    def test_a_rejected_label_create_is_exit_1_with_the_reason(self):
+        fake = FakeTracker(
+            ensure_error=iface.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+        )
+        code = self.run_setup({"acme/app": fake}.__getitem__)
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+        self.assertIn("acme/app", self.err.getvalue())
+        self.assertEqual(self.out.getvalue(), "")
+
     def test_partial_failure_with_a_create_is_3(self):
         with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
