@@ -517,7 +517,35 @@ def _bootstrap_labels(repo, tracker):
     return bool(report.created), bool(report.refused)
 
 
-def _bootstrap_board(repo, entry_name, ops_root, provisioner_factory):
+def _commit_mapping(target, entry_name, toml_target, git):
+    """Commit exactly the new board mapping after a successful bootstrap.
+
+    The scaffold commit already ran, so the mapping write dirtied the
+    tree; a follow-up commit of exactly that file leaves the tree clean
+    with the mapping recorded. In the split layout the mapping lives
+    outside the new project's tree (the ops root owns it), so there is
+    nothing to commit here. Failures are exit 4.
+    """
+    rel = os.path.relpath(toml_target, target)
+    if rel == ".." or rel.startswith(".." + os.sep):
+        return
+    message = f"chore: record the {entry_name} board mapping"
+    try:
+        add = git(["add", "--", rel], target)
+    except OSError as err:
+        raise NewError(f"cannot run git in {target}: {err}") from None
+    if add is None or getattr(add, "returncode", 1) != 0:
+        raise NewError(f"cannot git add {toml_target} in {target}")
+    try:
+        made = git(["commit", "-m", message], target)
+    except OSError as err:
+        raise NewError(f"cannot run git in {target}: {err}") from None
+    if made is None or getattr(made, "returncode", 1) != 0:
+        raise NewError(f"cannot git commit {target}")
+    sys.stdout.write(f"committed {rel} in {target}: {message}\n")
+
+
+def _bootstrap_board(repo, entry_name, ops_root, provisioner_factory, target, git):
     """Ensure the board for a fresh `--create-remote` repo and write its mapping.
 
     The same ensure operation `corral github setup` runs: the spec comes
@@ -526,8 +554,11 @@ def _bootstrap_board(repo, entry_name, ops_root, provisioner_factory):
     the provisioner comes from the injected factory. Returns
     `(changed, refused)`, or None when the board is unreachable: the
     manual `github setup` command is printed as the next step, and the
-    caller exits 3. A refused board prints the same next step and
-    returns `(changed, True)`, so the caller exits 1. A spec or adapter
+    caller exits 3. A refused provision writes nothing (the mapping would
+    omit refused concepts) and returns `(changed, True)` with the same
+    next step, so the caller exits 1 leaving a clean tree with no
+    mapping. On success the mapping is committed as a follow-up of
+    exactly that file, after the scaffold commit. A spec or adapter
     `ValueError` is a usage error, raised as `NewError` (exit 4). The
     mapping write raises `init.InitError` (exit 4) the same way.
     """
@@ -551,6 +582,8 @@ def _bootstrap_board(repo, entry_name, ops_root, provisioner_factory):
         sys.stdout.write("next: corral github setup\n")
         return None
     sys.stdout.write(tracker_iface.render_provision(repo, provision))
+    if provision.refused:
+        return bool(provision.created), True
     toml_target = os.path.join(ops_root, settings.PROJECT_FILE)
     new_text, noop = init.board_table_change(toml_target, entry_name, spec, provision)
     if not noop:
@@ -560,7 +593,8 @@ def _bootstrap_board(repo, entry_name, ops_root, provisioner_factory):
         except OSError as err:
             raise NewError(f"corral: cannot write {toml_target}: {err}") from None
         sys.stdout.write(f"wrote [repo.board] for {entry_name}\n")
-    return bool(provision.created) or not noop, bool(provision.refused)
+        _commit_mapping(target, entry_name, toml_target, git)
+    return bool(provision.created) or not noop, False
 
 
 def _ensure_origin(target, url, git):
@@ -722,7 +756,7 @@ def _apply(opts, git, forge, tracker, provisioner_factory):
         if bootstrapped is None:
             return UNREACHABLE
         labels_changed, refused = bootstrapped
-        boarded = _bootstrap_board(repo, opts.name, ops_root, provisioner_factory)
+        boarded = _bootstrap_board(repo, opts.name, ops_root, provisioner_factory, target, git)
         if boarded is None:
             return UNREACHABLE
         board_changed, board_refused = boarded

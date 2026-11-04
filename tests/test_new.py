@@ -18,7 +18,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, forge as iface, init, new, settings
+from corral import cli, forge as iface, gc, init, new, settings
 from corral import tracker as tracker_iface
 from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
@@ -267,6 +267,19 @@ def isolated_config(test):
     patcher.start()
     test.addCleanup(patcher.stop)
     return cfg
+
+
+def isolated_git_identity(test):
+    """A throwaway XDG config giving real git a commit identity."""
+    xdg = tempfile.mkdtemp(prefix="corral-xdg-")
+    test.addCleanup(shutil.rmtree, xdg, True)
+    os.makedirs(os.path.join(xdg, "git"))
+    with open(os.path.join(xdg, "git", "config"), "w", encoding="utf-8") as handle:
+        handle.write("[user]\n\tname = Suite\n\temail = suite@corral.invalid\n")
+    patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg})
+    patcher.start()
+    test.addCleanup(patcher.stop)
+    return xdg
 
 
 class TemplateNames(unittest.TestCase):
@@ -1285,6 +1298,7 @@ class BoardEnsure(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.parent = tmp.name
         isolated_config(self)
+        isolated_git_identity(self)
 
     def target(self):
         return os.path.join(self.parent, FIXTURE)
@@ -1432,6 +1446,69 @@ class BoardEnsure(unittest.TestCase):
                 )
                 self.assertEqual(code, 4)
                 self.assertIn("this tracker does not provision boards", err)
+
+    def test_successful_create_remote_commits_the_mapping_and_leaves_a_clean_tree(self):
+        forge = FakeForge(user="operator")
+        made = kept_provision(created=("project", "link:operator/demo"), kept=())
+        code, out, err = run_new(
+            path=self.parent,
+            git=gc.git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: FakeProvisioner(provision=made),
+            create_remote=True,
+        )
+        self.assertEqual((code, err), (0, ""))
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout.strip(), "")
+        show = subprocess.run(
+            ["git", "show", "HEAD:corral.toml"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertIn("[repo.board]", show.stdout)
+        self.assertIn("next: corral doctor", out)
+
+    def test_refused_board_leaves_a_clean_tree_with_no_mapping(self):
+        forge = FakeForge(user="operator")
+        provisioner = FakeProvisioner(
+            provision=kept_provision(refused=("add the High option by hand",))
+        )
+        code, out, err = run_new(
+            path=self.parent,
+            git=gc.git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=lambda: provisioner,
+            create_remote=True,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(err, "")
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+        self.assertNotIn("[repo.board]", self.toml_text())
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(status.stdout.strip(), "")
+        show = subprocess.run(
+            ["git", "show", "HEAD:corral.toml"],
+            cwd=self.target(),
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(show.returncode, 0, show.stderr)
+        self.assertNotIn("[repo.board]", show.stdout)
 
     def test_without_create_remote_never_builds_a_provisioner(self):
         git = FakeGit(root=self.parent)
