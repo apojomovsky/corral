@@ -581,7 +581,7 @@ def _follow_key(row):
     shared key.
     """
     key = row.get("id")
-    if key is None:
+    if not key:
         return (None, json.dumps(row, sort_keys=True))
     return key
 
