@@ -106,7 +106,7 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | `corral prompts show ROLE [--ops DIR]` | print the effective role prompt template (override or built-in), unrendered |
 | `corral prompts eject ROLE [--ops DIR] [--force]` | copy the built-in template to `.corral/prompts/` for editing; prints the path and refuses to overwrite without `--force` |
 | `corral prompts check [--ops DIR]` | validate every override's placeholders and report stale ejections; exit 1 when something is stale or invalid |
-| `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
+| `corral coord ... --project <name>` | one coordinator per project: a lease (`acquire`, `heartbeat`, `release`, `takeover`, `status`), a logbook (`log`, `followup`, `handoff`, `brief`) and an event queue (`wait`, `events`, `ack`). `CORRAL_PROJECT` names the project when `--project` is not given. |
 | **State and quota** | |
 | `corral quota [--json]` | the provider pool and its quota ledger: state, windows, marks and staleness |
 | `corral quota refresh [provider]` | run the readers, record readings or failures; exit 3 when every reader failed |
