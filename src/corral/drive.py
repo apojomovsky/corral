@@ -994,8 +994,19 @@ def install_timer(
 
 
 def _default_live(registered):
-    """Live (project, repo, number) triples from units and the registry."""
-    return launch.admission_state(registered, units.list_units, registry.config(), "")
+    """Live (project, repo, number) triples from units and the registry.
+
+    Repos are store keys through the one short-to-tracker resolver, so
+    the admission repo cap counts the same repo the gate request
+    names. A short name no entry maps keeps itself, exactly as before.
+    """
+    mapping = _tracker_repo_map(registered, git=syncli._git)
+    return {
+        (project, *_tracker_key((repo, number), mapping))
+        for project, repo, number in launch.admission_state(
+            registered, units.list_units, registry.config(), ""
+        )
+    }
 
 
 def _default_host_inputs(registered):
@@ -1927,13 +1938,14 @@ def entry_for_claim(claim, *, agent_states, agent_tickets=None):
     (`drive-<hash8>-<n>`); registry entries are keyed by unit name
     (`<prefix>-<repo>-<n>`, `-r<gen>` on later generations), so the
     holder id never names an entry. The link is the ticket:
-    `agent_tickets` maps entry id to (repo, number), and the newest
-    entry for the claim's ticket wins by last heartbeat (a relaunch
-    heartbeats past the generation it replaced; a reviewer heartbeats
-    past the worker it took over from). With no ticket index the
-    holder id itself is the only key available: production always
-    passes the index, so that fallback never fires outside tests.
-    A ticket with no entry resolves to None.
+    `agent_tickets` maps entry id to the claim's (repo, number) store
+    key, built through the one short-to-tracker resolver, and the
+    newest entry for the claim's ticket wins by last heartbeat (a
+    relaunch heartbeats past the generation it replaced; a reviewer
+    heartbeats past the worker it took over from). With no ticket
+    index the holder id itself is the only key available: production
+    always passes the index, so that fallback never fires outside
+    tests. A ticket with no entry resolves to None.
     """
     states = agent_states or {}
     if agent_tickets is None:
@@ -2197,15 +2209,20 @@ def fix_message(repo, number) -> str:
     )
 
 
-def production_finished_for(*, now, cfg=None, path=None) -> dict:
+def production_finished_for(registered, *, now, cfg=None, path=None, git=None) -> dict:
     """{(repo, number): (agent id, role)} for the newest finished entry. Reads only.
 
     Built from the host registry: finished entries kept for RETAIN_S,
-    newest first by end time, entries without a ticket skipped. `cfg`
-    and `path` are the registry seams tests inject; production reads
-    the host registry. The role is `""` for entries that record none;
-    the gate treats only a known reviewer role as reviewed.
+    newest first by end time, entries without a ticket skipped. Keys
+    are store keys through the one short-to-tracker resolver, so the
+    gate and the finished scans join them straight to claimed rows.
+    `cfg` and `path` are the registry seams tests inject; production
+    reads the host registry. `git` names the origin-lookup seam for
+    entries without an explicit tracker repo. The role is `""` for
+    entries that record none; the gate treats only a known reviewer
+    role as reviewed.
     """
+    mapping = _tracker_repo_map(registered, git=syncli._git if git is None else git)
     found: dict = {}
     for entry, state in registry.visible(now, cfg, path):
         if state != registry.FINISHED:
@@ -2213,12 +2230,13 @@ def production_finished_for(*, now, cfg=None, path=None) -> dict:
         ticket = registry.ticket_of(entry)
         if ticket is None:
             continue
+        key = _tracker_key(ticket, mapping)
         at = entry.get("ended_at") or entry.get("last_seen") or 0
-        prior = found.get(ticket)
+        prior = found.get(key)
         if prior is not None and prior[2] >= at:
             continue
-        found[ticket] = (entry["id"], entry.get("role") or "", at)
-    return {ticket: (agent, role) for ticket, (agent, role, _) in found.items()}
+        found[key] = (entry["id"], entry.get("role") or "", at)
+    return {key: (agent, role) for key, (agent, role, _) in found.items()}
 
 
 def cap_label(day_cap) -> str:
@@ -2588,25 +2606,64 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         events.append({"event": "give_up", "at": now, "ticket": ref, "agent": claim.agent})
 
 
-def production_stuck_inputs(registered, *, now):
+def _tracker_repo_map(registered, *, git):
+    """`{short [[repo]] name: tracker repo}` across registered roots.
+
+    The one resolver for the tracker repo behind a registry entry's
+    short ticket repo: each root's entries resolve through the shared
+    `repo_operators`, and the first project naming a short name wins.
+    A configuration problem raises SettingsError, so the pass refuses
+    with exit 4 instead of joining against a guess.
+    """
+    found = {}
+    for project in registered:
+        names = settings.repo_names(project.root)
+        entries, problem = syncli.repo_operators(project.root, names, git)
+        if problem is not None:
+            raise settings.SettingsError(problem)
+        for name, (tracker_repo, _operators) in entries.items():
+            found.setdefault(name, tracker_repo)
+    return found
+
+
+def _tracker_key(ticket, mapping):
+    """The store key `(tracker repo, number)` for one registry ticket. Pure.
+
+    A ticket the mapping knows takes its tracker repo; an unknown
+    short name keeps itself, so entries from a removed project behave
+    exactly as before (they never match a store row either way). Every
+    registry-to-store join builds its keys through here, never a raw
+    `(ticket, (claim.repo, claim.number))` comparison elsewhere.
+    """
+    repo, number = ticket
+    return (mapping.get(repo, repo), number)
+
+
+def production_stuck_inputs(registered, *, now, path=None, git=None):
     """`(agent_states, stale_s, agent_tickets)` from the registry for the stuck sweep.
 
     `agent_states` maps every visible agent id to (state, last_seen);
     an id with no entry reads as gone. `agent_tickets` maps every
-    visible agent id naming a ticket to (repo, number): the ticket
+    visible agent id naming a ticket to its store key: the ticket
     index `entry_for_claim` resolves holders through, since a claim's
-    holder id never names its unit-name entry. Raises SettingsError
-    for bad registry settings.
+    holder id never names its unit-name entry. Keys go through the
+    one short-to-tracker resolver, so a short registry repo never
+    misses its tracker-repo claim. `path` is the registry dir seam
+    tests inject; production reads the host registry. `git` names the
+    origin-lookup seam for entries without an explicit tracker repo;
+    tests pass a fake, production the real runner. Raises
+    SettingsError for bad registry or project settings.
     """
     cfg = registry.config()
+    mapping = _tracker_repo_map(registered, git=syncli._git if git is None else git)
     states = {}
     tickets = {}
-    for entry, state in registry.visible(now, cfg):
+    for entry, state in registry.visible(now, cfg, path):
         last = entry.get("last_seen") or entry.get("started_at") or 0
         states[entry["id"]] = (state, float(last))
         ticket = registry.ticket_of(entry)
         if ticket is not None:
-            tickets[entry["id"]] = ticket
+            tickets[entry["id"]] = _tracker_key(ticket, mapping)
     return states, cfg["stale_s"], tickets
 
 
@@ -3532,19 +3589,16 @@ def _claim_and_launch(
 def _local_repo(root, repo):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
-    Only the entry whose resolved tracker repo names it wins: an entry
-    name that merely equals `repo` is not a mapping, and a reported
-    problem is surfaced, never masked. Anything else is a `LaunchError`
-    naming the root and the repo.
+    The reverse of the one short-to-tracker resolver, read through the
+    same shared `repo_operators`: only the entry whose resolved tracker
+    repo names it wins, an entry name that merely equals `repo` is not
+    a mapping, and a reported problem is surfaced, never masked.
+    Anything else is a `LaunchError` naming the root and the repo.
     """
-    for name in settings.repo_names(root):
-        try:
-            resolved = settings.load(root=root, repo=name)
-        except settings.SettingsError as err:
-            raise launch.LaunchError(str(err)) from None
-        tracker_repo, problem = syncli._tracker_repo(root, name, resolved, worktrees.git)
-        if problem is not None:
-            raise launch.LaunchError(problem)
+    entries, problem = syncli.repo_operators(root, settings.repo_names(root), worktrees.git)
+    if problem is not None:
+        raise launch.LaunchError(problem)
+    for name, (tracker_repo, _operators) in entries.items():
         if tracker_repo == repo:
             return name
     raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
@@ -3593,27 +3647,32 @@ def _worker_prompt(root, tgt, number, title):
     return render_prompt
 
 
-def production_orphan_inputs(registered, *, now):
+def production_orphan_inputs(registered, *, now, path=None, git=None):
     """`(present_agents, live_units, gone_s)` from the registry and units.
 
     `present_agents` is every agent id with a live or stale registry
     entry; `live_units` is every (repo, number) with a live unit under
-    any registered prefix; `gone_s` is the registry setting of the same
-    name, the single resolver for it. Raises the settings error when
-    the registry settings are bad, and `units.Unreachable` when a unit
-    listing fails.
+    any registered prefix, as store keys through the one
+    short-to-tracker resolver, so the orphan and stuck checks join
+    them straight to claimed rows; `gone_s` is the registry setting
+    of the same name, the single resolver for it. `path` is the
+    registry dir seam tests inject; `git` names the origin-lookup
+    seam for entries without an explicit tracker repo. Raises the
+    settings error when the registry or project settings are bad, and
+    `units.Unreachable` when a unit listing fails.
     """
     cfg = registry.config()
+    mapping = _tracker_repo_map(registered, git=syncli._git if git is None else git)
     present = {
         entry["id"]
-        for entry, state in registry.visible(now, cfg)
+        for entry, state in registry.visible(now, cfg, path)
         if state in (registry.LIVE, registry.STALE)
     }
     tickets = set()
     for project in registered:
         listed = units.list_units(project.unit_prefix, run=units.default_run)
         tickets |= units.live_tickets(project.unit_prefix, listed)
-    return present, tickets, cfg["gone_s"]
+    return present, {_tracker_key(ticket, mapping) for ticket in tickets}, cfg["gone_s"]
 
 
 def _reviewer_prompt(root, tgt, number, title, author):

@@ -353,7 +353,11 @@ keyed by its unit name (`<prefix>-<repo>-<n>`, `-r<gen>` on
 relaunches). The loop links the two by ticket (repo, number) through
 one resolver: the newest registry entry for the ticket wins by last
 heartbeat, so a relaunch reads past the generation it replaced and a
-reviewer reads past the worker it took over from. The stuck sweep,
+reviewer reads past the worker it took over from. Registry tickets
+carry the short `[[repo]]` name while store rows carry the tracker
+repo, so every ticket the loop joins goes through the one
+short-to-tracker resolver first; a raw short-to-tracker comparison
+would never match, exactly like keying on the holder id. The stuck sweep,
 the finished-claims scan, the fix-round readiness, the reviewer role
 check that serializes a fix behind a live reviewer, the
 finished-role carry that frees a reviewed row, and the orphan
