@@ -257,22 +257,22 @@ def cmd_drive(args: argparse.Namespace) -> int:
     except board.StoreError as problem:
         print(f"corral drive: {problem}", file=sys.stderr)
         return drive.USAGE
-    try:
-        host_settings = settings.load(root=None)
-        max_starts = host_settings["drive.max_starts_per_day"]
-        hold_label = host_settings["board.hold_label"]
-        hub_url = host_settings["hub.url"]
-    except settings.SettingsError as problem:
-        print(f"corral drive: {problem}", file=sys.stderr)
-        return drive.USAGE
-    hub = None
-    if not args.plan and str(hub_url or "").strip():
+    with store:
         try:
-            hub = hub_mode_for(host_settings, token_path=paths.hub_token_path())
-        except (drive.HubConfigError, paths.PathError) as problem:
+            host_settings = settings.load(root=None)
+            max_starts = host_settings["drive.max_starts_per_day"]
+            hold_label = host_settings["board.hold_label"]
+            hub_url = host_settings["hub.url"]
+        except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=sys.stderr)
             return drive.USAGE
-    with store:
+        hub = None
+        if not args.plan and str(hub_url or "").strip():
+            try:
+                hub = hub_mode_for(host_settings, token_path=paths.hub_token_path())
+            except (drive.HubConfigError, paths.PathError) as problem:
+                print(f"corral drive: {problem}", file=sys.stderr)
+                return drive.USAGE
         if args.plan:
             try:
                 registered = projects.load_all()

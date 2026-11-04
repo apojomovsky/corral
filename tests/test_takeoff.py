@@ -1050,6 +1050,132 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(found.skipped_by, "flag")
         self.assertEqual(found.detail, "skipped by --skip review")
 
+    def test_plan_reports_each_command_as_planned_without_running(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[checks]\n"
+            'takeoff = ["make lint", "make test"]\n'
+        )
+        result = self.gate(plan=True)
+        planned = [c for c in result.checks if c.name == "checks"]
+        self.assertEqual(
+            [(c.status, c.detail) for c in planned],
+            [("planned", "`make lint`"), ("planned", "`make test`")],
+        )
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_plan_runs_nothing_by_default(self):
+        result = self.gate(body_file=None, plan=True)
+        planned = [c for c in result.checks if c.name == "checks"]
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0].status, "planned")
+        self.assertEqual(planned[0].detail, "`make test`")
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_plan_resolves_the_checks_that_need_no_execution(self):
+        result = self.gate(plan=True)
+        self.assertEqual(result.base, self.base)
+        by_name = {}
+        for check in result.checks:
+            by_name.setdefault(check.name, []).append(check.status)
+        self.assertEqual(
+            by_name,
+            {
+                "base": ["ok"],
+                "worktree": ["ok"],
+                "commits": ["ok"],
+                "em-dash": ["ok"],
+                "body": ["ok"],
+                "leak": ["ok"],
+                "review": ["ok"],
+                "checks": ["planned"],
+            },
+        )
+
+    def test_plan_mirrors_a_resolved_failure(self):
+        self.write("loose.txt", "uncommitted\n", root=self.work)
+        result = self.gate(plan=True)
+        self.assertEqual(result.exit_code, 1)
+        found = [c for c in result.checks if c.name == "worktree"][0]
+        self.assertEqual(found.status, "fail")
+        planned = [c for c in result.checks if c.name == "checks"]
+        self.assertEqual([c.status for c in planned], ["planned"])
+        self.assertEqual(self.cmd_calls, [])
+
+    def test_plan_takes_no_lock(self):
+        clock = _FakeClock()
+        self.patch_lock_seams(_contended(None), clock)
+        result = self.gate(body_file=None, plan=True)
+        self.assertEqual(result.exit_code, 0)
+        planned = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(planned.status, "planned")
+        self.assertEqual(clock.sleeps, [])
+        self.assertEqual(self.cmd_calls, [])
+
+    def test_plan_with_a_skip_reports_the_skip(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[checks]\n"
+            'takeoff = ["make test"]\n'
+        )
+        result = self.gate(body_file=None, skips=["checks"], plan=True)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "skipped")
+        self.assertEqual(found.skipped_by, "flag")
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_plan_with_no_commands_is_ok_and_takes_no_lock(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+        )
+
+        def exploding(fd, flags):
+            raise AssertionError("the lock must not be taken without suite commands")
+
+        self.patch_lock_seams(exploding, _FakeClock())
+        result = self.gate(body_file=None, plan=True)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "ok")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_plan_with_test_flag_plans_the_test_command(self):
+        result = self.gate(body_file=None, with_test=True, plan=True)
+        planned = [c for c in result.checks if c.name == "checks"]
+        self.assertEqual([(c.status, c.detail) for c in planned], [("planned", "`make test`")])
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(result.exit_code, 0)
+
+    def test_plan_unreachable_remote_exits_3_without_running(self):
+        self.ls_error = takeoff.LsRemoteError("connection refused")
+        result = self.gate(plan=True)
+        self.assertEqual(result.exit_code, 3)
+        self.assertEqual(self.cmd_calls, [])
+
+    def test_plan_unknown_skip_is_a_usage_error(self):
+        with self.assertRaisesRegex(takeoff.TakeoffError, "bogus"):
+            self.gate(plan=True, skips=["bogus"])
+
+    def test_planned_rows_carry_no_skip_provenance_or_fix(self):
+        result = self.gate(body_file=None, plan=True)
+        for check in result.checks:
+            if check.status == "planned":
+                self.assertIsNone(check.skipped_by, check.name)
+                self.assertEqual(check.fix, "", check.name)
+
 
 class TakeoffCliCase(unittest.TestCase):
     def setUp(self):
@@ -1280,6 +1406,70 @@ class TakeoffCliCase(unittest.TestCase):
         for name in takeoff.SKIPPABLE_CHECKS:
             with self.subTest(skip=name):
                 self.assertIn(name, skip_help)
+
+    def test_cli_plan_json_lists_planned_commands_without_running(self):
+        from corral import takeoffcli
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(
+            [
+                "takeoff",
+                "--ops",
+                self.case.ops,
+                "--body",
+                self.case.body,
+                "--json",
+                "--plan",
+                self.case.work,
+            ]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 0)
+        doc = json.loads(out.getvalue())
+        planned = [c for c in doc["checks"] if c["name"] == "checks"]
+        self.assertEqual(len(planned), 1)
+        self.assertEqual(planned[0]["status"], "planned")
+        self.assertEqual(planned[0]["detail"], "`make test`")
+        self.assertIsNone(planned[0]["skipped_by"])
+        self.assertEqual(self.case.cmd_calls, [])
+
+    def test_cli_plan_text_names_the_planned_commands(self):
+        from corral import takeoffcli
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(
+            ["takeoff", "--ops", self.case.ops, "--body", self.case.body, "--plan", self.case.work]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 0)
+        self.assertIn("takeoff checks: planned - `make test`", out.getvalue())
+        self.assertEqual(self.case.cmd_calls, [])
+
+    def test_cli_plan_mirrors_a_resolved_failure(self):
+        from corral import takeoffcli
+        import argparse
+
+        self.case.remote_sha = "f" * 40
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        args = parser.parse_args(["takeoff", "--ops", self.case.ops, "--plan", self.case.work])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL", out.getvalue())
+        self.assertEqual(self.case.cmd_calls, [])
 
 
 class NoEmDashInCodeCase(unittest.TestCase):

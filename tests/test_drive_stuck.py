@@ -18,6 +18,7 @@ from dataclasses import replace
 
 from corral import board, drive, registry
 from corral import tracker as iface
+from corral import projects as projects_mod
 from corral.tracker import NEEDS_DECISION
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
@@ -120,8 +121,8 @@ class ClassifyTest(unittest.TestCase):
     def test_an_unknown_agent_restarts_when_its_unit_is_dead(self):
         self.assertEqual(self.check(known=False, age=float("inf"), unit_live=False), "restart")
 
-    def test_an_unknown_agent_restarts_even_with_a_live_unit(self):
-        self.assertEqual(self.check(known=False, age=float("inf"), unit_live=True), "restart")
+    def test_an_unknown_agent_with_a_live_unit_watches_once_more(self):
+        self.assertEqual(self.check(known=False, age=float("inf"), unit_live=True), "watch")
 
     def test_boundaries_watch_below_gone_and_restart_at_gone(self):
         self.assertEqual(self.check(age=GONE_S - 1.0, unit_live=True), "watch")
@@ -191,35 +192,77 @@ class GiveUpBodyTest(unittest.TestCase):
         self.assertNotIn("drive-", body)
 
 
-class ReleaseFinishedTest(unittest.TestCase):
+class ReviewedClaimsTest(unittest.TestCase):
+    def test_a_finished_reviewer_is_free_for_release(self):
+        authors = {("app", 7): AGENT}
+        finished = {("app", 7): (AGENT, "reviewer")}
+        self.assertEqual(drive.reviewed_claims(authors, finished), {("app", 7): AGENT})
+
+    def test_a_finished_worker_is_kept_for_its_reviewer(self):
+        authors = {("app", 7): AGENT}
+        for finished in (
+            {("app", 7): (AGENT, "worker")},
+            {("app", 7): (AGENT, None)},
+            {("app", 7): (AGENT, "")},
+        ):
+            self.assertEqual(drive.reviewed_claims(authors, finished), {})
+
+    def test_a_reviewer_entry_for_another_agent_frees_nothing(self):
+        authors = {("app", 7): AGENT}
+        finished = {("app", 7): ("drive-host-1-19999-acme--app-7", "reviewer")}
+        self.assertEqual(drive.reviewed_claims(authors, finished), {})
+
+    def test_missing_maps_read_as_nothing_reviewed(self):
+        self.assertEqual(drive.reviewed_claims(None, None), {})
+        self.assertEqual(drive.reviewed_claims({}, {}), {})
+
+
+class ReleaseReviewedTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-finished-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-reviewed-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
-    def test_a_finished_holder_is_released_with_a_completion_line(self):
+    def test_a_finished_reviewer_is_released_with_a_completion_line(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         made = claimed(store, "app", 7)
         out = io.StringIO()
-        states = {AGENT: (registry.FINISHED, NOW - 10.0)}
-        released = drive.release_finished(store, agent_states=states, now=NOW, out=out)
-        self.assertEqual(released, 1)
+        released = drive.release_reviewed(
+            store,
+            claims={("app", 7): AGENT},
+            live_units=frozenset(),
+            now=NOW,
+            out=out,
+        )
+        self.assertEqual(released, {("app", 7): AGENT})
         self.assertIn("app#7", out.getvalue())
-        self.assertIn("finished worker", out.getvalue())
+        self.assertIn("finished reviewer", out.getvalue())
         self.assertIn(AGENT, out.getvalue())
         self.assertNotIn("released dead claim", out.getvalue())
         self.assertIsNone(store.claim_of("app", 7))
+        following = store.claim("app", 7, "drive-host-1-20000-acme--app-7", HOST, now=NOW)
+        self.assertEqual(following.epoch, made.epoch + 1)
 
-    def test_a_release_keeps_the_epoch_for_the_next_claim(self):
+    def test_a_finished_reviewer_with_a_live_unit_is_kept(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         made = claimed(store, "app", 7)
         out = io.StringIO()
-        states = {AGENT: (registry.FINISHED, NOW - 10.0)}
-        drive.release_finished(store, agent_states=states, now=NOW, out=out)
-        following = store.claim("app", 7, "drive-host-1-20000-acme--app-7", HOST, now=NOW)
-        self.assertEqual(following.epoch, made.epoch + 1)
+        released = drive.release_reviewed(
+            store,
+            claims={("app", 7): AGENT},
+            live_units=frozenset({("app", 7)}),
+            now=NOW,
+            out=out,
+        )
+        self.assertEqual(released, {})
+        self.assertIn("live unit", out.getvalue())
+        self.assertIn("claim kept", out.getvalue())
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
     def test_a_race_with_a_reclaim_skips_with_a_logbook_line(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -234,35 +277,43 @@ class ReleaseFinishedTest(unittest.TestCase):
             return original(repo, number, agent, epoch, now=now)
 
         store.release = racy  # type: ignore[method-assign]
-        states = {AGENT: (registry.FINISHED, NOW - 10.0)}
         out = io.StringIO()
-        released = drive.release_finished(store, agent_states=states, now=NOW, out=out)
-        self.assertEqual(released, 0)
+        try:
+            released = drive.release_reviewed(
+                store,
+                claims={("app", 7): AGENT},
+                live_units=frozenset(),
+                now=NOW,
+                out=out,
+            )
+        finally:
+            store.release = original  # type: ignore[method-assign]
+        self.assertEqual(released, {})
         self.assertIn("app#7", out.getvalue())
+        self.assertIn("left held", out.getvalue())
         found = store.claim_of("app", 7)
         self.assertIsNotNone(found)
         assert found is not None
         self.assertEqual(found.agent, "drive-host-1-19999-acme--app-7")
 
-    def test_live_stale_and_unknown_holders_are_left_alone(self):
-        store = stored(
-            self.db,
-            [("app", 1, "open"), ("app", 2, "open"), ("app", 3, "open"), ("app", 4, "open")],
-        )
+    def test_a_changed_claim_is_left_held(self):
+        store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        for number in (1, 2, 3):
-            claimed(store, "app", number)
-        claimed(store, "app", 4, agent="manual-9")
-        states = {
-            AGENT: (registry.LIVE, NOW - 10.0),
-        }
+        claimed(store, "app", 7)
         out = io.StringIO()
-        released = drive.release_finished(store, agent_states=states, now=NOW, out=out)
-        self.assertEqual(released, 0)
-        self.assertEqual(out.getvalue(), "")
-        for number, want in ((1, AGENT), (2, AGENT), (3, AGENT), (4, "manual-9")):
-            row, _ = store.item("app", number, now=NOW)
-            self.assertEqual(row.agent, want)
+        released = drive.release_reviewed(
+            store,
+            claims={("app", 7): "drive-host-1-19999-acme--app-7"},
+            live_units=frozenset(),
+            now=NOW,
+            out=out,
+        )
+        self.assertEqual(released, {})
+        self.assertIn("left held", out.getvalue())
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, AGENT)
 
 
 class RestartPassTest(unittest.TestCase):
@@ -620,44 +671,92 @@ class FinishedPassTest(unittest.TestCase):
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
 
-    def test_a_finished_holder_takes_the_completion_path_never_the_orphan_one(self):
+    def test_a_finished_holder_is_kept_for_its_reviewer_never_restarted(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        claimed(store, "app", 7)
+        made = claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
         out, err = io.StringIO(), io.StringIO()
         code = stuck_pass(
             store,
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 7)),
             agent_states={AGENT: (registry.FINISHED, OLD + 10.0)},
             live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
             restarts_path=self.budget,
         )
         self.assertEqual(code, 0)
-        self.assertIn("finished worker", out.getvalue())
+        self.assertIn("finished", out.getvalue())
+        self.assertIn("claim kept", out.getvalue())
         self.assertNotIn("released dead claim", out.getvalue())
-        self.assertNotIn("restart", out.getvalue())
-        self.assertIsNone(store.claim_of("app", 7))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
-    def test_a_finished_holder_is_released_even_with_a_live_unit(self):
+    def test_a_withdrawn_finished_holder_is_released_with_the_reason(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
         out, err = io.StringIO(), io.StringIO()
         code = stuck_pass(
             store,
             self.lock,
             out,
             err,
+            **wants(self.policies, ("app", 9)),
             agent_states={AGENT: (registry.FINISHED, OLD + 10.0)},
-            live_units=frozenset({("app", 7)}),
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
             restarts_path=self.budget,
         )
         self.assertEqual(code, 0)
-        self.assertIn("finished worker", out.getvalue())
+        self.assertIn("withdrawn by this pass's eligibility", out.getvalue())
+        self.assertIn("not restarted", out.getvalue())
+        self.assertIn("claim released", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
         self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_finished_holder_with_a_live_unit_is_kept_with_the_reason(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            **wants(self.policies, ("app", 9)),
+            agent_states={AGENT: (registry.FINISHED, OLD + 10.0)},
+            live_units=frozenset({("app", 7)}),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("withdrawn by this pass's eligibility", out.getvalue())
+        self.assertIn("live unit", out.getvalue())
+        self.assertIn("claim kept", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
     def test_plan_writes_nothing_including_the_budget_file(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -2277,7 +2376,7 @@ class FinishedWorkerReviewTest(unittest.TestCase):
     def test_a_finished_worker_without_a_pr_is_reviewed_never_restarted(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        claimed(store, "app", 7)
+        made = claimed(store, "app", 7)
         fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
         launcher, stop = FakeLauncher(), FakeStop()
         out, err = io.StringIO(), io.StringIO()
@@ -2300,9 +2399,179 @@ class FinishedWorkerReviewTest(unittest.TestCase):
         self.assertEqual(len(launcher.calls), 1)
         self.assertEqual(launcher.calls[0][3], "review")
         self.assertEqual(launcher.calls[0][6], AGENT)
+        self.assertNotEqual(launcher.calls[0][4], AGENT)
         self.assertEqual(stop.calls, [])
-        self.assertIn("released finished worker", out.getvalue())
+        self.assertIn("takes over", out.getvalue())
         self.assertNotIn("restart", out.getvalue())
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, launcher.calls[0][4])
+        self.assertEqual(found.epoch, made.epoch + 1)
+
+
+class BasicInFlightTest(unittest.TestCase):
+    """The ready-made basic policy keeps requesting in-flight tickets. Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-basic-in-flight-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+        self.project = projects_mod.Project(
+            name="blue",
+            unit_prefix="blue-agent-",
+            root=os.path.join(self.tmp.name, "ops", "blue"),
+            eligibility="corral.policies:basic",
+        )
+
+    def test_basic_keeps_a_stuck_in_flight_ticket_restart_eligible(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[self.project],
+            agent_states={},
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("withdrawn by this pass's eligibility", out.getvalue())
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        project, repo, number, kind, agent, _title, _author = launcher.calls[0]
+        self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "start"))
+        self.assertEqual(agent, AGENT)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (AGENT, made.epoch))
+
+    def test_basic_never_withdraws_a_live_in_flight_ticket(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[self.project],
+            agent_states={},
+            live_units=frozenset({("app", 7)}),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertNotIn("withdrawn by this pass's eligibility", out.getvalue())
+        self.assertIn("already claimed", out.getvalue())
+        self.assertNotIn("claim released", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_basic_reviews_a_finished_worker_instead_of_restarting_it(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[self.project],
+            launcher=launcher,
+            agent_states={AGENT: (registry.FINISHED, OLD + 10.0)},
+            live_units=frozenset(),
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "review")
+        self.assertEqual(launcher.calls[0][6], AGENT)
+        self.assertIn("takes over", out.getvalue())
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, launcher.calls[0][4])
+
+    def test_a_held_in_flight_ticket_is_withdrawn_but_kept_while_its_unit_is_live(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[self.project],
+            read_labels=lambda kind, repo, number: ["hold"],
+            agent_states={AGENT: (registry.LIVE, NOW - GONE_S - 1.0)},
+            live_units=frozenset({("app", 7)}),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("held for a human", out.getvalue())
+        self.assertIn("not restarted", out.getvalue())
+        self.assertIn("live unit", out.getvalue())
+        self.assertIn("claim kept", out.getvalue())
+        self.assertNotIn("claim released", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_held_in_flight_ticket_is_released_once_its_unit_is_dead(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[self.project],
+            read_labels=lambda kind, repo, number: ["hold"],
+            agent_states={},
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("held for a human", out.getvalue())
+        self.assertIn("not restarted", out.getvalue())
+        self.assertIn("claim released", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of("app", 7))
 
     def test_a_full_pass_releases_a_withdrawn_stuck_claim(self):
         store = stored(self.db, [("app", 7, "open")])

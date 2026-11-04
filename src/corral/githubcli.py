@@ -64,6 +64,10 @@ def setup_root(root, names, *, tracker_factory, git, out, err) -> int:
             return USAGE
         try:
             report = repo_tracker.ensure_labels(tracker_repo)
+        except iface.TrackerRejected as problem:
+            _err(f"{tracker_repo}: {problem}", err)
+            refused += 1
+            continue
         except iface.TrackerError as problem:
             _err(f"{tracker_repo}: {problem}", err)
             failed += 1
