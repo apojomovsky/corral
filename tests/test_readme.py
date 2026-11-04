@@ -224,7 +224,8 @@ class TakeoffStatuses(unittest.TestCase):
             takeoff.SKIPPED: "`skipped`",
             takeoff.PLANNED: "`planned`",
         }
-        for status in (takeoff.OK, takeoff.FAIL, takeoff.SKIPPED, takeoff.PLANNED):
+        self.assertEqual(set(display), set(takeoff.STATUSES))
+        for status in takeoff.STATUSES:
             self.assertIn(display[status], sentence, f"README takeoff status list omits {status}")
 
 
