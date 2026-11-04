@@ -29,6 +29,7 @@ _SCHEMA_BY_NUMBER = """query BoardSchemaByNumber($owner: String!, $number: Int!)
 }
 fragment BoardProject on ProjectV2 {
   id
+  title
   fields(first: 100) {
     nodes {
       __typename
@@ -44,6 +45,7 @@ _SCHEMA_BY_ID = """query BoardSchemaById($id: ID!) {
 }
 fragment BoardProject on ProjectV2 {
   id
+  title
   fields(first: 100) {
     nodes {
       __typename
@@ -196,6 +198,70 @@ class BoardReader:
         """The project's node id, field ids and option ids, live."""
         return self._parse_schema(self._fetch_project())
 
+    def snapshot(self) -> iface.BoardSnapshot:
+        """The board's read-only shape for the doctor, as plain data.
+
+        The live title, every live field raw (duplicates kept, so the
+        comparison refuses the ambiguity instead of this picking one),
+        and every board under the same owner. Malformed answers fail
+        closed with ``TrackerError``; rate limits surface as
+        ``TrackerRateLimited`` through the shared classifier, like any
+        other read.
+        """
+        project = self._fetch_project()
+        _project_id(project)
+        title = project.get("title")
+        if not isinstance(title, str) or not title:
+            raise _fail("board title is missing")
+        fields = project.get("fields")
+        nodes = fields.get("nodes") if isinstance(fields, dict) else None
+        if not isinstance(nodes, list):
+            raise _fail("board fields are not a list")
+        found = [_live_field(node) for node in nodes]
+        owner_boards = self._owner_boards(self._board.project_owner)
+        return iface.BoardSnapshot(title=title, fields=tuple(found), owner_boards=owner_boards)
+
+    def issue_refs(self) -> set[tuple[str, int]]:
+        """``(repo, number)`` on the board, paged, else ``TrackerError``.
+
+        Membership only: no field value is read and no issue is fetched
+        over REST, so the doctor diffs board presence against the
+        store's open rows without a full poll. A malformed page fails
+        closed, never a partial set.
+        """
+        project_id = _project_id(self._fetch_project())
+        refs = set()
+        after = None
+        while True:
+            nodes, info = self._page(project_id, after)
+            for node in nodes:
+                ref = _content_ref(node)
+                if ref is not None:
+                    refs.add(ref)
+            end, more = self._resume(info, len(nodes))
+            if not more:
+                return refs
+            after = end
+
+    def _owner_boards(self, login) -> tuple:
+        """``(number, title)`` for every board under ``login``, paged.
+
+        The same title list provisioning searches, read through the
+        one page validation, so the two cannot fork.
+        """
+        boards = []
+        after = None
+        while True:
+            if after is None:
+                payload = self._graphql(_TITLES, login=login)
+            else:
+                payload = self._graphql(_TITLES, login=login, after=after)
+            entries, info = _titles_entries(payload)
+            boards.extend((number, title) for _, number, title in entries)
+            after, more = _titles_next(info)
+            if not more:
+                return tuple(boards)
+
     def _fetch_project(self):
         """The live board project object, else ``TrackerError``."""
         if self._board.project_id is not None:
@@ -220,11 +286,7 @@ class BoardReader:
 
     def _project_index(self, project):
         """``(project id, fields by name)`` for one project object."""
-        if not isinstance(project, dict):
-            raise _fail(f"board project is not an object: {project!r}")
-        project_id = project.get("id")
-        if not isinstance(project_id, str) or not project_id:
-            raise _fail(f"bad board project id {project_id!r}")
+        project_id = _project_id(project)
         fields = project.get("fields")
         nodes = fields.get("nodes") if isinstance(fields, dict) else None
         if not isinstance(nodes, list):
@@ -736,6 +798,64 @@ _TITLES = """query ProvisionBoardTitles($login: String!, $after: String) {
   }
 }"""
 
+
+def _titles_entries(data):
+    """``(entries, pageInfo)`` for one board-title page, else ``TrackerError``.
+
+    Shared by the provisioner's title search and the doctor's snapshot:
+    one validation of the owner-halves shape, so the two cannot fork.
+    Entries are ``(node id, number, title)`` in listed order.
+    """
+    if not isinstance(data, dict):
+        raise _fail("board title list is missing")
+    halves = [
+        half for half in (data.get("user"), data.get("organization")) if isinstance(half, dict)
+    ]
+    if not halves:
+        raise _fail("board title list is missing")
+    if len(halves) > 1:
+        raise _fail("board title list is ambiguous")
+    connection = halves[0].get("projectsV2")
+    if not isinstance(connection, dict):
+        raise _fail("board title list is missing")
+    nodes = connection.get("nodes")
+    if not isinstance(nodes, list):
+        raise _fail("board titles are not a list")
+    entries = []
+    for entry in nodes:
+        if not isinstance(entry, dict):
+            raise _fail(f"bad board title {entry!r}")
+        eid = entry.get("id")
+        number = entry.get("number")
+        title = entry.get("title")
+        if not isinstance(eid, str) or not eid:
+            raise _fail(f"bad board title {entry!r}")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise _fail(f"bad board title {entry!r}")
+        if not isinstance(title, str) or not title:
+            raise _fail(f"bad board title {entry!r}")
+        entries.append((eid, number, title))
+    info = connection.get("pageInfo")
+    if info is None:
+        raise _fail("board title list is missing its pageInfo")
+    if not isinstance(info, dict):
+        raise _fail(f"bad board pageInfo {info!r}")
+    return entries, info
+
+
+def _titles_next(info):
+    """``(cursor, True)`` to continue a title list, ``(None, False)`` at its end."""
+    more = info.get("hasNextPage")
+    if not isinstance(more, bool):
+        raise _fail(f"bad board pageInfo {info!r}")
+    if not more:
+        return None, False
+    end = info.get("endCursor")
+    if not isinstance(end, str) or not end:
+        raise _fail("board title list claims more boards but names no cursor")
+    return end, True
+
+
 _CREATE = """mutation ProvisionBoardCreate($owner: ID!, $title: String!, $repo: ID) {
   createProjectV2(input: {ownerId: $owner, title: $title, repositoryId: $repo}) {
     projectV2 { id number title public }
@@ -802,6 +922,83 @@ _ADD_ATTEMPTS = 5
 
 #: The fix line for a spec addressing a board that no longer resolves.
 _REMOVE_TABLE_LINE = "the board in the config no longer exists: remove the table and re-run"
+
+
+def _project_id(project) -> str:
+    """One project object's node id, else ``TrackerError``.
+
+    The light half of ``BoardReader._project_index`` for reads that
+    need no field mapping: the snapshot and the membership listing
+    resolve fields themselves, so a duplicate field name must not fail
+    them here.
+    """
+    if not isinstance(project, dict):
+        raise _fail(f"board project is not an object: {project!r}")
+    project_id = project.get("id")
+    if not isinstance(project_id, str) or not project_id:
+        raise _fail(f"bad board project id {project_id!r}")
+    return project_id
+
+
+def _live_field(node) -> iface.LiveField:
+    """One schema node as raw doctor data, duplicates kept, else ``TrackerError``.
+
+    Malformed nodes and options fail closed like any other unusable
+    answer; two fields under one name are both listed, and the
+    comparison refuses the ambiguity instead of this picking one.
+    """
+    if not isinstance(node, dict):
+        raise _fail(f"bad board field {node!r}")
+    fid = node.get("id")
+    name = node.get("name")
+    if not isinstance(fid, str) or not fid:
+        raise _fail(f"bad board field {node!r}")
+    if not isinstance(name, str) or not name:
+        raise _fail(f"bad board field {node!r}")
+    kind = _field_kind(node)
+    options: list = []
+    if kind == "single_select":
+        entries = node.get("options")
+        if not isinstance(entries, list):
+            raise _fail(f"board field {name!r} has no options")
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise _fail(f"bad board option {entry!r} in {name!r}")
+            oid = entry.get("id")
+            oname = entry.get("name")
+            if not isinstance(oid, str) or not oid:
+                raise _fail(f"bad board option {entry!r} in {name!r}")
+            if not isinstance(oname, str):
+                raise _fail(f"bad board option {entry!r} in {name!r}")
+            options.append(iface.LiveOption(id=oid, name=oname))
+    return iface.LiveField(name=name, kind=kind, options=tuple(options))
+
+
+def _content_ref(node):
+    """``(repo, number)`` for one board item node, ``None`` for a gone item.
+
+    A null content (an item whose issue is gone) reads as absent, like
+    the populate membership does; a draft without a number is skipped
+    the way the poll skips it. Anything short of that shape is a
+    ``TrackerError``, never a partial membership set.
+    """
+    if not isinstance(node, dict):
+        raise _fail(f"board item is not an object: {node!r}")
+    content = node.get("content", {})
+    if content is None:
+        return None
+    if not isinstance(content, dict):
+        raise _fail(f"bad board content {content!r}")
+    if content.get("__typename") == "DraftIssue" and "number" not in content:
+        return None
+    number = content.get("number")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise _fail(f"bad board content number {number!r}")
+    repo = content.get("repository")
+    repo = repo.get("nameWithOwner") if isinstance(repo, dict) else None
+    if not isinstance(repo, str) or "/" not in repo:
+        raise _fail(f"bad board content repo {repo!r}")
+    return repo, number
 
 
 def _link_fix(repo) -> str:
@@ -1247,51 +1444,13 @@ class GithubBoardProvisioner:
                 data = self._read(_TITLES, None, login=spec.owner)
             else:
                 data = self._read(_TITLES, None, login=spec.owner, after=after)
-            if not isinstance(data, dict):
-                raise _fail("board title list is missing")
-            halves = [
-                half
-                for half in (data.get("user"), data.get("organization"))
-                if isinstance(half, dict)
-            ]
-            if not halves:
-                raise _fail("board title list is missing")
-            if len(halves) > 1:
-                raise _fail("board title list is ambiguous")
-            connection = halves[0].get("projectsV2")
-            if not isinstance(connection, dict):
-                raise _fail("board title list is missing")
-            nodes = connection.get("nodes")
-            if not isinstance(nodes, list):
-                raise _fail("board titles are not a list")
-            for entry in nodes:
-                if not isinstance(entry, dict):
-                    raise _fail(f"bad board title {entry!r}")
-                eid = entry.get("id")
-                number = entry.get("number")
-                title = entry.get("title")
-                if not isinstance(eid, str) or not eid:
-                    raise _fail(f"bad board title {entry!r}")
-                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-                    raise _fail(f"bad board title {entry!r}")
-                if not isinstance(title, str) or not title:
-                    raise _fail(f"bad board title {entry!r}")
+            entries, info = _titles_entries(data)
+            for eid, number, title in entries:
                 if title == spec.title:
                     matches.append((eid, number))
-            info = connection.get("pageInfo")
-            if info is None:
-                raise _fail("board title list is missing its pageInfo")
-            if not isinstance(info, dict):
-                raise _fail(f"bad board pageInfo {info!r}")
-            more = info.get("hasNextPage")
-            if not isinstance(more, bool):
-                raise _fail(f"bad board pageInfo {info!r}")
+            after, more = _titles_next(info)
             if not more:
                 break
-            end = info.get("endCursor")
-            if not isinstance(end, str) or not end:
-                raise _fail("board title list claims more boards but names no cursor")
-            after = end
         if not matches:
             return None
         if len(matches) > 1:
