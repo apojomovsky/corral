@@ -492,6 +492,18 @@ class SliceDrift(unittest.TestCase):
         rows = by_name(resourcedoctor.check(readings(slices=launch_slices)))
         self.assertEqual(rows["resources-slices"].status, "ok")
 
+    def test_manager_timespan_rendering_matches_the_budget(self):
+        """`systemctl show` renders the quota as a timespan: 800% reads `8s`."""
+        launch_slices = {
+            "corral.slice": {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8s"},
+            "corral-web.slice": {
+                "MemoryMax": "16777216000",
+                "CPUQuotaPerSecUSec": "8s",
+            },
+        }
+        rows = by_name(resourcedoctor.check(readings(slices=launch_slices)))
+        self.assertEqual(rows["resources-slices"].status, "ok")
+
     def test_a_tasksmax_on_a_slice_is_not_drift(self):
         slices = {
             "corral.slice": {
@@ -522,7 +534,7 @@ class SliceDrift(unittest.TestCase):
         )
         self.assertEqual(rows["resources-slices"].status, "ok")
 
-    def test_drift_warns_with_the_operator_refresh_step(self):
+    def test_drift_warns_only_until_the_next_launch(self):
         rows = by_name(
             resourcedoctor.check(
                 readings(
@@ -544,8 +556,9 @@ class SliceDrift(unittest.TestCase):
         self.assertIn("corral.slice", row.detail)
         self.assertIn("MemoryMax", row.detail)
         self.assertIn("CPUQuotaPerSecUSec", row.detail)
-        self.assertIn("never reconcile", row.detail)
-        self.assertIn("daemon-reload", row.fix)
+        self.assertIn("reconcile on the next launch", row.detail)
+        self.assertIn("launch an agent", row.fix)
+        self.assertIn("stop the slice by hand", row.fix)
 
     def test_unset_limit_matches_infinity(self):
         state = readings(
@@ -592,6 +605,23 @@ class SliceDriftUnit(unittest.TestCase):
             resourcedoctor.slice_drift(
                 R.Usage(cpu_m=8000, memory_mb=16000, pids=4096),
                 {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8000000", "TasksMax": "4096"},
+            ),
+            [],
+        )
+
+    def test_timespan_renderings_match(self):
+        """The quota the manager reports (`500ms`) parses back to millicores."""
+        self.assertEqual(
+            resourcedoctor.slice_drift(
+                R.Usage(cpu_m=500, memory_mb=512, pids=100),
+                {"MemoryMax": "536870912", "CPUQuotaPerSecUSec": "500ms"},
+            ),
+            [],
+        )
+        self.assertEqual(
+            resourcedoctor.slice_drift(
+                R.Usage(cpu_m=8000, memory_mb=16000, pids=4096),
+                {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8s"},
             ),
             [],
         )
