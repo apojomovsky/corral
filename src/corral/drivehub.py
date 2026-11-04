@@ -282,15 +282,19 @@ def cmd_drive(args: argparse.Namespace) -> int:
             moment = time.time()
             try:
                 planned_states, _, planned_tickets = drive.production_stuck_inputs(
-                    registered, now=moment
+                    registered, now=moment, git=syncli._git
                 )
-                planned_finished = drive.production_finished_for(now=moment)
+                planned_finished = drive.production_finished_for(
+                    registered, now=moment, git=syncli._git
+                )
                 planned_roles = drive.production_agent_roles(now=moment)
             except settings.SettingsError as problem:
                 print(f"corral drive: {problem}", file=sys.stderr)
                 return drive.USAGE
             try:
-                _, planned_live, _ = drive.production_orphan_inputs(registered, now=moment)
+                _, planned_live, _ = drive.production_orphan_inputs(
+                    registered, now=moment, git=syncli._git
+                )
             except settings.SettingsError as problem:
                 print(f"corral drive: {problem}", file=sys.stderr)
                 return drive.USAGE
@@ -344,9 +348,9 @@ def cmd_drive(args: argparse.Namespace) -> int:
         moment = time.time()
         try:
             stuck_states, stuck_stale, stuck_tickets = drive.production_stuck_inputs(
-                registered, now=moment
+                registered, now=moment, git=syncli._git
             )
-            finished_for = drive.production_finished_for(now=moment)
+            finished_for = drive.production_finished_for(registered, now=moment, git=syncli._git)
             agent_roles = drive.production_agent_roles(now=moment)
         except settings.SettingsError as problem:
             print(f"corral drive: {problem}", file=sys.stderr)

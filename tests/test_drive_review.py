@@ -338,7 +338,7 @@ class ProductionFinishedForTest(unittest.TestCase):
     def test_newest_finished_entry_wins_per_ticket(self):
         self.register_done("worker-1", "app", 7, "worker", at=1000.0)
         self.register_done("reviewer-1", "app", 7, "reviewer", at=2000.0)
-        found = drive.production_finished_for(now=3000.0, cfg=self.cfg, path=self.dir)
+        found = drive.production_finished_for([], now=3000.0, cfg=self.cfg, path=self.dir)
         self.assertEqual(found, {("app", 7): ("reviewer-1", "reviewer")})
 
     def test_live_entries_and_ticketless_entries_are_ignored(self):
@@ -346,7 +346,7 @@ class ProductionFinishedForTest(unittest.TestCase):
         registry.register("live-1", "muse", now=2990.0, path=self.dir)
         registry.register("lonely-1", "muse", now=2000.0, path=self.dir)
         registry.done("lonely-1", now=2001.0, path=self.dir)
-        found = drive.production_finished_for(now=3000.0, cfg=self.cfg, path=self.dir)
+        found = drive.production_finished_for([], now=3000.0, cfg=self.cfg, path=self.dir)
         self.assertEqual(found, {("app", 7): ("worker-1", "worker")})
 
     def test_entries_without_a_role_read_as_unreviewed(self):
@@ -358,7 +358,7 @@ class ProductionFinishedForTest(unittest.TestCase):
             path=self.dir,
         )
         registry.done("old-1", now=1001.0, path=self.dir)
-        found = drive.production_finished_for(now=3000.0, cfg=self.cfg, path=self.dir)
+        found = drive.production_finished_for([], now=3000.0, cfg=self.cfg, path=self.dir)
         self.assertEqual(found, {("app", 7): ("old-1", "")})
 
 
