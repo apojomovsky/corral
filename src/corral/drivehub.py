@@ -264,6 +264,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
         hub_url = host_settings["hub.url"]
     except settings.SettingsError as problem:
         print(f"corral drive: {problem}", file=sys.stderr)
+        store.close()
         return drive.USAGE
     hub = None
     if not args.plan and str(hub_url or "").strip():
@@ -271,6 +272,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             hub = hub_mode_for(host_settings, token_path=paths.hub_token_path())
         except (drive.HubConfigError, paths.PathError) as problem:
             print(f"corral drive: {problem}", file=sys.stderr)
+            store.close()
             return drive.USAGE
     with store:
         if args.plan:

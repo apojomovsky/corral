@@ -761,8 +761,8 @@ class HubClientForTest(unittest.TestCase):
         )
 
 
-class CmdDrivePlanTest(unittest.TestCase):
-    """`cmd_drive --plan` over a real temporary root: exit 0, zero hub calls.
+class CmdDriveHubBuildTest(unittest.TestCase):
+    """`cmd_drive` hub setup over a real temporary root.
 
     The store, host config, project registry and ops root are real
     files in temporary directories; the seeded rows stand for
@@ -771,7 +771,8 @@ class CmdDrivePlanTest(unittest.TestCase):
     and agent state reads empty from the fresh temp state dir. With
     no hub configured no hub client is ever built; with `hub.url`
     set the plan still makes zero hub calls, through a recording
-    fake standing at the client seam.
+    fake standing at the client seam. A non-plan pass maps hub
+    setup failures to exit 4 and closes the store it opened.
     """
 
     def setUp(self):
@@ -814,6 +815,30 @@ class CmdDrivePlanTest(unittest.TestCase):
             code = drivehub.cmd_drive(argparse.Namespace(plan=True, drive_verb=None))
         return code, out.getvalue(), err.getvalue()
 
+    def run_non_plan(self):
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive.sys, "stdout", out),
+            mock.patch.object(drive.sys, "stderr", err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        return code, out.getvalue(), err.getvalue()
+
+    def recording_open_store(self):
+        """`board.open_store` double that records `close` on the real store."""
+        opened = []
+        real_open = board.open_store
+
+        def spy(*args, **kwargs):
+            wrapper = mock.MagicMock(wraps=real_open(*args, **kwargs))
+            opened.append(wrapper)
+            return wrapper
+
+        patcher = mock.patch.object(board, "open_store", side_effect=spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return opened
+
     def test_plan_with_no_hub_configured_exits_zero(self):
         class BombClient:
             def __init__(self, *args, **kwargs):
@@ -847,22 +872,47 @@ class CmdDrivePlanTest(unittest.TestCase):
         with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write('[hub]\nurl = "http://host-1:8000"\nhost_id = "host-1"\n')
         problem = paths.PathError("CORRAL_CONFIG='relative' must be an absolute path")
+        opened = self.recording_open_store()
 
         class BombClient:
             def __init__(self, *args, **kwargs):
                 raise AssertionError("no client without a token path")
 
-        out, err = io.StringIO(), io.StringIO()
         with (
             mock.patch.object(paths, "hub_token_path", side_effect=problem),
             mock.patch.object(drivehub.hubmod, "HubClient", BombClient),
-            mock.patch.object(drive.sys, "stdout", out),
-            mock.patch.object(drive.sys, "stderr", err),
         ):
-            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+            code, logged, errors = self.run_non_plan()
         self.assertEqual(code, 4)
-        self.assertIn("corral drive: CORRAL_CONFIG=", err.getvalue())
-        self.assertEqual(out.getvalue(), "")
+        self.assertIn("corral drive: CORRAL_CONFIG=", errors)
+        self.assertEqual(logged, "")
+        self.assertEqual(len(opened), 1)
+        opened[0].close.assert_called_once_with()
+
+    def test_non_plan_with_hub_url_and_no_host_id_is_a_usage_error(self):
+        with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[hub]\nurl = "http://host-1:8000"\n')
+        opened = self.recording_open_store()
+        code, logged, errors = self.run_non_plan()
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive: hub.url is set but hub.host_id is empty", errors)
+        self.assertEqual(logged, "")
+        self.assertEqual(len(opened), 1)
+        opened[0].close.assert_called_once_with()
+
+    def test_non_plan_with_unreadable_settings_closes_the_store(self):
+        opened = self.recording_open_store()
+        with mock.patch.object(
+            drivehub.settings,
+            "load",
+            side_effect=settings.SettingsError("bad settings"),
+        ):
+            code, logged, errors = self.run_non_plan()
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive: bad settings", errors)
+        self.assertEqual(logged, "")
+        self.assertEqual(len(opened), 1)
+        opened[0].close.assert_called_once_with()
 
 
 class HubVersionMappingTest(unittest.TestCase):
