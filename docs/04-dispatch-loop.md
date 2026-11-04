@@ -119,10 +119,12 @@ Ready-made policy: most projects need no policy code. The
 registration names as `eligibility = "corral.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
-standalone `HOLD` word in the title), unclaimed, unblocked (empty
+standalone `HOLD` word in the title), unblocked (empty
 `blocked_by` and no `blocked` label), and with no open linked pull
-request. Weight is the board priority rank, highest first, with unknown
-priorities lowest; ties keep row order for the drive loop to break.
+request, claimed or not: in-flight rows stay requested so the loop
+never withdraws them by omission. Weight is the board priority rank,
+highest first, with unknown priorities lowest; ties keep row order for
+the drive loop to break.
 
 ## 3. Ordering and fairness; caps, quota and hold; what exit 75 does
 
@@ -159,6 +161,12 @@ Per-candidate gate order, cheapest first:
      a fresh `start` on the same ticket and branch (the branch is
      reused, nothing is deleted).
    - Claimed row plus `start`: skip ("already claimed by `<agent>`").
+   - Claimed row plus `start` or `review` whose holder has a
+     finished worker entry behind it: proceed as a reviewer takeover
+     (section 5). The finished worker keeps its claim until the
+     reviewer takes it over, so there is never a window where the
+     row is unclaimed and a fresh worker could start on finished
+     work. Foreign holders never take over.
    - Claimed row plus `resume`, `fix` or restart: proceed only when
      the holder is a managed agent, meaning an id this loop minted
      (recognized by its `drive-` prefix; every other reader still
@@ -173,7 +181,7 @@ Per-candidate gate order, cheapest first:
      read as a managed holder.
    - Claimed row plus `review`: skip while the worker still holds
      the claim. The review is scheduled on a later pass, after the
-     section 5 completion release frees the row.
+     worker finishes and the takeover above schedules it.
 3. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
@@ -327,42 +335,55 @@ it failed to flag for a human.
 
 Finished workers are reconciled before stuck ones. When the row's
 holder has a `finished` registry entry (a `done` file, kept for
-`RETAIN_S`), the worker is complete: the loop releases the claim
-with a logbook line, leaving branch and PR untouched, so a later
-pass can schedule review on the unclaimed PR-ready row. Before
-releasing, the loop captures the worker's agent id (falling back to
-the `finished` registry entry, which carries it for `RETAIN_S`) and
-passes it as the reviewer's `--author`: `review record --author` is
-required and `reviewrecord` refuses author==reviewer, so the
-reviewer start needs the worker id the release just cleared from
-the row. Worker completion releases before any reviewer start and
-long before merge; merge-ready rows stay unclaimed and the loop
-ignores them. A `finished` entry is neither `live` nor `stale` under
-`registry.status`, so it already counts as "no live or stale entry"
-for the section 4 orphan rule; reconciliation runs first, so a
-finished worker always takes this completion path, never the orphan
-one. Completion needs no pull request: the finished entry proves the
+`RETAIN_S`), the worker is complete: the loop keeps the claim until
+the reviewer takes it over, leaving branch and PR untouched. The pass
+captures the worker's agent id (falling back to the `finished`
+registry entry, which carries it for `RETAIN_S`) and passes it as the
+reviewer's `--author`: `review record --author` is required and
+`reviewrecord` refuses author==reviewer, so the reviewer start needs
+the worker id still on the row. The takeover releases the worker
+claim and claims a fresh reviewer id in the same handoff, so there is
+never a window where the row is unclaimed. Worker completion takes
+over before any reviewer start and long before merge; merge-ready rows
+stay claimed by their reviewer until the row is freed for a fix round
+(see below), and the loop otherwise ignores them. A `finished` entry
+is neither `live` nor `stale` under `registry.status`, so a finished
+row left alone long enough (no live unit, claim older than twice
+`registry.gone_s`) still recycles through the section 4 orphan rule;
+the takeover normally schedules the reviewer long before that.
+Completion needs no pull request: the finished entry proves the
 worker's turn ended, so the reviewer is scheduled on the branch
-whether or not a PR was opened. Without any registry entry for the
-holder, a clean exit is indistinguishable from a crash: the claim
-stays held and the stuck handling below applies.
+whether or not a PR was opened. A finished reviewer entry frees its
+row at once: the claim is released (never while its unit is live),
+so a later pass can schedule a fix round on the unclaimed row.
+Without any registry entry for the holder, a clean exit is
+indistinguishable from a crash: the claim stays held and the stuck
+handling below applies, except that a live unit is only ever watched,
+never restarted or released (see below).
 
 Stuck agents: each pass compares claimed tickets against registry
 liveness and unit liveness. Only managed holders ever reach here;
-foreign claims were skipped at gate step 2.
+foreign claims were skipped at gate step 2. A holder with a finished
+entry is not stuck: the claim is kept for the reviewer takeover, so
+a finished worker is never restarted here.
 
 - Heartbeat older than `registry.stale_s` with a live unit: watch once
   more; older than `registry.gone_s` or unit dead: restart (stop the
   unit through the injected stop seam, launch again on the same claim
   and epoch, reusing the identical agent id: `Store.claim` is
   idempotent only for the same agent, and a fresh id on a still-held
-  row gets `Claimed`).
+  row gets `Claimed`). A live unit with no registry entry at all
+  watches too, never restarts: the agent may have just started and
+  not heartbeated yet.
 - Eligibility of restarts: a restart re-checks the row-state subset
   of the section 3 gate before spending any budget. A non-open or
   externally owned row, a held row, a row waiting on a human, or a
   row no project requested this pass is not restarted: the loop
   releases its claim (the epoch is kept, so the next claim fences
-  correctly) and logs why. No budget stamp is written and no give-up
+  correctly) and logs why, except when the ticket has a live unit:
+  a live unit is logged and left to finish, and its claim is never
+  released, whatever the eligibility says (it is stopped only through
+  `corral stop`). No budget stamp is written and no give-up
   is posted. Unreadable hold labels fail closed instead: the claim
   is kept for a later pass.
 - Operator stops: `corral stop` marks the unit's registry entry done,
@@ -466,7 +487,11 @@ is tested through the seam its production code already injects:
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
-| Finished worker releases before review; `finished` takes the completion path, never the orphan one | temp `Store`, fake registry with a `done` entry, linked-PR fixture |
+| Finished worker keeps its claim until the reviewer takes over; `start` and `review` on a finished holder proceed as a takeover | temp `Store`, fake registry with a `done` entry, recording launcher, author==reviewer refusal case |
+| Finished holders skip the stuck sweep; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
+| Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
+| Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
+| Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked and open-pull rows stay withdrawn | pure policy call over fixture rows |
 | Orphan release rule and epoch fencing | temp `Store`, fake registry entries and unit list |
 | Orphan release racing a re-claim: `Claimed` skips with a logbook line | temp `Store`, release with a stale epoch after a second claim |
 | Stale row with failed freshness re-read skips the claim, local bookkeeping continues | fake `Tracker` raising `TrackerError` on the re-read, temp `Store` with an aged row |
@@ -476,7 +501,7 @@ is tested through the seam its production code already injects:
 | Ordering: resume before start, priority, wait time, determinism | pure ordering function over constructed rows |
 | Restart budget counts stop-plus-launch restarts in a sliding 24h window, foreign holders never restart, give-up comments and releases | fake units stop seam, fake registry, temp state dir with budget timestamps |
 | Decision comment and `needs-decision` label through the new seam; a failed write keeps the claim | fake `Tracker` recording `comment`/`add_label` calls, scripted `TrackerError` |
-| Reviewer start carries the pre-release worker id as `--author` | temp `Store`, fake registry with a `done` entry, author==reviewer refusal case |
+| Reviewer start carries the pre-takeover worker id as `--author` | temp `Store`, fake registry with a `done` entry, author==reviewer refusal case |
 | Day cap stops starts, not resumes; pause file stops all | temp state dir with counter and pause files |
 | `--plan` writes nothing | read-only assertion: store and outbox hashes unchanged |
 | Snapshot `drive` section on missing or corrupt journal | temp state dir, section-error shape |

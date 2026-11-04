@@ -1,7 +1,7 @@
 """The drive reviewer and fix-round pass: schedule reviewers, resume or redo fixes.
 
 Reviewers start only for PR-ready rows (a finished worker proves pushed
-work exists to review) with the pre-release worker id passed as the
+work exists to review) with the pre-takeover worker id passed as the
 author; fix rounds resume the holder's session when it is still usable
 and otherwise restart on the same branch; merge-ready rows (reviewed
 since the last work) are ignored. Fakes only: a temporary board store,
@@ -92,17 +92,6 @@ class FinishedHoldersTest(unittest.TestCase):
         self.addCleanup(store.close)
         claimed(store, "app", 7)
         self.assertEqual(drive.finished_holders(store, agent_states=None), {})
-
-    def test_a_missing_state_map_releases_nothing_and_keeps_the_claim(self):
-        store = stored(self.db, [("app", 7, "open")])
-        self.addCleanup(store.close)
-        before = claimed(store, "app", 7)
-        out = io.StringIO()
-        self.assertEqual(drive.release_finished(store, agent_states=None, now=NOW, out=out), 0)
-        self.assertEqual(out.getvalue(), "")
-        after = store.claim_of("app", 7)
-        assert after is not None
-        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
 
     def test_a_transient_lock_on_the_scan_retries_then_reports(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -373,10 +362,10 @@ class ReviewPassTest(unittest.TestCase):
         )
         return code, out.getvalue(), err.getvalue()
 
-    def test_a_reviewer_starts_with_the_released_worker_as_author(self):
+    def test_a_reviewer_takes_over_the_finished_worker_claim_as_author(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        claimed(store, "app", 7)
+        made = claimed(store, "app", 7)
         fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
         launcher = FakeLauncher()
         code, out, _ = self.run_review(
@@ -393,7 +382,13 @@ class ReviewPassTest(unittest.TestCase):
         self.assertEqual(author, WORKER)
         self.assertTrue(agent.startswith(drive.MANAGED_PREFIX))
         self.assertNotEqual(agent, WORKER)
+        self.assertIn("takes over", out)
         self.assertIn("reviewed 1", out.splitlines()[-1])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, agent)
+        self.assertEqual(found.epoch, made.epoch + 1)
 
     def test_a_later_pass_reviews_with_the_finished_entry_as_author(self):
         store = stored(self.db, [("app", 7, "open")])
