@@ -253,6 +253,72 @@ class RepoTracker(NamedTuple):
     tracker: iface.Tracker  # the built tracker
 
 
+class SetupEntry(NamedTuple):
+    """One ``[[repo]]`` entry's plain-data half for ``github setup``.
+
+    The label half needs a tracker and the board half needs a spec;
+    both derive from this, so no caller re-loads settings to recover
+    them. ``board`` is the resolved ``[repo.board]`` table (or None
+    when the entry names none), and ``max_pages`` is the resolved
+    board poll cap. No tracker is built here: setup builds it lazily,
+    per entry, inside its loop.
+    """
+
+    name: str  # the entry name, which the reports print
+    tracker_repo: str  # "owner/name" the adapter talks to
+    operators: list  # the entry's trusted logins
+    variant: str  # "labels" | "board", as resolved
+    board: object  # the resolved board table, or None
+    max_pages: int  # the resolved board poll cap
+
+
+def setup_entry(root, name, *, git) -> SetupEntry:
+    """One entry's plain-data half, resolved the way `production_trackers` does.
+
+    Raises ``ValueError`` when the entry cannot be resolved (unknown
+    name, unusable settings, no tracker repo); the caller counts that
+    as the entry's usage error and continues with the next entry.
+    """
+    from corral import settings, syncli
+
+    entries, problem = syncli.repo_operators(root, [name], git)
+    if problem is not None:
+        raise ValueError(problem)
+    if name not in entries:
+        raise ValueError(f"unknown repo {name!r} (not a [[repo]] entry in {root})")
+    try:
+        resolved = settings.load(root=root, repo=name)
+    except settings.SettingsError as err:
+        raise ValueError(str(err)) from err
+    tracker_repo, operators = entries[name]
+    return SetupEntry(
+        name=name,
+        tracker_repo=tracker_repo,
+        operators=list(operators),
+        variant=str(resolved["tracker.variant"]),
+        board=resolved.board,
+        max_pages=resolved["board.poll_pages"],
+    )
+
+
+def setup_tracker(entry, *, run=None, pacer=None) -> iface.Tracker:
+    """One entry's label-half tracker, built lazily inside the setup loop.
+
+    A labels entry and a board entry with a table go through the one
+    factory exactly as the passes do; a board entry with no table goes
+    through as a labels entry for its label half (labels are repository
+    state and need no board), while its board half goes to the
+    provisioner. An unknown variant raises ``ValueError``.
+    """
+    if entry.variant == "board" and entry.board is None:
+        return build_tracker(
+            variant="labels", board=None, max_pages=entry.max_pages, run=run, pacer=pacer
+        )
+    return build_tracker(
+        variant=entry.variant, board=entry.board, max_pages=entry.max_pages, run=run, pacer=pacer
+    )
+
+
 def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.Tracker:
     """One repo's tracker from validated settings data: the one factory.
 
