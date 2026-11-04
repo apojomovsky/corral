@@ -569,7 +569,7 @@ class HoldLabelWiringTest(unittest.TestCase):
                 mock.patch.object(drive.board, "open_store", return_value=store),
                 mock.patch.object(drive.settings, "load", return_value=host_settings) as loaded,
                 mock.patch.object(drive.projects, "load_all", return_value=[]),
-                mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0)),
+                mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0, {})),
                 mock.patch.object(drive, "production_finished_for", return_value={}),
                 mock.patch.object(drive, "production_agent_roles", return_value={}),
                 mock.patch.object(drive, "production_operators", return_value=({}, None)),

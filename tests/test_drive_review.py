@@ -21,7 +21,8 @@ from corral import board, drive, registry
 from corral.tracker import NEEDS_DECISION
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
-from tests.test_drive_stuck import AGENT, HOST, NOW, OLD, claimed
+from tests.test_drive_stuck import AGENT, HOST, NOW, OLD, UNIT, UNIT_R1, claimed
+from tests.test_drive_stuck import HOLDER, FakeStop
 from tests.test_tracker import FakeTracker, reading
 
 WORKER = AGENT
@@ -92,6 +93,28 @@ class FinishedHoldersTest(unittest.TestCase):
         self.addCleanup(store.close)
         claimed(store, "app", 7)
         self.assertEqual(drive.finished_holders(store, agent_states=None), {})
+
+    def test_a_finished_unit_entry_captures_the_drive_id_holder(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, HOLDER, HOST, now=NOW - 4000.0)
+        holders = drive.finished_holders(
+            store,
+            agent_states={UNIT: (FINISHED, NOW)},
+            agent_tickets={UNIT: ("app", 7)},
+        )
+        self.assertEqual(holders, {("app", 7): HOLDER})
+
+    def test_a_finished_entry_for_another_ticket_captures_nothing(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, HOLDER, HOST, now=NOW - 4000.0)
+        holders = drive.finished_holders(
+            store,
+            agent_states={UNIT: (FINISHED, NOW)},
+            agent_tickets={UNIT: ("app", 8)},
+        )
+        self.assertEqual(holders, {})
 
     def test_a_transient_lock_on_the_scan_retries_then_reports(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -252,6 +275,28 @@ class FixModeTest(unittest.TestCase):
         )
         self.assertEqual(mode, "fresh")
 
+    def test_a_live_unit_entry_resumes_behind_a_drive_id_holder(self):
+        mode = drive.fix_mode(
+            HOLDER,
+            repo="app",
+            number=7,
+            agent_states={UNIT: (registry.LIVE, NOW)},
+            agent_tickets={UNIT: ("app", 7)},
+            live_units=frozenset(),
+        )
+        self.assertEqual(mode, "resume")
+
+    def test_a_finished_unit_entry_without_a_unit_restarts_fresh(self):
+        mode = drive.fix_mode(
+            HOLDER,
+            repo="app",
+            number=7,
+            agent_states={UNIT: (FINISHED, NOW)},
+            agent_tickets={UNIT: ("app", 7)},
+            live_units=frozenset(),
+        )
+        self.assertEqual(mode, "fresh")
+
 
 class ProductionFinishedForTest(unittest.TestCase):
     def setUp(self):
@@ -384,6 +429,44 @@ class ReviewPassTest(unittest.TestCase):
         self.assertNotEqual(agent, WORKER)
         self.assertIn("takes over", out)
         self.assertIn("reviewed 1", out.splitlines()[-1])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, agent)
+        self.assertEqual(found.epoch, made.epoch + 1)
+
+    def test_a_reviewer_takes_over_a_finished_drive_id_claim(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = store.claim("app", 7, HOLDER, HOST, now=OLD)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=1900.0)])
+        launcher = FakeLauncher()
+        stop, restarter = FakeStop(), FakeLauncher()
+        budget = os.path.join(self.tmp.name, "restarts.json")
+        code, out, _ = self.run_review(
+            store,
+            [("blue", [("app", 7, "review")])],
+            fake,
+            launcher,
+            agent_states={UNIT: (FINISHED, NOW - 10.0)},
+            agent_tickets={UNIT: ("app", 7)},
+            finished_for={("app", 7): (UNIT, "")},
+            stop_unit=stop,
+            restarter=restarter,
+            restarts_path=budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        project, repo, number, kind, agent, title, author = launcher.calls[0]
+        self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "review"))
+        self.assertEqual(author, HOLDER)
+        self.assertTrue(agent.startswith(drive.MANAGED_PREFIX))
+        self.assertNotEqual(agent, HOLDER)
+        self.assertIn("takes over", out)
+        self.assertNotIn("restart", out)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(restarter.calls, [])
+        self.assertEqual(drive.load_restarts(budget), {})
         found = store.claim_of("app", 7)
         self.assertIsNotNone(found)
         assert found is not None

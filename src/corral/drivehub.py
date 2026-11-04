@@ -281,7 +281,9 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 return drive.USAGE
             moment = time.time()
             try:
-                planned_states, _ = drive.production_stuck_inputs(registered, now=moment)
+                planned_states, _, planned_tickets = drive.production_stuck_inputs(
+                    registered, now=moment
+                )
                 planned_finished = drive.production_finished_for(now=moment)
                 planned_roles = drive.production_agent_roles(now=moment)
             except settings.SettingsError as problem:
@@ -298,6 +300,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 agent_states=planned_states,
                 finished_for=planned_finished,
                 agent_roles=planned_roles,
+                agent_tickets=planned_tickets,
             )
         try:
             registered = projects.load_all()
@@ -327,7 +330,9 @@ def cmd_drive(args: argparse.Namespace) -> int:
 
         moment = time.time()
         try:
-            stuck_states, stuck_stale = drive.production_stuck_inputs(registered, now=moment)
+            stuck_states, stuck_stale, stuck_tickets = drive.production_stuck_inputs(
+                registered, now=moment
+            )
             finished_for = drive.production_finished_for(now=moment)
             agent_roles = drive.production_agent_roles(now=moment)
         except settings.SettingsError as problem:
@@ -350,6 +355,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             restarts_path=drive.restarts_path(),
             stuck_project=lambda repo, number: drive.production_stuck_project(registered, repo),
             agent_roles=agent_roles,
+            agent_tickets=stuck_tickets,
             finished_for=finished_for,
             journal_path=drive.journal_path(),
             pause_path=drive.pause_path(),

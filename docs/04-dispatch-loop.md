@@ -334,14 +334,25 @@ claim, logs, and retries on a later pass: it never releases a ticket
 it failed to flag for a human.
 
 Finished workers are reconciled before stuck ones. When the row's
-holder has a `finished` registry entry (a `done` file, kept for
+ticket has a `finished` registry entry (a `done` file, kept for
 `RETAIN_S`), the worker is complete: the loop keeps the claim until
 the reviewer takes it over, leaving branch and PR untouched. The pass
 captures the worker's agent id (falling back to the `finished`
 registry entry, which carries it for `RETAIN_S`) and passes it as the
 reviewer's `--author`: `review record --author` is required and
 `reviewrecord` refuses author==reviewer, so the reviewer start needs
-the worker id still on the row. The takeover releases the worker
+the worker id still on the row.
+
+Holder and entry never share an id: the claim holder is an opaque id
+the loop minted (`drive-<hash8>-<n>`), while a registry entry is
+keyed by its unit name (`<prefix>-<repo>-<n>`, `-r<gen>` on
+relaunches). The loop links the two by ticket (repo, number) through
+one resolver: the newest registry entry for the ticket wins by last
+heartbeat, so a relaunch reads past the generation it replaced and a
+reviewer reads past the worker it took over from. The stuck sweep,
+the finished-claims scan and the fix-round readiness all read that
+resolver, never a second copy; keying on the holder id instead would
+match no entry and mistake every finished worker for a crash. The takeover releases the worker
 claim and claims a fresh reviewer id in the same handoff, so there is
 never a window where the row is unclaimed. Worker completion takes
 over before any reviewer start and long before merge; merge-ready rows
@@ -363,8 +374,9 @@ never restarted or released (see below).
 
 Stuck agents: each pass compares claimed tickets against registry
 liveness and unit liveness. Only managed holders ever reach here;
-foreign claims were skipped at gate step 2. A holder with a finished
-entry is not stuck: the claim is kept for the reviewer takeover, so
+foreign claims were skipped at gate step 2. A ticket with a finished
+entry (resolved by ticket, never by holder id) is not stuck: the
+claim is kept for the reviewer takeover, so
 a finished worker is never restarted here.
 
 - Heartbeat older than `registry.stale_s` with a live unit: watch once
