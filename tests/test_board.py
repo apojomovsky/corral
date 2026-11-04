@@ -846,6 +846,52 @@ class PullRequestRowTest(TempStoreTest):
         row, _ = store.item("app", 7, now=2000.0)
         self.assertEqual(row.title, "Title")
 
+    def test_pr_reading_drops_the_claim_and_queued_writes(self):
+        store = self.open()
+        self.seed_legacy_pr(store)
+        store._conn.execute(
+            "INSERT INTO claims(repo, number, agent, host, epoch, claimed_at)"
+            " VALUES(?, ?, ?, ?, ?, ?)",
+            ("app", 9, "agent-1", "host-1", 1, 1500.0),
+        )
+        store._conn.execute(
+            "INSERT INTO outbox(repo, number, field, value, created_at,"
+            " attempts, state, reason) VALUES(?, ?, ?, ?, ?, 0, ?, '')",
+            ("app", 9, "agent", "agent-1", 1500.0, board.QUEUED),
+        )
+        store.upsert_item(
+            reading(number=9, kind="pr", tracker_updated_at=2000.0),
+            operators=["alice"],
+            now=2000.0,
+        )
+        self.assertIsNone(store.claim_of("app", 9))
+        self.assertEqual(
+            [row for row in store.queued_writes() if (row.repo, row.number) == ("app", 9)],
+            [],
+        )
+        dropped = [
+            row
+            for row in store.outbox_rows(state=board.DROPPED)
+            if (row.repo, row.number) == ("app", 9)
+        ]
+        self.assertEqual(len(dropped), 1)
+        self.assertEqual(dropped[0].field, "agent")
+
+    def test_write_entry_points_refuse_a_legacy_pr_row(self):
+        store = self.open()
+        self.seed_legacy_pr(store)
+        with self.assertRaises(board.StoreError):
+            store.claim("app", 9, "agent-1", "host-1", now=2000.0)
+        with self.assertRaises(board.StoreError):
+            store.enqueue("app", 9, "agent", "agent-1", now=2000.0)
+        with self.assertRaises(board.StoreError):
+            store.refresh_claim("app", 9, "agent-1", 1, now=2000.0)
+        with self.assertRaises(board.StoreError):
+            store.release("app", 9, "agent-1", 1, now=2000.0)
+        with self.assertRaises(board.StoreError):
+            store.mark_absent("app", 9, now=2000.0)
+        self.assertFalse(store.adopt_claim("app", 9, "agent-1", epoch=2000, now=2000.0))
+
 
 if __name__ == "__main__":
     unittest.main()
