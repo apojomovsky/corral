@@ -224,6 +224,12 @@ class EffectiveSpecTests(unittest.TestCase):
         self.assertEqual(area.options, ("Mobile",))
         self.assertFalse(area.keep_only)
 
+    def test_bare_string_options_are_refused_not_split(self):
+        with self.assertRaises(ValueError):
+            spec_for(table(), areas="Mobile")
+        with self.assertRaises(ValueError):
+            spec_for(table(), pools="Core")
+
 
 class PlanBoardTests(unittest.TestCase):
     def test_empty_board_creates_every_mapped_field(self):

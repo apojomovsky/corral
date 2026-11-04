@@ -12,7 +12,7 @@ from typing import NamedTuple
 
 from corral import tracker as iface
 from corral.github import gh
-from corral.github.board import BoardReader, BoardSchema, BoardTracker
+from corral.github.board import BoardReader, BoardSchema, BoardTracker, GithubBoardProvisioner
 from corral.github.gh import paced_run
 from corral.github.tracker import GithubTracker
 
@@ -284,6 +284,17 @@ def board_schema_for(board_config, *, run, pacer=None) -> BoardSchema:
     the schema is read. Tests pass a fake; production passes the raw runner.
     """
     return BoardReader(board_config, run, pacer=pacer).schema()
+
+
+def production_board_provisioner(*, run=None, pacer=None) -> GithubBoardProvisioner:
+    """The one production wiring for board provisioning, beside ``production_trackers``.
+
+    The provisioner needs no ``BoardConfig`` (it runs in the bootstrap
+    states where no board tracker can exist yet), so this wires only the
+    runner and the pacer, the same way ``build_tracker`` wires board
+    mode. Tests pass fakes; production takes the defaults.
+    """
+    return GithubBoardProvisioner(gh.run if run is None else run, pacer=pacer)
 
 
 def production_trackers(root, names, *, git) -> tuple[dict[str, RepoTracker], str | None]:
