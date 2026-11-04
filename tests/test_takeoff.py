@@ -939,7 +939,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertIn("corral.takeoff", settings.PROVIDERS)
 
     def test_each_policy_check_names_its_flag_skip(self):
-        for name in ("commits", "em-dash", "body", "leak", "review", "checks"):
+        for name in takeoff.SKIPPABLE_CHECKS:
             with self.subTest(skip=name):
                 result = self.gate(skips=[name])
                 found = [c for c in result.checks if c.name == name][0]
@@ -1263,6 +1263,23 @@ class TakeoffCliCase(unittest.TestCase):
             code = args.func(args)
         self.assertEqual(code, 4)
         self.assertIn("base", err.getvalue())
+
+    def test_skip_help_names_every_skippable_check(self):
+        from corral import takeoffcli
+        import argparse
+
+        parser = argparse.ArgumentParser(prog="corral")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        takeoff_parser = sub.choices["takeoff"]
+        skip_help = ""
+        for action in takeoff_parser._actions:
+            if "--skip" in action.option_strings:
+                skip_help = action.help or ""
+        self.assertTrue(skip_help, "the takeoff parser has no --skip flag")
+        for name in takeoff.SKIPPABLE_CHECKS:
+            with self.subTest(skip=name):
+                self.assertIn(name, skip_help)
 
 
 class NoEmDashInCodeCase(unittest.TestCase):
