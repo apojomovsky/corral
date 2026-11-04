@@ -1306,6 +1306,7 @@ def _pass(
     finished_for=None,
     agent_roles=None,
     agent_tickets=None,
+    live_units=None,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
@@ -1315,7 +1316,11 @@ def _pass(
     `agent_states`, `agent_tickets`, `finished_for` and `agent_roles`
     feed the reviewer and fix-round readiness exactly like the claiming
     pass, so the plan shows the verdicts the real pass would print;
-    all are reads only.
+    all are reads only. `live_units` filters the finished-reviewer
+    simulation the same way the claiming pass filters its release, so
+    a live unit's row gates as still claimed here too; without it every
+    finished reviewer row simulates as released. The production CLI
+    supplies the host units.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1344,6 +1349,7 @@ def _pass(
         quota_for,
         pool,
     ) = ctx
+    plan_live = frozenset(live_units or ())
     authors = _capture_finished_holders(
         store, agent_states=agent_states, agent_tickets=agent_tickets, err=err
     )
@@ -1362,7 +1368,7 @@ def _pass(
         ledger_data=ledger_data,
         read_labels=read_labels,
         hold_label=hold_label,
-        released=reviewed_claims(authors, finished),
+        released=reviewed_claims(authors, finished, live_units=plan_live),
         finished=finished,
         agent_roles=agent_roles,
         agent_states=agent_states,
@@ -1950,7 +1956,7 @@ def _finished_claims(store, agent_states, agent_tickets=None):
     return _retry_scan(scan)
 
 
-def reviewed_claims(authors, finished) -> dict:
+def reviewed_claims(authors, finished, live_units=None) -> dict:
     """{(repo, number): agent} finished holders a reviewer already reviewed. Pure.
 
     `authors` is this pass's {(repo, number): worker id} capture and
@@ -1958,11 +1964,17 @@ def reviewed_claims(authors, finished) -> dict:
     current holder matches a finished reviewer entry is merge-ready, so
     its row is free for a fix round. A finished worker entry (or an
     unknown role, which reads as unreviewed work) keeps the claim for
-    the reviewer takeover instead. Missing maps read as nothing
-    reviewed.
+    the reviewer takeover instead. Tickets in `live_units` are never
+    freed: the real pass keeps a live unit's claim whatever the
+    registry says, and the plan pass filters the same way so both
+    passes gate those rows as still claimed. Missing maps read as
+    nothing reviewed.
     """
+    live = live_units if live_units is not None else frozenset()
     found = {}
     for ticket, agent in (authors or {}).items():
+        if ticket in live:
+            continue
         newest = (finished or {}).get(ticket)
         if newest is not None and newest[0] == agent and newest[1] == "reviewer":
             found[ticket] = agent
@@ -2255,11 +2267,12 @@ def handle_stuck(
     claim fences correctly), except unreadable labels, which fail
     closed with the claim kept, and except rows with a live unit, which
     keep their claim with a logbook line whatever the eligibility says.
-    A ticket with a finished registry entry is not stuck: the claim is
-    kept for the reviewer takeover, so a finished worker is never
-    restarted. The entry comes from `entry_for_claim` (by ticket, with
-    `agent_tickets`): the holder id never names an entry. In hub mode
-    `hub_epoch_of` maps
+    A ticket with a finished registry entry (from `entry_for_claim`,
+    by ticket with `agent_tickets`, never by holder id) is never
+    restarted: the claim is kept for the reviewer takeover. Finished
+    rows still enter the sweep, so a withdrawn or held finished row
+    with a dead unit releases through the eligibility re-check above.
+    In hub mode `hub_epoch_of` maps
     (repo, number) to the hub row's fencing epoch (None when the hub
     shows no row); a local epoch the hub superseded skips instead of
     restarting, and an unreadable hub epoch skips without stopping, so
@@ -2276,8 +2289,9 @@ def handle_stuck(
     budget allows it the row
     restarts (stop through the stop seam, launch again on the same
     claim and epoch reusing the identical agent id); past the budget
-    the loop posts through the decision-write seam, then releases.
-    `tracker_factory` maps a tracker repo to its tracker (labels or
+    the loop posts through the decision-write seam, then releases,
+    except rows with a live unit, which keep their claim with a
+    logbook line. `tracker_factory` maps a tracker repo to its tracker (labels or
     board, built by the one factory): the give-up decision writes use
     the tracker the factory returns for the claim's repo. With no
     factory, or for a repo the factory does not know, the give-up is
@@ -2377,6 +2391,9 @@ def handle_stuck(
         key = f"{claim.repo}#{claim.number}"
         stamps = budgets.get(key, [])
         if not restart_allowed(stamps, now=now):
+            if (claim.repo, claim.number) in live:
+                print(f"{ref}: past the restart budget, live unit, claim kept", file=out)
+                continue
             tracker = None
             if tracker_factory is not None:
                 try:
@@ -4168,7 +4185,10 @@ def run_pass(
     `present_agents` (ids with a live or stale registry entry),
     `live_units` ((repo, number) pairs with a live unit) and `gone_s`
     feed orphan recovery; `gone_s=None` reads all three from the host
-    instead. The stuck sweep runs only when `agent_states` (ids to
+    instead. The plan pass filters its finished-reviewer simulation
+    by `live_units` exactly like the claiming pass filters its
+    release; the production CLI supplies the host units. The stuck
+    sweep runs only when `agent_states` (ids to
     (state, last_seen)) is given: `stale_s` bounds its heartbeats,
     `stop_unit(repo, number)` stops a ticket, the restarter (or
     `launcher` when None) relaunches it, `restarts_path` persists the
@@ -4230,6 +4250,7 @@ def run_pass(
             finished_for=finished_for,
             agent_roles=agent_roles,
             agent_tickets=agent_tickets,
+            live_units=live_units,
             **args,
         )
     try:

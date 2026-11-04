@@ -221,6 +221,22 @@ class ReviewedClaimsTest(unittest.TestCase):
         self.assertEqual(drive.reviewed_claims(None, None), {})
         self.assertEqual(drive.reviewed_claims({}, {}), {})
 
+    def test_a_live_unit_is_not_freed_for_a_fix_round(self):
+        authors = {("app", 7): AGENT}
+        finished = {("app", 7): (AGENT, "reviewer")}
+        self.assertEqual(
+            drive.reviewed_claims(authors, finished, live_units=frozenset({("app", 7)})),
+            {},
+        )
+
+    def test_a_dead_unit_still_frees_a_finished_reviewer(self):
+        authors = {("app", 7): AGENT}
+        finished = {("app", 7): (AGENT, "reviewer")}
+        self.assertEqual(
+            drive.reviewed_claims(authors, finished, live_units=frozenset()),
+            {("app", 7): AGENT},
+        )
+
 
 class ReleaseReviewedTest(unittest.TestCase):
     def setUp(self):
@@ -372,6 +388,76 @@ class ReleaseReviewedTest(unittest.TestCase):
         self.assertIsNotNone(found)
         assert found is not None
         self.assertEqual(found.agent, AGENT)
+
+
+class LiveUnitAgreementTest(unittest.TestCase):
+    """Plan and give-up agree with the real pass on live units. Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-live-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_plan_and_real_agree_on_a_live_finished_reviewer_row(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        claimed(store, "app", 7)
+        kwargs = {
+            **wants(self.policies, ("app", 7)),
+            "agent_states": {AGENT: (registry.FINISHED, OLD + 10.0)},
+            "finished_for": {("app", 7): (AGENT, "reviewer")},
+            "live_units": frozenset({("app", 7)}),
+            "fake_tracker": FakeTracker([reading(repo="app", number=7, updated_at=19000.0)]),
+        }
+        plan_out, plan_err = io.StringIO(), io.StringIO()
+        plan_code = stuck_pass(store, self.lock, plan_out, plan_err, plan=True, **kwargs)
+        real_out, real_err = io.StringIO(), io.StringIO()
+        real_code = stuck_pass(
+            store, self.lock, real_out, real_err, restarts_path=self.budget, **kwargs
+        )
+        self.assertEqual(plan_code, 0)
+        self.assertEqual(real_code, 0)
+        self.assertIn("already claimed", plan_out.getvalue())
+        self.assertIn("already claimed", real_out.getvalue())
+        self.assertIsNotNone(store.claim_of("app", 7))
+
+    def test_a_live_unit_past_the_budget_keeps_its_claim_without_a_decision_write(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        drive.save_restarts(self.budget, {"app#7": [NOW - 100.0, NOW - 200.0, NOW - 300.0]})
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=19000.0)])
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            **wants(self.policies, ("app", 7)),
+            agent_states={AGENT: (registry.STALE, OLD)},
+            live_units=frozenset({("app", 7)}),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+            fake_tracker=fake,
+        )
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("live unit", text)
+        self.assertIn("claim kept", text)
+        self.assertNotIn("gave up", text)
+        self.assertEqual([call for call in fake.calls if call[0] in ("comment", "add_label")], [])
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
 
 class RestartPassTest(unittest.TestCase):

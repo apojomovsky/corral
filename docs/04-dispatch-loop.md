@@ -377,9 +377,11 @@ never restarted or released (see below).
 Stuck agents: each pass compares claimed tickets against registry
 liveness and unit liveness. Only managed holders ever reach here;
 foreign claims were skipped at gate step 2. A ticket with a finished
-entry (resolved by ticket, never by holder id) is not stuck: the
-claim is kept for the reviewer takeover, so
-a finished worker is never restarted here.
+entry (resolved by ticket through the one resolver, never by holder
+id) is never restarted here: the claim is kept for the reviewer
+takeover. Finished rows still enter the sweep, so a withdrawn or
+held finished row with a dead unit releases through the eligibility
+re-check below.
 
 - Heartbeat older than `registry.stale_s` with a live unit: watch once
   more; older than `registry.gone_s` or unit dead: restart (stop the
@@ -421,7 +423,9 @@ a finished worker is never restarted here.
   tail of what was observed with `Tracker.comment`, add
   `needs-decision` with `Tracker.add_label` (the decision-write seam
   above; the outbox carries neither), then release the claim. A
-  failed decision write keeps the claim for a later pass.
+  ticket with a live unit keeps its claim instead, whatever the
+  eligibility says. A failed decision write keeps the claim for a
+  later pass.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 
@@ -502,7 +506,7 @@ is tested through the seam its production code already injects:
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
 | Finished worker keeps its claim until the reviewer takes over; `start` and `review` on a finished holder proceed as a takeover | temp `Store`, fake registry with a `done` entry, recording launcher, author==reviewer refusal case |
-| Finished holders skip the stuck sweep; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
+| Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
 | Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked and open-pull rows stay withdrawn | pure policy call over fixture rows |
