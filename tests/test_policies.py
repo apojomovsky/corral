@@ -5,6 +5,7 @@ subprocess, or a real state dir. The purity test fails when the policy
 module touches the clock, the environment, or the settings layer.
 """
 
+import ast
 import inspect
 import os
 import sys
@@ -58,8 +59,39 @@ class SelectionTest(unittest.TestCase):
     def test_external_ticket_is_skipped(self):
         self.assertEqual(selected([row(7, external=True)]), [])
 
-    def test_claimed_ticket_is_skipped(self):
-        self.assertEqual(selected([row(7, agent="drive-host-1--app-7")]), [])
+    def test_claimed_ticket_is_requested_as_start(self):
+        self.assertEqual(
+            selected([row(7, agent="drive-host-1--app-7")]),
+            [("app", 7)],
+        )
+
+    def test_claimed_ticket_request_kind_is_start(self):
+        (request,) = policies.basic([row(7, agent="drive-host-1--app-7")], now=1000.0)
+        self.assertEqual(request.kind, "start")
+
+    def test_claimed_ticket_with_a_hold_label_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("hold",))]), [])
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("needs-decision",))]), [])
+
+    def test_claimed_ticket_with_a_hold_word_in_title_is_skipped(self):
+        self.assertEqual(
+            selected([row(7, agent="drive-x", title="Widget 7: cutover (HOLD for approval)")]),
+            [],
+        )
+
+    def test_closed_claimed_ticket_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", state="closed")]), [])
+
+    def test_external_claimed_ticket_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", external=True)]), [])
+
+    def test_blocked_claimed_ticket_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", extra={"blocked_by": "app#3"})]), [])
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("blocked",))]), [])
+
+    def test_claimed_ticket_with_an_open_linked_pull_is_skipped(self):
+        pull = eligibility.LinkedPull(number=11, state="open")
+        self.assertEqual(selected([row(7, agent="drive-x", pulls=(pull,))]), [])
 
     def test_hold_label_is_skipped(self):
         self.assertEqual(selected([row(7, labels=("hold",))]), [])
@@ -114,8 +146,9 @@ class SelectionTest(unittest.TestCase):
             row(4, labels=("hold",)),
             row(5, extra={"blocked_by": "app#1"}),
             row(6),
+            row(8, agent="drive-host-1--app-8", labels=("hold",)),
         ]
-        self.assertEqual(selected(rows), [("app", 1), ("app", 6)])
+        self.assertEqual(selected(rows), [("app", 1), ("app", 3), ("app", 6)])
 
 
 class WeightsTest(unittest.TestCase):
@@ -201,6 +234,40 @@ class PurityTest(unittest.TestCase):
             "clock",
         ):
             self.assertNotIn(token, source)
+
+
+class ConstantsTest(unittest.TestCase):
+    def test_hold_labels_match_tracker_needs_decision(self):
+        self.assertEqual(
+            policies.HOLD_LABELS,
+            ("hold", tracker.NEEDS_DECISION, "needs-triage"),
+        )
+
+    def test_hold_labels_reference_tracker_constant(self):
+        source = inspect.getsource(policies)
+        self.assertIn("tracker.NEEDS_DECISION", source)
+
+    def test_constants_have_docstrings(self):
+        source = inspect.getsource(policies)
+        tree = ast.parse(source)
+        names = ("HOLD_LABELS", "HOLD_TITLE_WORD")
+        for index, node in enumerate(tree.body):
+            if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id in names for target in node.targets
+            ):
+                follower = tree.body[index + 1]
+                assert isinstance(follower, ast.Expr)
+                value = follower.value
+                assert isinstance(value, ast.Constant)
+                assert isinstance(value.value, str)
+                self.assertTrue(value.value.strip())
+                names = tuple(
+                    name
+                    for name in names
+                    if name
+                    not in (target.id for target in node.targets if isinstance(target, ast.Name))
+                )
+        self.assertEqual(names, ())
 
 
 class ResolveTest(unittest.TestCase):

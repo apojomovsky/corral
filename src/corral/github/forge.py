@@ -62,6 +62,37 @@ def _sha(value, field):
     return value
 
 
+#: The provider states where the head is not green but no action can
+#: turn it green by waiting: the merge gate refuses until the branch
+#: is updated, reviewed, or fixed. Only ``clean`` reads as passing and
+#: only ``unknown`` (the provider has not finished computing) reads as
+#: pending; anything unnamed is a ``ForgeError``, never a guess.
+_FAILING_MERGEABLE = frozenset({"blocked", "behind", "unstable", "dirty", "draft", "has_hooks"})
+
+
+def _checks_state(payload, number):
+    """``"passing"`` | ``"failing"`` | ``"pending"`` for a PR object."""
+    raw = payload.get("mergeable_state")
+    if raw == "clean":
+        return "passing"
+    if raw == "unknown":
+        return "pending"
+    if isinstance(raw, str) and raw in _FAILING_MERGEABLE:
+        return "failing"
+    raise _shape(f"PR {number} has an unusable checks state {raw!r}")
+
+
+def _merge_sha(payload, number, state):
+    """The merge commit SHA once merged, else ``None``.
+
+    An open PR may carry a preview merge commit; only a merged PR
+    reports the SHA the verify step ties to the pinned head.
+    """
+    if state != forge.MERGED:
+        return None
+    return _sha(payload.get("merge_commit_sha"), f"PR {number} merge sha")
+
+
 def _parse_pull(payload, number):
     """A single-PR response to a ``PullRequest``. Raises ``ForgeError``
     on anything that is not the expected shape, never a guess."""
@@ -106,10 +137,11 @@ def _parse_pull(payload, number):
         raise _shape(f"PR {number} has no base ref")
     if not isinstance(head.get("ref"), str) or not head["ref"]:
         raise _shape(f"PR {number} has no head ref")
+    state = _pr_state(payload)
     return forge.PullRequest(
         repo=base_name,
         number=number,
-        state=_pr_state(payload),
+        state=state,
         base_ref=base["ref"],
         base_sha=_sha(base.get("sha"), "base sha"),
         head_ref=head["ref"],
@@ -117,6 +149,8 @@ def _parse_pull(payload, number):
         author=author,
         from_fork=head_name is None or head_name != base_name,
         labels=tuple(names),
+        checks_state=_checks_state(payload, number),
+        merge_sha=_merge_sha(payload, number, state),
     )
 
 
@@ -163,6 +197,20 @@ def _is_not_found(err):
 def _is_already_exists(err):
     """Whether a failed `gh repo create` lost a race to an existing repo."""
     return "already exists" in str(err).lower()
+
+
+#: The merge endpoint's refusal answers. The provider documents 405 (the
+#: merge cannot be performed: the PR was merged or closed, or a rule
+#: blocks it) and 409 (a sha was sent and the head no longer matches)
+#: for ``PUT pulls/{n}/merge``. Anything else (a dead connection, a 403,
+#: a 404, a 422) reads as unreachable, never as a refusal. The status
+#: matches inside its parentheses, so a port number never reads as one.
+_MERGE_REFUSED_RE = re.compile(r"\(HTTP (405|409)\)", re.IGNORECASE)
+
+
+def _is_merge_refused(err):
+    """Whether a failed merge PUT is a provider refusal (else unreachable)."""
+    return _MERGE_REFUSED_RE.search(str(err)) is not None
 
 
 class GithubForge:
@@ -267,6 +315,55 @@ class GithubForge:
         except Exception as err:
             raise forge.ForgeError(f"unusable answer for PR {number}: {err}") from err
         return _parse_pull(payload, number)
+
+    def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
+        """Squash-merge PR ``number`` pinned to ``head_sha``.
+
+        The pin travels in the merge call itself, so the provider
+        merges exactly the approved head or nothing. The fresh
+        post-merge read must report ``merged`` with the reported merge
+        SHA tied to that head; anything else fails closed because the
+        merge happened but is unverified. A PR that is not open at the
+        pinned head is ``ForgeRefused``, never merged.
+        """
+        if method != "squash":
+            raise forge.ForgeError(f"unsupported merge method {method!r}")
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        _sha(head_sha, "head sha")
+        current = self.pull_request(repo, number)
+        if current.state != forge.OPEN:
+            raise forge.ForgeRefused(f"PR {number} is {current.state}, nothing to merge")
+        if current.head_sha != head_sha:
+            raise forge.ForgeRefused(f"PR {number} head moved: want {head_sha}")
+        try:
+            raw = self._run(
+                [
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"repos/{repo}/pulls/{number}/merge",
+                    "-f",
+                    "merge_method=squash",
+                    "-f",
+                    f"sha={head_sha}",
+                ]
+            )
+        except Exception as err:
+            if _is_merge_refused(err):
+                raise forge.ForgeRefused(f"PR {number} merge refused: {err}") from err
+            raise forge.ForgeError(f"forge unreachable during merge of PR {number}: {err}") from err
+        try:
+            payload = json.loads(raw)
+        except Exception as err:
+            raise forge.ForgeError(f"unusable merge answer for PR {number}: {err}") from err
+        if not isinstance(payload, dict) or payload.get("merged") is not True:
+            raise _shape(f"PR {number} merge was not accepted")
+        reported = _sha(payload.get("sha"), f"PR {number} merge sha")
+        verified = self.pull_request(repo, number)
+        if verified.state != forge.MERGED or verified.merge_sha != reported:
+            raise forge.ForgeError(f"PR {number} merge unverified: want {reported}")
+        return reported
 
     def pr_index(self, repo: str) -> dict[str, str]:
         """``{head branch: state}`` for every PR ever opened on ``repo``.

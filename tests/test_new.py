@@ -1155,6 +1155,25 @@ class LabelBootstrap(unittest.TestCase):
         self.assertIn("next: corral github setup", out)
         self.assertNotIn("next: corral doctor", out)
 
+    def test_rejected_labels_are_exit_1_with_only_the_reason_line(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+        tracker = FakeTracker(
+            ensure_error=tracker_iface.TrackerRejected(
+                "tracker rejected: Validation Failed (HTTP 422)"
+            )
+        )
+        code, out, _ = run_new(
+            path=self.parent, git=git, forge=forge, tracker=tracker, create_remote=True
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(len(forge.created), 1)
+        self.assertIn(f"labels on operator/{FIXTURE} not bootstrapped", out)
+        self.assertIn("tracker rejected", out)
+        self.assertEqual(out.count("not bootstrapped"), 1)
+        self.assertIn("next: corral github setup", out)
+        self.assertNotIn("next: corral doctor", out)
+
     def test_adopted_remotes_bootstrap_too(self):
         git = FakeGit(root=self.parent)
         forge = FakeForge(

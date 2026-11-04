@@ -95,7 +95,10 @@ def _format_event_row(event):
     reads as an empty field.
     """
     evidence = " ".join(str(event.get("evidence") or "").split())
-    return f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
+    row_id = event.get("id") or ""
+    kind = event.get("kind") or ""
+    ref = event.get("ref") or ""
+    return f"{row_id} {kind} {ref} {evidence}".rstrip()
 
 
 def cmd_coord(args: argparse.Namespace) -> int:
@@ -257,13 +260,45 @@ def cmd_coord(args: argparse.Namespace) -> int:
     if verb == "events":
         from corral import coordevents as events
 
+        if args.timeout is not None:
+            _err("events takes no --timeout (timeouts belong to coord wait)")
+            return USAGE
+        name = os.path.basename(root)
+        if args.follow:
+            try:
+                for row in events.follow_events(root=root, include_resolved=args.all):
+                    if args.json:
+                        print(
+                            json.dumps(
+                                {
+                                    "schema_version": events.SCHEMA_VERSION,
+                                    "project": name,
+                                    "events": [row],
+                                },
+                                sort_keys=True,
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        print(_format_event_row(row), flush=True)
+            except KeyboardInterrupt:
+                pass
+            except BrokenPipeError:
+                # The reader went away (`--follow | head -n 1`): a clean
+                # stop, not a failure. Point stdout at devnull so the
+                # interpreter's flush at exit stays silent too.
+                try:
+                    sys.stdout = open(os.devnull, "w")
+                except OSError:
+                    pass
+            return OK
         rows = events.list_events(root=root, include_resolved=args.all)
         if args.json:
             print(
                 json.dumps(
                     {
                         "schema_version": events.SCHEMA_VERSION,
-                        "project": os.path.basename(root),
+                        "project": name,
                         "events": rows,
                     },
                     indent=2,
@@ -348,7 +383,13 @@ def add_parser(sub) -> None:
         "events", parents=[project], help="list coordinator events (unresolved unless --all)"
     )
     p.add_argument("--all", action="store_true", help="include resolved rows")
+    p.add_argument(
+        "--follow",
+        action="store_true",
+        help="print the current selection, then new arrivals until killed",
+    )
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--timeout", default=None, help="rejected: timeouts belong to coord wait")
     p = verbs.add_parser("ack", parents=[project], help="resolve one coordinator event")
     p.add_argument("event_id", help="event id from wait")
     coord.set_defaults(func=cmd_coord)

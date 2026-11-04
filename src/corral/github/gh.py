@@ -66,11 +66,18 @@ _GRAPHQL_RES = (_anchored("graphql"), _anchored("rate_limited"))
 
 
 class GhError(Exception):
-    """A `gh` invocation failed. `kind` classifies it for the caller's exit code."""
+    """A `gh` invocation failed. `kind` classifies it for the caller's exit code.
 
-    def __init__(self, kind: str, message: str):
+    `output` carries whatever the child printed to stdout before failing:
+    `gh api graphql` prints the response body there even when GraphQL
+    `errors` entries make it exit non-zero, so an adapter that decides
+    from the body reads it here instead of losing it to the raise.
+    """
+
+    def __init__(self, kind: str, message: str, output: str = ""):
         super().__init__(message)
         self.kind = kind
+        self.output = output
 
 
 def is_rate_limited(text: str | None) -> bool:
@@ -201,7 +208,7 @@ def run(args: list[str], timeout: float | None = GH_TIMEOUT_S, paced: bool = Fal
             _active_procs.discard(proc)
     if proc.returncode != 0:
         err = (stderr or "").strip()
-        raise GhError(_classify(err), err or f"gh exited {proc.returncode}")
+        raise GhError(_classify(err), err or f"gh exited {proc.returncode}", output=stdout or "")
     return stdout
 
 
@@ -456,6 +463,53 @@ def _pacer() -> GraphqlPacer:
     return GraphqlPacer(pacing_path())
 
 
+def _variable_flags(key: str, value) -> list[str]:
+    """One variable as `-f`/`-F` flags, expanding composite values.
+
+    Scalars keep the established rule (`-F` for typed int and bool
+    values, `-f` for strings). A list expands to one bracketed flag per
+    entry (`key[]=v` for scalars, `key[][sub]=v` for the entries of a
+    dict, in order), which is how `gh` groups object lists; a dict
+    expands to `key[sub]=v`. An empty list expands to nothing. Deeper
+    nesting JSON-encodes the leaf.
+    """
+    if isinstance(value, dict):
+        flags: list[str] = []
+        for sub, leaf in value.items():
+            flags += _variable_flags(f"{key}[{sub}]", leaf)
+        return flags
+    if isinstance(value, (list, tuple)):
+        flags = []
+        for entry in value:
+            if isinstance(entry, dict):
+                for sub, leaf in entry.items():
+                    flags += _variable_flags(f"{key}[][{sub}]", leaf)
+            else:
+                flags += _variable_flags(f"{key}[]", entry)
+        return flags
+    if isinstance(value, bool):
+        return ["-F", f"{key}={json.dumps(value)}"]
+    if isinstance(value, int):
+        return ["-F", f"{key}={value}"]
+    if isinstance(value, (str, float)) or value is None:
+        return ["-f", f"{key}={value}"]
+    return ["-f", f"{key}={json.dumps(value)}"]
+
+
+def graphql_args(query: str, variables: dict) -> list[str]:
+    """`gh api graphql` arguments for one query and its variables.
+
+    The one builder for GraphQL arguments: `graphql` sends these, and
+    callers that must read the response body themselves (a body that
+    carries GraphQL `errors` beside partial `data`, which `graphql`
+    refuses to return) build the same arguments for the raw `run` seam.
+    """
+    args = ["api", "graphql", "-f", f"query={query}"]
+    for key, value in variables.items():
+        args += _variable_flags(key, value)
+    return args
+
+
 def graphql(query: str, run=None, pacer=None, **variables) -> dict:
     """Run a GraphQL query and return its `data` payload, paced by the
     machine-wide bucket. A mutation costs GRAPHQL_MUTATION_COST, a
@@ -465,18 +519,14 @@ def graphql(query: str, run=None, pacer=None, **variables) -> dict:
     ones: `run(args, paced=True)` runs `gh`, and the pacer meters the
     shared bucket. Their names are reserved for these seams and are
     never sent as variables: every other keyword becomes a `-f`/`-F`
-    variable, so a query needing variables named `run` or `pacer`
-    cannot go through this function as written."""
+    variable (lists and dicts expand to bracketed flags, so option
+    lists ride along), and a query needing variables named `run` or
+    `pacer` cannot go through this function as written."""
     active_pacer = _pacer() if pacer is None else pacer
     # The parameter shadows the module's `run`: fall back to it by name,
     # so tests patching the module attribute still steer the default.
     active_run = globals()["run"] if run is None else run
-    args = ["api", "graphql", "-f", f"query={query}"]
-    for key, value in variables.items():
-        # gh needs -F for typed (int, bool) values and -f for strings.
-        flag = "-F" if isinstance(value, (int, bool)) else "-f"
-        value_str = json.dumps(value) if isinstance(value, bool) else value
-        args += [flag, f"{key}={value_str}"]
+    args = graphql_args(query, variables)
     cost = GRAPHQL_MUTATION_COST if re.search(r"\bmutation\b", query) else GRAPHQL_CALL_COST
     active_pacer.acquire(cost=cost)
     try:
