@@ -487,10 +487,16 @@ def _bootstrap_labels(repo, tracker):
 
     Returns `(changed, refused)`, or None when the tracker is
     unreachable: the manual `github setup` command is printed as the
-    next step, and the caller exits 3.
+    next step, and the caller exits 3. A validation rejection (a 422
+    the tracker answered) is refused, not unreachable: only the reason
+    line is printed here and `(False, True)` is returned, so the caller
+    takes its refused branch with the same next step (exit 1).
     """
     try:
         report = tracker.ensure_labels(repo)
+    except tracker_iface.TrackerRejected as err:
+        sys.stdout.write(f"labels on {repo} not bootstrapped: {err}\n")
+        return False, True
     except tracker_iface.TrackerError as err:
         sys.stdout.write(f"labels on {repo} not bootstrapped: {err}\n")
         sys.stdout.write("next: corral github setup\n")
