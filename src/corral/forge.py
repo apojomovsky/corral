@@ -35,6 +35,18 @@ class ForgeExists(ForgeError):
     exit_code = 2
 
 
+class ForgeRefused(ForgeError):
+    """The forge answered fine but refused the operation.
+
+    A refused merge (a closed PR, a moved head) is a gate saying no,
+    not an unreachable remote. A subclass of ``ForgeError`` so callers
+    that do not handle the refusal still fail closed. Exit code 1
+    through the CLI: nothing to do or a gate said no.
+    """
+
+    exit_code = 1
+
+
 class PullRequest(NamedTuple):
     repo: str  # "owner/name" as the forge names it
     number: int
@@ -46,6 +58,8 @@ class PullRequest(NamedTuple):
     author: str
     from_fork: bool
     labels: tuple[str, ...]
+    checks_state: str  # "passing" | "failing" | "pending" on the head SHA
+    merge_sha: str | None  # the merge commit once merged, else None
 
 
 class Forge(Protocol):
@@ -107,4 +121,15 @@ class Forge(Protocol):
         head branch name, valued ``"open"`` | ``"merged"`` | ``"closed"``.
         Raises ``ForgeError`` when the forge is unreachable or answers
         something unusable."""
+        ...
+
+    def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
+        """Squash-merge PR ``number`` and return the merge commit SHA.
+
+        Refuses with ``ForgeRefused`` unless the PR is open at
+        ``head_sha``. Raises ``ForgeError`` when the forge is unreachable
+        or answers something unusable. Only the adapters call ``gh`` or
+        know provider shapes. ``method`` takes one value today,
+        ``"squash"``.
+        """
         ...
