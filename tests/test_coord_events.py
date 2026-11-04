@@ -961,6 +961,22 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertEqual(events_code, cli.OK)
         self.assertEqual(wait_out, events_out)
 
+    def test_row_format_missing_keys_read_as_empty_fields(self):
+        self.assertEqual(coordcli._format_event_row({}), "")
+        self.assertEqual(
+            coordcli._format_event_row({"kind": "supply", "ref": "fleet", "evidence": "ok"}),
+            " supply fleet ok",
+        )
+        self.assertEqual(
+            coordcli._format_event_row({"id": "aaaabbbb", "ref": "fleet", "evidence": "ok"}),
+            "aaaabbbb  fleet ok",
+        )
+        self.assertEqual(
+            coordcli._format_event_row({"id": "aaaabbbb", "kind": "supply", "evidence": "ok"}),
+            "aaaabbbb supply  ok",
+        )
+        self.assertNotIn("None", coordcli._format_event_row({}))
+
     def test_events_all_json_carries_open_and_resolved(self):
         from corral import coordevents as live
 

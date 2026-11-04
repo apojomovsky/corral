@@ -95,7 +95,10 @@ def _format_event_row(event):
     reads as an empty field.
     """
     evidence = " ".join(str(event.get("evidence") or "").split())
-    return f"{event.get('id')} {event.get('kind')} {event.get('ref')} {evidence}".rstrip()
+    row_id = event.get("id") or ""
+    kind = event.get("kind") or ""
+    ref = event.get("ref") or ""
+    return f"{row_id} {kind} {ref} {evidence}".rstrip()
 
 
 def cmd_coord(args: argparse.Namespace) -> int:
