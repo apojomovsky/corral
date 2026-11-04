@@ -1482,6 +1482,11 @@ class NoEmDashInCodeCase(unittest.TestCase):
                     self.assertNotIn(literal, line, f"{name}:{lineno} carries a literal em-dash")
 
 
+class TakeoffDocstringCase(unittest.TestCase):
+    def test_exit_zero_line_names_planned_rows(self):
+        self.assertIn("0 every check ok, skipped or planned", takeoff.__doc__ or "")
+
+
 class TicketRepoRelativePath(unittest.TestCase):
     """`_ticket_repo` with a relative `clone.path`: the ops root wins from any cwd."""
 
