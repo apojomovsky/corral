@@ -78,6 +78,7 @@ def _remote_row(site: RepoSite) -> RepoRow:
             f"{site.name}: the default branch was not checked: {site.cause}",
             _CAUSE_FIX,
         )
+    # Defensive-only: every origin-set gather path already sets branch or cause.
     return RepoRow(
         name,
         "warn",
@@ -127,6 +128,7 @@ def _labels_row(site: RepoSite) -> RepoRow:
             f"{site.name}: the board labels were not checked: {site.cause}",
             _CAUSE_FIX,
         )
+    # Defensive-only: every origin-set gather path already sets labels or cause.
     return RepoRow(
         name,
         "warn",

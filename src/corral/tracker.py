@@ -273,9 +273,6 @@ BOARD_CONCEPT_ATTRS = (
 #: The concepts corral provisions, in standard order.
 BOARD_CONCEPTS = tuple(concept for concept, _ in BOARD_CONCEPT_ATTRS)
 
-#: Concepts carried as free text; the rest are single-select columns.
-BOARD_TEXT_CONCEPTS = frozenset({"agent", "status", "blocked_by"})
-
 
 class FieldSpec(NamedTuple):
     """One board field the provisioner ensures, as plain data.
@@ -420,7 +417,13 @@ def _split_spec_repo(repo: str) -> tuple[str, str]:
 
 
 def _checked_options(flag: str, values) -> tuple[str, ...]:
-    """Declared ``--area``/``--pool`` names deduplicated, else ``ValueError``."""
+    """Declared ``--area``/``--pool`` names deduplicated, else ``ValueError``.
+
+    A bare string is refused outright: iterating it would silently split
+    it into characters.
+    """
+    if isinstance(values, str):
+        raise _spec_error(f"{flag} names must be a list or tuple of strings, got {values!r}")
     seen: tuple[str, ...] = ()
     for value in values or ():
         if not isinstance(value, str) or not value:
