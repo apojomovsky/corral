@@ -534,7 +534,7 @@ class SliceDrift(unittest.TestCase):
         )
         self.assertEqual(rows["resources-slices"].status, "ok")
 
-    def test_drift_warns_with_the_operator_refresh_step(self):
+    def test_drift_warns_only_until_the_next_launch(self):
         rows = by_name(
             resourcedoctor.check(
                 readings(
@@ -556,8 +556,9 @@ class SliceDrift(unittest.TestCase):
         self.assertIn("corral.slice", row.detail)
         self.assertIn("MemoryMax", row.detail)
         self.assertIn("CPUQuotaPerSecUSec", row.detail)
-        self.assertIn("never reconcile", row.detail)
-        self.assertIn("daemon-reload", row.fix)
+        self.assertIn("reconcile on the next launch", row.detail)
+        self.assertIn("launch an agent", row.fix)
+        self.assertIn("stop the slice by hand", row.fix)
 
     def test_unset_limit_matches_infinity(self):
         state = readings(

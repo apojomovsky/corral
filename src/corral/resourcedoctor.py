@@ -518,10 +518,13 @@ def slice_drift(expected: resources.Usage, props: Mapping[str, str]) -> list[str
 def _check_slices(state: ResourceReadings) -> ResourceRow | None:
     """Existing slices against their budgets; no row without a budget to compare.
 
-    Launches create missing slices but never reconcile existing ones, so a
-    difference warns with the operator refresh step. A missing slice is no
-    drift: the next launch creates it. A slice the manager never created
+    Launches create missing slices and reconcile existing ones on the next
+    launch of that project, so a difference warns only between the
+    operator's change and that launch. A missing slice is no drift: the
+    next launch creates it. A slice the manager never created
     (exit 0 with every limit unset, no fragment, inactive) reads as missing.
+    A cleared budget applies nothing: stale limits stay until the operator
+    stops the slice by hand.
     """
     if state.host is None or state.limits_error is not None:
         return None
@@ -569,10 +572,9 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
         return ResourceRow(
             "resources-slices",
             "warn",
-            "; ".join(drifts)
-            + "; launches create missing slices but never reconcile existing ones",
-            "stop the slice, or run `systemctl --user daemon-reload`"
-            " and restart the affected units, then run `corral doctor` again",
+            "; ".join(drifts) + "; limits reconcile on the next launch of that project",
+            "launch an agent of that project, then run `corral doctor` again"
+            " (a cleared budget applies nothing: stop the slice by hand)",
         )
     if matched == 1:
         detail = "1 resource slice matches its budget"

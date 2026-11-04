@@ -912,11 +912,15 @@ class SealTest(unittest.TestCase):
         self.assertEqual(found, {("units.py", STOP_NAME)})
 
     def test_no_test_calls_a_manager_seam_without_an_injected_fake(self):
-        """Every direct manager-seam call in tests injects its fake.
+        """Every listed direct manager-seam call in tests injects its fake.
 
         The seam (`run`, `list_fn`, `stop_fn`) is how a test would reach a
         real manager: a call without one fails here instead of on the host.
         `suiteguard` remains the runtime net for indirect calls.
+        `drive.timer_state` is not listed: one test calls it through the
+        real seam with `PATH` emptied, so no manager can answer.
+        `doctor._check_drive_timer` takes a pre-read state string, not a
+        seam, so there is nothing to inject.
         """
         required = {
             ("units", "ensure_slice"): ("run",),
@@ -924,6 +928,7 @@ class SealTest(unittest.TestCase):
             ("units", "list_units"): ("run",),
             ("units", "stop"): ("list_fn", "stop_fn"),
             ("resourcedoctor", "load_slice_actual"): ("run",),
+            ("drive", "_timer_systemctl"): ("run",),
         }
         offenders = []
         for name, tree in self._modules("tests"):
