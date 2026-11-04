@@ -100,6 +100,15 @@ class ExitCodeTest(SyncRootCase):
         fake.changes_error = "connection refused"
         self.assertEqual(self.run_sync(fake), 3)
 
+    def test_rejected_read_exits_1(self):
+        class RejectingTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        code = self.run_sync(RejectingTracker())
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+
     def test_partial_errors_still_exit_0(self):
         fake = FakeTracker(
             [

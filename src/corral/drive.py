@@ -1385,7 +1385,8 @@ def sync_all(store, tracker_factory, *, operators, now):
     ``tracker_factory`` maps a tracker repo to its tracker (labels or
     board, built by the one factory); board repos run the feed step then
     the board step. Returns (seen, errors, store_errors): the rows
-    applied, one line per tracker/outage failure, and one line per
+    applied, one line per tracker/outage failure (refused reads ride
+    along as error lines, worded as rejected), and one line per
     corrupt stored row. A failed repo keeps its rows and its cursor
     (that is `sync_repo`'s contract) and the pass moves on to the next
     repo; a repo the factory does not know is an error line, never a
@@ -1432,6 +1433,7 @@ def sync_all(store, tracker_factory, *, operators, now):
         )
         seen += result.items_seen
         errors.extend(result.errors)
+        errors.extend(result.refused)
         store_errors.extend(result.store_errors)
         if not trackers.is_board_tracker(tracker):
             continue
@@ -1451,6 +1453,7 @@ def sync_all(store, tracker_factory, *, operators, now):
         )
         seen += board_result.items_seen
         errors.extend(board_result.errors)
+        errors.extend(board_result.refused)
         store_errors.extend(board_result.store_errors)
     return seen, errors, store_errors
 
