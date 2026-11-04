@@ -236,6 +236,34 @@ class PurityTest(unittest.TestCase):
             self.assertNotIn(token, source)
 
 
+def check_constant_docstrings(testcase, source, names):
+    """Assert every named constant assignment is followed by a docstring.
+
+    A trailing assignment with no follower fails instead of raising
+    IndexError.
+    """
+    tree = ast.parse(source)
+    remaining = list(names)
+    for index, node in enumerate(tree.body):
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id in names for target in node.targets
+        ):
+            testcase.assertLess(index + 1, len(tree.body))
+            follower = tree.body[index + 1]
+            testcase.assertIsInstance(follower, ast.Expr)
+            value = follower.value
+            testcase.assertIsInstance(value, ast.Constant)
+            testcase.assertIsInstance(value.value, str)
+            testcase.assertTrue(value.value.strip())
+            remaining = [
+                name
+                for name in remaining
+                if name
+                not in (target.id for target in node.targets if isinstance(target, ast.Name))
+            ]
+    testcase.assertEqual(tuple(remaining), ())
+
+
 class ConstantsTest(unittest.TestCase):
     def test_hold_labels_match_tracker_needs_decision(self):
         self.assertEqual(
@@ -248,26 +276,13 @@ class ConstantsTest(unittest.TestCase):
         self.assertIn("tracker.NEEDS_DECISION", source)
 
     def test_constants_have_docstrings(self):
-        source = inspect.getsource(policies)
-        tree = ast.parse(source)
-        names = ("HOLD_LABELS", "HOLD_TITLE_WORD")
-        for index, node in enumerate(tree.body):
-            if isinstance(node, ast.Assign) and any(
-                isinstance(target, ast.Name) and target.id in names for target in node.targets
-            ):
-                follower = tree.body[index + 1]
-                assert isinstance(follower, ast.Expr)
-                value = follower.value
-                assert isinstance(value, ast.Constant)
-                assert isinstance(value.value, str)
-                self.assertTrue(value.value.strip())
-                names = tuple(
-                    name
-                    for name in names
-                    if name
-                    not in (target.id for target in node.targets if isinstance(target, ast.Name))
-                )
-        self.assertEqual(names, ())
+        check_constant_docstrings(
+            self, inspect.getsource(policies), ("HOLD_LABELS", "HOLD_TITLE_WORD")
+        )
+
+    def test_trailing_constant_fails_without_an_index_error(self):
+        with self.assertRaises(AssertionError):
+            check_constant_docstrings(self, 'HOLD_LABELS = ("hold",)\n', ("HOLD_LABELS",))
 
 
 class ResolveTest(unittest.TestCase):

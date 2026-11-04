@@ -33,7 +33,7 @@ import os
 import re
 import tempfile
 
-from corral import paths
+from corral import paths, tracker
 from corral.runtimes import muse as muse_adapter
 
 COORD_TTL_S = 900
@@ -501,7 +501,7 @@ JOURNAL_ARCHIVE_PREFIX = "journal-"
 JOURNAL_MAX = 500
 ARCHIVE_KEEP_DAYS = 14
 KINDS = ("decision", "action", "incident", "followup", "done", "handoff", "note")
-HUMAN_PR_LABELS = frozenset({"needs-decision", "needs-human"})
+HUMAN_PR_LABELS = frozenset({tracker.NEEDS_DECISION, "needs-human"})
 #: The coordinator's rules: the agent overlay in the ops root (onboarding, 3a).
 RULES_PATH = "agents.overlay.md"
 
