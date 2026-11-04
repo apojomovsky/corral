@@ -1882,10 +1882,11 @@ def release_reviewed(store, *, claims, live_units, now, out, events=None) -> dic
     unclaimed. A successful release clears the holder and leaves the
     epoch for the next claim to mint. A `Claimed` there means the row
     changed under the pass, so it is left held with a logbook line,
-    never retried in the same pass. When `events` is a list, each
-    release appends its journal entry. Store errors propagate to the
-    caller, like orphans. The returned {(repo, number): agent} names
-    only the rows actually freed, so the gate can simulate the
+    never retried in the same pass. A failed write is likewise left
+    held with a logbook line while the rest of the sweep moves on, so
+    one bad row never blocks the others. When `events` is a list, each
+    release appends its journal entry. The returned {(repo, number): agent}
+    names only the rows actually freed, so the gate can simulate the
     post-release rows the store reads still show as claimed (their
     queued mirror write drains on a later pass).
     """
@@ -1908,6 +1909,9 @@ def release_reviewed(store, *, claims, live_units, now, out, events=None) -> dic
             store.release(repo, number, agent, current.epoch, now=now)
         except board.Claimed:
             print(f"{ref}: reviewer release raced a re-claim, left held", file=out)
+            continue
+        except (board.StoreError, sqlite3.Error) as problem:
+            print(f"{ref}: finished release refused ({problem}), left held", file=out)
             continue
         print(
             f"{ref}: released finished reviewer `{agent}`, row open for a fix round",
@@ -2073,11 +2077,14 @@ def restart_refusal(item, *, read_labels, hold_label, requested, linked=()):
     if item.external:
         return f"{ref}: externally owned, not restarted", False
     if read_labels is None:
-        return f"{ref}: hold labels unreadable (no label reader), restart deferred", True
+        return (
+            f"{ref}: hold labels unreadable (no label reader), restart deferred, not restarted",
+            True,
+        )
     held = hold.reason(read_labels, (item.repo, item.number), linked, hold_label=hold_label)
     if held is not None:
         if "unreadable" in held:
-            return f"{held}, restart deferred", True
+            return f"{held}, restart deferred, not restarted", True
         return f"{held}, not restarted", False
     if iface.NEEDS_DECISION in (item.labels or ()):
         return f"{ref}: carries {iface.NEEDS_DECISION}, waiting on a human, not restarted", False
