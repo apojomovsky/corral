@@ -313,7 +313,6 @@ def _ensure_slices(decided, run):
     assert decided.share is not None
     units.ensure_slice(
         units.project_slice(decided.project),
-        parent=units.HOST_SLICE,
         memory_max=decided.share.memory_mb,
         cpu_quota=decided.share.cpu_m,
         run=run,

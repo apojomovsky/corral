@@ -17,6 +17,7 @@ inject fakes at all three; production wires the real seams in
 
 import math
 import os
+import re
 import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
@@ -392,6 +393,64 @@ def parse_show(text: str) -> dict:
     return props
 
 
+#: systemd timespan units to microseconds. `systemctl show` renders
+#: usec properties as a timespan (`CPUQuotaPerSecUSec=500ms` for a 50%
+#: quota), so the quota reader parses that form back to microseconds.
+_TIMESPAN_US = {
+    "us": 1,
+    "usec": 1,
+    "usecs": 1,
+    "ms": 1_000,
+    "msec": 1_000,
+    "msecs": 1_000,
+    "s": 1_000_000,
+    "sec": 1_000_000,
+    "secs": 1_000_000,
+    "second": 1_000_000,
+    "seconds": 1_000_000,
+    "min": 60_000_000,
+    "mins": 60_000_000,
+    "minute": 60_000_000,
+    "minutes": 60_000_000,
+    "h": 3_600_000_000,
+    "hr": 3_600_000_000,
+    "hrs": 3_600_000_000,
+    "hour": 3_600_000_000,
+    "hours": 3_600_000_000,
+    "d": 86_400_000_000,
+    "day": 86_400_000_000,
+    "days": 86_400_000_000,
+    "w": 604_800_000_000,
+    "week": 604_800_000_000,
+    "weeks": 604_800_000_000,
+    "month": 2_592_000_000_000,
+    "months": 2_592_000_000_000,
+    "year": 31_536_000_000_000,
+    "years": 31_536_000_000_000,
+}
+
+_TIMESPAN_PART = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*([a-z]+)")
+
+
+def _timespan_us(text: str) -> float | None:
+    """Microseconds for a systemd timespan (`500ms`, `1min 30s`), else None."""
+    total = 0.0
+    rest = text.strip().lower()
+    if not rest:
+        return None
+    while rest:
+        match = _TIMESPAN_PART.match(rest)
+        if match is None:
+            return None
+        try:
+            factor = _TIMESPAN_US[match.group(2)]
+        except KeyError:
+            return None
+        total += float(match.group(1)) * factor
+        rest = rest[match.end() :].strip()
+    return total
+
+
 def _actual_number(raw: str | None, divisor: float) -> float | None:
     """The kernel-reported limit in budget units, None when unset or unreadable."""
     if raw is None:
@@ -402,7 +461,11 @@ def _actual_number(raw: str | None, divisor: float) -> float | None:
     try:
         return int(text) / divisor
     except ValueError:
+        pass
+    parsed = _timespan_us(text)
+    if parsed is None:
         return None
+    return parsed / divisor
 
 
 #: (Usage dimension, show property, divisor to budget units, unit word).

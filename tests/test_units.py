@@ -449,52 +449,153 @@ class DelegationTest(unittest.TestCase):
             units.delegated_controllers(path="/none/cgroup.controllers", read=read)
 
 
-class EnsureSliceTest(unittest.TestCase):
-    def test_creating_a_slice_runs_systemd_run_with_its_limits(self):
-        fake = FakeRun()
-        units.ensure_slice(
-            "corral-web.slice",
-            parent="corral.slice",
-            memory_max=2048,
-            cpu_quota=1000,
-            run=fake,
+class SliceStartArgvTest(unittest.TestCase):
+    def test_host_slice_starts_by_name(self):
+        self.assertEqual(
+            units.slice_start_argv("corral.slice"),
+            ["systemctl", "--user", "start", "corral.slice"],
         )
-        (argv,) = fake.calls
-        self.assertEqual(argv[0], "systemd-run")
-        self.assertIn("--unit=corral-web.slice", argv)
-        self.assertIn("--slice=corral.slice", argv)
-        self.assertIn("--property=MemoryMax=2048M", argv)
-        self.assertIn("--property=CPUQuota=100%", argv)
 
-    def test_a_slice_without_a_parent_needs_no_slice_line(self):
+    def test_project_slice_carries_no_parent_flag(self):
+        """Hierarchy comes from the name: corral-web.slice nests under corral.slice."""
+        argv = units.slice_start_argv("corral-web.slice")
+        self.assertEqual(argv, ["systemctl", "--user", "start", "corral-web.slice"])
+        self.assertFalse([a for a in argv if a.startswith("--slice=")])
+
+    def test_a_non_slice_name_is_refused(self):
+        for bad in ("corral.slice.service", ".slice", "corral", "", None, 5):
+            with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
+                units.slice_start_argv(bad)
+
+
+class SliceSetPropertyArgvTest(unittest.TestCase):
+    def test_limits_render_as_runtime_assignments(self):
+        self.assertEqual(
+            units.slice_set_property_argv("corral.slice", memory_max=16000, cpu_quota=8000),
+            [
+                "systemctl",
+                "--user",
+                "set-property",
+                "--runtime",
+                "corral.slice",
+                "MemoryMax=16000M",
+                "CPUQuota=800%",
+            ],
+        )
+
+    def test_a_fractional_cpu_quota_formats_without_trailing_zeros(self):
+        argv = units.slice_set_property_argv("corral-web.slice", cpu_quota=555)
+        self.assertEqual(argv[-1], "CPUQuota=55.5%")
+
+    def test_unset_or_zero_limits_mean_no_call(self):
+        self.assertIsNone(units.slice_set_property_argv("corral.slice"))
+        self.assertIsNone(
+            units.slice_set_property_argv("corral.slice", memory_max=0, cpu_quota=None)
+        )
+
+    def test_a_bad_limit_or_name_is_refused(self):
+        for bad in (True, "2048", -1):
+            with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
+                units.slice_set_property_argv("corral.slice", memory_max=bad)
+        with self.assertRaises(units.UnitsError):
+            units.slice_set_property_argv("corral.slice.service", memory_max=16000)
+
+
+class EnsureSliceTest(unittest.TestCase):
+    def test_host_slice_starts_then_sets_its_limits(self):
         fake = FakeRun()
-        units.ensure_slice("corral.slice", memory_max=16000, run=fake)
-        self.assertFalse([a for a in fake.calls[0] if a.startswith("--slice=")])
+        units.ensure_slice("corral.slice", memory_max=16000, cpu_quota=8000, run=fake)
+        self.assertEqual(
+            fake.calls,
+            [
+                ["systemctl", "--user", "start", "corral.slice"],
+                [
+                    "systemctl",
+                    "--user",
+                    "set-property",
+                    "--runtime",
+                    "corral.slice",
+                    "MemoryMax=16000M",
+                    "CPUQuota=800%",
+                ],
+            ],
+        )
 
-    def test_an_existing_slice_reads_as_created(self):
-        fake = FakeRun(result=done([], 1, "", "Unit corral.slice already exists."))
-        units.ensure_slice("corral.slice", run=fake)  # no raise
+    def test_project_slice_needs_no_parent_flag(self):
+        """The name parents it: corral-web.slice starts under corral.slice."""
+        fake = FakeRun()
+        units.ensure_slice("corral-web.slice", memory_max=2048, cpu_quota=1000, run=fake)
+        self.assertEqual(len(fake.calls), 2)
+        self.assertEqual(fake.calls[0], ["systemctl", "--user", "start", "corral-web.slice"])
+        self.assertFalse([a for call in fake.calls for a in call if a.startswith("--slice=")])
+
+    def test_a_slice_without_limits_runs_start_only(self):
+        fake = FakeRun()
+        units.ensure_slice("corral.slice", run=fake)
+        self.assertEqual(fake.calls, [["systemctl", "--user", "start", "corral.slice"]])
+
+    def test_an_already_loaded_slice_stays_success(self):
+        calls = []
+
+        def run(argv, timeout=None):
+            calls.append(list(argv))
+            if len(calls) == 1:
+                return done(argv, 1, "", "Unit corral.slice already exists.")
+            return done(argv)
+
+        units.ensure_slice("corral.slice", memory_max=16000, cpu_quota=8000, run=run)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][:3], ["systemctl", "--user", "start"])
+        self.assertIn("set-property", calls[1])
+
+    def test_an_unreachable_bus_is_exit_3_on_start_and_on_set_property(self):
+        start_down = FakeRun(result=done([], 1, "", "Failed to connect to bus: refused"))
+        with self.assertRaises(units.Unreachable) as caught:
+            units.ensure_slice("corral.slice", memory_max=16000, run=start_down)
+        self.assertEqual(caught.exception.exit_code, 3)
+
+        def run(argv, timeout=None):
+            if argv[2] == "start":
+                return done(argv)
+            return done(argv, 1, "", "Failed to connect to bus: no medium found")
+
+        with self.assertRaises(units.Unreachable) as caught:
+            units.ensure_slice("corral.slice", memory_max=16000, run=run)
+        self.assertEqual(caught.exception.exit_code, 3)
 
     def test_a_refused_property_names_it_with_exit_4(self):
-        fake = FakeRun(result=done([], 1, "", "Failed to set property MemoryMax: denied"))
+        def run(argv, timeout=None):
+            if argv[2] == "start":
+                return done(argv)
+            return done(argv, 1, "", "Failed to set property MemoryMax: Access denied")
+
         with self.assertRaisesRegex(units.UnitsError, "MemoryMax") as caught:
+            units.ensure_slice("corral.slice", memory_max=16000, run=run)
+        self.assertEqual(caught.exception.exit_code, 4)
+
+    def test_a_failed_start_is_exit_4(self):
+        fake = FakeRun(result=done([], 1, "", "Failed to start corral.slice: bad slice"))
+        with self.assertRaises(units.UnitsError) as caught:
             units.ensure_slice("corral.slice", memory_max=16000, run=fake)
         self.assertEqual(caught.exception.exit_code, 4)
 
-    def test_an_unreachable_bus_is_exit_3(self):
-        fake = FakeRun(result=done([], 1, "", "Failed to connect to bus: refused"))
-        with self.assertRaises(units.Unreachable) as caught:
+    def test_a_missing_manager_binary_is_exit_4(self):
+        fake = FakeRun(error=OSError("no systemctl"))
+        with self.assertRaises(units.UnitsError) as caught:
             units.ensure_slice("corral.slice", run=fake)
-        self.assertEqual(caught.exception.exit_code, 3)
+        self.assertEqual(caught.exception.exit_code, 4)
 
-    def test_a_bad_slice_name_is_refused(self):
-        with self.assertRaises(units.UnitsError):
-            units.ensure_slice("corral.slice.service", run=FakeRun())
-
-    def test_creating_a_slice_needs_no_units_log(self):
+    def test_a_bad_name_or_limit_runs_nothing(self):
         fake = FakeRun()
-        units.ensure_slice("corral.slice", run=fake)
-        self.assertEqual(fake.calls[0][0], "systemd-run")
+        with self.assertRaises(units.UnitsError):
+            units.ensure_slice("corral.slice.service", run=fake)
+        with self.assertRaises(units.UnitsError):
+            units.ensure_slice("corral.slice", memory_max="2048", run=fake)
+        self.assertEqual(fake.calls, [])
+
+    def test_run_is_required(self):
+        with self.assertRaises(TypeError):
+            units.ensure_slice("corral.slice")  # ty: ignore[missing-argument]
 
 
 class StartTest(Dirs):
@@ -782,8 +883,9 @@ class SealTest(unittest.TestCase):
             {
                 ("units.py", "systemctl", "list_units"),
                 ("units.py", "systemctl", STOP_NAME),
+                ("units.py", "systemctl", "slice_set_property_argv"),
+                ("units.py", "systemctl", "slice_start_argv"),
                 ("units.py", "systemd-run", "unit_argv"),
-                ("units.py", "systemd-run", "slice_argv"),
                 ("drive.py", "systemctl", "timer_state"),
                 ("drive.py", "systemctl", "_timer_systemctl"),
                 ("doctor.py", "systemctl", "_check_drive_timer"),
@@ -808,6 +910,65 @@ class SealTest(unittest.TestCase):
                         if {"systemctl", "stop"} <= strings:
                             found.add((name, func.name))
         self.assertEqual(found, {("units.py", STOP_NAME)})
+
+    def test_no_test_calls_a_manager_seam_without_an_injected_fake(self):
+        """Every direct manager-seam call in tests injects its fake.
+
+        The seam (`run`, `list_fn`, `stop_fn`) is how a test would reach a
+        real manager: a call without one fails here instead of on the host.
+        `suiteguard` remains the runtime net for indirect calls.
+        """
+        required = {
+            ("units", "ensure_slice"): ("run",),
+            ("units", "start"): ("run",),
+            ("units", "list_units"): ("run",),
+            ("units", "stop"): ("list_fn", "stop_fn"),
+            ("resourcedoctor", "load_slice_actual"): ("run",),
+        }
+        offenders = []
+        for name, tree in self._modules("tests"):
+            probed = self._typeerror_probe_lines(tree)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                func = node.func
+                if not (
+                    isinstance(func, ast.Attribute)
+                    and isinstance(func.value, ast.Name)
+                    and (func.value.id, func.attr) in required
+                ):
+                    continue
+                if any(first <= node.lineno <= last for first, last in probed):
+                    continue
+                given = {kw.arg for kw in node.keywords}
+                missing = [key for key in required[func.value.id, func.attr] if key not in given]
+                if missing:
+                    offenders.append(f"{name}: {func.value.id}.{func.attr} without {missing}")
+        self.assertEqual(offenders, [])
+
+    @staticmethod
+    def _typeerror_probe_lines(tree):
+        """Line ranges of `with ... assertRaises(TypeError)` blocks.
+
+        A seam call inside one never runs: it probes the missing-argument
+        TypeError, so the guard exempts it.
+        """
+        ranges = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.With):
+                continue
+            for item in node.items:
+                expr = item.context_expr
+                if (
+                    isinstance(expr, ast.Call)
+                    and isinstance(expr.func, ast.Attribute)
+                    and expr.func.attr == "assertRaises"
+                    and expr.args
+                    and isinstance(expr.args[0], ast.Name)
+                    and expr.args[0].id == "TypeError"
+                ):
+                    ranges.append((node.lineno, node.end_lineno or node.lineno))
+        return ranges
 
     def test_no_test_reaches_the_production_stop(self):
         for name, tree in self._modules("tests"):
