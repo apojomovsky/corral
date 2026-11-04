@@ -1166,6 +1166,28 @@ class FollowEventsTest(unittest.TestCase):
         rows = self._collect(sleep_fn=stop_at_once)
         self.assertEqual([row["evidence"] for row in rows], ["first", "second"])
 
+    def test_follow_prints_rows_with_empty_ids_once_each(self):
+        path = events.events_path(root=self.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        first = {
+            "id": "",
+            "kind": "supply",
+            "ref": "fleet",
+            "evidence": "first",
+            "first_seen": "t",
+            "resolved_at": None,
+        }
+        second = dict(first, evidence="second")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(first) + "\n")
+            handle.write(json.dumps(second) + "\n")
+
+        def stop_at_once(s):
+            raise KeyboardInterrupt
+
+        rows = self._collect(sleep_fn=stop_at_once)
+        self.assertEqual([row["evidence"] for row in rows], ["first", "second"])
+
     def test_follow_with_all_forgets_ids_that_left_the_poll(self):
         first = {"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "A"}
         second = {"id": "ccccdddd", "kind": "supply", "ref": "fleet2", "evidence": "B"}

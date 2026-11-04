@@ -417,6 +417,39 @@ class FindBoardTests(unittest.TestCase):
         self.assertIn("project", report.created)
         self.assertEqual(report.number, 7)
 
+    def test_title_page_without_page_info_fails_closed(self):
+        run = script_full_create(ProvisionFakeRun())
+        run.scripted["BoardTitles"] = [
+            {"user": {"projectsV2": {"nodes": []}}, "organization": None}
+        ]
+        provisioner, spec = bootstrap_provisioner_for(run)
+        with self.assertRaises(iface.TrackerError):
+            provisioner.ensure_board(spec)
+        self.assertEqual(run.mutations(), [])
+
+    def test_title_search_reads_the_set_half_from_one_query(self):
+        from corral.github import board as board_mod
+
+        self.assertFalse(hasattr(board_mod, "_TITLES_USER"))
+        self.assertFalse(hasattr(board_mod, "_TITLES_ORG"))
+        self.assertIn("user(login", board_mod._TITLES)
+        self.assertIn("organization(login", board_mod._TITLES)
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("organization")])
+        run.scripted["BoardTitles"] = [
+            titles_payload(("PVT_a", 2, "demo board"), half="organization")
+        ]
+        run.script(
+            "BoardById",
+            by_id(
+                project_node(pid="PVT_a", number=2, fields=standard_field_nodes()),
+                project_node(pid="PVT_a", number=2, fields=standard_field_nodes()),
+            ),
+        )
+        provisioner, spec = bootstrap_provisioner_for(run)
+        report = provisioner.ensure_board(spec)
+        self.assertEqual(report.created, ())
+        self.assertEqual(report.refused, ())
+
 
 class FullCreateTests(unittest.TestCase):
     def script_mid_and_final(self, run, mid_fields, final_fields=None):
@@ -616,6 +649,31 @@ class VisibilityTests(unittest.TestCase):
         self.assertFalse(run.has_mutation("BoardLinkRepo"))
         self.assertFalse(run.has_mutation("FieldCreate"))
         self.assertEqual(report.created, ("project",))
+
+    def test_still_public_after_update_keeps_the_atomic_link(self):
+        run = script_full_create(ProvisionFakeRun(), public=True)
+        run.scripted["BoardCreate"] = [
+            {
+                "createProjectV2": {
+                    "projectV2": {"id": "PVT_9", "number": 7, "title": "demo board", "public": True}
+                }
+            }
+        ]
+        run.script(
+            "BoardById",
+            by_id(
+                project_node(pid="PVT_9", number=7, public=True),
+                project_node(pid="PVT_9", number=7, public=True),
+            ),
+        )
+        run.script(
+            "BoardMakePrivate",
+            [{"updateProjectV2": {"projectV2": {"id": "PVT_9", "public": True}}}],
+        )
+        provisioner, spec = bootstrap_provisioner_for(run)
+        report = provisioner.ensure_board(spec)
+        self.assertEqual(report.created, ("project",))
+        self.assertEqual(report.kept, ("link:example/demo",))
 
     def test_addressed_public_board_is_refused_but_continues(self):
         run = addressed_run(*standard_field_nodes(), public=True)
@@ -956,6 +1014,194 @@ class RateLimitTests(unittest.TestCase):
         provisioner, spec = provisioner_for(run)
         with self.assertRaises(iface.TrackerRateLimited):
             provisioner.ensure_board(spec)
+
+
+class DryRunTests(unittest.TestCase):
+    def test_fresh_board_preview_lists_creations_without_mutating(self):
+        run = script_full_create(ProvisionFakeRun())
+        provisioner, spec = bootstrap_provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertEqual(
+            report.created,
+            (
+                "project",
+                "field:Agent",
+                "field:Agent state",
+                "field:Priority",
+                "field:Blocked by",
+            ),
+        )
+        self.assertEqual(report.kept, ("link:example/demo", "field:Status"))
+        self.assertEqual(report.refused, ())
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_over_an_exact_board_is_all_kept(self):
+        run = addressed_run(*standard_field_nodes())
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertEqual(report.created, ())
+        self.assertEqual(report.refused, ())
+        self.assertIn("link:example/demo", report.kept)
+        self.assertIn("field:Priority", report.kept)
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_never_searches_by_title_for_an_address(self):
+        run = addressed_run(*standard_field_nodes())
+        provisioner, spec = provisioner_for(run)
+        provisioner.dry_run(spec)
+        self.assertFalse(any("BoardTitles" in query for query in run.queries()))
+
+    def test_preview_of_an_address_that_no_longer_resolves_is_refused(self):
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        run.script("BoardByNumber", [{"user": {"projectV2": None}, "organization": None}])
+        provisioner, spec = provisioner_for(run)
+        with self.assertRaises(ValueError) as caught:
+            provisioner.dry_run(spec)
+        self.assertIn("no longer exists", str(caught.exception))
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_names_both_numbers_for_an_ambiguous_title(self):
+        run = script_full_create(ProvisionFakeRun())
+        run.scripted["BoardTitles"] = [
+            titles_payload(("PVT_a", 2, "demo board"), ("PVT_b", 5, "demo board"))
+        ]
+        provisioner, spec = bootstrap_provisioner_for(run)
+        with self.assertRaises(ValueError) as caught:
+            provisioner.dry_run(spec)
+        self.assertIn("2", str(caught.exception))
+        self.assertIn("5", str(caught.exception))
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_of_a_title_found_public_board_lists_the_link_only(self):
+        run = script_full_create(ProvisionFakeRun())
+        run.scripted["BoardTitles"] = [titles_payload(("PVT_a", 2, "demo board"))]
+        run.script(
+            "BoardById",
+            by_id(project_node(pid="PVT_a", number=2, public=True, fields=standard_field_nodes())),
+        )
+        provisioner, spec = bootstrap_provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertEqual(len(report.refused), 1)
+        self.assertIn("private", report.refused[0])
+        self.assertIn("link:example/demo", report.kept)
+        self.assertNotIn("field:Priority", report.kept)
+        self.assertEqual(report.created, ())
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_of_an_addressed_public_board_keeps_planning_fields(self):
+        run = addressed_run(*standard_field_nodes(), public=True)
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertEqual(len(report.refused), 1)
+        self.assertIn("private", report.refused[0])
+        self.assertIn("field:Priority", report.kept)
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_lists_missing_ranks_as_option_creations(self):
+        live = [
+            text_node("F_agent", "Agent"),
+            text_node("F_status", "Agent state"),
+            select_node("F_board", "Status", STATUS_OPTIONS),
+            select_node(
+                "F_prio",
+                "Priority",
+                [
+                    ("opt-1", "Urgent", "RED", ""),
+                    ("opt-2", "High", "ORANGE", ""),
+                    ("opt-3", "Normal", "YELLOW", ""),
+                ],
+            ),
+            text_node("F_blocked", "Blocked by"),
+        ]
+        run = addressed_run(*live)
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertIn("option:Priority/Low", report.created)
+        self.assertIn("option:Priority/Backlog", report.created)
+        self.assertIn("field:Priority", report.kept)
+        self.assertEqual(report.refused, ())
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_refuses_an_unresendable_append_by_hand(self):
+        options = [
+            {"id": "opt-1", "name": "Urgent", "color": None, "description": ""},
+            {"id": "opt-2", "name": "High", "color": "ORANGE", "description": ""},
+            {"id": "opt-3", "name": "Normal", "color": "YELLOW", "description": ""},
+        ]
+        live = [
+            text_node("F_agent", "Agent"),
+            text_node("F_status", "Agent state"),
+            select_node("F_board", "Status", STATUS_OPTIONS),
+            {
+                "__typename": "ProjectV2SingleSelectField",
+                "id": "F_prio",
+                "name": "Priority",
+                "dataType": "SINGLE_SELECT",
+                "options": options,
+            },
+            text_node("F_blocked", "Blocked by"),
+        ]
+        run = addressed_run(*live)
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertEqual(len(report.refused), 2)
+        self.assertTrue(all("by hand" in line for line in report.refused))
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_lists_the_link_as_would_create_without_mutating(self):
+        run = addressed_run(*standard_field_nodes(), repos=())
+        run.add_rest("repos/example/demo", {"node_id": "R_1"})
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertIn("link:example/demo", report.created)
+        self.assertEqual(report.refused, ())
+        self.assertFalse(run.has_mutation("BoardLinkRepo"))
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_refuses_the_link_only_when_the_repo_does_not_resolve(self):
+        run = addressed_run(*standard_field_nodes(), repos=())
+        run.add_rest("repos/example/demo", gh.GhError("other", "Not Found (HTTP 404)"))
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.dry_run(spec)
+        self.assertEqual(len(report.refused), 1)
+        self.assertIn("example/demo", report.refused[0])
+        self.assertNotIn("link:example/demo", report.created)
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_rate_limit_propagates(self):
+        run = ProvisionFakeRun().script(
+            "OwnerResolve",
+            [gh.GhError("unavailable", "API rate limit exceeded for user ID 1. (HTTP 403)")],
+        )
+        provisioner, spec = provisioner_for(run)
+        with self.assertRaises(iface.TrackerRateLimited):
+            provisioner.dry_run(spec)
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_of_a_malformed_schema_fails_closed(self):
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        bad = project_node()
+        bad["fields"] = {"nodes": "nope"}
+        run.script("BoardByNumber", [by_number(bad)])
+        provisioner, spec = provisioner_for(run)
+        with self.assertRaises(iface.TrackerError):
+            provisioner.dry_run(spec)
+        self.assertEqual(run.mutations(), [])
+
+    def test_preview_rejects_an_unknown_concept_before_any_read(self):
+        from corral import tracker as iface_mod
+
+        run = ProvisionFakeRun()
+        provisioner, _ = provisioner_for(run)
+        spec = iface_mod.BoardSpec(
+            owner="example",
+            title="demo board",
+            repo="example/demo",
+            fields=(iface_mod.FieldSpec("mystery", "Mystery", "text", ()),),
+        )
+        with self.assertRaises(ValueError):
+            provisioner.dry_run(spec)
+        self.assertEqual(run.calls, [])
 
 
 class FactoryTests(unittest.TestCase):
