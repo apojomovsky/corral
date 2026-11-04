@@ -452,9 +452,23 @@ class DoctorFetchTest(unittest.TestCase):
         from corral.github import gh
 
         cfg = config()
-        with mock.patch.object(trackers, "board_schema_for", return_value="SCHEMA") as fetch:
+        with mock.patch.object(trackers, "board_snapshot_for", return_value="SNAPSHOT") as fetch:
             found = doctor.production_board_fetch(cfg)
-        self.assertEqual(found, "SCHEMA")
+        self.assertEqual(found, "SNAPSHOT")
+        args, kwargs = fetch.call_args
+        self.assertIs(args[0], cfg)
+        self.assertIs(kwargs["run"], gh.run)
+
+    def test_production_membership_uses_the_factory(self):
+        from corral import doctor
+        from corral.github import gh
+
+        cfg = config()
+        with mock.patch.object(
+            trackers, "board_issue_refs_for", return_value={("example/demo", 7)}
+        ) as fetch:
+            found = doctor.production_board_issue_refs(cfg)
+        self.assertEqual(found, {("example/demo", 7)})
         args, kwargs = fetch.call_args
         self.assertIs(args[0], cfg)
         self.assertIs(kwargs["run"], gh.run)
