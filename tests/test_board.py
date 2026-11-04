@@ -757,5 +757,95 @@ class ReposTest(TempStoreTest):
         self.assertEqual(store.repos(), ["acme/api", "acme/app"])
 
 
+class PullRequestRowTest(TempStoreTest):
+    """A pull request is never a ticket row: readings are dropped and
+    legacy rows stay hidden from every reader."""
+
+    def seed_legacy_pr(self, store, number=9, **over):
+        """One pre-fix row for a pull request, straight into the table.
+
+        The public upsert can no longer write one, so the legacy shape
+        a past sync stored goes in as raw SQL.
+        """
+        values = {
+            "repo": "app",
+            "number": number,
+            "kind": "pr",
+            "title": "Title 9",
+            "body": "Body 9",
+            "state": "open",
+            "author": "alice",
+            "labels": '["ready"]',
+            "priority": "high",
+            "assignees": "[]",
+            "url": "https://example.com/app/9",
+            "tracker_updated_at": 1000.0,
+            "fetched_at": 1000.0,
+            "confidence": board.CONFIRMED,
+            "external": 0,
+            "extra": "{}",
+        }
+        values.update(over)
+        store._conn.execute(
+            "INSERT INTO items(repo, number, kind, title, body, state,"
+            " author, labels, priority, assignees, url,"
+            " tracker_updated_at, fetched_at, confidence, external, extra)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                values["repo"],
+                values["number"],
+                values["kind"],
+                values["title"],
+                values["body"],
+                values["state"],
+                values["author"],
+                values["labels"],
+                values["priority"],
+                values["assignees"],
+                values["url"],
+                values["tracker_updated_at"],
+                values["fetched_at"],
+                values["confidence"],
+                values["external"],
+                values["extra"],
+            ),
+        )
+        return store
+
+    def row_count(self, store):
+        return store._conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+
+    def test_pr_reading_is_never_stored(self):
+        store = self.open()
+        store.upsert_item(
+            reading(kind="pr", state="open", author="alice", labels=["ready"]),
+            operators=["alice"],
+            now=1000.0,
+        )
+        self.assertIsNone(store.item("app", 7, now=1000.0)[0])
+        self.assertEqual(store.items(), [])
+
+    def test_legacy_pr_row_is_hidden_from_item_and_items(self):
+        store = self.open()
+        store.upsert_item(reading(number=7), operators=["alice"], now=1000.0)
+        self.seed_legacy_pr(store)
+        self.assertIsNone(store.item("app", 9, now=1000.0)[0])
+        self.assertEqual([(row.repo, row.number) for row in store.items()], [("app", 7)])
+
+    def test_pr_reading_drops_the_legacy_row_and_keeps_issues(self):
+        store = self.open()
+        store.upsert_item(reading(number=7), operators=["alice"], now=1000.0)
+        self.seed_legacy_pr(store)
+        store.upsert_item(
+            reading(number=9, kind="pr", tracker_updated_at=2000.0),
+            operators=["alice"],
+            now=2000.0,
+        )
+        self.assertEqual(self.row_count(store), 1)
+        self.assertIsNone(store.item("app", 9, now=2000.0)[0])
+        row, _ = store.item("app", 7, now=2000.0)
+        self.assertEqual(row.title, "Title")
+
+
 if __name__ == "__main__":
     unittest.main()

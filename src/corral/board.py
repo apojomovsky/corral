@@ -148,6 +148,20 @@ def is_external(author, operators, from_fork):
     return not author or str(author).lower() not in names
 
 
+def is_ticket(item) -> bool:
+    """Whether one reading is a ticket row: only issues are tickets. Pure.
+
+    GitHub's issues feed returns pull requests too, and the adapters
+    tag them with ``kind="pr"``. The store is the one place that
+    decides: ``upsert_item`` drops any other kind (deleting a row a
+    past sync stored), and reads never return one, so every consumer
+    skips pull requests without checking kinds itself. A missing kind
+    reads as an issue, the store's default. Linked pulls are untouched:
+    they arrive through the forge, never as ticket rows.
+    """
+    return getattr(item, "kind", "issue") == "issue"
+
+
 def db_path():
     """The store file: inside the state dir. The only path join for it."""
     return os.path.join(paths.state_dir(), DB_NAME)
@@ -330,9 +344,13 @@ class Store:
         ).fetchall()
 
     def _get(self, repo, number):
-        """The stored item with read-your-writes overlays, or None."""
+        """The stored item with read-your-writes overlays, or None.
+
+        A row for a pull request reads as missing: past syncs stored
+        them, and every reader skips them until a sync drops the row.
+        """
         row = self._row(repo, number)
-        if row is None:
+        if row is None or row[2] != "issue":
             return None
         holder = self._holder(repo, number)
         queued_agent = self._queued_value(repo, number, "agent")
@@ -371,7 +389,7 @@ class Store:
     def item(self, repo, number, *, now, max_age=None):
         """The cached item and whether it is fresh. Fresh is false for a
         missing item, and when ``max_age`` is given and the row is older
-        than it."""
+        than it. A pull-request row reads as missing."""
         found = self._get(repo, number)
         if found is None:
             return None, False
@@ -380,7 +398,9 @@ class Store:
         return found, True
 
     def items(self, repo=None, state=None, label=None):
-        """Cached items, oldest first, filtered by repo, state and label."""
+        """Cached items, oldest first, filtered by repo, state and label.
+
+        Pull-request rows are never returned: only issue rows are tickets."""
         query = "SELECT repo, number FROM items ORDER BY fetched_at ASC, repo ASC, number ASC"
         args: list = []
         clauses = []
@@ -504,8 +524,17 @@ class Store:
         drops it as overridden, and a reading that says nothing (an empty
         value, e.g. a title-only edit that left no label behind) settles
         nothing. A stale reading settles nothing either and keeps the
-        stored concepts."""
+        stored concepts. A reading for a pull request stores nothing: it
+        deletes a row a past sync held instead, so the next sync heals
+        stores that already hold one. Claims and queued writes are left
+        alone: coordination state is never dropped with the cached row."""
         with _txn(self._conn):
+            if not is_ticket(item):
+                self._conn.execute(
+                    "DELETE FROM items WHERE repo=? AND number=?",
+                    (item.repo, item.number),
+                )
+                return
             stored = self._row(item.repo, item.number)
             external = bool(
                 (stored and stored[14]) or is_external(item.author, operators, item.from_fork)

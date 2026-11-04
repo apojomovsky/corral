@@ -698,6 +698,14 @@ class PaginationTest(unittest.TestCase):
         )
         self.assertEqual([item.number for item in self.adapter.items("acme/app")], [1, 2, 3])
 
+    def test_feed_marks_pull_request_entries_as_pr(self):
+        pr = item_payload(9)
+        pr["pull_request"] = {"url": "https://example.com/pulls/9"}
+        self.pages("acme/app", [item_payload(1), pr], [])
+        self.gh.add("repos/acme/app/pulls/9", pull_payload(9, fork=False))
+        found, _ = self.adapter.changes("acme/app", None)
+        self.assertEqual([(item.number, item.kind) for item in found], [(1, "issue"), (9, "pr")])
+
 
 class DecisionRecordTest(unittest.TestCase):
     """The fake Tracker records both decision-seam calls."""
