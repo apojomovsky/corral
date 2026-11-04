@@ -1129,18 +1129,58 @@ class FollowEventsTest(unittest.TestCase):
         self.assertEqual(self._collect(sleep_fn=sleep, poll_s=0.05), [])
         self.assertEqual(seen, [0.05])
 
-    def test_follow_accepts_an_injected_clock(self):
-        events.record(
-            [{"kind": "supply", "ref": "fleet", "evidence": "S"}],
-            root=self.root,
-            now=1000.0,
-            event_id_fn=ids("aaaabbbb"),
-        )
+    def test_follow_prints_rows_without_ids_once_each(self):
+        path = events.events_path(root=self.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        first = {
+            "kind": "supply",
+            "ref": "fleet",
+            "evidence": "first",
+            "first_seen": "t",
+            "resolved_at": None,
+        }
+        second = dict(first, evidence="second")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(first) + "\n")
+            handle.write(json.dumps(second) + "\n")
 
-        def sleep(s):
+        def stop_at_once(s):
             raise KeyboardInterrupt
 
-        rows = self._collect(sleep_fn=sleep, now_fn=lambda: 1234.0)
+        rows = self._collect(sleep_fn=stop_at_once)
+        self.assertEqual([row["evidence"] for row in rows], ["first", "second"])
+
+    def test_follow_with_all_forgets_ids_that_left_the_poll(self):
+        first = {"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "A"}
+        second = {"id": "ccccdddd", "kind": "supply", "ref": "fleet2", "evidence": "B"}
+        polls = iter([[first, second], [second], [first]])
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            if len(calls) == 3:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(
+            events, "list_events", lambda root=None, include_resolved=False: next(polls)
+        ):
+            rows = self._collect(sleep_fn=sleep, include_resolved=True)
+        self.assertEqual([row["id"] for row in rows], ["aaaabbbb", "ccccdddd", "aaaabbbb"])
+
+    def test_follow_without_all_never_reprints_a_resolved_id(self):
+        row = {"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "A"}
+        polls = iter([[row], [], [row]])
+        calls = []
+
+        def sleep(s):
+            calls.append(s)
+            if len(calls) == 3:
+                raise KeyboardInterrupt
+
+        with mock.patch.object(
+            events, "list_events", lambda root=None, include_resolved=False: next(polls)
+        ):
+            rows = self._collect(sleep_fn=sleep)
         self.assertEqual([row["id"] for row in rows], ["aaaabbbb"])
 
 
@@ -1233,6 +1273,35 @@ class FollowCliTest(unittest.TestCase):
         self.assertEqual(code, cli.OK)
         self.assertEqual(out, "")
         self.assertEqual(err, "")
+
+    def test_follow_closed_pipe_exits_zero(self):
+        import sys
+        import warnings
+
+        class _ClosedPipe:
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                pass
+
+        rows = [{"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "slots free"}]
+        captured = []
+        err = io.StringIO()
+        # The devnull handle outlives the patched stdout here, so its
+        # collection warns; in production it stays open as stdout until
+        # exit and warns nothing.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            with mock.patch.object(events, "follow_events", self._fake_follow(rows, captured)):
+                with mock.patch.object(sys, "stdout", _ClosedPipe()):
+                    with redirect_stderr(err):
+                        try:
+                            code = cli.main(["coord", "events", "--follow"])
+                        except SystemExit as exit_:
+                            code = exit_.code
+        self.assertEqual(code, cli.OK)
+        self.assertEqual(err.getvalue(), "")
 
     def test_follow_timeout_is_exit_4(self):
         code, _, err = self._run(["coord", "events", "--follow", "--timeout", "5"])

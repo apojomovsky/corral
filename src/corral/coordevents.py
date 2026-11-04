@@ -572,29 +572,53 @@ def wait_for_events(timeout=None, root=None, poll_s=WAIT_POLL_S, now_fn=None, sl
         sleep(poll_s)
 
 
-def follow_events(
-    root=None, include_resolved=False, poll_s=WAIT_POLL_S, now_fn=None, sleep_fn=None
-):
+def _follow_key(row):
+    """The dedupe key of one polled row for `follow_events`.
+
+    Rows carry an id; a row without one (a hand edit, never a clean
+    write) keys on its serialized content, so each distinct id-less
+    row still prints once instead of all of them collapsing onto one
+    shared key.
+    """
+    key = row.get("id")
+    if key is None:
+        return (None, json.dumps(row, sort_keys=True))
+    return key
+
+
+def follow_events(root=None, include_resolved=False, poll_s=WAIT_POLL_S, sleep_fn=None):
     """Yield queue rows as they arrive: the dump first, then arrivals.
 
     The first poll yields the current selection (honoring
     `include_resolved`, the `--all` flag); later polls yield rows with
-    unseen ids, oldest first, so each event prints once however many
+    unseen keys, oldest first, so each event prints once however many
     polls see it. Runs until the caller stops it; the CLI turns the
     kill into exit 0. Reads only the queue file under the shared lock;
     never the tracker or the forge.
 
-    The clock and sleep seams mirror `wait_for_events` so tests drive
-    the loop without waiting; the loop reads no deadline, so only the
-    sleep seam advances it.
+    The sleep seam mirrors `wait_for_events` so tests drive the loop
+    without waiting; the loop reads no deadline and takes no clock.
+
+    `seen` pruning: with `include_resolved` the poll carries every
+    row, so a key missing from the latest poll left the file for good
+    (old resolved rows are pruned on write, and ids are never reused)
+    and drops out of `seen`, bounding memory on long runs. Without
+    `include_resolved` the poll hides resolved rows, so `seen` keeps
+    every key: a resolved id that reappears was already printed and
+    must not print again.
     """
     sleep = sleep_fn or time.sleep
     seen = set()
     while True:
-        for row in list_events(root=root, include_resolved=include_resolved):
-            key = row.get("id")
+        keyed = [
+            (_follow_key(row), row)
+            for row in list_events(root=root, include_resolved=include_resolved)
+        ]
+        for key, row in keyed:
             if key in seen:
                 continue
             seen.add(key)
             yield row
+        if include_resolved:
+            seen.intersection_update(key for key, _ in keyed)
         sleep(poll_s)

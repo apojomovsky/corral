@@ -280,6 +280,14 @@ def cmd_coord(args: argparse.Namespace) -> int:
                         print(_format_event_row(row), flush=True)
             except KeyboardInterrupt:
                 pass
+            except BrokenPipeError:
+                # The reader went away (`--follow | head -n 1`): a clean
+                # stop, not a failure. Point stdout at devnull so the
+                # interpreter's flush at exit stays silent too.
+                try:
+                    sys.stdout = open(os.devnull, "w")
+                except OSError:
+                    pass
             return OK
         rows = events.list_events(root=root, include_resolved=args.all)
         if args.json:
