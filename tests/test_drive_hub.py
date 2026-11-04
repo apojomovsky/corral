@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, drivehub, hub, registry, settings
+from corral import board, drive, drivehub, hub, paths, registry, settings
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, FakeStop, claimed
@@ -842,6 +842,27 @@ class CmdDrivePlanTest(unittest.TestCase):
         self.assertIn("app#7", logged)
         self.assertEqual(errors, "")
         self.assertEqual(FakeHubClient.built, [])
+
+    def test_non_plan_with_unusable_token_path_is_a_usage_error(self):
+        with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[hub]\nurl = "http://host-1:8000"\nhost_id = "host-1"\n')
+        problem = paths.PathError("CORRAL_CONFIG='relative' must be an absolute path")
+
+        class BombClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("no client without a token path")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(paths, "hub_token_path", side_effect=problem),
+            mock.patch.object(drivehub.hubmod, "HubClient", BombClient),
+            mock.patch.object(drive.sys, "stdout", out),
+            mock.patch.object(drive.sys, "stderr", err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        self.assertEqual(code, 4)
+        self.assertIn("corral drive: CORRAL_CONFIG=", err.getvalue())
+        self.assertEqual(out.getvalue(), "")
 
 
 class HubVersionMappingTest(unittest.TestCase):
