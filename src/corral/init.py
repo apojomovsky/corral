@@ -467,8 +467,18 @@ def _entry_block(name, active):
 
 
 def _entry_values_equal(entry, name, active):
-    """True when the parsed `[[repo]]` table equals the entry we would write."""
-    return isinstance(entry, dict) and entry.get("name") == name and _flatten_entry(entry) == active
+    """True when the parsed `[[repo]]` table equals the entry we would write.
+
+    Setup's `[repo.board]` mapping table is not init's to judge: its
+    keys are excluded from the comparison, so a provisioned entry still
+    converges. Board settings init owns (such as `ready`) still compare.
+    """
+    if not isinstance(entry, dict) or entry.get("name") != name:
+        return False
+    flat = _flatten_entry(entry)
+    for key in _canonical_board_table(entry.get("board")):
+        flat.pop(f"board.{key}", None)
+    return flat == active
 
 
 def render(inputs):
@@ -935,6 +945,71 @@ def _board_block_text(lines, start):
     return "".join(lines[begin:end])
 
 
+def _insert_board_table(text, entry_name, table):
+    """`text` with `table` after the named entry's own block, or None.
+
+    The table lands after the entry's last `[repo.*]` subtable, before
+    the next `[[repo]]` header or end of file, where TOML attaches it
+    to that entry and no other; appending at end of file would attach it
+    to whichever entry happens to be last. Every other byte is
+    preserved. A file whose entry block cannot be located textually
+    returns None.
+    """
+    lines = text.splitlines(keepends=True)
+    at = _repo_block_index(lines, entry_name)
+    if at is None:
+        return None
+    starts = [i for i, line in enumerate(lines) if _REPO_HEADER.match(line)]
+    rank = starts.index(at)
+    end = starts[rank + 1] if rank + 1 < len(starts) else len(lines)
+    head = "".join(lines[:end]).rstrip("\n") + "\n\n"
+    tail = "".join(lines[end:])
+    if tail:
+        return head + table + "\n" + tail.lstrip("\n")
+    return head + table
+
+
+def _is_board_mapping_block(block):
+    """True when `block` is setup's board mapping table, not board settings.
+
+    The mapping table carries the board address (owner plus number or
+    node id); a settings-only `[repo.board]` block (such as a hand-added
+    `ready`) does not, and stays init's to refuse.
+    """
+    try:
+        parsed = tomllib.loads(block)
+    except tomllib.TOMLDecodeError:
+        return False
+    if not isinstance(parsed, dict):
+        return False
+    repo = parsed.get("repo")
+    if not isinstance(repo, dict):
+        return False
+    board = repo.get("board")
+    if not isinstance(board, dict):
+        return False
+    return any(key in board for key in ("project_owner", "project_number", "project_id"))
+
+
+def _board_table_only_difference(current, rendered, entry_name):
+    """True when `current` is `rendered` plus the entry's mapping table.
+
+    `init` does not own setup's `[repo.board]` mapping table, so a file
+    that matches the render except for that one block converges instead
+    of refusing: `corral init` and `corral new` reruns stay no-ops after
+    `corral github setup` provisions the board. Replaying the insertion
+    keeps the comparison byte-exact for everything else.
+    """
+    lines = current.splitlines(keepends=True)
+    at = _repo_block_index(lines, entry_name)
+    if at is None:
+        return False
+    block = _board_block_text(lines, at + 1)
+    if not block or not _is_board_mapping_block(block):
+        return False
+    return _insert_board_table(rendered, entry_name, block) == current
+
+
 def board_table_change(toml_target, entry_name, spec, provision):
     """`(new_text, is_noop)` writing the provisioned mapping into `toml_target`.
 
@@ -982,7 +1057,7 @@ def board_table_change(toml_target, entry_name, spec, provision):
             spec, provision
         ):
             return None, True
-        old = _board_block_text(lines, at or 0)
+        old = _board_block_text(lines, at + 1 if at is not None else 0)
         sys.stdout.write(plan_diff(old, table, os.path.basename(toml_target)))
         raise InitError(
             f"{toml_target} already holds a [repo.board] table for {entry_name!r}"
@@ -994,14 +1069,14 @@ def board_table_change(toml_target, entry_name, spec, provision):
             f"{toml_target}: cannot locate the [[repo]] entry for {entry_name!r}"
             " in the file text: paste the table above into the right entry by hand"
         )
-    starts = [i for i, line in enumerate(lines) if _REPO_HEADER.match(line)]
-    rank = starts.index(at)
-    end = starts[rank + 1] if rank + 1 < len(starts) else len(lines)
-    head = "".join(lines[:end]).rstrip("\n") + "\n\n"
-    tail = "".join(lines[end:])
-    if tail:
-        return head + table + "\n" + tail.lstrip("\n"), False
-    return head + table, False
+    new_text = _insert_board_table(current, entry_name, table)
+    if new_text is None:
+        sys.stdout.write(table)
+        raise InitError(
+            f"{toml_target}: cannot locate the [[repo]] entry for {entry_name!r}"
+            " in the file text: paste the table above into the right entry by hand"
+        )
+    return new_text, False
 
 
 def apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops_fresh=False):
@@ -1034,7 +1109,10 @@ def apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops
     else:
         current = _read_text(toml_target)
         text = render(inputs)
-        if current is not None and current != text and not opts.force and not opts.plan:
+        same = current is not None and (
+            current == text or _board_table_only_difference(current, text, inputs.name)
+        )
+        if current is not None and not same and not opts.force and not opts.plan:
             sys.stdout.write(plan_diff(current, text))
             print(
                 f"corral: {toml_target} exists with different content:"
@@ -1042,7 +1120,7 @@ def apply(ops_root, clone_root, inputs, opts, git, split, ops_created=False, ops
                 file=sys.stderr,
             )
             return USAGE
-        toml_changed = current != text
+        toml_changed = not same
     extra = dict(inputs.extra)
     cap = extra.get("agents.cap", settings.REGISTRY["agents.cap"].default)
     if not isinstance(cap, int) or isinstance(cap, bool):

@@ -12,10 +12,11 @@ Every scaffold write is create-only: missing files are written,
 identical files are kept, and a file that differs from the render
 refuses (exit 4) unless `--force` leaves it alone and converges the
 rest. With `--create-remote`, `new` pre-checks the intended remote
-through the forge, creates it after the commit, sets it as origin, and
-bootstraps the board labels through the tracker (the same operation
-`corral github setup` performs); without it, `new` prints the planned
-create command and runs nothing outward.
+through the forge, creates it after the commit, sets it as origin,
+bootstraps the board labels through the tracker, then ensures the
+board and writes its mapping (the same operation `corral github setup`
+performs, leaving the new entry on the inert labels variant); without
+it, `new` prints the planned create command and runs nothing outward.
 """
 
 import argparse
@@ -28,7 +29,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from corral import forge as iface
-from corral import gc, init, paths
+from corral import gc, init, paths, settings
 from corral import tracker as tracker_iface
 
 OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
@@ -424,6 +425,17 @@ def _production_tracker():
     return ghtracker.GithubTracker(paced_run)
 
 
+def _production_provisioner_factory():
+    """The live board provisioner over the production `gh` runner.
+
+    The factory shape is the one `github setup` passes in: called once
+    per entry, it builds the provisioner the board ensure runs through.
+    """
+    from corral import trackers
+
+    return trackers.production_board_provisioner()
+
+
 def _resolve_owner(opts, forge):
     """The remote owner: `--owner` when given, else the forge current user.
 
@@ -505,6 +517,52 @@ def _bootstrap_labels(repo, tracker):
     return bool(report.created), bool(report.refused)
 
 
+def _bootstrap_board(repo, entry_name, ops_root, provisioner_factory):
+    """Ensure the board for a fresh `--create-remote` repo and write its mapping.
+
+    The same ensure operation `corral github setup` runs: the spec comes
+    from `effective_spec` over the new labels entry (no table yet, so the
+    board is found by title or created, and the table stays inert), and
+    the provisioner comes from the injected factory. Returns
+    `(changed, refused)`, or None when the board is unreachable: the
+    manual `github setup` command is printed as the next step, and the
+    caller exits 3. A refused board prints the same next step and
+    returns `(changed, True)`, so the caller exits 1. A spec or adapter
+    `ValueError` is a usage error, raised as `NewError` (exit 4). The
+    mapping write raises `init.InitError` (exit 4) the same way.
+    """
+    try:
+        spec = tracker_iface.effective_spec(variant="labels", board=None, repo=repo)
+    except ValueError as err:
+        raise NewError(f"corral: {err}") from None
+    try:
+        provisioner = provisioner_factory()
+    except ValueError as err:
+        raise NewError(f"corral: {err}") from None
+    ensure = getattr(provisioner, "ensure_board", None)
+    if not callable(ensure):
+        raise NewError("corral: this tracker does not provision boards")
+    try:
+        provision = ensure(spec)
+    except ValueError as err:
+        raise NewError(f"corral: {err}") from None
+    except tracker_iface.TrackerError as err:
+        sys.stdout.write(f"board on {repo} not bootstrapped: {err}\n")
+        sys.stdout.write("next: corral github setup\n")
+        return None
+    sys.stdout.write(tracker_iface.render_provision(repo, provision))
+    toml_target = os.path.join(ops_root, settings.PROJECT_FILE)
+    new_text, noop = init.board_table_change(toml_target, entry_name, spec, provision)
+    if not noop:
+        try:
+            with open(toml_target, "w", encoding="utf-8") as handle:
+                handle.write(new_text)
+        except OSError as err:
+            raise NewError(f"corral: cannot write {toml_target}: {err}") from None
+        sys.stdout.write(f"wrote [repo.board] for {entry_name}\n")
+    return bool(provision.created) or not noop, bool(provision.refused)
+
+
 def _ensure_origin(target, url, git):
     """Set `origin` to `url` in `target`, unless it already points there.
 
@@ -530,7 +588,7 @@ def _ensure_origin(target, url, git):
     return True
 
 
-def run(opts, git=gc.git, forge=None, tracker=None):
+def run(opts, git=gc.git, forge=None, tracker=None, provisioner_factory=None):
     """Run `new` with injectable seams. Returns the exit code."""
     try:
         return _apply(
@@ -538,6 +596,9 @@ def run(opts, git=gc.git, forge=None, tracker=None):
             git,
             forge if forge is not None else _production_forge(),
             tracker if tracker is not None else _production_tracker(),
+            provisioner_factory
+            if provisioner_factory is not None
+            else _production_provisioner_factory,
         )
     except iface.ForgeExists as err:
         print(f"corral: {err}", file=sys.stderr)
@@ -550,7 +611,7 @@ def run(opts, git=gc.git, forge=None, tracker=None):
         return USAGE
 
 
-def _apply(opts, git, forge, tracker):
+def _apply(opts, git, forge, tracker, provisioner_factory):
     """Create the tree, init the repo, write the scaffold, onboard, commit."""
     if opts.public and not opts.create_remote:
         raise NewError("--public needs --create-remote: it would mean nothing")
@@ -661,8 +722,13 @@ def _apply(opts, git, forge, tracker):
         if bootstrapped is None:
             return UNREACHABLE
         labels_changed, refused = bootstrapped
+        boarded = _bootstrap_board(repo, opts.name, ops_root, provisioner_factory)
+        if boarded is None:
+            return UNREACHABLE
+        board_changed, board_refused = boarded
+        refused = refused or board_refused
     else:
-        labels_changed, refused = False, False
+        labels_changed, board_changed, refused = False, False, False
     if refused:
         sys.stdout.write("next: corral github setup\n")
         return NOTHING
@@ -673,6 +739,7 @@ def _apply(opts, git, forge, tracker):
         or remote_changed
         or origin_changed
         or labels_changed
+        or board_changed
     ):
         sys.stdout.write("next: corral doctor\n")
         return OK
