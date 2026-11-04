@@ -268,9 +268,13 @@ Orphaned claims are recovered, not adopted, by the loop. Adoption from
 tracker labels happens only in the full resync path (`sync.resync_repo`
 via `Store.adopt_claim`), never in a drive pass. Each pass instead
 releases claims that are provably dead: the store names an agent, and
-the registry shows no live or stale entry for that agent id, and no
+the registry shows no live or stale entry for the ticket, and no
 live unit exists for the ticket, and the claim is older than twice
-`registry.gone_s`. The loop passes the agent and epoch straight
+`registry.gone_s`. Presence resolves through the one resolver
+(`entry_for_claim`, by ticket): a live or stale registry entry for the
+ticket leaves the claim alone, even though the holder id never names
+its unit-name entry. The legacy same-namespace `present_agents` check
+remains only for callers without a ticket index. The loop passes the agent and epoch straight
 from the store row into `Store.release(repo, number, agent, epoch,
 *, now)`, which releases only on a matching agent plus epoch and
 raises `Claimed` otherwise. A `Claimed` there means the row changed
@@ -334,14 +338,32 @@ claim, logs, and retries on a later pass: it never releases a ticket
 it failed to flag for a human.
 
 Finished workers are reconciled before stuck ones. When the row's
-holder has a `finished` registry entry (a `done` file, kept for
+ticket has a `finished` registry entry (a `done` file, kept for
 `RETAIN_S`), the worker is complete: the loop keeps the claim until
 the reviewer takes it over, leaving branch and PR untouched. The pass
 captures the worker's agent id (falling back to the `finished`
 registry entry, which carries it for `RETAIN_S`) and passes it as the
 reviewer's `--author`: `review record --author` is required and
 `reviewrecord` refuses author==reviewer, so the reviewer start needs
-the worker id still on the row. The takeover releases the worker
+the worker id still on the row.
+
+Holder and entry never share an id: the claim holder is an opaque id
+the loop minted (`drive-<hash8>-<n>`), while a registry entry is
+keyed by its unit name (`<prefix>-<repo>-<n>`, `-r<gen>` on
+relaunches). The loop links the two by ticket (repo, number) through
+one resolver: the newest registry entry for the ticket wins by last
+heartbeat, so a relaunch reads past the generation it replaced and a
+reviewer reads past the worker it took over from. Registry tickets
+carry the short `[[repo]]` name while store rows carry the tracker
+repo, so every ticket the loop joins goes through the one
+short-to-tracker resolver first; a raw short-to-tracker comparison
+would never match, exactly like keying on the holder id. The stuck sweep,
+the finished-claims scan, the fix-round readiness, the reviewer role
+check that serializes a fix behind a live reviewer, the
+finished-role carry that frees a reviewed row, and the orphan
+presence check all read that
+resolver, never a second copy; keying on the holder id instead would
+match no entry and mistake every finished worker for a crash. The takeover releases the worker
 claim and claims a fresh reviewer id in the same handoff, so there is
 never a window where the row is unclaimed. Worker completion takes
 over before any reviewer start and long before merge; merge-ready rows
@@ -363,9 +385,12 @@ never restarted or released (see below).
 
 Stuck agents: each pass compares claimed tickets against registry
 liveness and unit liveness. Only managed holders ever reach here;
-foreign claims were skipped at gate step 2. A holder with a finished
-entry is not stuck: the claim is kept for the reviewer takeover, so
-a finished worker is never restarted here.
+foreign claims were skipped at gate step 2. A ticket with a finished
+entry (resolved by ticket through the one resolver, never by holder
+id) is never restarted here: the claim is kept for the reviewer
+takeover. Finished rows still enter the sweep, so a withdrawn or
+held finished row with a dead unit releases through the eligibility
+re-check below.
 
 - Heartbeat older than `registry.stale_s` with a live unit: watch once
   more; older than `registry.gone_s` or unit dead: restart (stop the
@@ -407,7 +432,9 @@ a finished worker is never restarted here.
   tail of what was observed with `Tracker.comment`, add
   `needs-decision` with `Tracker.add_label` (the decision-write seam
   above; the outbox carries neither), then release the claim. A
-  failed decision write keeps the claim for a later pass.
+  ticket with a live unit keeps its claim instead, whatever the
+  eligibility says. A failed decision write keeps the claim for a
+  later pass.
 
 ## 6. Observability: logbook, snapshot and `--plan`
 
@@ -488,7 +515,7 @@ is tested through the seam its production code already injects:
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
 | Finished worker keeps its claim until the reviewer takes over; `start` and `review` on a finished holder proceed as a takeover | temp `Store`, fake registry with a `done` entry, recording launcher, author==reviewer refusal case |
-| Finished holders skip the stuck sweep; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
+| Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |
 | Unknown holder with a live unit watches, never restarts | pure `classify_stuck` over constructed states |
 | Ready-made policy requests claimed in-flight rows as `start`; held, closed, external, blocked and open-pull rows stay withdrawn | pure policy call over fixture rows |
@@ -510,7 +537,11 @@ New logic stays pure where decisions live (ordering comparator, orphan
 predicate, budget counter); subprocesses (`gh`, `systemd-run`,
 `systemctl`) and network stay behind the one seam per tool, and the
 stop seam keeps its required-argument rule with the guard test
-extended to the loop's stop path.
+extended to the loop's stop path. The holder-to-entry link stays
+behind the one resolver too: `tests/test_drive_resolver_guard.py`
+parses `drive.py` and `drivehub.py` and fails on any `.get(`, `in` or
+`[...]` that keys on a holder id outside the allow-list, so a second
+resolver cannot be added by accident.
 
 ## 10. Implementation tickets, in order
 
