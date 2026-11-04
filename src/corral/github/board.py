@@ -12,6 +12,7 @@ resolve live against the fetched schema on every poll; display names
 are never matched.
 """
 
+import json
 import re
 from typing import NamedTuple
 
@@ -104,11 +105,34 @@ class BoardSchema(NamedTuple):
 #: module only names the reader's kind contract below.
 _CONCEPT_ATTRS = iface.BOARD_CONCEPT_ATTRS
 
-#: Concepts carried as option display names.
+#: Concepts carried as option display names. Every other board concept
+#: is carried as free text: this one set owns the text-versus-select
+#: fact, and both the read and provision paths resolve it through
+#: ``_want_kind`` below.
 _SELECT_CONCEPTS = frozenset({"board_status", "priority", "area", "pool"})
 
-#: Concepts carried as free text.
-_TEXT_CONCEPTS = frozenset({"agent", "status", "blocked_by"})
+
+def _want_kind(concept) -> str:
+    """``"single_select"`` or ``"text"`` for one board concept."""
+    return "single_select" if concept in _SELECT_CONCEPTS else "text"
+
+
+def _field_kind(node) -> str:
+    """``"text"``, ``"single_select"`` or ``"other"`` for one schema node.
+
+    The one mapping from the provider's ``(__typename, dataType)`` shape
+    to a kind: the read path (``_parse_field``) and the provision path
+    (``_live_fields``) both call this, so the contract cannot fork.
+    """
+    if (
+        node.get("__typename") == "ProjectV2SingleSelectField"
+        and node.get("dataType") == "SINGLE_SELECT"
+    ):
+        return "single_select"
+    if node.get("__typename") == "ProjectV2Field" and node.get("dataType") == "TEXT":
+        return "text"
+    return "other"
+
 
 #: One ``owner/repo#N`` reference, matched whole: owner is a login,
 #: the repo allows dots and underscores, the number never starts at 0.
@@ -236,15 +260,8 @@ class BoardReader:
 
     def _parse_field(self, concept, name, node) -> FieldDef:
         """One mapped schema node as a ``FieldDef``, else ``TrackerError``."""
-        typename = node.get("__typename")
-        datatype = node.get("dataType")
-        if typename == "ProjectV2SingleSelectField" and datatype == "SINGLE_SELECT":
-            kind = "single_select"
-        elif typename == "ProjectV2Field" and datatype == "TEXT":
-            kind = "text"
-        else:
-            kind = "other"
-        want = "single_select" if concept in _SELECT_CONCEPTS else "text"
+        kind = _field_kind(node)
+        want = _want_kind(concept)
         if kind != want:
             raise _fail(f"board field {name!r} for {concept} has the wrong kind")
         options = {}
@@ -415,7 +432,7 @@ class BoardReader:
         concept = by_field.get(fid)
         if concept is None:
             return None, None, None
-        if concept in _TEXT_CONCEPTS:
+        if _want_kind(concept) == "text":
             if "text" not in entry:
                 raise _fail(f"board value for {concept} is not text")
             text = entry["text"]
@@ -654,3 +671,807 @@ class BoardTracker(BoardReader):
         if entry.get("optionId") is not None:
             return fid, None
         return fid, ""
+
+
+#: The owner lookup: one query asking for the login as both halves, so
+#: the adapter learns the owner's node id and user-or-organization kind
+#: without a second round trip. Exactly one half resolves; the other
+#: answers a NOT_FOUND error beside the data, which the runner reports
+#: with a non-zero exit while still printing the body on stdout.
+_OWNER_QUERY = """query ProvisionOwnerResolve($login: String!) {
+  user(login: $login) { id }
+  organization(login: $login) { id }
+}"""
+
+#: Everything one ensure step needs from a project: identity, title and
+#: visibility, the linked repositories, and the schema with every
+#: option's id, color and description (the append resends the whole
+#: list, so a partial option shape would silently reset the rest).
+_PROJECT_FRAGMENT = """fragment ProvisionBoardProject on ProjectV2 {
+  id number title public
+  repositories(first: 100) { nodes { nameWithOwner } }
+  fields(first: 100) {
+    nodes {
+      __typename
+      ... on ProjectV2Field { id name dataType }
+      ... on ProjectV2SingleSelectField { id name dataType options { id name color description } }
+      ... on ProjectV2IterationField { id name dataType }
+    }
+  }
+}"""
+
+_BY_NUMBER = (
+    """query ProvisionBoardByNumber($owner: String!, $number: Int!) {
+  user(login: $owner) { projectV2(number: $number) { ...ProvisionBoardProject } }
+  organization(login: $owner) { projectV2(number: $number) { ...ProvisionBoardProject } }
+}
+"""
+    + _PROJECT_FRAGMENT
+)
+
+_BY_ID = (
+    """query ProvisionBoardById($id: ID!) {
+  node(id: $id) { ... on ProjectV2 { ...ProvisionBoardProject } }
+}
+"""
+    + _PROJECT_FRAGMENT
+)
+
+_TITLES_USER = """query ProvisionBoardTitles($login: String!, $after: String) {
+  user(login: $login) {
+    projectsV2(first: 100, after: $after) {
+      nodes { id number title }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
+_TITLES_ORG = """query ProvisionBoardTitles($login: String!, $after: String) {
+  organization(login: $login) {
+    projectsV2(first: 100, after: $after) {
+      nodes { id number title }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}"""
+
+_CREATE = """mutation ProvisionBoardCreate($owner: ID!, $title: String!, $repo: ID) {
+  createProjectV2(input: {ownerId: $owner, title: $title, repositoryId: $repo}) {
+    projectV2 { id number title public }
+  }
+}"""
+
+_MAKE_PRIVATE = """mutation ProvisionBoardMakePrivate($project: ID!) {
+  updateProjectV2(input: {projectId: $project, public: false}) {
+    projectV2 { id public }
+  }
+}"""
+
+_LINK = """mutation ProvisionBoardLinkRepo($project: ID!, $repo: ID!) {
+  linkProjectV2ToRepository(input: {projectId: $project, repositoryId: $repo}) {
+    repository { id nameWithOwner }
+  }
+}"""
+
+_TEXT_FIELD_CREATE = """mutation ProvisionTextFieldCreate($project: ID!, $name: String!) {
+  createProjectV2Field(input: {projectId: $project, dataType: TEXT, name: $name}) {
+    projectV2Field { id name }
+  }
+}"""
+
+_SELECT_FIELD_CREATE = """mutation ProvisionSelectFieldCreate($project: ID!, $name: String!, $options: [ProjectV2SingleSelectFieldOptionInput!]) {
+  createProjectV2Field(input: {projectId: $project, dataType: SINGLE_SELECT, name: $name, singleSelectOptions: $options}) {
+    projectV2Field { id name }
+  }
+}"""
+
+_OPTIONS_APPEND = """mutation ProvisionOptionsAppend($field: ID!, $options: [ProjectV2SingleSelectFieldOptionInput!]) {
+  updateProjectV2Field(input: {fieldId: $field, singleSelectOptions: $options}) {
+    projectV2Field { id name }
+  }
+}"""
+
+#: The fix line for a spec addressing a board that no longer resolves.
+_REMOVE_TABLE_LINE = "the board in the config no longer exists: remove the table and re-run"
+
+
+def _link_fix(repo) -> str:
+    """The fix line when the account may not link ``repo`` to the board."""
+    return (
+        f"could not link {repo} to the board: the account may not see or administer "
+        "that repository; link it on the board by hand, then re-run"
+    )
+
+
+#: The color of an option the provisioner creates. New options carry no
+#: meaning, so they share one neutral color; people recolor by hand.
+_NEW_OPTION_COLOR = "GRAY"
+
+
+def _response_body(err):
+    """A GraphQL response body surviving on a failed ``run``, else None.
+
+    The runner prints the body on stdout even when GraphQL ``errors``
+    entries make it exit non-zero, and the seam carries that output on
+    the error; a seam double may also carry the body as the message.
+    Anything else is not a body.
+    """
+    output = getattr(err, "output", "") or ""
+    if output:
+        try:
+            parsed = json.loads(output)
+        except ValueError:
+            pass
+        else:
+            if isinstance(parsed, dict):
+                return parsed
+    try:
+        parsed = json.loads(str(err) or "")
+    except ValueError:
+        return None
+    if isinstance(parsed, dict) and "data" in parsed:
+        return parsed
+    return None
+
+
+def _missing_only(text) -> bool:
+    """Whether a failure is only NOT_FOUND entries, never a resolve.
+
+    Seam doubles that raise instead of returning a body still name an
+    unresolvable owner or board this way; anything broader fails closed.
+    """
+    try:
+        parsed = json.loads(text or "")
+    except ValueError:
+        return False
+    if not isinstance(parsed, list) or not parsed:
+        return False
+    return all(isinstance(entry, dict) and entry.get("type") == "NOT_FOUND" for entry in parsed)
+
+
+def _errors_rate_limited(errors) -> bool:
+    """Whether a GraphQL body's errors answer a rate limit.
+
+    Structured first, like ``gh.graphql``: a RATE_LIMITED entry is rate
+    limited even when its message names something else.
+    """
+    if not isinstance(errors, list):
+        return False
+    if any(isinstance(entry, dict) and entry.get("type") == "RATE_LIMITED" for entry in errors):
+        return True
+    return gh.is_rate_limited(json.dumps(errors))
+
+
+class _BoardForbidden(iface.TrackerError):
+    """A GraphQL answer refused the call: no permission, not unreachable.
+
+    A subclass of ``TrackerError`` so paths that do not distinguish it
+    still fail closed with exit code 3. The link step catches it and
+    reports the refusal with its fix line instead.
+    """
+
+
+def _check_body_errors(body, pacer) -> None:
+    """Raise for the error entries a GraphQL body carries beside its data.
+
+    The one classifier every provision read and mutation runs its failed
+    response through, so the error contract holds on all paths: a
+    RATE_LIMITED entry raises ``TrackerRateLimited``, a FORBIDDEN entry
+    raises ``_BoardForbidden``, and any other entry besides the expected
+    NOT_FOUND noise (the losing half of the owner lookup) raises
+    ``TrackerError`` instead of resolving to a missing board or a
+    refusal. A transient conflict entry therefore fails closed here;
+    only the populate operation retries those. A body with no errors, or
+    only NOT_FOUND entries, passes: the caller decides those from the
+    data.
+    """
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if not errors:
+        return
+    if _errors_rate_limited(errors):
+        text = json.dumps(errors)
+        if pacer is not None:
+            pacer.cooldown(gh.retry_after_s(text))
+        raise iface.TrackerRateLimited(text, gh.retry_after_s(text))
+    if any(isinstance(entry, dict) and entry.get("type") == "FORBIDDEN" for entry in errors):
+        raise _BoardForbidden(json.dumps(errors))
+    if all(isinstance(entry, dict) and entry.get("type") == "NOT_FOUND" for entry in errors):
+        return
+    raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
+
+
+class GithubBoardProvisioner:
+    """One board's idempotent ensure, over the injected ``run`` seam.
+
+    Constructed with only ``run`` and the pacer, never a ``BoardConfig``:
+    provisioning runs in the bootstrap states where no board tracker can
+    exist yet. Each step checks its precondition against the live board,
+    so a partial run converges on re-run; the board itself is the state.
+    A spec that cannot run as given raises ``ValueError`` before any
+    mutation, an unreachable provider raises ``TrackerError``, and a
+    rate-limit answer raises ``TrackerRateLimited``.
+    """
+
+    def __init__(self, run, pacer=None):
+        """``run(args)`` returns stdout and raises when ``gh`` fails."""
+        self._run = run
+        self._pacer = pacer
+
+    def _active_pacer(self):
+        """The injected pacer, else the machine-wide shared bucket."""
+        return self._pacer if self._pacer is not None else gh._pacer()
+
+    def _mutate(self, query, **variables):
+        """One paced GraphQL mutation as its ``data`` payload.
+
+        Rate-limit text maps to ``TrackerRateLimited`` through the shared
+        classifier, and a response body surviving on the error is decided
+        by the one body classifier; anything else fails closed, like the
+        board reads and writes.
+        """
+        try:
+            return gh.graphql(query, run=self._run, pacer=self._pacer, **variables)
+        except gh.GhError as err:
+            text = str(err) or repr(err)
+            if err.kind == "unavailable" or gh.is_rate_limited(text):
+                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            body = _response_body(err)
+            if body is not None:
+                _check_body_errors(body, self._active_pacer())
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
+
+    def _read(self, query, make_missing, **variables):
+        """One paced GraphQL read as its ``data`` payload, tolerating bodies.
+
+        A body that carries GraphQL ``errors`` beside partial ``data``
+        still decides: ``make_missing`` builds the ``ValueError`` for
+        data that resolves nothing (``None`` when the caller has no such
+        case, and then an unresolvable read fails closed instead).
+        """
+        try:
+            return gh.graphql(query, run=self._run, pacer=self._pacer, **variables)
+        except gh.GhError as err:
+            text = str(err) or repr(err)
+            if err.kind == "unavailable" or gh.is_rate_limited(text):
+                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            body = _response_body(err)
+            if body is not None:
+                _check_body_errors(body, self._active_pacer())
+                data = body.get("data")
+                if data is None or isinstance(data, dict):
+                    return data
+            if make_missing is not None and _missing_only(text):
+                raise make_missing() from err
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
+
+    def _read_body(self, query, make_missing, **variables):
+        """One paced GraphQL read as its full response body.
+
+        The owner lookup expects a NOT_FOUND error on the losing half
+        beside the winning half's data, which ``graphql`` refuses to
+        return; this goes through the raw seam instead, paced as a read,
+        and decides from the body, never from the exit code.
+        """
+        pacer = self._active_pacer()
+        try:
+            pacer.acquire(cost=gh.GRAPHQL_CALL_COST)
+            out = self._run(gh.graphql_args(query, variables), paced=True)
+        except gh.GhError as err:
+            text = str(err) or repr(err)
+            if err.kind == "unavailable" or gh.is_rate_limited(text):
+                pacer.cooldown(gh.retry_after_s(text))
+                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            body = _response_body(err)
+            if body is None:
+                if _missing_only(text):
+                    raise make_missing() from err
+                raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
+        else:
+            try:
+                body = json.loads(out)
+            except ValueError:
+                raise iface.TrackerError(f"unusable board answer: {out[:80]!r}") from None
+        if not isinstance(body, dict):
+            raise iface.TrackerError(f"unusable board answer: {body!r}")
+        _check_body_errors(body, pacer)
+        data = body.get("data")
+        if data is None or isinstance(data, dict):
+            return data
+        raise iface.TrackerError(f"unusable board answer: {body!r}")
+
+    def _resolve_owner(self, login):
+        """``(kind, node id)`` for one board owner login.
+
+        ``kind`` is ``"user"`` or ``"organization"``. An unknown login
+        and a login resolving to both halves raise ``ValueError`` before
+        any mutation; a half that resolves without a node id is an
+        unusable answer.
+        """
+
+        def missing():
+            return ValueError(
+                f"board owner {login!r} resolves to neither a user nor an organization"
+            )
+
+        data = self._read_body(_OWNER_QUERY, missing, login=login)
+        if not isinstance(data, dict):
+            raise missing()
+        user = data.get("user")
+        org = data.get("organization")
+        if user is None and org is None:
+            raise missing()
+        for half in (user, org):
+            if half is None:
+                continue
+            if not isinstance(half, dict):
+                raise _fail(f"bad board owner {half!r}")
+            node_id = half.get("id")
+            if not isinstance(node_id, str) or not node_id:
+                raise _fail(f"bad board owner {half!r}")
+        if user is not None and org is not None:
+            raise ValueError(f"board owner {login!r} resolves to both a user and an organization")
+        if user is not None:
+            return "user", user["id"]
+        return "organization", org["id"]
+
+    def _live_option(self, field_name, entry):
+        """One raw option node as a ``LiveOption``, else ``TrackerError``.
+
+        A missing color or description rides as ``None``: the append
+        step refuses to resend an option it cannot reproduce in full.
+        """
+        if not isinstance(entry, dict):
+            raise _fail(f"bad board option {entry!r} in {field_name!r}")
+        oid = entry.get("id")
+        name = entry.get("name")
+        if not isinstance(oid, str) or not oid:
+            raise _fail(f"bad board option {entry!r} in {field_name!r}")
+        if not isinstance(name, str):
+            raise _fail(f"bad board option {entry!r} in {field_name!r}")
+        color = entry.get("color")
+        description = entry.get("description")
+        if color is not None and not isinstance(color, str):
+            raise _fail(f"bad board option {entry!r} in {field_name!r}")
+        if description is not None and not isinstance(description, str):
+            raise _fail(f"bad board option {entry!r} in {field_name!r}")
+        return iface.LiveOption(id=oid, name=name, color=color, description=description)
+
+    def _live_fields(self, nodes):
+        """Raw field nodes as planner input, else ``TrackerError``.
+
+        Duplicate names are not deduped here: the planner refuses them
+        with a fix line, never silently picks one.
+        """
+        if not isinstance(nodes, list):
+            raise _fail("board fields are not a list")
+        found = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                raise _fail(f"bad board field {node!r}")
+            fid = node.get("id")
+            name = node.get("name")
+            if not isinstance(fid, str) or not fid:
+                raise _fail(f"bad board field {node!r}")
+            if not isinstance(name, str) or not name:
+                raise _fail(f"bad board field {node!r}")
+            kind = _field_kind(node)
+            if kind != "single_select":
+                found.append(iface.LiveField(name=name, kind=kind))
+                continue
+            options = node.get("options")
+            if not isinstance(options, list):
+                raise _fail(f"board field {name!r} has no options")
+            found.append(
+                iface.LiveField(
+                    name=name,
+                    kind=kind,
+                    options=tuple(self._live_option(name, entry) for entry in options),
+                )
+            )
+        return tuple(found)
+
+    def _parse_project(self, payload):
+        """One extended project object as plain data, else ``TrackerError``.
+
+        Returns ``(id, number, title, public, repos, live fields, field
+        ids by name)``; the ids serve the option-append update, which the
+        planner input does not carry.
+        """
+        if not isinstance(payload, dict):
+            raise _fail(f"board project is not an object: {payload!r}")
+        project_id = payload.get("id")
+        number = payload.get("number")
+        title = payload.get("title")
+        public = payload.get("public")
+        if not isinstance(project_id, str) or not project_id:
+            raise _fail(f"bad board project id {project_id!r}")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise _fail(f"bad board project number {number!r}")
+        if not isinstance(title, str) or not title:
+            raise _fail(f"bad board project title {title!r}")
+        if not isinstance(public, bool):
+            raise _fail(f"bad board project visibility {public!r}")
+        repositories = payload.get("repositories")
+        nodes = repositories.get("nodes") if isinstance(repositories, dict) else None
+        if not isinstance(nodes, list):
+            raise _fail("board repositories are not a list")
+        repos = []
+        for entry in nodes:
+            if not isinstance(entry, dict):
+                raise _fail(f"bad board repository {entry!r}")
+            name = entry.get("nameWithOwner")
+            if not isinstance(name, str) or not name:
+                raise _fail(f"bad board repository {entry!r}")
+            repos.append(name)
+        fields = payload.get("fields")
+        field_nodes = fields.get("nodes") if isinstance(fields, dict) else None
+        if not isinstance(field_nodes, list):
+            raise _fail("board fields are not a list")
+        live = self._live_fields(field_nodes)
+        ids = {}
+        for node, field in zip(field_nodes, live):
+            ids.setdefault(field.name, node["id"])
+        return (project_id, number, title, public, tuple(repos), live, ids)
+
+    def _read_project_by_id(self, project_id):
+        """One board by node id as parsed data, else ``ValueError`` or ``TrackerError``."""
+
+        def missing():
+            return ValueError(_REMOVE_TABLE_LINE)
+
+        data = self._read(_BY_ID, missing, id=project_id)
+        if not isinstance(data, dict):
+            raise missing()
+        node = data.get("node")
+        if node is None:
+            raise missing()
+        return self._parse_project(node)
+
+    def _find_by_address(self, spec):
+        """The spec's addressed board as parsed data, never a neighbor.
+
+        A board found by address is the board whatever its current title
+        is; an address that resolves nothing raises ``ValueError`` with
+        the remove-the-table fix before any mutation, and never falls
+        through to title search or creation.
+        """
+
+        def missing():
+            return ValueError(_REMOVE_TABLE_LINE)
+
+        if spec.project_id is not None:
+            return self._read_project_by_id(spec.project_id)
+        data = self._read(_BY_NUMBER, missing, owner=spec.owner, number=spec.number)
+        if not isinstance(data, dict):
+            raise missing()
+        user = data.get("user")
+        org = data.get("organization")
+        for half in (user, org):
+            if half is not None and not isinstance(half, dict):
+                raise _fail(f"bad board owner {half!r}")
+        user_project = user.get("projectV2") if isinstance(user, dict) else None
+        org_project = org.get("projectV2") if isinstance(org, dict) else None
+        if user_project is None and org_project is None:
+            raise missing()
+        if user_project is not None and org_project is not None:
+            raise _fail("board project is missing or ambiguous")
+        project = user_project if org_project is None else org_project
+        return self._parse_project(project)
+
+    def _find_by_title(self, spec, kind):
+        """The spec's title match as a project node id, ``None`` or ``ValueError``.
+
+        Zero matches means create; two or more name every matching
+        number and raise before any mutation. Titles are a
+        provisioning-time search key only: an addressed run never calls
+        this.
+        """
+        query = _TITLES_USER if kind == "user" else _TITLES_ORG
+        matches = []
+        after = None
+        while True:
+            if after is None:
+                data = self._read(query, None, login=spec.owner)
+            else:
+                data = self._read(query, None, login=spec.owner, after=after)
+            half = data.get(kind) if isinstance(data, dict) else None
+            if not isinstance(half, dict):
+                raise _fail("board title list is missing")
+            connection = half.get("projectsV2")
+            if not isinstance(connection, dict):
+                raise _fail("board title list is missing")
+            nodes = connection.get("nodes")
+            if not isinstance(nodes, list):
+                raise _fail("board titles are not a list")
+            for entry in nodes:
+                if not isinstance(entry, dict):
+                    raise _fail(f"bad board title {entry!r}")
+                eid = entry.get("id")
+                number = entry.get("number")
+                title = entry.get("title")
+                if not isinstance(eid, str) or not eid:
+                    raise _fail(f"bad board title {entry!r}")
+                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                    raise _fail(f"bad board title {entry!r}")
+                if not isinstance(title, str) or not title:
+                    raise _fail(f"bad board title {entry!r}")
+                if title == spec.title:
+                    matches.append((eid, number))
+            info = connection.get("pageInfo")
+            if info is None:
+                break
+            if not isinstance(info, dict):
+                raise _fail(f"bad board pageInfo {info!r}")
+            more = info.get("hasNextPage")
+            if not isinstance(more, bool):
+                raise _fail(f"bad board pageInfo {info!r}")
+            if not more:
+                break
+            end = info.get("endCursor")
+            if not isinstance(end, str) or not end:
+                raise _fail("board title list claims more boards but names no cursor")
+            after = end
+        if not matches:
+            return None
+        if len(matches) > 1:
+            numbers = ", ".join(
+                str(number) for _, number in sorted(matches, key=lambda item: item[1])
+            )
+            raise ValueError(
+                f"board title {spec.title!r} under {spec.owner} matches more than one board "
+                f"(numbers {numbers}): delete the board the config does not address by hand, then re-run"
+            )
+        return matches[0][0]
+
+    def _create_board(self, spec, owner_id, repo_id):
+        """The spec's board, created and read back, as parsed data."""
+        variables = {"ownerId": owner_id, "title": spec.title}
+        if repo_id is not None:
+            variables["repositoryId"] = repo_id
+        payload = self._mutate(_CREATE, **variables)
+        node = payload.get("createProjectV2") if isinstance(payload, dict) else None
+        project = node.get("projectV2") if isinstance(node, dict) else None
+        if not isinstance(project, dict):
+            raise _fail(f"unusable board create answer: {payload!r}")
+        project_id = project.get("id")
+        if not isinstance(project_id, str) or not project_id:
+            raise _fail(f"unusable board create answer: {payload!r}")
+        return self._read_project_by_id(project_id)
+
+    def _make_private(self, project_id):
+        """A just-created board made private: one update mutation.
+
+        Making the board private is part of creating it as specced, and
+        gates everything after it: when the update errors the error
+        propagates and nothing else runs.
+        """
+        payload = self._mutate(_MAKE_PRIVATE, projectId=project_id)
+        node = payload.get("updateProjectV2") if isinstance(payload, dict) else None
+        if not isinstance(node, dict) or not isinstance(node.get("projectV2"), dict):
+            raise _fail(f"unusable board update answer: {payload!r}")
+
+    def _fetch_repo_id(self, repo):
+        """One tracker repo's node id, ``None`` when unlinkable, else ``TrackerError``.
+
+        A repo the account cannot see or administer refuses only the
+        link step; a rate-limit answer stops the run, and anything else
+        fails closed.
+        """
+        try:
+            payload = json.loads(
+                gh.paced_run(["api", f"repos/{repo}"], run=self._run, pacer=self._pacer)
+            )
+        except gh.GhError as err:
+            text = str(err) or repr(err)
+            if gh.is_rate_limited(text):
+                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            if "(HTTP 404)" in text or "(HTTP 403)" in text:
+                return None
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
+        if not isinstance(payload, dict):
+            raise _fail(f"unusable repo answer: {payload!r}")
+        node_id = payload.get("node_id")
+        if not isinstance(node_id, str) or not node_id:
+            raise _fail(f"unusable repo answer: {payload!r}")
+        return node_id
+
+    def _ensure_link(self, spec, project_id, repos, repo_ids, created, kept, refused):
+        """The spec's repo linked, or kept, or refused with a fix line."""
+        if not spec.repo:
+            return
+        if spec.repo in repos:
+            kept.append(f"link:{spec.repo}")
+            return
+        if spec.repo in repo_ids:
+            repo_id = repo_ids[spec.repo]
+        else:
+            repo_id = self._fetch_repo_id(spec.repo)
+            repo_ids[spec.repo] = repo_id
+        if repo_id is None:
+            refused.append(_link_fix(spec.repo))
+            return
+        try:
+            payload = self._mutate(_LINK, projectId=project_id, repositoryId=repo_id)
+        except iface.TrackerRateLimited:
+            raise
+        except _BoardForbidden:
+            refused.append(_link_fix(spec.repo))
+            return
+        except iface.TrackerError as err:
+            if "(HTTP 403)" in str(err):
+                refused.append(_link_fix(spec.repo))
+                return
+            raise
+        node = payload.get("linkProjectV2ToRepository") if isinstance(payload, dict) else None
+        if not isinstance(node, dict):
+            raise _fail(f"unusable board link answer: {payload!r}")
+        created.append(f"link:{spec.repo}")
+
+    def _create_field(self, project_id, field):
+        """One spec field created, with its standard options when single-select."""
+        if field.kind == "text":
+            payload = self._mutate(_TEXT_FIELD_CREATE, projectId=project_id, name=field.name)
+        else:
+            options = [
+                {"name": name, "color": _NEW_OPTION_COLOR, "description": ""}
+                for name in field.options
+            ]
+            payload = self._mutate(
+                _SELECT_FIELD_CREATE,
+                projectId=project_id,
+                name=field.name,
+                singleSelectOptions=options,
+            )
+        node = payload.get("createProjectV2Field") if isinstance(payload, dict) else None
+        created = node.get("projectV2Field") if isinstance(node, dict) else None
+        if (
+            not isinstance(created, dict)
+            or not isinstance(created.get("id"), str)
+            or not created["id"]
+        ):
+            raise _fail(f"unusable board field answer: {payload!r}")
+
+    def _append_options(self, project_id, field_ids, plan, created, refused):
+        """A kept Priority field's missing ranks appended, or refused by hand.
+
+        The update replaces the whole option list, so every existing
+        option rides along with its id, color and description unchanged;
+        an option that cannot be resent in full refuses the append
+        instead, since resetting people's colors is forbidden and new
+        ids would silently invalidate every map in the wild.
+        """
+        missing = [option for option in plan.options]
+        resend = list(plan.resend)
+        if any(
+            option.id is None or option.color is None or option.description is None
+            for option in resend
+        ):
+            for name in missing:
+                refused.append(
+                    f"add the {name!r} option to field {plan.name!r} on the board by hand, then re-run"
+                )
+            return
+        options = [
+            {
+                "id": option.id,
+                "name": option.name,
+                "color": option.color,
+                "description": option.description,
+            }
+            for option in resend
+        ]
+        options += [
+            {"name": name, "color": _NEW_OPTION_COLOR, "description": ""} for name in missing
+        ]
+        payload = self._mutate(
+            _OPTIONS_APPEND, fieldId=field_ids[plan.name], singleSelectOptions=options
+        )
+        node = payload.get("updateProjectV2Field") if isinstance(payload, dict) else None
+        if not isinstance(node, dict) or not isinstance(node.get("projectV2Field"), dict):
+            raise _fail(f"unusable board options answer: {payload!r}")
+        created.extend(f"option:{plan.name}/{name}" for name in missing)
+
+    def _ensure_fields(self, spec, project_id, live, field_ids, created, kept, refused):
+        """The planner's field actions executed: creates, keeps, appends."""
+        plan = iface.plan_board(spec, live)
+        refused.extend(plan.refused)
+        for field, field_plan in zip(spec.fields, plan.fields):
+            if field_plan.decision == "create":
+                self._create_field(project_id, field)
+                created.append(f"field:{field.name}")
+            elif field_plan.decision == "keep":
+                kept.append(f"field:{field.name}")
+                if field_plan.options:
+                    self._append_options(project_id, field_ids, field_plan, created, refused)
+
+    def _report(self, spec, project_id, number, created, kept, refused, live):
+        """The ensure outcome, built from the final read-back.
+
+        The names in ``fields`` come from the provision, never
+        re-derived from defaults, and a refused concept renders nothing;
+        the map is built rename-is-free, so the file never names an id
+        the board does not hold. A refusal standing on the final
+        read-back is the same refusal, never a second line.
+        """
+        plan = iface.plan_board(spec, live)
+        refused = tuple(dict.fromkeys(tuple(refused) + plan.refused))
+        live_concepts = {
+            field_plan.concept for field_plan in plan.fields if field_plan.decision != "refuse"
+        }
+        fields = tuple(field for field in spec.fields if field.concept in live_concepts)
+        return iface.BoardProvision(
+            owner=spec.owner,
+            number=number,
+            project_id=project_id,
+            fields=fields,
+            created=tuple(created),
+            kept=tuple(kept),
+            refused=refused,
+            priority_map=plan.priority_map,
+        )
+
+    def ensure_board(self, spec):
+        """Create what the spec names and is missing, keep the rest.
+
+        Never alters or deletes what exists: an existing field is kept
+        byte-for-byte, and options are only ever appended to a kept
+        Priority field. See the class docstring for the error contract.
+        """
+        owner_kind, owner_id = self._resolve_owner(spec.owner)
+        created: list = []
+        kept: list = []
+        refused: list = []
+        repo_ids: dict = {}
+        if spec.project_id is not None or spec.number is not None:
+            project = self._find_by_address(spec)
+            kept.append("project")
+            via_address = True
+        else:
+            found_id = self._find_by_title(spec, owner_kind)
+            if found_id is None:
+                repo_id = None
+                if spec.repo:
+                    repo_id = self._fetch_repo_id(spec.repo)
+                    repo_ids[spec.repo] = repo_id
+                project = self._create_board(spec, owner_id, repo_id)
+                created.append("project")
+                via_address = False
+            else:
+                project = self._read_project_by_id(found_id)
+                kept.append("project")
+                via_address = False
+        project_id, number, title, public, repos, live, field_ids = project
+        if spec.private and public:
+            if created:
+                self._make_private(project_id)
+                project = self._read_project_by_id(project_id)
+                project_id, number, title, public, repos, live, field_ids = project
+                if public:
+                    fix = (
+                        f"new board {title!r} is public but the spec asks for private: "
+                        "make it private by hand, then re-run"
+                    )
+                    return self._report(spec, project_id, number, ["project"], [], [fix], live)
+            elif via_address:
+                refused.append(
+                    f"board {title!r} is public but the spec asks for private: make it private by hand"
+                )
+            else:
+                refused.append(
+                    f"board {title!r} is public but the spec asks for private: make it private by hand"
+                )
+                self._ensure_link(spec, project_id, repos, repo_ids, created, kept, refused)
+                return self._report(spec, project_id, number, created, kept, refused, live)
+        self._ensure_link(spec, project_id, repos, repo_ids, created, kept, refused)
+        self._ensure_fields(spec, project_id, live, field_ids, created, kept, refused)
+        project = self._read_project_by_id(project_id)
+        project_id, number, _, _, _, live, _ = project
+        return self._report(spec, project_id, number, created, kept, refused, live)
