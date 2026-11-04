@@ -460,6 +460,13 @@ class BudgetWiringTest(OpsCase):
         self.assertIn("auditor", str(caught.exception))
         self.assertEqual(caught.exception.exit_code, 4)
 
+    def test_an_empty_role_reaches_the_gate_as_unknown(self):
+        self.host_config(HOST_BUDGET + WORKER_PRICE)
+        with self.assertRaises(resources.LimitsError) as caught:
+            self.admit(role="")
+        self.assertIn("unknown role ''", str(caught.exception))
+        self.assertEqual(caught.exception.exit_code, 4)
+
     def test_an_unpriced_role_under_a_host_budget_is_refused_with_4(self):
         self.host_config(HOST_BUDGET + WORKER_PRICE)
         with self.assertRaisesRegex(launch.LaunchError, "reviewer") as caught:
