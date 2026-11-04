@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from typing import Any
-from corral import board, drive, sync, tracker
+from corral import board, drive, eligibility, policies, sync, tracker
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -118,13 +118,116 @@ class ExternalTest(StoreCase):
         row, _ = self.store.item(REPO, 1, now=T0)
         self.assertFalse(row.external)
 
-    def test_fork_pr_is_external_for_operator_author(self):
+    def test_fork_pr_is_no_ticket_row_for_operator_author(self):
+        # A pull request is never a ticket, not even hidden as an
+        # external row: the sync drops its reading instead of storing it.
         fake = FakeTracker(
             [reading(number=9, kind="pr", author="alice", from_fork=True, updated_at=T0)]
         )
+        result = sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
+        self.assertEqual(result.errors, ())
+        self.assertIsNone(self.store.item(REPO, 9, now=T0)[0])
+        self.assertEqual(self.store.items(repo=REPO), [])
+
+
+class PullRequestSyncTest(StoreCase):
+    """A pull request is never a ticket: no feed, listing, or audit
+    re-read may store one, and a store holding one selects nothing."""
+
+    def seed_legacy_pr(self, number=9):
+        """One pre-fix row for a pull request, straight into the table."""
+        self.store._conn.execute(
+            "INSERT INTO items(repo, number, kind, title, body, state,"
+            " author, labels, priority, assignees, url,"
+            " tracker_updated_at, fetched_at, confidence, external, extra)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                REPO,
+                number,
+                "pr",
+                "Title 9",
+                "Body 9",
+                "open",
+                "alice",
+                '["ready"]',
+                "high",
+                "[]",
+                "https://example.com/acme/app/9",
+                T0 - 100,
+                T0 - 100,
+                board.CONFIRMED,
+                0,
+                "{}",
+            ),
+        )
+
+    def row_count(self):
+        return self.store._conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+
+    def test_feed_pr_stores_no_row_and_advances_cursor(self):
+        # The bug shape: open, operator-authored, same-repo, ready.
+        # The loop once offered exactly this row as a fresh start.
+        fake = FakeTracker(
+            [
+                reading(
+                    number=9,
+                    kind="pr",
+                    author="alice",
+                    labels=("ready",),
+                    from_fork=False,
+                    updated_at=T0,
+                )
+            ]
+        )
+        result = sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.cursor, tracker.format_cursor(T0))
+        self.assertIsNone(self.store.item(REPO, 9, now=T0)[0])
+        self.assertEqual(self.store.items(repo=REPO), [])
+
+    def test_feed_issue_beside_pr_stores_only_the_issue(self):
+        fake = FakeTracker(
+            [
+                reading(number=1, updated_at=T0 - 50),
+                reading(number=9, kind="pr", author="alice", updated_at=T0),
+            ]
+        )
         sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
-        row, _ = self.store.item(REPO, 9, now=T0)
-        self.assertTrue(row.external)
+        self.assertEqual(
+            [(row.repo, row.number) for row in self.store.items(repo=REPO)], [(REPO, 1)]
+        )
+
+    def test_resync_pr_reading_stores_no_row_and_adopts_no_claim(self):
+        fake = FakeTracker(
+            [reading(number=9, kind="pr", author="alice", agent="alice", updated_at=T0)]
+        )
+        result = sync.resync_repo(self.store, fake, REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.conflicts, ())
+        self.assertIsNone(self.store.item(REPO, 9, now=T0)[0])
+        self.assertIsNone(self.store.claim_of(REPO, 9))
+
+    def test_audit_skips_the_legacy_pr_row(self):
+        # The audit enumerates visible rows only, so a legacy pull-request
+        # row is ignored rather than re-read; feed or resync contact
+        # drops it instead.
+        self.seed_legacy_pr()
+        fake = FakeTracker([reading(number=9, kind="pr", author="alice", updated_at=T0 - 100)])
+        result = sync.audit_repo(self.store, fake, REPO, operators=["alice"], now=T0, limit=10)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(result.store_errors, ())
+        self.assertEqual(result.items_seen, 0)
+        self.assertIsNone(self.store.item(REPO, 9, now=T0)[0])
+        self.assertEqual(self.store.items(repo=REPO), [])
+
+    def test_store_holding_only_a_pr_selects_nothing(self):
+        self.stored(1)
+        self.seed_legacy_pr()
+        rows = eligibility.rows_from_items(self.store.items(repo=REPO))
+        self.assertEqual(
+            [(request.repo, request.number) for request in policies.basic(rows, now=T0)],
+            [(REPO, 1)],
+        )
 
 
 class ResyncTest(StoreCase):

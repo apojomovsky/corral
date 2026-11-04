@@ -269,6 +269,8 @@ def gate(
     now,
     finished=None,
     agent_roles=None,
+    agent_states=None,
+    agent_tickets=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -282,7 +284,9 @@ def gate(
     by that finished worker itself, which the reviewer takes over. Rows
     reviewed since the last work are merge-ready and ignored, and a fix
     round requested after the fix already landed is skipped. A fix or
-    resume behind a reviewer holder (from `agent_roles`) skips with the
+    resume behind a reviewer holder (from `agent_roles`, resolved to
+    its registry entry by ticket through the one resolver, since a
+    drive-id holder never names a unit-name entry) skips with the
     claim kept, matching the claiming pass, so `--plan` prints the
     verdict the real pass would print. Every input is plain data or an
     injected seam (`read_labels`); nothing is launched, claimed or
@@ -404,7 +408,18 @@ def gate(
         roles = ", ".join(f"role {name!r} ({blocked[name]['state']})" for name in sorted(blocked))
         return _skip(candidate, kind, "quota", f"{ref}: quota refuses {roles}: skipped")
 
-    if kind in ("resume", "fix") and (agent_roles or {}).get(holder) == "reviewer":
+    if (
+        kind in ("resume", "fix")
+        and holder_role(
+            holder,
+            row.repo,
+            row.number,
+            agent_states=agent_states,
+            agent_tickets=agent_tickets,
+            agent_roles=agent_roles,
+        )
+        == "reviewer"
+    ):
         return _skip(
             candidate,
             kind,
@@ -1160,6 +1175,8 @@ def _gate_all(
     released=None,
     finished=None,
     agent_roles=None,
+    agent_states=None,
+    agent_tickets=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -1172,8 +1189,9 @@ def _gate_all(
     still-claimed rows gates what the real pass would gate after the
     release; `finished` carries the newest finished entry per ticket for
     the reviewer and fix-round readiness; `agent_roles` ({agent id:
-    role}) feeds the gate's reviewer-holder skip, so a plan matches
-    the claiming pass. Nothing is written.
+    role} for visible entries), resolved through `agent_states` and
+    `agent_tickets` by ticket, feeds the gate's reviewer-holder skip,
+    so a plan matches the claiming pass. Nothing is written.
     """
     rows = eligibility.rows_from_items(items)
     by_key = {(row.repo, row.number): row for row in rows}
@@ -1260,6 +1278,8 @@ def _gate_all(
             now=now,
             finished=finished,
             agent_roles=agent_roles,
+            agent_states=agent_states,
+            agent_tickets=agent_tickets,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1285,6 +1305,7 @@ def _pass(
     agent_states=None,
     finished_for=None,
     agent_roles=None,
+    agent_tickets=None,
     live_units=None,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
@@ -1292,13 +1313,14 @@ def _pass(
     Nothing is synced, claimed, enqueued, started, mirrored or journaled.
     A project whose policy or quota settings fail is skipped with one
     error line; the pass still gates every other project and exits 4.
-    `agent_states`, `finished_for` and `agent_roles` feed the reviewer
-    and fix-round readiness exactly like the claiming pass, so the plan
-    shows the verdicts the real pass would print; all are reads only.
-    `live_units` filters the finished-reviewer simulation the same way
-    the claiming pass filters its release, so a live unit's row gates
-    as still claimed here too; without it every finished reviewer row
-    simulates as released. The production CLI supplies the host units.
+    `agent_states`, `agent_tickets`, `finished_for` and `agent_roles`
+    feed the reviewer and fix-round readiness exactly like the claiming
+    pass, so the plan shows the verdicts the real pass would print;
+    all are reads only. `live_units` filters the finished-reviewer
+    simulation the same way the claiming pass filters its release, so
+    a live unit's row gates as still claimed here too; without it every
+    finished reviewer row simulates as released. The production CLI
+    supplies the host units.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1328,8 +1350,12 @@ def _pass(
         pool,
     ) = ctx
     plan_live = frozenset(live_units or ())
-    authors = _capture_finished_holders(store, agent_states=agent_states, err=err)
-    finished = resolve_finished(finished_for, authors)
+    authors = _capture_finished_holders(
+        store, agent_states=agent_states, agent_tickets=agent_tickets, err=err
+    )
+    finished = resolve_finished(
+        finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
+    )
     gated_rows, problems, _ = _gate_all(
         items,
         registered,
@@ -1345,6 +1371,8 @@ def _pass(
         released=reviewed_claims(authors, finished, live_units=plan_live),
         finished=finished,
         agent_roles=agent_roles,
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
     )
     table = [
         Candidate(
@@ -1505,36 +1533,64 @@ def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_a
     return found, None
 
 
-def is_orphan(claim, *, now, gone_s, present_agents, live_units) -> bool:
+def is_orphan(
+    claim,
+    *,
+    now,
+    gone_s,
+    present_agents=None,
+    live_units=None,
+    agent_states=None,
+    agent_tickets=None,
+) -> bool:
     """Whether `claim` is provably dead under the section 4 rule. Pure.
 
     Dead means the store names a managed holder (an id this loop
-    minted), the registry shows no live or stale entry for that id, no
-    live unit exists for the ticket, and the claim is older than twice
-    `gone_s`. `present_agents` is the ids with a live or stale registry
-    entry; `live_units` is the (repo, number) pairs with a live unit.
-    Anything less certain (a present agent, a live unit, a young claim)
-    is left for stuck handling, and a foreign holder is never an
-    orphan: the loop never touches a foreign claim.
+    minted), the registry shows no live or stale entry for the
+    ticket, no live unit exists for the ticket, and the claim is older
+    than twice `gone_s`. Presence resolves through the one resolver
+    (`entry_for_claim`, by ticket with `agent_tickets`, never by holder
+    id): a live or stale entry for the ticket leaves the claim alone.
+    `present_agents` is the legacy same-namespace set (ids with a live
+    or stale entry) kept for callers without a ticket index; a holder
+    found there is also left alone. `live_units` is the (repo, number)
+    pairs with a live unit. Anything less certain (a present agent, a
+    live unit, a young claim) is left for stuck handling, and a foreign
+    holder is never an orphan: the loop never touches a foreign claim.
     """
     if claim is None or not claim.agent:
         return False
     if not is_managed_agent(claim.agent):
         return False
-    if claim.agent in present_agents:
+    present = present_agents if present_agents is not None else frozenset()
+    if claim.agent in present:
         return False
-    if (claim.repo, claim.number) in live_units:
+    live = live_units if live_units is not None else frozenset()
+    if (claim.repo, claim.number) in live:
         return False
+    if agent_states is not None:
+        seen = entry_for_claim(claim, agent_states=agent_states, agent_tickets=agent_tickets)
+        if seen is not None and seen[1] in (registry.LIVE, registry.STALE):
+            return False
     return now - claim.claimed_at > 2 * gone_s
 
 
-def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
+def _orphan_claims(
+    store,
+    *,
+    now,
+    gone_s,
+    present_agents=None,
+    live_units=None,
+    agent_states=None,
+    agent_tickets=None,
+):
     """The provably-dead claims, in store order. Pure reads.
 
     The scan half of `release_orphans`: each store row whose claim the
-    orphan rule calls dead. Runs through the shared retry policy; a
-    persistent failure propagates for the caller to skip the step with
-    every claim kept.
+    orphan rule calls dead, resolved through the one resolver. Runs
+    through the shared retry policy; a persistent failure propagates
+    for the caller to skip the step with every claim kept.
     """
 
     def scan():
@@ -1547,6 +1603,8 @@ def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
                 gone_s=gone_s,
                 present_agents=present_agents,
                 live_units=live_units,
+                agent_states=agent_states,
+                agent_tickets=agent_tickets,
             ):
                 continue
             found.append(claim)
@@ -1555,7 +1613,18 @@ def _orphan_claims(store, *, now, gone_s, present_agents, live_units):
     return _retry_scan(scan)
 
 
-def release_orphans(store, *, now, gone_s, present_agents, live_units, out, events=None) -> int:
+def release_orphans(
+    store,
+    *,
+    now,
+    gone_s,
+    present_agents=None,
+    live_units=None,
+    out,
+    events=None,
+    agent_states=None,
+    agent_tickets=None,
+) -> int:
     """Release every provably-dead claim, one logbook line each.
 
     Returns the released count. The scan runs first, through the
@@ -1579,6 +1648,8 @@ def release_orphans(store, *, now, gone_s, present_agents, live_units, out, even
         gone_s=gone_s,
         present_agents=present_agents,
         live_units=live_units,
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
     )
     released = 0
     for claim in orphans:
@@ -1832,16 +1903,86 @@ def give_up_body(repo, number, *, observed, restarts):
     )
 
 
-def _finished_claims(store, agent_states):
+@dataclass(frozen=True)
+class _HolderClaim:
+    """The (repo, number, agent) `entry_for_claim` reads off a claim."""
+
+    repo: str
+    number: int
+    agent: str
+
+
+def _holder_claim(holder, repo, number) -> _HolderClaim:
+    """The claim view for a bare holder id, for `entry_for_claim`."""
+    return _HolderClaim(repo=repo, number=number, agent=holder or "")
+
+
+def entry_for_claim(claim, *, agent_states, agent_tickets=None):
+    """`(entry id, state, last_seen)` of the registry entry for this claim. Pure.
+
+    The one resolver for which registry entry belongs to a claim, read
+    by the stuck sweep, the finished-claims scan and the fix-round
+    readiness: every one of them goes through here, never a second
+    copy. A claim's holder is an opaque id this loop minted
+    (`drive-<hash8>-<n>`); registry entries are keyed by unit name
+    (`<prefix>-<repo>-<n>`, `-r<gen>` on later generations), so the
+    holder id never names an entry. The link is the ticket:
+    `agent_tickets` maps entry id to (repo, number), and the newest
+    entry for the claim's ticket wins by last heartbeat (a relaunch
+    heartbeats past the generation it replaced; a reviewer heartbeats
+    past the worker it took over from). With no ticket index the
+    holder id itself is the only key available: production always
+    passes the index, so that fallback never fires outside tests.
+    A ticket with no entry resolves to None.
+    """
+    states = agent_states or {}
+    if agent_tickets is None:
+        seen = states.get(claim.agent)
+        if seen is None:
+            return None
+        return (claim.agent, seen[0], seen[1])
+    newest = None
+    for entry_id, ticket in agent_tickets.items():
+        if ticket != (claim.repo, claim.number):
+            continue
+        seen = states.get(entry_id)
+        if seen is None:
+            continue
+        if newest is None or seen[1] > newest[2]:
+            newest = (entry_id, seen[0], seen[1])
+    return newest
+
+
+def holder_role(holder, repo, number, *, agent_states, agent_tickets, agent_roles):
+    """The registry role behind this claim holder, or None. Pure.
+
+    The only reader of `agent_roles` by holder: it resolves the
+    holder to its registry entry through `entry_for_claim` (by
+    ticket, never by holder id) and reads that entry's role, so a
+    unit-name-keyed role map is never keyed by an opaque drive id.
+    Unknown holders and entries without a recorded role read as
+    None, which every caller treats as not a reviewer.
+    """
+    entry = entry_for_claim(
+        _holder_claim(holder, repo, number),
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
+    )
+    if entry is None:
+        return None
+    return (agent_roles or {}).get(entry[0])
+
+
+def _finished_claims(store, agent_states, agent_tickets=None):
     """Managed claims with a finished registry entry. Pure reads.
 
     The scan `finished_holders` reads: each store row whose holder is
-    a managed agent with a finished entry. A missing state map reads as
-    nothing finished. The scan runs through the shared retry policy; a
-    persistent failure propagates for the caller to skip the step with
-    every claim kept.
+    a managed agent whose ticket has a finished entry, resolved through
+    `entry_for_claim`. A missing state map reads as nothing finished.
+    The scan runs through the shared retry policy; a persistent
+    failure propagates for the caller to skip the step with every
+    claim kept.
     """
-    states = agent_states or {}
 
     def scan():
         found = []
@@ -1849,8 +1990,8 @@ def _finished_claims(store, agent_states):
             claim = store.claim_of(item.repo, item.number)
             if claim is None or not claim.agent or not is_managed_agent(claim.agent):
                 continue
-            seen = states.get(claim.agent)
-            if seen is None or seen[0] != registry.FINISHED:
+            seen = entry_for_claim(claim, agent_states=agent_states, agent_tickets=agent_tickets)
+            if seen is None or seen[1] != registry.FINISHED:
                 continue
             found.append(claim)
         return found
@@ -1935,20 +2076,22 @@ def release_reviewed(store, *, claims, live_units, now, out, events=None) -> dic
     return released
 
 
-def finished_holders(store, *, agent_states) -> dict:
+def finished_holders(store, *, agent_states, agent_tickets=None) -> dict:
     """{(repo, number): worker id} for finished managed holders. Pure reads.
 
     The pass captures the pre-takeover worker ids before any reviewer
     takes over, so a reviewer start in the same pass can pass the
-    worker id as its author. Scans with `_finished_claims`; a missing
-    state map reads as nothing finished, so the map is empty.
+    worker id as its author. Scans with `_finished_claims`, resolving
+    each holder through `entry_for_claim`; a missing state map reads
+    as nothing finished, so the map is empty.
     """
     return {
-        (claim.repo, claim.number): claim.agent for claim in _finished_claims(store, agent_states)
+        (claim.repo, claim.number): claim.agent
+        for claim in _finished_claims(store, agent_states, agent_tickets)
     }
 
 
-def _capture_finished_holders(store, *, agent_states, err) -> dict:
+def _capture_finished_holders(store, *, agent_states, agent_tickets=None, err) -> dict:
     """The pre-takeover worker ids for this pass, never raising.
 
     Both passes read this capture: the launching pass before any
@@ -1961,43 +2104,65 @@ def _capture_finished_holders(store, *, agent_states, err) -> dict:
     if agent_states is None:
         return {}
     try:
-        return finished_holders(store, agent_states=agent_states)
+        return finished_holders(store, agent_states=agent_states, agent_tickets=agent_tickets)
     except (board.StoreError, sqlite3.Error) as problem:
         print(f"corral drive: finished holder capture skipped ({problem})", file=err)
         return {}
 
 
-def resolve_finished(finished_for, released) -> dict:
+def resolve_finished(finished_for, released, *, agent_states=None, agent_tickets=None) -> dict:
     """{(repo, number): (agent id, role)} newest finished entry per ticket. Pure.
 
     `finished_for` is the cross-pass map from finished registry entries
     (agent id to role, `None` when the entry records none); `released`
     is this pass's {(repo, number): worker id} capture. A same-pass
     capture always wins: it just happened, so it is the newest event.
-    It keeps the cross-pass role only for the same agent id, else its
-    role is unknown (`None`), which the gate reads as unreviewed work.
+    It keeps the cross-pass role only for the same ticket's entry:
+    the cross-pass agent id is a unit name while the capture holds
+    the opaque drive id, so raw ids never compare equal. The capture
+    holder is resolved to its registry entry through the one
+    resolver (`entry_for_claim`, by ticket) and the role carries
+    over only when that entry is the cross-pass one; anything newer
+    reads as unknown (`None`), which the gate reads as unreviewed
+    work. Without a ticket index only raw ids compare, which keeps
+    the same-namespace unit tests exact.
     """
     resolved = dict(finished_for or {})
     for ticket, agent in (released or {}).items():
         role = None
         prior = resolved.get(ticket)
-        if prior is not None and prior[0] == agent:
-            role = prior[1]
+        if prior is not None:
+            if prior[0] == agent:
+                role = prior[1]
+            else:
+                entry = entry_for_claim(
+                    _holder_claim(agent, ticket[0], ticket[1]),
+                    agent_states=agent_states,
+                    agent_tickets=agent_tickets,
+                )
+                if entry is not None and entry[0] == prior[0]:
+                    role = prior[1]
         resolved[ticket] = (agent, role)
     return resolved
 
 
-def fix_mode(holder, *, repo, number, agent_states, live_units) -> str:
+def fix_mode(holder, *, repo, number, agent_states, live_units, agent_tickets=None) -> str:
     """`"resume"` when the holder is still usable, else `"fresh"`. Pure.
 
-    A fix round resumes the holder's session when the holder's registry
-    entry is live or stale, or a live unit exists for the ticket; either
-    proves something usable survived. Anything else restarts fresh on
-    the same ticket and branch. A fresh restart counts against the
-    restart budget; a resume reuses the session and never does.
+    A fix round resumes the holder's session when the ticket's registry
+    entry (resolved through `entry_for_claim`: the holder id never
+    names an entry) is live or stale, or a live unit exists for the
+    ticket; either proves something usable survived. Anything else
+    restarts fresh on the same ticket and branch. A fresh restart
+    counts against the restart budget; a resume reuses the session and
+    never does.
     """
-    seen = (agent_states or {}).get(holder)
-    if seen is not None and seen[0] in (registry.LIVE, registry.STALE):
+    entry = entry_for_claim(
+        _holder_claim(holder, repo, number),
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
+    )
+    if entry is not None and entry[1] in (registry.LIVE, registry.STALE):
         return "resume"
     if (repo, number) in (live_units or frozenset()):
         return "resume"
@@ -2128,6 +2293,7 @@ def handle_stuck(
     read_labels=None,
     hold_label=hold.HOLD_LABEL,
     requested=None,
+    agent_tickets=None,
 ):
     """Restart or give up on stuck managed claims. Returns (restarted, capped).
 
@@ -2144,10 +2310,12 @@ def handle_stuck(
     claim fences correctly), except unreadable labels, which fail
     closed with the claim kept, and except rows with a live unit, which
     keep their claim with a logbook line whatever the eligibility says.
-    A holder with a finished registry entry is never restarted: the
-    claim is kept for the reviewer takeover. Finished rows still enter
-    the sweep, so a withdrawn or held finished row with a dead unit
-    releases through the eligibility re-check above. In hub mode `hub_epoch_of` maps
+    A ticket with a finished registry entry (from `entry_for_claim`,
+    by ticket with `agent_tickets`, never by holder id) is never
+    restarted: the claim is kept for the reviewer takeover. Finished
+    rows still enter the sweep, so a withdrawn or held finished row
+    with a dead unit releases through the eligibility re-check above.
+    In hub mode `hub_epoch_of` maps
     (repo, number) to the hub row's fencing epoch (None when the hub
     shows no row); a local epoch the hub superseded skips instead of
     restarting, and an unreadable hub epoch skips without stopping, so
@@ -2216,12 +2384,12 @@ def handle_stuck(
                     file=out,
                 )
                 continue
-        seen = agent_states.get(claim.agent)
-        if seen is None or not isinstance(seen[1], (int, float)):
+        seen = entry_for_claim(claim, agent_states=agent_states, agent_tickets=agent_tickets)
+        if seen is None or not isinstance(seen[2], (int, float)):
             known, age = False, float("inf")
             observed = "no registry entry for the holder"
         else:
-            known, age = True, now - seen[1]
+            known, age = True, now - seen[2]
             observed = f"last heartbeat {int(age)}s ago"
         unit_live = (claim.repo, claim.number) in live
         observed += " with a live unit" if unit_live else " and no live unit"
@@ -2260,7 +2428,7 @@ def handle_stuck(
             if events is not None:
                 events.append({"event": "release", "at": now, "ticket": ref, "agent": claim.agent})
             continue
-        if seen is not None and seen[0] == registry.FINISHED:
+        if seen is not None and seen[1] == registry.FINISHED:
             print(f"{ref}: worker `{claim.agent}` finished, not stuck, claim kept", file=out)
             continue
         key = f"{claim.repo}#{claim.number}"
@@ -2421,18 +2589,25 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
 
 
 def production_stuck_inputs(registered, *, now):
-    """`(agent_states, stale_s)` from the registry for the stuck sweep.
+    """`(agent_states, stale_s, agent_tickets)` from the registry for the stuck sweep.
 
     `agent_states` maps every visible agent id to (state, last_seen);
-    an id with no entry reads as gone. Raises SettingsError for bad
-    registry settings.
+    an id with no entry reads as gone. `agent_tickets` maps every
+    visible agent id naming a ticket to (repo, number): the ticket
+    index `entry_for_claim` resolves holders through, since a claim's
+    holder id never names its unit-name entry. Raises SettingsError
+    for bad registry settings.
     """
     cfg = registry.config()
     states = {}
+    tickets = {}
     for entry, state in registry.visible(now, cfg):
         last = entry.get("last_seen") or entry.get("started_at") or 0
         states[entry["id"]] = (state, float(last))
-    return states, cfg["stale_s"]
+        ticket = registry.ticket_of(entry)
+        if ticket is not None:
+            tickets[entry["id"]] = ticket
+    return states, cfg["stale_s"], tickets
 
 
 def production_agent_roles(*, now):
@@ -2692,6 +2867,7 @@ def _claim_and_launch(
     released=None,
     finished=None,
     agent_states=None,
+    agent_tickets=None,
     live_units=None,
     restarts_path=None,
     agent_roles=None,
@@ -2716,9 +2892,10 @@ def _claim_and_launch(
     resumes when the holder is still usable and otherwise releases and
     reclaims before restarting on the same branch, which the launch
     path reuses. A fix or resume behind a reviewer holder waits: when the
-    current holder's role (from `agent_roles`) is a reviewer, the row
-    is skipped with the claim kept, and the fix is scheduled on a
-    later pass after the reviewer finishes and is released. A fresh
+    current holder's role (from `agent_roles`, resolved to its
+    registry entry by ticket through the one resolver) is a reviewer,
+    the row is skipped with the claim kept, and the fix is scheduled
+    on a later pass after the reviewer finishes and is released. A fresh
     restart first gates on the day cap, then on the restart budget:
     past the budget the row routes to the give-up path exactly as the
     stuck sweep does (decision writes through `tracker_factory`, then
@@ -2956,7 +3133,17 @@ def _claim_and_launch(
                     )
                 )
                 continue
-            if (agent_roles or {}).get(holder) == "reviewer":
+            if (
+                holder_role(
+                    holder,
+                    gated.repo,
+                    gated.number,
+                    agent_states=agent_states,
+                    agent_tickets=agent_tickets,
+                    agent_roles=agent_roles,
+                )
+                == "reviewer"
+            ):
                 rows.append(
                     Gated(
                         project=gated.project,
@@ -2978,6 +3165,7 @@ def _claim_and_launch(
                 number=gated.number,
                 agent_states=agent_states,
                 live_units=live_units,
+                agent_tickets=agent_tickets,
             )
             effective = "resume" if mode == "resume" else "fix"
             key = f"{gated.repo}#{gated.number}"
@@ -3588,6 +3776,7 @@ def _launching_pass(
     restarts_path,
     stuck_project,
     agent_roles=None,
+    agent_tickets=None,
     finished_for=None,
     journal_path=None,
     day_path=None,
@@ -3748,8 +3937,12 @@ def _launching_pass(
     else:
         present_agents = frozenset(present_agents or ())
         live_units = frozenset(live_units or ())
-    authors = _capture_finished_holders(store, agent_states=agent_states, err=err)
-    finished = resolve_finished(finished_for, authors)
+    authors = _capture_finished_holders(
+        store, agent_states=agent_states, agent_tickets=agent_tickets, err=err
+    )
+    finished = resolve_finished(
+        finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
+    )
     freed: dict = {}
     if agent_states is not None:
         try:
@@ -3781,6 +3974,8 @@ def _launching_pass(
                 live_units=live_units,
                 out=out,
                 events=events if journal_path is not None else None,
+                agent_states=agent_states,
+                agent_tickets=agent_tickets,
             )
         except (board.StoreError, sqlite3.Error) as problem:
             print(f"corral drive: orphan recovery skipped ({problem})", file=err)
@@ -3806,6 +4001,9 @@ def _launching_pass(
         hold_label=hold_label,
         released=freed,
         finished=finished,
+        agent_roles=agent_roles,
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
     )
     if host is None:
         try:
@@ -3835,6 +4033,7 @@ def _launching_pass(
             released=authors,
             finished=finished,
             agent_states=agent_states,
+            agent_tickets=agent_tickets,
             live_units=live_units,
             restarts_path=restarts_path,
             agent_roles=agent_roles,
@@ -3878,6 +4077,7 @@ def _launching_pass(
                 read_labels=read_labels,
                 hold_label=hold_label,
                 requested=eligible_keys,
+                agent_tickets=agent_tickets,
             )
             started += stuck_restarted
         except (board.StoreError, sqlite3.Error) as problem:
@@ -3999,6 +4199,7 @@ def run_pass(
     restarts_path=None,
     stuck_project=None,
     agent_roles=None,
+    agent_tickets=None,
     finished_for=None,
     journal_path=None,
     pause_path=None,
@@ -4048,7 +4249,11 @@ def run_pass(
     ticket) feeds the reviewer and fix-round readiness alongside the
     same-pass capture. `agent_roles` ({agent id: role} for visible
     entries) serializes a fix behind a reviewer holder; unknown
-    holders proceed as before. The plan pass reads it too, so `--plan`
+    holders proceed as before. `agent_tickets` ({agent id: (repo,
+    number)} for visible entries naming a ticket) is the ticket index
+    the stuck sweep, the finished-claims scan and the fix-round
+    readiness resolve holders through: a claim's holder id never names
+    its unit-name entry. The plan pass reads it too, so `--plan`
     prints the same reviewer-holder skips. When `pause_path` names an
     existing pause file, either pass reports it and exits 1, starting
     nothing. When `journal_path` is set, the non-plan pass journals its
@@ -4089,6 +4294,7 @@ def run_pass(
             agent_states=agent_states,
             finished_for=finished_for,
             agent_roles=agent_roles,
+            agent_tickets=agent_tickets,
             live_units=live_units,
             **args,
         )
@@ -4113,6 +4319,7 @@ def run_pass(
                 restarts_path=restarts_path,
                 stuck_project=stuck_project,
                 agent_roles=agent_roles,
+                agent_tickets=agent_tickets,
                 finished_for=finished_for,
                 journal_path=journal_path,
                 day_path=day_path,

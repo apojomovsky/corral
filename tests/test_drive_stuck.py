@@ -32,6 +32,11 @@ OLDER = NOW - 8000.0
 YOUNG = NOW - 100.0
 AGENT = "drive-host-1-16000-acme--app-7"
 HOST = "host-1"
+#: Real-shaped ids: a claim holder is an opaque minted id, while a
+#: registry entry is keyed by its unit name (with `-rN` on relaunches).
+HOLDER = "drive-a1b2c3d4-7"
+UNIT = "blue-agent-app-7"
+UNIT_R1 = "blue-agent-app-7-r1"
 
 
 def claimed(store, repo, number, agent=AGENT, *, at=OLD):
@@ -1079,6 +1084,179 @@ class FinishedPassTest(unittest.TestCase):
             self.assertEqual(handle.read(), "{}")
 
 
+class EntryForClaimTest(unittest.TestCase):
+    """The one claim-to-entry resolver: a holder maps by ticket, never by id."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-entry-for-claim-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+
+    def claim(self, agent=HOLDER):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, agent, HOST, now=OLD)
+        found = store.claim_of("app", 7)
+        assert found is not None
+        return found
+
+    def test_a_drive_holder_resolves_to_its_unit_entry_by_ticket(self):
+        claim = self.claim()
+        seen = drive.entry_for_claim(
+            claim,
+            agent_states={UNIT: (registry.FINISHED, OLD + 10.0)},
+            agent_tickets={UNIT: ("app", 7)},
+        )
+        self.assertEqual(seen, (UNIT, registry.FINISHED, OLD + 10.0))
+
+    def test_the_newest_entry_wins_across_restart_generations(self):
+        claim = self.claim()
+        seen = drive.entry_for_claim(
+            claim,
+            agent_states={
+                UNIT: (registry.FINISHED, OLD + 10.0),
+                UNIT_R1: (registry.LIVE, NOW - 5.0),
+            },
+            agent_tickets={UNIT: ("app", 7), UNIT_R1: ("app", 7)},
+        )
+        self.assertEqual(seen, (UNIT_R1, registry.LIVE, NOW - 5.0))
+
+    def test_the_newest_finished_entry_wins_after_a_restart(self):
+        claim = self.claim()
+        seen = drive.entry_for_claim(
+            claim,
+            agent_states={
+                UNIT: (registry.FINISHED, OLD + 10.0),
+                UNIT_R1: (registry.FINISHED, OLD + 20.0),
+            },
+            agent_tickets={UNIT: ("app", 7), UNIT_R1: ("app", 7)},
+        )
+        self.assertEqual(seen, (UNIT_R1, registry.FINISHED, OLD + 20.0))
+
+    def test_a_ticket_with_no_entry_resolves_to_nothing(self):
+        claim = self.claim()
+        self.assertIsNone(
+            drive.entry_for_claim(
+                claim,
+                agent_states={UNIT: (registry.FINISHED, OLD + 10.0)},
+                agent_tickets={UNIT: ("app", 8)},
+            )
+        )
+        self.assertIsNone(drive.entry_for_claim(claim, agent_states={}, agent_tickets={}))
+
+    def test_without_a_ticket_index_the_holder_id_is_the_only_key(self):
+        claim = self.claim()
+        seen = drive.entry_for_claim(claim, agent_states={HOLDER: (registry.FINISHED, OLD)})
+        self.assertEqual(seen, (HOLDER, registry.FINISHED, OLD))
+
+
+class FinishedLookupPassTest(unittest.TestCase):
+    """Real-shaped stuck passes: a drive-id holder, unit-name entries, no live unit."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="corral-finished-lookup-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.budget = os.path.join(self.tmp.name, "restarts.json")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_finished_unit_keeps_a_drive_id_claim_without_restarting(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = store.claim("app", 7, HOLDER, HOST, now=OLD)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            **wants(self.policies, ("app", 7)),
+            agent_states={UNIT: (registry.FINISHED, OLD + 10.0)},
+            agent_tickets={UNIT: ("app", 7)},
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("finished, not stuck, claim kept", out.getvalue())
+        self.assertNotIn("restarted", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_finished_restart_generation_never_restarts_again(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = store.claim("app", 7, HOLDER, HOST, now=OLD)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            **wants(self.policies, ("app", 7)),
+            agent_states={
+                UNIT: (registry.FINISHED, OLD + 10.0),
+                UNIT_R1: (registry.FINISHED, OLD + 20.0),
+            },
+            agent_tickets={UNIT: ("app", 7), UNIT_R1: ("app", 7)},
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("finished, not stuck, claim kept", out.getvalue())
+        self.assertNotIn("restarted", out.getvalue())
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
+
+    def test_a_killed_worker_with_no_entry_is_still_a_restart_candidate(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = store.claim("app", 7, HOLDER, HOST, now=OLD)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = stuck_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            **wants(self.policies, ("app", 7)),
+            agent_states={},
+            agent_tickets={},
+            live_units=frozenset(),
+            stop_unit=stop,
+            restarter=launcher,
+            restarts_path=self.budget,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(stop.calls, [("app", 7)])
+        self.assertEqual(len(launcher.calls), 1)
+        project, repo, number, kind, agent, _title, _author = launcher.calls[0]
+        self.assertEqual((project, repo, number, kind), ("blue", "app", 7, "start"))
+        self.assertEqual(agent, HOLDER)
+        self.assertEqual(drive.load_restarts(self.budget), {"app#7": [NOW]})
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (HOLDER, made.epoch))
+
+
 class ProductionStuckProjectTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-project-")
@@ -1125,7 +1303,7 @@ class ProductionStuckInputsTest(unittest.TestCase):
             ),
             mock.patch.object(drive.registry, "visible", return_value=entries),
         ):
-            states, stale_s = drive.production_stuck_inputs(registered, now=NOW)
+            states, stale_s, tickets = drive.production_stuck_inputs(registered, now=NOW)
         self.assertEqual(
             states,
             {
@@ -1135,6 +1313,35 @@ class ProductionStuckInputsTest(unittest.TestCase):
             },
         )
         self.assertEqual(stale_s, STALE_S)
+        self.assertEqual(tickets, {})
+
+    def test_entries_naming_a_ticket_are_indexed_by_ticket(self):
+        from unittest import mock
+
+        from corral import projects as projects_mod
+
+        registered = [
+            projects_mod.Project(name="blue", unit_prefix="blue-agent-", root="/tmp/x"),
+        ]
+        entries = [
+            (
+                {
+                    "id": UNIT,
+                    "last_seen": 100.0,
+                    "ticket": {"project": "blue", "repo": "app", "number": 7},
+                },
+                registry.FINISHED,
+            ),
+            ({"id": "live-1", "last_seen": 50.0}, registry.LIVE),
+        ]
+        with (
+            mock.patch.object(
+                drive.registry, "config", return_value={"stale_s": STALE_S, "gone_s": GONE_S}
+            ),
+            mock.patch.object(drive.registry, "visible", return_value=entries),
+        ):
+            _, _, tickets = drive.production_stuck_inputs(registered, now=NOW)
+        self.assertEqual(tickets, {UNIT: ("app", 7)})
 
 
 def external_row(store, repo, number):

@@ -121,6 +121,20 @@ class IsOrphanTest(unittest.TestCase):
     def test_a_foreign_holder_is_never_an_orphan(self):
         self.assertFalse(self.check(self.dead(agent="manual-9")))
 
+    def test_a_live_entry_for_the_ticket_is_not_an_orphan(self):
+        holder = "drive-a1b2c3d4-7"
+        unit = "blue-agent-app-7"
+        claim = self.dead(agent=holder)
+        self.assertFalse(
+            self.check(
+                claim,
+                present_agents=frozenset(),
+                live_units=frozenset(),
+                agent_states={unit: (registry.LIVE, NOW - 10.0)},
+                agent_tickets={unit: ("app", 7)},
+            )
+        )
+
 
 class ReleaseOrphansTest(unittest.TestCase):
     def setUp(self):
