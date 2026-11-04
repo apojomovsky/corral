@@ -16,6 +16,15 @@ raw `ticket != (claim.repo, claim.number)` can never match and
 mistakes every finished worker for a crash. Every `==`/`!=` between a
 ticket-shaped value and a `(claim.repo, claim.number)` tuple outside
 `entry_for_claim` fails.
+
+The same files must never compare a claim holder id with a registry
+entry id outside the resolver either: holders are opaque
+`drive-<hash8>-<n>` ids while registry entries are keyed by unit name,
+so a raw `prior[0] == agent` can never match in production and hides
+behind same-namespace fixtures in tests. Every `==`/`!=` between a
+holder-shaped value and a `[0]`-subscripted entry id outside the
+allow-list below fails. Additions need the one resolver or an explicit
+allow-list entry with a comment.
 """
 
 import ast
@@ -42,6 +51,21 @@ ALLOW = {
 #: ticket against a claim's `(repo, number)`: the one resolver only.
 TICKET_COMPARE_ALLOW = {
     ("drive.py", "entry_for_claim"),
+}
+
+#: (file, enclosing function) pairs allowed to compare a holder id
+#: against a `[0]`-subscripted entry id. `gate` and `reviewed_claims`
+#: read `finished` from `resolve_finished`, whose values are holder ids
+#: from this pass's capture, so `newest[0] == holder`/`agent` there is
+#: holder-vs-holder, never holder-vs-registry. `resolve_finished`
+#: keeps the raw `prior[0] == agent` fast path only for same-namespace
+#: fixtures with no ticket index (production always passes one and
+#: resolves through `entry_for_claim`, comparing registry-vs-registry
+#: as `entry[0] == prior[0]`).
+HOLDER_COMPARE_ALLOW = {
+    ("drive.py", "gate"),
+    ("drive.py", "reviewed_claims"),
+    ("drive.py", "resolve_finished"),
 }
 
 
@@ -130,6 +154,49 @@ def _ticket_comparisons(path):
     return _ticket_comparisons_in(ast.parse(path.read_text(encoding="utf-8")))
 
 
+#: Holder-id spellings that pair with a `[0]`-subscripted entry id in a
+#: raw comparison: the claim holder (`claim.agent`, `holder`,
+#: `holder_now`, `current.agent`), the bare loop variable (`agent`) and
+#: the reviewer author (`author`, itself a holder id).
+_HOLDER_ID_TEXTS = HOLDER_KEYS | {"holder_now", "author", "current.agent"}
+
+
+def _is_holder_id(node):
+    """Whether `node` names a claim holder id."""
+    text = ast.unparse(node).replace(" ", "")
+    return text in _HOLDER_ID_TEXTS or text.endswith(".agent")
+
+
+def _is_registry_id(node):
+    """Whether `node` is a `[0]`-subscripted entry id (`prior[0]`, ...)."""
+    return (
+        isinstance(node, ast.Subscript)
+        and isinstance(node.slice, ast.Constant)
+        and node.slice.value == 0
+    )
+
+
+def _holder_comparisons_in(tree):
+    """`(function, lineno)` for every holder-vs-registry-id `==`/`!=`."""
+    enclosing = _enclosing_names(tree)
+    found = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            continue
+        parts = [node.left, *node.comparators]
+        if any(_is_holder_id(part) for part in parts) and any(
+            _is_registry_id(part) for part in parts
+        ):
+            found.append((enclosing[node], node.lineno))
+    return found
+
+
+def _holder_comparisons(path):
+    return _holder_comparisons_in(ast.parse(path.read_text(encoding="utf-8")))
+
+
 class ResolverGuardTest(unittest.TestCase):
     def test_holder_ids_never_key_registry_maps_directly(self):
         problems = []
@@ -180,6 +247,42 @@ class ResolverGuardTest(unittest.TestCase):
     def test_a_holder_id_comparison_is_not_a_ticket_comparison(self):
         tree = ast.parse("def somewhere_else(prior, agent):\n    return prior[0] == agent\n")
         self.assertEqual(_ticket_comparisons_in(tree), [])
+
+    def test_claim_holder_ids_never_compare_against_registry_ids_directly(self):
+        problems = []
+        for name in FILES:
+            for func, lineno in _holder_comparisons(ROOT / name):
+                if (name, func) not in HOLDER_COMPARE_ALLOW:
+                    problems.append(f"{name}:{lineno} {func} holder ==/!= registry[0]")
+        self.assertEqual(problems, [], f"raw holder-id comparisons: {problems}")
+
+    def test_the_holder_compare_allow_list_names_real_uses(self):
+        seen = set()
+        for name in FILES:
+            for func, _ in _holder_comparisons(ROOT / name):
+                seen.add((name, func))
+        for entry in HOLDER_COMPARE_ALLOW:
+            self.assertIn(entry, seen, f"stale holder-compare allow-list entry: {entry}")
+
+    def test_a_second_holder_comparison_outside_the_resolver_fails(self):
+        tree = ast.parse("def somewhere_else(prior, agent):\n    return prior[0] == agent\n")
+        self.assertEqual(_holder_comparisons_in(tree), [("somewhere_else", 2)])
+
+    def test_a_holder_inequality_outside_the_resolver_fails(self):
+        tree = ast.parse("def somewhere_else(prior, holder):\n    return prior[0] != holder\n")
+        self.assertEqual(_holder_comparisons_in(tree), [("somewhere_else", 2)])
+
+    def test_a_registry_against_registry_comparison_passes(self):
+        tree = ast.parse("def resolve_finished(entry, prior):\n    return entry[0] == prior[0]\n")
+        self.assertEqual(_holder_comparisons_in(tree), [])
+
+    def test_a_holder_against_holder_comparison_passes(self):
+        tree = ast.parse("def somewhere_else(current, agent):\n    return current.agent != agent\n")
+        self.assertEqual(_holder_comparisons_in(tree), [])
+
+    def test_a_role_comparison_is_not_a_holder_comparison(self):
+        tree = ast.parse('def somewhere_else(newest):\n    return newest[1] == "reviewer"\n')
+        self.assertEqual(_holder_comparisons_in(tree), [])
 
 
 if __name__ == "__main__":
