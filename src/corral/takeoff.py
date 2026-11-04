@@ -23,7 +23,7 @@ gives up with exit 75. The lock is an advisory `flock` on
 when the holder dies, so a dead holder leaves nothing to reap. A takeoff
 with no commands to run never takes the lock.
 
-Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
+Exit codes: 0 every check ok, skipped or planned, 1 a check failed, 3 the remote
 is unreachable, 4 usage or configuration, 75 the suite lock stayed held
 past the wait. `--skip NAME` waives one policy check and records the
 skip; an unknown name or an identity check (`base`, `worktree`) is

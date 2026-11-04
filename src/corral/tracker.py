@@ -348,6 +348,39 @@ class BoardPopulate(NamedTuple):
     refused: tuple[str, ...]
 
 
+def render_provision(repo: str, provision: BoardProvision) -> str:
+    """One board ensure report as ``setup`` output lines. Pure.
+
+    One line per created entry (``project``, ``field:Agent``,
+    ``option:Priority/High``, ``link:owner/name``), one count for the
+    entries left alone, and the provisioner's own fix line per refusal.
+    """
+    lines = []
+    for name in provision.created:
+        lines.append(f"created {name} on {repo}\n")
+    if provision.kept:
+        lines.append(f"kept {len(provision.kept)} board entries on {repo}\n")
+    for line in provision.refused:
+        lines.append(f"refused on {repo}: {line}\n")
+    return "".join(lines)
+
+
+def render_populate(repo: str, report: BoardPopulate) -> str:
+    """One adopt-issues report as ``setup --populate`` output lines. Pure.
+
+    Added entries name ``repo#number``; one line per added issue, one
+    count for the issues already present, and the fix line per refusal.
+    """
+    lines = []
+    for name in report.added:
+        lines.append(f"added {name} to the board\n")
+    if report.kept:
+        lines.append(f"kept {len(report.kept)} board items on {repo}\n")
+    for line in report.refused:
+        lines.append(f"refused on {repo}: {line}\n")
+    return "".join(lines)
+
+
 class BoardProvisioner(Protocol):
     """One board's idempotent ensure and populate, provider-neutral."""
 

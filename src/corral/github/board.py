@@ -717,16 +717,17 @@ _BY_ID = (
     + _PROJECT_FRAGMENT
 )
 
-_TITLES_USER = """query ProvisionBoardTitles($login: String!, $after: String) {
+#: The title search: one query asking for the login as both halves, the
+#: way ``_BY_NUMBER`` does. Exactly one half resolves; the other answers
+#: null (with the expected NOT_FOUND noise, which passes the body
+#: classifier). The caller picks the set half from the body.
+_TITLES = """query ProvisionBoardTitles($login: String!, $after: String) {
   user(login: $login) {
     projectsV2(first: 100, after: $after) {
       nodes { id number title }
       pageInfo { hasNextPage endCursor }
     }
   }
-}"""
-
-_TITLES_ORG = """query ProvisionBoardTitles($login: String!, $after: String) {
   organization(login: $login) {
     projectsV2(first: 100, after: $after) {
       nodes { id number title }
@@ -771,6 +772,34 @@ _OPTIONS_APPEND = """mutation ProvisionOptionsAppend($field: ID!, $options: [Pro
   }
 }"""
 
+#: Everything one populate step needs from a project: the item ids with
+#: the content behind each item. Draft items carry no content and read
+#: as skipped, never as failures.
+_ITEMS = """query ProvisionBoardItems($project: ID!, $after: String) {
+  node(id: $project) {
+    ... on ProjectV2 {
+      items(first: 100, after: $after) {
+        nodes {
+          id
+          content { __typename ... on Issue { id number } }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}"""
+
+_ADD_ITEM = """mutation ProvisionBoardAddItem($project: ID!, $content: ID!) {
+  addProjectV2ItemById(input: {projectId: $project, contentId: $content}) {
+    item { id }
+  }
+}"""
+
+#: How many times one issue add is attempted before the run reports it:
+#: the first answer after a link or create can be a temporary move
+#: conflict, and retrying converges without ever refusing a transient.
+_ADD_ATTEMPTS = 5
+
 #: The fix line for a spec addressing a board that no longer resolves.
 _REMOVE_TABLE_LINE = "the board in the config no longer exists: remove the table and re-run"
 
@@ -781,6 +810,43 @@ def _link_fix(repo) -> str:
         f"could not link {repo} to the board: the account may not see or administer "
         "that repository; link it on the board by hand, then re-run"
     )
+
+
+def _option_fix(name, field_name) -> str:
+    """The fix line when a live option cannot be resent in full."""
+    return f"add the {name!r} option to field {field_name!r} on the board by hand, then re-run"
+
+
+def _public_fix_new(title) -> str:
+    """The fix line when a just-created board stays public after correction."""
+    return (
+        f"new board {title!r} is public but the spec asks for private: "
+        "make it private by hand, then re-run"
+    )
+
+
+def _public_fix_keep(title) -> str:
+    """The fix line when an existing board is public but private was specced."""
+    return f"board {title!r} is public but the spec asks for private: make it private by hand"
+
+
+def _transient_add_failure(text) -> bool:
+    """Whether a failed issue add reads as transient and merits a retry.
+
+    The move conflict right after a link or create names itself, as
+    does the generic execution failure the spike observed. Anything
+    else fails into the per-issue refusal, never into a retry loop.
+    """
+    lowered = text.lower()
+    return "temporary conflict" in lowered or "request id" in lowered
+
+
+class _ItemRefused(Exception):
+    """One issue add the run reports instead of failing: carries the fix line.
+
+    Caught per issue by ``populate``; anything else propagates like any
+    other adapter failure.
+    """
 
 
 #: The color of an option the provisioner creates. New options carry no
@@ -1164,26 +1230,35 @@ class GithubBoardProvisioner:
         project = user_project if org_project is None else org_project
         return self._parse_project(project)
 
-    def _find_by_title(self, spec, kind):
+    def _find_by_title(self, spec):
         """The spec's title match as a project node id, ``None`` or ``ValueError``.
 
         Zero matches means create; two or more name every matching
-        number and raise before any mutation. Titles are a
+        number and raise before any mutation. The one query carries
+        both owner halves and the set half is picked from the body, the
+        way ``_find_by_address`` does. Titles are a
         provisioning-time search key only: an addressed run never calls
         this.
         """
-        query = _TITLES_USER if kind == "user" else _TITLES_ORG
         matches = []
         after = None
         while True:
             if after is None:
-                data = self._read(query, None, login=spec.owner)
+                data = self._read(_TITLES, None, login=spec.owner)
             else:
-                data = self._read(query, None, login=spec.owner, after=after)
-            half = data.get(kind) if isinstance(data, dict) else None
-            if not isinstance(half, dict):
+                data = self._read(_TITLES, None, login=spec.owner, after=after)
+            if not isinstance(data, dict):
                 raise _fail("board title list is missing")
-            connection = half.get("projectsV2")
+            halves = [
+                half
+                for half in (data.get("user"), data.get("organization"))
+                if isinstance(half, dict)
+            ]
+            if not halves:
+                raise _fail("board title list is missing")
+            if len(halves) > 1:
+                raise _fail("board title list is ambiguous")
+            connection = halves[0].get("projectsV2")
             if not isinstance(connection, dict):
                 raise _fail("board title list is missing")
             nodes = connection.get("nodes")
@@ -1205,7 +1280,7 @@ class GithubBoardProvisioner:
                     matches.append((eid, number))
             info = connection.get("pageInfo")
             if info is None:
-                break
+                raise _fail("board title list is missing its pageInfo")
             if not isinstance(info, dict):
                 raise _fail(f"bad board pageInfo {info!r}")
             more = info.get("hasNextPage")
@@ -1355,9 +1430,7 @@ class GithubBoardProvisioner:
             for option in resend
         ):
             for name in missing:
-                refused.append(
-                    f"add the {name!r} option to field {plan.name!r} on the board by hand, then re-run"
-                )
+                refused.append(_option_fix(name, plan.name))
             return
         options = [
             {
@@ -1425,7 +1498,7 @@ class GithubBoardProvisioner:
         byte-for-byte, and options are only ever appended to a kept
         Priority field. See the class docstring for the error contract.
         """
-        owner_kind, owner_id = self._resolve_owner(spec.owner)
+        _, owner_id = self._resolve_owner(spec.owner)
         created: list = []
         kept: list = []
         refused: list = []
@@ -1435,7 +1508,7 @@ class GithubBoardProvisioner:
             kept.append("project")
             via_address = True
         else:
-            found_id = self._find_by_title(spec, owner_kind)
+            found_id = self._find_by_title(spec)
             if found_id is None:
                 repo_id = None
                 if spec.repo:
@@ -1455,19 +1528,15 @@ class GithubBoardProvisioner:
                 project = self._read_project_by_id(project_id)
                 project_id, number, title, public, repos, live, field_ids = project
                 if public:
-                    fix = (
-                        f"new board {title!r} is public but the spec asks for private: "
-                        "make it private by hand, then re-run"
+                    fix = _public_fix_new(title)
+                    link_kept = [f"link:{spec.repo}"] if spec.repo and spec.repo in repos else []
+                    return self._report(
+                        spec, project_id, number, ["project"], link_kept, [fix], live
                     )
-                    return self._report(spec, project_id, number, ["project"], [], [fix], live)
             elif via_address:
-                refused.append(
-                    f"board {title!r} is public but the spec asks for private: make it private by hand"
-                )
+                refused.append(_public_fix_keep(title))
             else:
-                refused.append(
-                    f"board {title!r} is public but the spec asks for private: make it private by hand"
-                )
+                refused.append(_public_fix_keep(title))
                 self._ensure_link(spec, project_id, repos, repo_ids, created, kept, refused)
                 return self._report(spec, project_id, number, created, kept, refused, live)
         self._ensure_link(spec, project_id, repos, repo_ids, created, kept, refused)
@@ -1475,3 +1544,271 @@ class GithubBoardProvisioner:
         project = self._read_project_by_id(project_id)
         project_id, number, _, _, _, live, _ = project
         return self._report(spec, project_id, number, created, kept, refused, live)
+
+    def dry_run(self, spec):
+        """What ``ensure_board`` would do, changing nothing. Read-only.
+
+        Every step is a read: the owner, the board by address or title,
+        the live schema, the repo for the link preview. The report has
+        the same shape as the ensure one, with would-be creations in
+        ``created``. A spec that cannot run raises ``ValueError`` before
+        any read; an unreachable provider raises ``TrackerError``.
+        """
+        iface.plan_board(spec, ())
+        self._resolve_owner(spec.owner)
+        if spec.project_id is not None or spec.number is not None:
+            project = self._find_by_address(spec)
+            via_address = True
+        else:
+            found_id = self._find_by_title(spec)
+            if found_id is None:
+                return self._dry_run_create(spec)
+            project = self._read_project_by_id(found_id)
+            via_address = False
+        project_id, number, title, public, repos, live, _ = project
+        created: list = []
+        kept: list = []
+        refused: list = []
+        stop_fields = False
+        if spec.private and public:
+            refused.append(_public_fix_keep(title))
+            stop_fields = not via_address
+        if spec.repo:
+            if spec.repo in repos:
+                kept.append(f"link:{spec.repo}")
+            else:
+                repo_id = self._fetch_repo_id(spec.repo)
+                if repo_id is None:
+                    refused.append(_link_fix(spec.repo))
+                else:
+                    created.append(f"link:{spec.repo}")
+        if not stop_fields:
+            plan = iface.plan_board(spec, live)
+            for field, field_plan in zip(spec.fields, plan.fields):
+                if field_plan.decision == "create":
+                    created.append(f"field:{field.name}")
+                elif field_plan.decision == "keep":
+                    kept.append(f"field:{field.name}")
+                    if field_plan.options:
+                        self._preview_append(field_plan, created, refused)
+        return self._report(spec, project_id, number, created, kept, refused, live)
+
+    def _dry_run_create(self, spec):
+        """The preview for a board the title search did not find.
+
+        Every spec field would be created (the planner over an empty
+        live schema says what the fresh board keeps), except a missing
+        keep-only field, which refuses with its flag fix line. The
+        standard-named ``Status`` field is the exception: every new
+        board ships that builtin, so the ensure keeps it and the
+        preview says kept, exactly as the create's own read-back would.
+        A remapped name misses the builtin and is created like any
+        other field. The atomic link the create would carry reads as
+        kept, like the ensure's own re-read reports it.
+        """
+        standard_status = next(
+            field.name for field in iface.STANDARD_BOARD if field.concept == "board_status"
+        )
+        created = ["project"]
+        kept: list = []
+        refused: list = []
+        if spec.repo:
+            repo_id = self._fetch_repo_id(spec.repo)
+            if repo_id is None:
+                refused.append(_link_fix(spec.repo))
+            else:
+                kept.append(f"link:{spec.repo}")
+        plan = iface.plan_board(spec, ())
+        for field, field_plan in zip(spec.fields, plan.fields):
+            if field_plan.decision != "create":
+                continue
+            if field.concept == "board_status" and field.name == standard_status:
+                kept.append(f"field:{field.name}")
+            else:
+                created.append(f"field:{field.name}")
+        refused.extend(plan.refused)
+        return self._report(spec, "", None, created, kept, refused, ())
+
+    def _preview_append(self, field_plan, created, refused):
+        """The option append one kept field would send, or its refusal."""
+        missing = list(field_plan.options)
+        if any(
+            option.id is None or option.color is None or option.description is None
+            for option in field_plan.resend
+        ):
+            for name in missing:
+                refused.append(_option_fix(name, field_plan.name))
+            return
+        created.extend(f"option:{field_plan.name}/{name}" for name in missing)
+
+    def _board_content_ids(self, project_id):
+        """The issue node ids on the board, paged, else ``TrackerError``.
+
+        Draft items carry no content and read as skipped. A malformed
+        page fails closed, never as a partial membership set: adopting
+        on partial knowledge would double-add or misreport.
+        """
+        seen = set()
+        after = None
+        while True:
+            if after is None:
+                payload = self._read(_ITEMS, None, project=project_id)
+            else:
+                payload = self._read(_ITEMS, None, project=project_id, after=after)
+            node = payload.get("node") if isinstance(payload, dict) else None
+            items = node.get("items") if isinstance(node, dict) else None
+            if not isinstance(items, dict):
+                raise _fail("board items are missing")
+            nodes = items.get("nodes")
+            if not isinstance(nodes, list):
+                raise _fail("board items are not a list")
+            for item in nodes:
+                if not isinstance(item, dict):
+                    raise _fail(f"bad board item {item!r}")
+                content = item.get("content")
+                if content is None:
+                    continue
+                if not isinstance(content, dict):
+                    raise _fail(f"bad board item content {content!r}")
+                if content.get("__typename") != "Issue":
+                    continue
+                content_id = content.get("id")
+                if not isinstance(content_id, str) or not content_id:
+                    raise _fail(f"bad board item content {content!r}")
+                seen.add(content_id)
+            info = items.get("pageInfo")
+            if not isinstance(info, dict):
+                raise _fail("board items are missing their pageInfo")
+            more = info.get("hasNextPage")
+            if not isinstance(more, bool):
+                raise _fail(f"bad board pageInfo {info!r}")
+            if not more:
+                return seen
+            end = info.get("endCursor")
+            if not isinstance(end, str) or not end:
+                raise _fail("board items claim more items but name no cursor")
+            after = end
+
+    def _open_issue_refs(self, repo):
+        """``(node id, number)`` for the tracker repo's open issues.
+
+        Closed issues stay people's history to add by hand, and pull
+        requests are never board items corral creates. A malformed page
+        fails closed, never as a partial issue set.
+        """
+        base = f"repos/{repo}/issues?state=open&per_page=100"
+        page = 1
+        while True:
+            path = base if page == 1 else f"{base}&page={page}"
+            try:
+                payload = json.loads(gh.paced_run(["api", path], run=self._run, pacer=self._pacer))
+            except gh.GhError as err:
+                text = str(err) or repr(err)
+                if gh.is_rate_limited(text):
+                    raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+                raise iface.TrackerError(f"board unreachable: {text}") from err
+            except Exception as err:
+                raise iface.TrackerError(f"board unreachable: {err}") from err
+            if not isinstance(payload, list):
+                raise _fail(f"issues of {repo} are not a list")
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    raise _fail(f"bad issue {entry!r} on {repo}")
+                if "pull_request" in entry:
+                    continue
+                if entry.get("state") != "open":
+                    continue
+                number = entry.get("number")
+                node_id = entry.get("node_id")
+                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                    raise _fail(f"bad issue {entry!r} on {repo}")
+                if not isinstance(node_id, str) or not node_id:
+                    raise _fail(f"bad issue {entry!r} on {repo}")
+                yield node_id, number
+            if len(payload) < 100:
+                return
+            page += 1
+
+    def _add_item(self, project_id, content_id):
+        """One issue added to the board: its item id, or ``_ItemRefused``.
+
+        A temporary move conflict (the first adds after a link or
+        create) retries bounded and never refuses; a permission answer
+        and an exhausted conflict refuse with a fix line instead.
+        """
+        attempts = 0
+        while True:
+            try:
+                payload = self._mutate(_ADD_ITEM, projectId=project_id, contentId=content_id)
+            except iface.TrackerRateLimited:
+                raise
+            except _BoardForbidden as err:
+                raise _ItemRefused(
+                    "the account may not add items to it; add it on the board by hand, then re-run"
+                ) from err
+            except iface.TrackerError as err:
+                text = str(err)
+                if "(HTTP 403)" in text:
+                    raise _ItemRefused(
+                        "the account may not add items to it; "
+                        "add it on the board by hand, then re-run"
+                    ) from err
+                if _transient_add_failure(text) and attempts + 1 < _ADD_ATTEMPTS:
+                    attempts += 1
+                    continue
+                raise _ItemRefused(f"{text}; re-run to retry") from err
+            node = payload.get("addProjectV2ItemById") if isinstance(payload, dict) else None
+            item = node.get("item") if isinstance(node, dict) else None
+            item_id = item.get("id") if isinstance(item, dict) else None
+            if not isinstance(item_id, str) or not item_id:
+                raise _fail(f"unusable board add answer: {payload!r}")
+            return item_id
+
+    def populate(self, project_id, repo):
+        """Add the tracker repo's open issues missing from the board.
+
+        Item-add only: no field value is ever written. Open issues
+        only, whatever their author; closed issues and pull requests
+        are never added. Each issue the run could not add reports its
+        own refused line, and a re-run converges because presence is
+        re-read each time. A listing that falls over raises
+        ``TrackerError`` instead of adopting on partial knowledge.
+        """
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("board populate needs a project id")
+        present = self._board_content_ids(project_id)
+        added: list = []
+        kept: list = []
+        refused: list = []
+        for node_id, number in self._open_issue_refs(repo):
+            name = f"{repo}#{number}"
+            if node_id in present:
+                kept.append(name)
+                continue
+            try:
+                self._add_item(project_id, node_id)
+            except _ItemRefused as err:
+                refused.append(f"could not add {name} to the board: {err}")
+            else:
+                added.append(name)
+        return iface.BoardPopulate(tuple(added), tuple(kept), tuple(refused))
+
+    def preview_populate(self, project_id, repo):
+        """What ``populate`` would add, changing nothing. Read-only.
+
+        The same membership read the mutating path starts from, with
+        would-be additions in ``added`` and the issues already present
+        in ``kept``. ``setup --plan`` reports this and adds nothing.
+        """
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("board populate needs a project id")
+        present = self._board_content_ids(project_id)
+        added: list = []
+        kept: list = []
+        for node_id, number in self._open_issue_refs(repo):
+            name = f"{repo}#{number}"
+            if node_id in present:
+                kept.append(name)
+            else:
+                added.append(name)
+        return iface.BoardPopulate(tuple(added), tuple(kept), ())
