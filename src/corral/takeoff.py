@@ -27,7 +27,10 @@ Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
 is unreachable, 4 usage or configuration, 75 the suite lock stayed held
 past the wait. `--skip NAME` waives one policy check and records the
 skip; an unknown name or an identity check (`base`, `worktree`) is
-exit 4.
+exit 4. `--plan` resolves every check without running the configured
+commands: each command is reported as `planned`, the suite lock is
+never taken, and `run_cmd` is never called. Exit codes mirror the
+resolved rows.
 """
 
 import contextlib
@@ -59,8 +62,8 @@ from corral.github import gh
 #: The version stamped on every `--json` document.
 SCHEMA_VERSION = 1
 
-#: Statuses a check reports: passed, failed, or not applicable.
-OK, FAIL, SKIPPED = "ok", "fail", "skipped"
+#: Statuses a check reports: passed, failed, not applicable, or planned.
+OK, FAIL, SKIPPED, PLANNED = "ok", "fail", "skipped", "planned"
 
 #: Never written literally: the commit-msg hook refuses it anywhere.
 EM_DASH = chr(0x2014)
@@ -91,7 +94,7 @@ class LsRemoteError(Exception):
 
 class Check(NamedTuple):
     """One gate row: the check name, its status, detail plus fix lines,
-    and where a skip came from (None when the check ran)."""
+    and where a skip came from (None when the check ran or was planned)."""
 
     name: str
     status: str
@@ -576,6 +579,31 @@ def suite_lock(path, timeout_s):
         os.close(fd)
 
 
+def _wanted_commands(commands, test_command, with_test):
+    """The takeoff commands to run or plan, in order (the one resolver).
+
+    The default is [checks.test] when it is set, else empty; --test adds
+    checks.test when it is not already listed.
+    """
+    if not isinstance(commands, list) or any(not isinstance(c, str) for c in commands):
+        raise TakeoffError("checks.takeoff must be a list of command strings")
+    wanted = list(commands) or ([test_command] if test_command else [])
+    if with_test and test_command and test_command not in wanted:
+        wanted.append(test_command)
+    return wanted
+
+
+def _planned_checks(wanted):
+    """One `planned` row per command: the plan lists what would run.
+
+    Nothing executes and the suite lock is never taken. With no commands
+    the group reports ok, the same row a run would report.
+    """
+    if not wanted:
+        return [Check("checks", OK, "no takeoff commands configured", "")]
+    return [Check("checks", PLANNED, f"`{cmd}`", "") for cmd in wanted]
+
+
 def _check_commands(
     commands,
     test_command,
@@ -595,13 +623,7 @@ def _check_commands(
     past `lock_timeout_s` the wait raises SuiteBusy instead of returning
     a row. A takeoff with nothing to run returns ok without the lock.
     """
-    if not isinstance(commands, list) or any(not isinstance(c, str) for c in commands):
-        raise TakeoffError("checks.takeoff must be a list of command strings")
-    # The default is [checks.test] when it is set, else empty; --test adds
-    # checks.test when it is not already listed.
-    wanted = list(commands) or ([test_command] if test_command else [])
-    if with_test and test_command and test_command not in wanted:
-        wanted.append(test_command)
+    wanted = _wanted_commands(commands, test_command, with_test)
     if not wanted:
         return Check("checks", OK, "no takeoff commands configured", "")
     with suite_lock(lock_path, lock_timeout_s):
@@ -643,7 +665,15 @@ def _check_commands(
 
 
 def run_takeoff(
-    path, *, body_file=None, with_test=False, ops_dir=None, skips=(), ls_remote, run_cmd
+    path,
+    *,
+    body_file=None,
+    with_test=False,
+    ops_dir=None,
+    skips=(),
+    plan=False,
+    ls_remote,
+    run_cmd,
 ):
     """Run the takeoff gate over `path`; returns a Result.
 
@@ -651,10 +681,13 @@ def run_takeoff(
     LsRemoteError; `run_cmd(cmd, cwd)` runs one takeoff command. Both are
     required: no default may silently answer for the remote or the suite.
     `skips` names policy checks `--skip` waives; an unknown or identity
-    name raises TakeoffError before anything runs. Usage and configuration
-    problems raise TakeoffError (exit 4). Exit 3 returns before any check
-    row, when the remote is unreadable; exit 75 returns the rows so far
-    with the suite wait as the failing checks row.
+    name raises TakeoffError before anything runs. With `plan` every check
+    that needs no execution still resolves, and each configured command is
+    reported as `planned` without running it: the suite lock is never taken
+    and `run_cmd` is never called. Usage and configuration problems raise
+    TakeoffError (exit 4). Exit 3 returns before any check row, when the
+    remote is unreadable; exit 75 returns the rows so far with the suite
+    wait as the failing checks row.
     """
     if ls_remote is None or run_cmd is None:
         raise TypeError("run_takeoff needs ls_remote and run_cmd seams")
@@ -745,6 +778,13 @@ def run_takeoff(
     if "checks" in skip_set:
         # A waived group runs nothing and takes no lock.
         checks.append(_flag_skip("checks"))
+    elif plan:
+        # A plan lists what would run: no lock, no execution.
+        checks.extend(
+            _planned_checks(
+                _wanted_commands(resolved["checks.takeoff"], resolved["checks.test"], with_test)
+            )
+        )
     else:
         if run_cmd is production_run_cmd:
             run_cmd = functools.partial(production_run_cmd, timeout=timeout_s)
