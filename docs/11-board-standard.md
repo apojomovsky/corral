@@ -110,9 +110,14 @@ REST issue payload, the edges from the sub-issues endpoints
   options by name (section 2, step 6). corral carries the display
   name verbatim into `extra["board_status"]` and gives it no meaning; what a status
   allows is project eligibility policy, as today. A new GitHub Project
-  is believed to ship a built-in `Status` single-select field with
-  exactly these options (UNVERIFIED: section 9, item U1). When it does,
-  provisioning keeps the built-in and creates nothing for this concept.
+  ships a built-in `Status` single-select field with exactly these
+  options, each with a color and a description (VERIFIED: section 9,
+  item U1), beside built-in fields for title, assignees, labels,
+  linked pull requests, milestone, repository, reviewers, parent
+  issue, sub-issues progress, and creation, update and close times.
+  Provisioning keeps the built-in and creates nothing for this
+  concept, and never deletes a built-in field: deleting `Status`
+  is refused, since only custom fields can be deleted.
 - `Priority`: five options, one per rank in the closed set every
   adapter already parses (`PRIORITIES` in `tracker.py`, the provider
   neutral interface module; `github/tracker.py` only imports it:
@@ -137,8 +142,9 @@ REST issue payload, the edges from the sub-issues endpoints
   provisions the option.
 - `Area` and `Pool`: the standard names the fields and no options.
   Areas and pools are the project's own vocabulary, and no generic
-  list is honest. A single-select field may not be creatable with zero
-  options (UNVERIFIED: U2), so provisioning creates these two fields
+  list is honest. A single-select field cannot be created with zero
+  options (VERIFIED: section 9, item U2), so provisioning creates
+  these two fields
   only when at least one option is declared for them. The only
   declarer in version one is the operator running setup, through
   repeatable `--area NAME` and `--pool NAME` flags on
@@ -320,7 +326,11 @@ is the one production wiring. `githubcli.cmd_setup` passes it into
 setup wiring restructure below; tests inject a fake. Mutations go through
 `gh.graphql`, so they are charged at mutation cost and rate-limit
 answers raise `TrackerRateLimited` through the shared classifier,
-exactly like board reads and writes. Nothing outside the adapter
+exactly like board reads and writes. `gh api graphql` exits non-zero
+on any `errors` entry even beside partial `data` (VERIFIED: section 9,
+item U11), so the seam returns the response body for GraphQL calls
+and the adapter classifies from the body, never from the exit code.
+Nothing outside the adapter
 knows a mutation name or a field-creation shape.
 
 Whether an adapter supports provisioning is what the factory says:
@@ -411,11 +421,15 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    resolves a *project* by number across user and organization (it
    asks both for `projectV2(number)` and accepts exactly one); it
    resolves neither an owner's type nor its node id. Provisioning
-   asks for the login as both a user and an organization, accepts
-   exactly one, and reads that owner's node id for the create step
-   (UNVERIFIED: U11, the query shape and its answer for an unknown
-   login). An owner that resolves to neither raises `ValueError`
-   (exit 4 in the aggregation) before any mutation. The standard is
+   asks for the login as both a `user` and an `organization` in one
+   query, accepts exactly one set half, and reads that owner's node
+   id for the create step (VERIFIED: section 9, item U11). An
+   unknown login answers with both halves null and one NOT_FOUND
+   error per half, which raises `ValueError` (exit 4 in the
+   aggregation) before any mutation. The runner exits non-zero
+   whenever the body carries any `errors` entry, even when one half
+   succeeded, so the adapter reads the JSON body and decides from
+   `data`, never from the exit code. The standard is
    one board per tracker repo, but the operation takes the repo to
    link as data and does not forbid other repos linking the same
    board later.
@@ -445,13 +459,23 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    same ambiguity in `_fetch_single` already fails closed the same
    way).
 3. **Create the Project when missing.** One create mutation with the
-   owner id and title (UNVERIFIED: U3, the mutation name and inputs).
-   Visibility: private by default, the `06-corral-new.md` section 3
-   rule for remotes applied to boards. A create may not accept a
-   visibility input (UNVERIFIED: U4); the design therefore reads the
-   new Project back and, when it reports public and the spec asks for
-   private, sends one update to make it private before anything else
-   is put on it. Making a just-created board private is part of
+   owner id and title: `createProjectV2(ownerId, title)`
+   (VERIFIED: section 9, item U3). Titles are not unique per owner,
+   so the create is never guarded by a title check (the racing
+   duplicate at the tail of this section is the accepted risk).
+   Where the API returns the new id form for the owner, the adapter
+   prefers it over the legacy node id, which answers with a
+   DEPRECATION warning naming `next_global_id`. Visibility: private
+   by default, the `06-corral-new.md` section 3 rule for remotes
+   applied to boards. Create takes no visibility input (VERIFIED:
+   section 9, item U4); the design therefore reads the new Project
+   back (a new user-owned Project reports `public: false`) and, when
+   it reports public and the spec asks for private, sends one update
+   to make it private before anything else is put on it. The update
+   input carries `public`. Create also accepts `repositoryId`, which
+   links the repository in the same step: when the spec names a repo
+   the adapter passes it, and step 4 then reads the link as kept.
+   Making a just-created board private is part of
    creating it as specced; it is the only update an ensure ever sends.
    The correction gates everything after it: when the update errors,
    provisioning stops before the link and field steps and the error
@@ -471,17 +495,19 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    fix line: adopting a public board a person made, on a title match
    alone, is not a default corral takes.
 4. **Link the repository.** When the spec names a repo, link it to the
-   Project (UNVERIFIED: U5, the link mutation and its already-linked
-   answer). The board reader does not need the link (it queries by
-   owner plus number); people do, since the link is what surfaces the
-   board from the repository. Already linked reads as kept. A repo
+   Project with `linkProjectV2ToRepository(projectId, repositoryId)`
+   (VERIFIED: section 9, item U5). The board reader does not need
+   the link (it queries by owner plus number); people do, since the
+   link is what surfaces the board from the repository. Already
+   linked reads as kept: linking the same repository twice succeeds
+   both times. A repo
    the account cannot administer refuses this step only (R5 in
    `01-onboarding.md`: someone else's repository), with a fix line,
    and the rest of the provision stands.
 5. **Ensure fields.** Read the live schema once (the `_SCHEMA_BY_NUMBER`
-   and `_SCHEMA_BY_ID` shapes, extended with each option's color and
-   description, which step 6's whole-list resend needs, and otherwise
-   only if the spike shows a missing datum), as a raw field list for
+   and `_SCHEMA_BY_ID` shapes, extended with each option's id, color
+   and description, which step 6's whole-list resend needs; the spike
+   showed no further datum missing), as a raw field list for
    the planner, not through
    `BoardReader._project_index`: that index raises `TrackerError` on a
    duplicate field name, which is right for the passes but wrong here.
@@ -500,12 +526,17 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    - name absent and keep-only: refused, with the fix line naming the
      `--area` or `--pool` options that would create it (section 1);
    - name absent: create it, with its standard options for a
-     single-select (UNVERIFIED: U6, the create-field mutation, the
-     `dataType` spellings, and whether options ride along at creation).
+     single-select: `createProjectV2Field` with `dataType` TEXT or
+     SINGLE_SELECT, the options riding along at creation with name,
+     color and description, answered back with ids (VERIFIED:
+     section 9, item U6).
    Built-in fields the spec does not name (titles, assignees and the
    like) are ignored, like any other team field. A spec field whose
-   name matches a built-in of the right kind (the expected `Status`
-   case, U1) is kept like any existing field.
+   name matches a built-in of the right kind (the `Status` case,
+   VERIFIED: U1) is kept like any existing field. Corral never
+   deletes a field: deleting a built-in is refused by the provider,
+   and anything beyond creating and keeping is outside this design
+   (section 0 designs no delete operation).
 6. **Ensure options, rename-is-free.** Appending by missing *name*
    would undo a person's rename: rename `High` to `P1` (the id is
    stable, the map still valid) and a name-based top-up would append a
@@ -521,23 +552,25 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    renamed; corral therefore never appends options to a kept `Status`
    field at all. Its standard names are creation defaults (section 1),
    and a kept field's options are wholly people's. Keep-only fields
-   are never topped up either. The provider's option update is
-   believed to replace the whole option list, so the one append
-   update corral may send (on `Priority` only) is the existing list,
-   in its existing order, with the missing ranks' names appended.
-   Because the whole list is resent, the planner's live-schema data
-   carries each existing option's color and description beside its
-   id and name, and the append resends them unchanged for every
-   carried-over option; only the appended options get provider
-   defaults. Existing ids, colors and descriptions must all survive
-   it (UNVERIFIED: U7). If the spike cannot confirm that survival,
-   this step does not ship as designed: the planner refuses the
-   append instead and prints a fix line ("add the `<rank>` option
-   to the field on the board by hand, then re-run"), because
-   resetting people's option colors is an alteration step 5 forbids,
-   and rewriting ids would silently invalidate every `priority_map`
-   in the wild. Options are never removed and never renamed by
-   corral.
+   are never topped up either. The provider's option update
+   (`updateProjectV2Field` with `singleSelectOptions`) replaces the
+   whole option list (VERIFIED with a refinement: section 9, item
+   U7), so the one append update corral may send (on `Priority`
+   only) is the existing list, in its existing order, with the
+   missing ranks' names appended. Because the whole list is resent,
+   the planner's live-schema data carries each existing option's id,
+   color and description beside its name, and the append resends
+   every carried-over option with its id and its color and
+   description unchanged; only the appended options omit the id and
+   get provider defaults. Resending without ids would give every
+   option a new id, and the update input requires `color` and
+   `description` on every option, so when any live option cannot be
+   resent in full, the planner refuses the append instead and prints
+   a fix line ("add the `<rank>` option to the field on the board by
+   hand, then re-run"), because resetting people's option colors is
+   an alteration step 5 forbids, and rewriting ids would silently
+   invalidate every `priority_map` in the wild. Options are never
+   removed and never renamed by corral.
 7. **Read back and report.** One final schema fetch is the truth the
    report and section 3 are built from: project owner, number and node
    id, the live per-concept field names (`BoardProvision.fields`,
@@ -597,7 +630,8 @@ so the same outcomes map onto its existing codes through its
 `_bootstrap_labels` precedent (section 8, ticket 7).
 
 Two `setup` runs racing can still create two same-title boards when
-both look before either creates (titles are not unique, U3): the
+both look before either creates (titles are not unique, VERIFIED:
+section 9, item U3): the
 create is not guarded by a title check, and no post-create re-list
 uncreates the second board. Duplicate titles are a documented risk
 of the operator command, flagged for a person to resolve, and the
@@ -615,24 +649,19 @@ lock is designed for it, and the failure is closed and visible.
 
 ### The token scope
 
-UNVERIFIED throughout (U8): Projects v2 over GraphQL is believed to
-need the `project` OAuth scope for writes and `read:project` for reads
-on a classic token (or the Projects read/write permission on a
-fine-grained one), which the scopes that suffice for issues and PRs do
-not include. Board reads and writes today ride on whatever token `gh`
-already holds, so a host can run label mode for years and only meet
-this at the first board call. The design states the fix line, never
-runs it: `gh auth refresh -s project` (exact scope string per the
-spike). Verification belongs to the spike in section 8, ticket 0,
-which checks, on a throwaway owner and only with the maintainer's
-go-ahead (creating boards is approval-gated, AGENTS.md): what
-`gh auth status` reports before and after, which of read and write
-fail without the scope and with what error text, and whether that text
-is what `gh`'s existing `_classify` already calls `scope`, so the
-doctor row in section 5 keys on a real answer rather than a guess.
-Until the spike runs, every scope claim in this doc is marked
-UNVERIFIED and no code may hard-code the string except behind the
-spike's outcome.
+PARTIAL (section 9, item U8): the spike ran every mutation in this
+section (create, link, field, option, item) with a token carrying
+`gist`, `project`, `read:org`, `repo` and `workflow`, adding no other
+scope, so the `project` scope suffices for board writes. What the
+spike did not reproduce is the refusal: with no token lacking the
+scope available, no refusal text was observed, so the error
+classification stays UNVERIFIED and is tested with canned payloads
+only until observed. Board reads and writes today ride on whatever
+token `gh` already holds, so a host can run label mode for years and
+only meet this at the first board call. The design states the fix
+line, never runs it: `gh auth refresh -s project`. The doctor row in
+section 5 keys on the shared classifier, never on a hard-coded
+refusal string, until the refusal text is observed.
 
 ### Who invokes it
 
@@ -829,11 +858,17 @@ returning added, kept and refused lines):
    issue, and external items stay read-only for every item write, as
    today (decision O8).
 3. Add each open issue not already present, one add-item mutation per
-   issue by its node id (UNVERIFIED: U9, the mutation name and what it
-   answers for an already-present item). An already-present answer,
-   if the pre-check raced a person adding the same issue, reads as
-   kept, never as a duplicate corral then tries to clean up: adoption
-   has no removal path at all.
+   issue by its node id: `addProjectV2ItemById(projectId, contentId)`
+   (VERIFIED: section 9, item U9). The add is idempotent: adding an
+   issue already present returns the same item id. An
+   already-present answer, if the pre-check raced a person adding the
+   same issue, reads as kept, never as a duplicate corral then tries
+   to clean up: adoption has no removal path at all. Immediately
+   after a link or create, the first adds can answer UNPROCESSABLE
+   with a temporary move conflict ("Your attempt to move this item
+   created a temporary conflict. Please try again.") or a generic
+   execution failure carrying a request id; the adapter retries these
+   bounded and classifies them transient, never a refusal.
 
 Adoption sets **no field value on any item**: not `Status`, not
 `Priority`, never the corral-owned texts. It adds items only; it
@@ -888,7 +923,7 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 | --- | --- | --- |
 | Board mode, no `[repo.board]` table | fail (exists) | `corral github setup` (creates the board and writes the table) |
 | Table names a board that does not resolve (deleted, wrong owner or number, no read access) | fail, naming owner and number | the board in the config no longer exists: remove the table and re-run `corral github setup`, or correct the address by hand (setup refuses the same state with exit 4 and this same line; it never recreates over a stale address) |
-| Token lacks the board scope | fail, naming the missing scope | `gh auth refresh -s project` (UNVERIFIED scope string, U8; printed for the person, who owns their login) |
+| Token lacks the board scope | fail, naming the missing scope | `gh auth refresh -s project` (scope verified for writes, refusal classification UNVERIFIED, U8; printed for the person, who owns their login) |
 | Board rate-limited during the check | fail (exists, marked transient) | wait for the cooldown, re-run `corral doctor` |
 | Mapped field missing on the live board | fail, naming repo, concept and field name | `corral github setup` (creates the missing field, alters nothing) |
 | Mapped field present with the wrong kind | fail, naming concept, field and both kinds | rename or delete the field on the board, then `corral github setup` |
@@ -917,10 +952,12 @@ than aspirational:
 - **The scope row** keys on classification of the fetch error's text.
   `github/gh.py` already classifies scope answers (`_classify`, today
   private); the ticket exposes that one classifier for the doctor's
-  seam rather than growing a second matcher in `boarddoctor`. Until
-  the spike (U8) confirms the real error text and scope string, the
-  row ships behind no hard-coded assumption stronger than the
-  classifier itself.
+  seam rather than growing a second matcher in `boarddoctor`. The
+  spike (U8) confirmed the `project` scope suffices for writes but did
+  not observe the refusal text, so the row still ships behind no
+  hard-coded refusal string: only the classifier decides, and the
+  refusal classification is tested with canned payloads until
+  observed.
 - **The warn rows need warn plumbing.** `boarddoctor.BoardRow.status`
   is only `"ok"` or `"fail"` today; `doctor.Check` already carries
   `"warn"` and warn-only rows do not fail the doctor. Ticket 6 widens
@@ -1264,36 +1301,93 @@ ticket.
 ## 9. Unverified facts and open decisions
 
 UNVERIFIED means: believed true of GitHub Projects v2 or GitLab, not
-run by the author of this doc, and not to be treated as fact by any
-implementation ticket until ticket 0 confirms it. Decisions O1 to O8
-are the maintainer's; each block has one line under 60 characters per
-option and one marked recommended.
+yet run, and not to be treated as fact by any implementation ticket.
+VERIFIED means the maintainer-run spike of ticket 0 showed it on real
+GitHub, against throwaway Projects that were created, exercised and
+deleted; this doc records mutation names and input shapes only, with
+generic stand-ins (`example-owner`, `PVT_xxx`) and no ids or logins.
+PARTIAL means the spike showed part of the claim. FALSE as written
+means the spike refuted the claim as stated, and the refined fact
+beside it is what implementation tickets use. Ticket 0 is recorded:
+U1 to U6 VERIFIED, U7 FALSE with a refinement, U8 PARTIAL, U9 and U11
+VERIFIED with refinements, U10 still UNVERIFIED. No open decision O1
+to O8 changes on these results. Decisions O1 to O8 are the
+maintainer's; each block has one line under 60 characters per option
+and one marked recommended.
 
-- U1. A new Project ships a built-in `Status` single-select field
-  (`Todo`, `In Progress`, `Done`), and built-ins cannot be deleted.
-- U2. A single-select field cannot be created with zero options.
-- U3. `createProjectV2` takes an owner node id and title; titles are
-  not unique per owner.
-- U4. Create does not take visibility; `updateProjectV2` can set a
-  project private after creation.
-- U5. A link mutation exists (`linkProjectV2ToRepository` or similar)
-  and re-linking an already-linked repo is harmless.
-- U6. `createProjectV2Field` takes `dataType` (`TEXT`,
-  `SINGLE_SELECT`) and options at creation for single-select.
-- U7. Appending options replaces the option list but preserves the
-  ids, colors and descriptions of the options carried over, when
-  the resent list carries each option's color and description with
-  it (and, if colors or descriptions cannot ride the update at all,
-  that is the failure this item records, and step 6 refuses).
-- U8. The needed token scope is `project` (write) / `read:project`
-  (read); its refusal text classifies as `scope`; the fix is
-  `gh auth refresh -s project`.
-- U9. `addProjectV2ItemById` adds an issue by node id and answers
-  identifiably when the item is already present.
-- U10. Every GitLab statement in section 6.
-- U11. An owner login can be resolved to exactly one of user or
-  organization, with its node id, by asking for both; and an unknown
-  login answers identifiably as neither (not as a generic failure).
+- U1. VERIFIED. A new Project ships built-in fields (Title,
+  Assignees, Labels, Linked pull requests, Milestone, Repository,
+  Reviewers, Parent issue, Sub-issues progress, Created, Updated,
+  Closed) and a single-select `Status` with `Todo`, `In Progress`
+  and `Done`, each with a color and a description. Shown by listing
+  the new Project's fields, and by `deleteProjectV2Field` on
+  `Status` failing UNPROCESSABLE with "Only custom fields can be
+  deleted."
+- U2. VERIFIED. `createProjectV2Field` with dataType SINGLE_SELECT
+  and zero options fails with "At least one singleSelectOption is
+  required for data_type SINGLE_SELECT."
+- U3. VERIFIED. `createProjectV2(ownerId: PVT_xxx, title: ...)`
+  takes an owner node id and a title; two creates with the same
+  title both succeed, so titles are not unique per owner. The legacy
+  node id form still answers but with a DEPRECATION warning naming
+  `next_global_id`;
+  the adapter prefers the new id form where the API returns it.
+- U4. VERIFIED, refined. `CreateProjectV2Input` carries `ownerId`,
+  `title`, `repositoryId` and `teamId`, and no visibility; a new
+  user-owned Project reports `public: false`. `UpdateProjectV2Input`
+  carries `public`, so the read-back plus make-private correction in
+  section 2 step 3 stands as designed. Create also accepts
+  `repositoryId`, which links the repository in the same step.
+- U5. VERIFIED. `linkProjectV2ToRepository(projectId, repositoryId)`
+  links a repository; linking the same repository a second time
+  succeeds again, so a repeated link reads as kept.
+- U6. VERIFIED. `createProjectV2Field` takes `dataType` TEXT or
+  SINGLE_SELECT; single-select options at creation carry `name`,
+  `color` and `description`, and come back with ids.
+- U7. FALSE as written, refined. `updateProjectV2Field(fieldId,
+  singleSelectOptions)` replaces the whole option list. Resending
+  the existing options WITHOUT their ids gives every option a new
+  id; resending each existing option WITH its `id` keeps every id,
+  color and description, and a new option without an `id` is
+  appended with a fresh id. `ProjectV2SingleSelectFieldOptionInput`
+  carries `id`, `name`, `color` and `description`, with `color` and
+  `description` required on every option (omitting either is a
+  schema error). Section 2 step 6 therefore ships only in the strict
+  form: read the live options with ids, colors and descriptions,
+  resend all of them with their ids, append the new ranks; refuse
+  with a fix line when any live option cannot be resent in full.
+- U8. PARTIAL. A token carrying `gist`, `project`, `read:org`,
+  `repo` and `workflow` ran every mutation above with no other scope
+  added, so `project` suffices for board writes. The refusal text
+  for a token lacking the scope was not reproduced (no such token
+  was available), so the error classification stays UNVERIFIED:
+  test it with canned payloads only until the text is observed, and
+  keep the doctor scope row behind the classifier, not behind a
+  hard-coded string.
+- U9. VERIFIED, refined. `addProjectV2ItemById(projectId, contentId)`
+  adds an issue by node id and is idempotent: adding the same issue
+  again returns the same item id, so a raced add reads as kept.
+  Immediately after a link or create, the first adds can answer
+  UNPROCESSABLE with a temporary move conflict ("Your attempt to
+  move this item created a temporary conflict. Please try again.")
+  or a generic execution failure carrying a request id; retrying
+  after a few seconds succeeded. The adapter retries these bounded
+  and classifies them transient, never a refusal.
+- U10. UNVERIFIED. Every GitLab statement in section 6. Unchanged:
+  not the spike's to settle.
+- U11. VERIFIED, refined. Resolving an owner login by asking
+  `user(login: example-owner)` and `organization(login:
+  example-owner)` in one query: for a user
+  login the body has the user half set and the organization half
+  null, plus a NOT_FOUND error naming the organization login ("Could
+  not resolve to an Organization with the login of ..."); for an
+  unknown login both halves are null with two NOT_FOUND errors.
+  `gh api` exits non-zero in both cases, even when one half
+  succeeded, and `gh api graphql` exits non-zero on any `errors`
+  entry even beside partial `data`. The adapter therefore reads the
+  JSON body and decides from `data`, never from the exit code, and
+  the `gh` seam returns the body for GraphQL calls for the adapter
+  to classify.
 
 O1. Priority option names on the standard board:
 Options:
