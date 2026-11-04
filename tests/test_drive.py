@@ -569,7 +569,7 @@ class HoldLabelWiringTest(unittest.TestCase):
                 mock.patch.object(drive.board, "open_store", return_value=store),
                 mock.patch.object(drive.settings, "load", return_value=host_settings) as loaded,
                 mock.patch.object(drive.projects, "load_all", return_value=[]),
-                mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0)),
+                mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0, {})),
                 mock.patch.object(drive, "production_finished_for", return_value={}),
                 mock.patch.object(drive, "production_agent_roles", return_value={}),
                 mock.patch.object(
@@ -596,6 +596,7 @@ class HoldLabelWiringTest(unittest.TestCase):
         code, seen, _, loaded = self.passing_cmd(plan=True)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("hold_label"), "paused")
+        self.assertEqual(seen.get("agent_tickets"), {})
         self.assertEqual(seen.get("live_units"), set())
         self.assertEqual(loaded.call_count, 1)
 
@@ -603,6 +604,7 @@ class HoldLabelWiringTest(unittest.TestCase):
         code, seen, launcher_seen, loaded = self.passing_cmd(plan=False)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("hold_label"), "paused")
+        self.assertEqual(seen.get("agent_tickets"), {})
         self.assertEqual(launcher_seen.get("hold_label"), "paused")
         self.assertEqual(loaded.call_count, 1)
 
