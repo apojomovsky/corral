@@ -187,6 +187,9 @@ def _setup_labels(resolved, repo_tracker, out, err, *, plan):
                 out.write(f"would create label {name} on {repo}\n")
             return (len(missing), 0, 0, 0)
         report = repo_tracker.ensure_labels(repo)
+    except iface.TrackerRejected as problem:
+        _err(f"{repo}: {problem}", err)
+        return (0, 0, 1, 0)
     except iface.TrackerError as problem:
         _err(f"{repo}: {problem}", err)
         return (0, 1, 0, 0)
