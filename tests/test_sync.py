@@ -199,10 +199,13 @@ class ResyncTest(StoreCase):
             def items(self, repo):
                 raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
 
+        self.stored(1)
         result = sync.resync_repo(self.store, RejectingTracker(), REPO, operators=["alice"], now=T0)
         self.assertEqual(result.errors, ())
         self.assertEqual(len(result.refused), 1)
         self.assertIn(REPO, result.refused[0])
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.confidence, board.CONFIRMED)
 
 
 class AuditTest(StoreCase):

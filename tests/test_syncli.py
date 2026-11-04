@@ -109,6 +109,33 @@ class ExitCodeTest(SyncRootCase):
         self.assertEqual(code, 1)
         self.assertIn("tracker rejected", self.err.getvalue())
 
+    def test_rejected_resync_exits_1(self):
+        class RejectingTracker(FakeTracker):
+            def items(self, repo):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        code = self.run_sync(RejectingTracker(), resync=True)
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+
+    def test_refused_plus_unreachable_exits_3(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n'
+                '[[repo]]\nname = "lib"\ntracker.repo = "acme/lib"\n'
+            )
+
+        class MixedTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                if repo == "acme/app":
+                    raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+                raise tracker.TrackerError("connection refused")
+
+        code = self.run_sync(MixedTracker())
+        self.assertEqual(code, 3)
+        self.assertIn("tracker rejected", self.err.getvalue())
+        self.assertIn("connection refused", self.err.getvalue())
+
     def test_partial_errors_still_exit_0(self):
         fake = FakeTracker(
             [

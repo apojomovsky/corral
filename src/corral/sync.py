@@ -299,7 +299,7 @@ def resync_repo(
             store.adopt_claim(shown_repo, shown_number, shown_agent, epoch=int(now), now=now)
         elif holder != shown_agent:
             conflicts.append(f"{shown_repo}#{shown_number}: store={holder} tracker={shown_agent}")
-    if not errors and not store_errors:
+    if not errors and not refused and not store_errors:
         absent = 0
         try:
             rows = store.items(repo=repo)
