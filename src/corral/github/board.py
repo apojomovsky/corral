@@ -105,11 +105,34 @@ class BoardSchema(NamedTuple):
 #: module only names the reader's kind contract below.
 _CONCEPT_ATTRS = iface.BOARD_CONCEPT_ATTRS
 
-#: Concepts carried as option display names.
+#: Concepts carried as option display names. Every other board concept
+#: is carried as free text: this one set owns the text-versus-select
+#: fact, and both the read and provision paths resolve it through
+#: ``_want_kind`` below.
 _SELECT_CONCEPTS = frozenset({"board_status", "priority", "area", "pool"})
 
-#: Concepts carried as free text.
-_TEXT_CONCEPTS = frozenset({"agent", "status", "blocked_by"})
+
+def _want_kind(concept) -> str:
+    """``"single_select"`` or ``"text"`` for one board concept."""
+    return "single_select" if concept in _SELECT_CONCEPTS else "text"
+
+
+def _field_kind(node) -> str:
+    """``"text"``, ``"single_select"`` or ``"other"`` for one schema node.
+
+    The one mapping from the provider's ``(__typename, dataType)`` shape
+    to a kind: the read path (``_parse_field``) and the provision path
+    (``_live_fields``) both call this, so the contract cannot fork.
+    """
+    if (
+        node.get("__typename") == "ProjectV2SingleSelectField"
+        and node.get("dataType") == "SINGLE_SELECT"
+    ):
+        return "single_select"
+    if node.get("__typename") == "ProjectV2Field" and node.get("dataType") == "TEXT":
+        return "text"
+    return "other"
+
 
 #: One ``owner/repo#N`` reference, matched whole: owner is a login,
 #: the repo allows dots and underscores, the number never starts at 0.
@@ -237,15 +260,8 @@ class BoardReader:
 
     def _parse_field(self, concept, name, node) -> FieldDef:
         """One mapped schema node as a ``FieldDef``, else ``TrackerError``."""
-        typename = node.get("__typename")
-        datatype = node.get("dataType")
-        if typename == "ProjectV2SingleSelectField" and datatype == "SINGLE_SELECT":
-            kind = "single_select"
-        elif typename == "ProjectV2Field" and datatype == "TEXT":
-            kind = "text"
-        else:
-            kind = "other"
-        want = "single_select" if concept in _SELECT_CONCEPTS else "text"
+        kind = _field_kind(node)
+        want = _want_kind(concept)
         if kind != want:
             raise _fail(f"board field {name!r} for {concept} has the wrong kind")
         options = {}
@@ -416,7 +432,7 @@ class BoardReader:
         concept = by_field.get(fid)
         if concept is None:
             return None, None, None
-        if concept in _TEXT_CONCEPTS:
+        if _want_kind(concept) == "text":
             if "text" not in entry:
                 raise _fail(f"board value for {concept} is not text")
             text = entry["text"]
@@ -758,6 +774,15 @@ _OPTIONS_APPEND = """mutation ProvisionOptionsAppend($field: ID!, $options: [Pro
 #: The fix line for a spec addressing a board that no longer resolves.
 _REMOVE_TABLE_LINE = "the board in the config no longer exists: remove the table and re-run"
 
+
+def _link_fix(repo) -> str:
+    """The fix line when the account may not link ``repo`` to the board."""
+    return (
+        f"could not link {repo} to the board: the account may not see or administer "
+        "that repository; link it on the board by hand, then re-run"
+    )
+
+
 #: The color of an option the provisioner creates. New options carry no
 #: meaning, so they share one neutral color; people recolor by hand.
 _NEW_OPTION_COLOR = "GRAY"
@@ -817,20 +842,42 @@ def _errors_rate_limited(errors) -> bool:
     return gh.is_rate_limited(json.dumps(errors))
 
 
-def _field_kind(node) -> str:
-    """``"text"``, ``"single_select"`` or ``"other"`` for one schema node.
+class _BoardForbidden(iface.TrackerError):
+    """A GraphQL answer refused the call: no permission, not unreachable.
 
-    The same contract the reader parses by: only the two shapes above
-    carry a concept, and anything else is a wrong kind, never a guess.
+    A subclass of ``TrackerError`` so paths that do not distinguish it
+    still fail closed with exit code 3. The link step catches it and
+    reports the refusal with its fix line instead.
     """
-    if (
-        node.get("__typename") == "ProjectV2SingleSelectField"
-        and node.get("dataType") == "SINGLE_SELECT"
-    ):
-        return "single_select"
-    if node.get("__typename") == "ProjectV2Field" and node.get("dataType") == "TEXT":
-        return "text"
-    return "other"
+
+
+def _check_body_errors(body, pacer) -> None:
+    """Raise for the error entries a GraphQL body carries beside its data.
+
+    The one classifier every provision read and mutation runs its failed
+    response through, so the error contract holds on all paths: a
+    RATE_LIMITED entry raises ``TrackerRateLimited``, a FORBIDDEN entry
+    raises ``_BoardForbidden``, and any other entry besides the expected
+    NOT_FOUND noise (the losing half of the owner lookup) raises
+    ``TrackerError`` instead of resolving to a missing board or a
+    refusal. A transient conflict entry therefore fails closed here;
+    only the populate operation retries those. A body with no errors, or
+    only NOT_FOUND entries, passes: the caller decides those from the
+    data.
+    """
+    errors = body.get("errors") if isinstance(body, dict) else None
+    if not errors:
+        return
+    if _errors_rate_limited(errors):
+        text = json.dumps(errors)
+        if pacer is not None:
+            pacer.cooldown(gh.retry_after_s(text))
+        raise iface.TrackerRateLimited(text, gh.retry_after_s(text))
+    if any(isinstance(entry, dict) and entry.get("type") == "FORBIDDEN" for entry in errors):
+        raise _BoardForbidden(json.dumps(errors))
+    if all(isinstance(entry, dict) and entry.get("type") == "NOT_FOUND" for entry in errors):
+        return
+    raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
 
 
 class GithubBoardProvisioner:
@@ -858,8 +905,9 @@ class GithubBoardProvisioner:
         """One paced GraphQL mutation as its ``data`` payload.
 
         Rate-limit text maps to ``TrackerRateLimited`` through the shared
-        classifier; anything else fails closed, like the board reads and
-        writes.
+        classifier, and a response body surviving on the error is decided
+        by the one body classifier; anything else fails closed, like the
+        board reads and writes.
         """
         try:
             return gh.graphql(query, run=self._run, pacer=self._pacer, **variables)
@@ -867,6 +915,9 @@ class GithubBoardProvisioner:
             text = str(err) or repr(err)
             if err.kind == "unavailable" or gh.is_rate_limited(text):
                 raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            body = _response_body(err)
+            if body is not None:
+                _check_body_errors(body, self._active_pacer())
             raise iface.TrackerError(f"board unreachable: {text}") from err
         except Exception as err:
             raise iface.TrackerError(f"board unreachable: {err}") from err
@@ -887,6 +938,7 @@ class GithubBoardProvisioner:
                 raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
             body = _response_body(err)
             if body is not None:
+                _check_body_errors(body, self._active_pacer())
                 data = body.get("data")
                 if data is None or isinstance(data, dict):
                     return data
@@ -927,10 +979,7 @@ class GithubBoardProvisioner:
                 raise iface.TrackerError(f"unusable board answer: {out[:80]!r}") from None
         if not isinstance(body, dict):
             raise iface.TrackerError(f"unusable board answer: {body!r}")
-        if _errors_rate_limited(body.get("errors")):
-            text = json.dumps(body["errors"])
-            pacer.cooldown(gh.retry_after_s(text))
-            raise iface.TrackerRateLimited(text, gh.retry_after_s(text))
+        _check_body_errors(body, pacer)
         data = body.get("data")
         if data is None or isinstance(data, dict):
             return data
@@ -1247,21 +1296,18 @@ class GithubBoardProvisioner:
             repo_id = self._fetch_repo_id(spec.repo)
             repo_ids[spec.repo] = repo_id
         if repo_id is None:
-            refused.append(
-                f"could not link {spec.repo} to the board: the account may not see or administer "
-                "that repository; link it on the board by hand, then re-run"
-            )
+            refused.append(_link_fix(spec.repo))
             return
         try:
             payload = self._mutate(_LINK, projectId=project_id, repositoryId=repo_id)
         except iface.TrackerRateLimited:
             raise
+        except _BoardForbidden:
+            refused.append(_link_fix(spec.repo))
+            return
         except iface.TrackerError as err:
             if "(HTTP 403)" in str(err):
-                refused.append(
-                    f"could not link {spec.repo} to the board: the account may not see or administer "
-                    "that repository; link it on the board by hand, then re-run"
-                )
+                refused.append(_link_fix(spec.repo))
                 return
             raise
         node = payload.get("linkProjectV2ToRepository") if isinstance(payload, dict) else None
@@ -1422,7 +1468,8 @@ class GithubBoardProvisioner:
                 refused.append(
                     f"board {title!r} is public but the spec asks for private: make it private by hand"
                 )
-                return self._report(spec, project_id, number, [], ["project"], refused, live)
+                self._ensure_link(spec, project_id, repos, repo_ids, created, kept, refused)
+                return self._report(spec, project_id, number, created, kept, refused, live)
         self._ensure_link(spec, project_id, repos, repo_ids, created, kept, refused)
         self._ensure_fields(spec, project_id, live, field_ids, created, kept, refused)
         project = self._read_project_by_id(project_id)

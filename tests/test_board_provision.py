@@ -625,7 +625,7 @@ class VisibilityTests(unittest.TestCase):
         self.assertIn("private", report.refused[0])
         self.assertIn("field:Priority", report.kept)
 
-    def test_title_found_public_board_stops_before_link_and_fields(self):
+    def test_title_found_public_board_runs_link_then_stops_before_fields(self):
         run = script_full_create(ProvisionFakeRun())
         run.scripted["BoardTitles"] = [titles_payload(("PVT_a", 2, "demo board"))]
         run.script(
@@ -636,8 +636,9 @@ class VisibilityTests(unittest.TestCase):
         report = provisioner.ensure_board(spec)
         self.assertEqual(len(report.refused), 1)
         self.assertIn("private", report.refused[0])
-        self.assertFalse(run.has_mutation("BoardLinkRepo"))
+        self.assertIn("link:example/demo", report.kept)
         self.assertFalse(run.has_mutation("FieldCreate"))
+        self.assertFalse(run.has_mutation("OptionsAppend"))
 
 
 class LinkTests(unittest.TestCase):
@@ -668,6 +669,24 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(len(report.refused), 1)
         self.assertIn("example/demo", report.refused[0])
         self.assertFalse(run.has_mutation("BoardLinkRepo"))
+        self.assertIn("field:Priority", report.kept)
+
+    def test_link_forbidden_body_is_refused_without_the_rest_shape(self):
+        body = {
+            "data": {"linkProjectV2ToRepository": None},
+            "errors": [{"type": "FORBIDDEN", "message": "nope"}],
+        }
+        run = addressed_run(*standard_field_nodes(), repos=())
+        run.add_rest("repos/example/demo", {"node_id": "R_1"})
+        run.script(
+            "BoardLinkRepo",
+            [gh.GhError("other", "generic failure", output=json.dumps(body))],
+        )
+        provisioner, spec = provisioner_for(run)
+        report = provisioner.ensure_board(spec)
+        self.assertEqual(len(report.refused), 1)
+        self.assertIn("example/demo", report.refused[0])
+        self.assertNotIn("link:example/demo", report.created)
         self.assertIn("field:Priority", report.kept)
 
 
@@ -903,6 +922,41 @@ class RateLimitTests(unittest.TestCase):
             provisioner.ensure_board(spec)
         self.assertEqual(run.mutations(), [])
 
+    def test_rate_limited_body_on_schema_fetch_is_rate_limited(self):
+        body = {
+            "data": {"node": None},
+            "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
+        }
+        run = ProvisionFakeRun().script("OwnerResolve", [owner_body("user")])
+        run.script(
+            "BoardByNumber",
+            [gh.GhError("other", "generic failure", output=json.dumps(body))],
+        )
+        provisioner, spec = provisioner_for(run)
+        with self.assertRaises(iface.TrackerRateLimited):
+            provisioner.ensure_board(spec)
+        self.assertEqual(run.mutations(), [])
+
+    def test_rate_limited_body_on_field_create_is_rate_limited(self):
+        body = {
+            "data": {"createProjectV2Field": None},
+            "errors": [{"type": "RATE_LIMITED", "message": "slow down"}],
+        }
+        live = [
+            text_node("F_status", "Agent state"),
+            select_node("F_board", "Status", STATUS_OPTIONS),
+            select_node("F_prio", "Priority", PRIORITY_OPTIONS),
+            text_node("F_blocked", "Blocked by"),
+        ]
+        run = addressed_run(*live)
+        run.script(
+            "TextFieldCreate",
+            [gh.GhError("other", "generic failure", output=json.dumps(body))],
+        )
+        provisioner, spec = provisioner_for(run)
+        with self.assertRaises(iface.TrackerRateLimited):
+            provisioner.ensure_board(spec)
+
 
 class FactoryTests(unittest.TestCase):
     def test_factory_builds_a_provisioner_on_the_injected_seams(self):
@@ -924,3 +978,19 @@ class FactoryTests(unittest.TestCase):
         self.assertIs(provisioner._run, run)
         params = list(inspect.signature(GithubBoardProvisioner.__init__).parameters)
         self.assertEqual(params, ["self", "run", "pacer"])
+
+
+class FieldKindTests(unittest.TestCase):
+    def test_one_kind_mapping_serves_read_and_provision_paths(self):
+        from corral.github.board import _field_kind, _want_kind
+
+        text = {"__typename": "ProjectV2Field", "dataType": "TEXT"}
+        select = {"__typename": "ProjectV2SingleSelectField", "dataType": "SINGLE_SELECT"}
+        other = {"__typename": "ProjectV2IterationField", "dataType": "ITERATION"}
+        self.assertEqual(_field_kind(text), "text")
+        self.assertEqual(_field_kind(select), "single_select")
+        self.assertEqual(_field_kind(other), "other")
+        for concept in ("agent", "status", "blocked_by"):
+            self.assertEqual(_want_kind(concept), "text")
+        for concept in ("board_status", "priority", "area", "pool"):
+            self.assertEqual(_want_kind(concept), "single_select")
