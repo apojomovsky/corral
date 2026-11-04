@@ -58,8 +58,39 @@ class SelectionTest(unittest.TestCase):
     def test_external_ticket_is_skipped(self):
         self.assertEqual(selected([row(7, external=True)]), [])
 
-    def test_claimed_ticket_is_skipped(self):
-        self.assertEqual(selected([row(7, agent="drive-host-1--app-7")]), [])
+    def test_claimed_ticket_is_requested_as_start(self):
+        self.assertEqual(
+            selected([row(7, agent="drive-host-1--app-7")]),
+            [("app", 7)],
+        )
+
+    def test_claimed_ticket_request_kind_is_start(self):
+        (request,) = policies.basic([row(7, agent="drive-host-1--app-7")], now=1000.0)
+        self.assertEqual(request.kind, "start")
+
+    def test_claimed_ticket_with_a_hold_label_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("hold",))]), [])
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("needs-decision",))]), [])
+
+    def test_claimed_ticket_with_a_hold_word_in_title_is_skipped(self):
+        self.assertEqual(
+            selected([row(7, agent="drive-x", title="Widget 7: cutover (HOLD for approval)")]),
+            [],
+        )
+
+    def test_closed_claimed_ticket_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", state="closed")]), [])
+
+    def test_external_claimed_ticket_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", external=True)]), [])
+
+    def test_blocked_claimed_ticket_is_skipped(self):
+        self.assertEqual(selected([row(7, agent="drive-x", extra={"blocked_by": "app#3"})]), [])
+        self.assertEqual(selected([row(7, agent="drive-x", labels=("blocked",))]), [])
+
+    def test_claimed_ticket_with_an_open_linked_pull_is_skipped(self):
+        pull = eligibility.LinkedPull(number=11, state="open")
+        self.assertEqual(selected([row(7, agent="drive-x", pulls=(pull,))]), [])
 
     def test_hold_label_is_skipped(self):
         self.assertEqual(selected([row(7, labels=("hold",))]), [])
@@ -114,8 +145,9 @@ class SelectionTest(unittest.TestCase):
             row(4, labels=("hold",)),
             row(5, extra={"blocked_by": "app#1"}),
             row(6),
+            row(8, agent="drive-host-1--app-8", labels=("hold",)),
         ]
-        self.assertEqual(selected(rows), [("app", 1), ("app", 6)])
+        self.assertEqual(selected(rows), [("app", 1), ("app", 3), ("app", 6)])
 
 
 class WeightsTest(unittest.TestCase):
