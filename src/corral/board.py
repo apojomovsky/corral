@@ -526,13 +526,22 @@ class Store:
         nothing. A stale reading settles nothing either and keeps the
         stored concepts. A reading for a pull request stores nothing: it
         deletes a row a past sync held instead, so the next sync heals
-        stores that already hold one. Claims and queued writes are left
-        alone: coordination state is never dropped with the cached row."""
+        stores that already hold one. The claim and the queued writes go
+        with the row: coordination state is never kept for a pull request,
+        so the mirror pass cannot write to one."""
         with _txn(self._conn):
             if not is_ticket(item):
                 self._conn.execute(
                     "DELETE FROM items WHERE repo=? AND number=?",
                     (item.repo, item.number),
+                )
+                self._conn.execute(
+                    "DELETE FROM claims WHERE repo=? AND number=?",
+                    (item.repo, item.number),
+                )
+                self._conn.execute(
+                    "UPDATE outbox SET state=?, reason=? WHERE repo=? AND number=? AND state=?",
+                    (DROPPED, "not-a-ticket", item.repo, item.number, QUEUED),
                 )
                 return
             stored = self._row(item.repo, item.number)
@@ -635,7 +644,8 @@ class Store:
         behind it; ``fetched_at`` moves to now, since absence was just
         verified. Unknown rows are a caller bug."""
         with _txn(self._conn):
-            if self._row(repo, number) is None:
+            row = self._row(repo, number)
+            if row is None or row[2] != "issue":
                 raise StoreError(f"unknown item {repo}#{number}")
             self._conn.execute(
                 "UPDATE items SET confidence=?, fetched_at=? WHERE repo=? AND number=?",
@@ -644,7 +654,7 @@ class Store:
 
     def _require_writable(self, repo, number):
         row = self._row(repo, number)
-        if row is None:
+        if row is None or row[2] != "issue":
             raise StoreError(f"unknown item {repo}#{number}")
         if row[5] != "open":
             raise StoreError(f"item {repo}#{number} is not open")
@@ -736,7 +746,7 @@ class Store:
         item nothing is enqueued and the item is not marked pending."""
         with _txn(self._conn):
             row = self._row(repo, number)
-            if row is None:
+            if row is None or row[2] != "issue":
                 raise StoreError(f"unknown item {repo}#{number}")
             held = self._conn.execute(
                 "SELECT agent, host, epoch, claimed_at FROM claims WHERE repo=? AND number=?",
@@ -772,11 +782,11 @@ class Store:
         holder's release is refused. Nothing is enqueued: the tracker
         already shows the claim, and confidence stays as the upsert left
         it. Returns False, never raises, when a claim row exists, the
-        item is unknown, external or closed, or an agent write is already
-        queued or sent."""
+        item is unknown, not a ticket, external or closed, or an agent
+        write is already queued or sent."""
         with _txn(self._conn):
             row = self._row(repo, number)
-            if row is None or row[5] != "open" or row[14] or not agent:
+            if row is None or row[2] != "issue" or row[5] != "open" or row[14] or not agent:
                 return False
             held = self._conn.execute(
                 "SELECT agent FROM claims WHERE repo=? AND number=?",
