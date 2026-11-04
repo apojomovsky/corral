@@ -269,6 +269,8 @@ def gate(
     now,
     finished=None,
     agent_roles=None,
+    agent_states=None,
+    agent_tickets=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -282,7 +284,9 @@ def gate(
     by that finished worker itself, which the reviewer takes over. Rows
     reviewed since the last work are merge-ready and ignored, and a fix
     round requested after the fix already landed is skipped. A fix or
-    resume behind a reviewer holder (from `agent_roles`) skips with the
+    resume behind a reviewer holder (from `agent_roles`, resolved to
+    its registry entry by ticket through the one resolver, since a
+    drive-id holder never names a unit-name entry) skips with the
     claim kept, matching the claiming pass, so `--plan` prints the
     verdict the real pass would print. Every input is plain data or an
     injected seam (`read_labels`); nothing is launched, claimed or
@@ -404,7 +408,18 @@ def gate(
         roles = ", ".join(f"role {name!r} ({blocked[name]['state']})" for name in sorted(blocked))
         return _skip(candidate, kind, "quota", f"{ref}: quota refuses {roles}: skipped")
 
-    if kind in ("resume", "fix") and (agent_roles or {}).get(holder) == "reviewer":
+    if (
+        kind in ("resume", "fix")
+        and holder_role(
+            holder,
+            row.repo,
+            row.number,
+            agent_states=agent_states,
+            agent_tickets=agent_tickets,
+            agent_roles=agent_roles,
+        )
+        == "reviewer"
+    ):
         return _skip(
             candidate,
             kind,
@@ -1160,6 +1175,8 @@ def _gate_all(
     released=None,
     finished=None,
     agent_roles=None,
+    agent_states=None,
+    agent_tickets=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -1172,8 +1189,9 @@ def _gate_all(
     still-claimed rows gates what the real pass would gate after the
     release; `finished` carries the newest finished entry per ticket for
     the reviewer and fix-round readiness; `agent_roles` ({agent id:
-    role}) feeds the gate's reviewer-holder skip, so a plan matches
-    the claiming pass. Nothing is written.
+    role} for visible entries), resolved through `agent_states` and
+    `agent_tickets` by ticket, feeds the gate's reviewer-holder skip,
+    so a plan matches the claiming pass. Nothing is written.
     """
     rows = eligibility.rows_from_items(items)
     by_key = {(row.repo, row.number): row for row in rows}
@@ -1260,6 +1278,8 @@ def _gate_all(
             now=now,
             finished=finished,
             agent_roles=agent_roles,
+            agent_states=agent_states,
+            agent_tickets=agent_tickets,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1327,7 +1347,9 @@ def _pass(
     authors = _capture_finished_holders(
         store, agent_states=agent_states, agent_tickets=agent_tickets, err=err
     )
-    finished = resolve_finished(finished_for, authors)
+    finished = resolve_finished(
+        finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
+    )
     gated_rows, problems, _ = _gate_all(
         items,
         registered,
@@ -1343,6 +1365,8 @@ def _pass(
         released=reviewed_claims(authors, finished),
         finished=finished,
         agent_roles=agent_roles,
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
     )
     table = [
         Candidate(
@@ -1880,6 +1904,26 @@ def entry_for_claim(claim, *, agent_states, agent_tickets=None):
     return newest
 
 
+def holder_role(holder, repo, number, *, agent_states, agent_tickets, agent_roles):
+    """The registry role behind this claim holder, or None. Pure.
+
+    The only reader of `agent_roles` by holder: it resolves the
+    holder to its registry entry through `entry_for_claim` (by
+    ticket, never by holder id) and reads that entry's role, so a
+    unit-name-keyed role map is never keyed by an opaque drive id.
+    Unknown holders and entries without a recorded role read as
+    None, which every caller treats as not a reviewer.
+    """
+    entry = entry_for_claim(
+        _holder_claim(holder, repo, number),
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
+    )
+    if entry is None:
+        return None
+    return (agent_roles or {}).get(entry[0])
+
+
 def _finished_claims(store, agent_states, agent_tickets=None):
     """Managed claims with a finished registry entry. Pure reads.
 
@@ -2011,22 +2055,38 @@ def _capture_finished_holders(store, *, agent_states, agent_tickets=None, err) -
         return {}
 
 
-def resolve_finished(finished_for, released) -> dict:
+def resolve_finished(finished_for, released, *, agent_states=None, agent_tickets=None) -> dict:
     """{(repo, number): (agent id, role)} newest finished entry per ticket. Pure.
 
     `finished_for` is the cross-pass map from finished registry entries
     (agent id to role, `None` when the entry records none); `released`
     is this pass's {(repo, number): worker id} capture. A same-pass
     capture always wins: it just happened, so it is the newest event.
-    It keeps the cross-pass role only for the same agent id, else its
-    role is unknown (`None`), which the gate reads as unreviewed work.
+    It keeps the cross-pass role only for the same ticket's entry:
+    the cross-pass agent id is a unit name while the capture holds
+    the opaque drive id, so raw ids never compare equal. The capture
+    holder is resolved to its registry entry through the one
+    resolver (`entry_for_claim`, by ticket) and the role carries
+    over only when that entry is the cross-pass one; anything newer
+    reads as unknown (`None`), which the gate reads as unreviewed
+    work. Without a ticket index only raw ids compare, which keeps
+    the same-namespace unit tests exact.
     """
     resolved = dict(finished_for or {})
     for ticket, agent in (released or {}).items():
         role = None
         prior = resolved.get(ticket)
-        if prior is not None and prior[0] == agent:
-            role = prior[1]
+        if prior is not None:
+            if prior[0] == agent:
+                role = prior[1]
+            else:
+                entry = entry_for_claim(
+                    _holder_claim(agent, ticket[0], ticket[1]),
+                    agent_states=agent_states,
+                    agent_tickets=agent_tickets,
+                )
+                if entry is not None and entry[0] == prior[0]:
+                    role = prior[1]
         resolved[ticket] = (agent, role)
     return resolved
 
@@ -2772,9 +2832,10 @@ def _claim_and_launch(
     resumes when the holder is still usable and otherwise releases and
     reclaims before restarting on the same branch, which the launch
     path reuses. A fix or resume behind a reviewer holder waits: when the
-    current holder's role (from `agent_roles`) is a reviewer, the row
-    is skipped with the claim kept, and the fix is scheduled on a
-    later pass after the reviewer finishes and is released. A fresh
+    current holder's role (from `agent_roles`, resolved to its
+    registry entry by ticket through the one resolver) is a reviewer,
+    the row is skipped with the claim kept, and the fix is scheduled
+    on a later pass after the reviewer finishes and is released. A fresh
     restart first gates on the day cap, then on the restart budget:
     past the budget the row routes to the give-up path exactly as the
     stuck sweep does (decision writes through `tracker_factory`, then
@@ -3012,7 +3073,17 @@ def _claim_and_launch(
                     )
                 )
                 continue
-            if (agent_roles or {}).get(holder) == "reviewer":
+            if (
+                holder_role(
+                    holder,
+                    gated.repo,
+                    gated.number,
+                    agent_states=agent_states,
+                    agent_tickets=agent_tickets,
+                    agent_roles=agent_roles,
+                )
+                == "reviewer"
+            ):
                 rows.append(
                     Gated(
                         project=gated.project,
@@ -3809,7 +3880,9 @@ def _launching_pass(
     authors = _capture_finished_holders(
         store, agent_states=agent_states, agent_tickets=agent_tickets, err=err
     )
-    finished = resolve_finished(finished_for, authors)
+    finished = resolve_finished(
+        finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
+    )
     freed: dict = {}
     if agent_states is not None:
         try:
@@ -3866,6 +3939,9 @@ def _launching_pass(
         hold_label=hold_label,
         released=freed,
         finished=finished,
+        agent_roles=agent_roles,
+        agent_states=agent_states,
+        agent_tickets=agent_tickets,
     )
     if host is None:
         try:

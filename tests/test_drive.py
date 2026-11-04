@@ -593,12 +593,14 @@ class HoldLabelWiringTest(unittest.TestCase):
         code, seen, _, loaded = self.passing_cmd(plan=True)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("hold_label"), "paused")
+        self.assertEqual(seen.get("agent_tickets"), {})
         self.assertEqual(loaded.call_count, 1)
 
     def test_a_claiming_pass_reads_the_hold_label_once_and_passes_it_in(self):
         code, seen, launcher_seen, loaded = self.passing_cmd(plan=False)
         self.assertEqual(code, 0)
         self.assertEqual(seen.get("hold_label"), "paused")
+        self.assertEqual(seen.get("agent_tickets"), {})
         self.assertEqual(launcher_seen.get("hold_label"), "paused")
         self.assertEqual(loaded.call_count, 1)
 

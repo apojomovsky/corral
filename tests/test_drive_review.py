@@ -223,6 +223,24 @@ class ResolveFinishedTest(unittest.TestCase):
         self.assertEqual(drive.resolve_finished(finished, {}), finished)
         self.assertEqual(drive.resolve_finished(None, None), {})
 
+    def test_a_same_pass_release_keeps_the_role_through_the_ticket_resolver(self):
+        resolved = drive.resolve_finished(
+            {("app", 7): (UNIT, "reviewer")},
+            {("app", 7): HOLDER},
+            agent_states={UNIT: (FINISHED, NOW)},
+            agent_tickets={UNIT: ("app", 7)},
+        )
+        self.assertEqual(resolved, {("app", 7): (HOLDER, "reviewer")})
+
+    def test_a_release_for_a_newer_entry_drops_the_older_role(self):
+        resolved = drive.resolve_finished(
+            {("app", 7): (UNIT, "reviewer")},
+            {("app", 7): HOLDER},
+            agent_states={UNIT_R1: (FINISHED, NOW)},
+            agent_tickets={UNIT_R1: ("app", 7)},
+        )
+        self.assertEqual(resolved, {("app", 7): (HOLDER, None)})
+
 
 class FixModeTest(unittest.TestCase):
     def test_a_live_registry_entry_resumes(self):
@@ -1143,6 +1161,53 @@ class FixBehindReviewerTest(unittest.TestCase):
         after = store.claim_of("app", 7)
         assert after is not None
         self.assertEqual(after.agent, launcher.calls[0][4])
+
+    def test_a_fix_behind_a_live_reviewer_waits_with_real_shaped_ids(self):
+        holder, unit = "drive-a1b2c3d4-7", "blue-agent-app-7-r1"
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        before = store.claim("app", 7, holder, HOST, now=NOW - 4000.0)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=NOW - 100.0)])
+        launcher = FakeLauncher()
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={unit: (registry.LIVE, NOW - 10.0)},
+            agent_tickets={unit: ("app", 7)},
+            live_units=frozenset({("app", 7)}),
+            agent_roles={unit: "reviewer"},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertEqual((after.agent, after.epoch), (before.agent, before.epoch))
+        self.assertIn("waits for release", out)
+
+    def test_a_finished_reviewer_from_an_earlier_pass_is_released_with_real_ids(self):
+        holder, unit = "drive-a1b2c3d4-7", "blue-agent-app-7-r1"
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, holder, HOST, now=NOW - 4000.0)
+        fake = FakeTracker([reading(repo="app", number=7, updated_at=NOW - 100.0)])
+        launcher = FakeLauncher()
+        code, out, _ = self.run_fix(
+            store,
+            [("blue", [("app", 7, "fix")])],
+            fake,
+            launcher,
+            agent_states={unit: (FINISHED, NOW - 10.0)},
+            agent_tickets={unit: ("app", 7)},
+            finished_for={("app", 7): (unit, "reviewer")},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertIn("released finished reviewer", out)
+        after = store.claim_of("app", 7)
+        assert after is not None
+        self.assertNotEqual(after.agent, holder)
 
 
 class ReviewFixDayCapTest(unittest.TestCase):

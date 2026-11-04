@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import accounts, admission, board, drive, projects
+from corral import accounts, admission, board, drive, projects, registry
 from corral.eligibility import LinkedPull, StartRequest, TicketRow
 from tests.test_drive import policy_source, stored
 
@@ -261,6 +261,7 @@ class ClaimRoutingTest(unittest.TestCase):
     def test_a_fix_behind_a_reviewer_holder_skips_with_the_claim_kept(self):
         gated = gate(
             entry(kind="fix", row_=row(agent="drive-host-1-x")),
+            agent_states={"drive-host-1-x": (registry.LIVE, 1990.0)},
             agent_roles={"drive-host-1-x": "reviewer"},
         )
         self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
@@ -269,6 +270,7 @@ class ClaimRoutingTest(unittest.TestCase):
     def test_a_resume_behind_a_reviewer_holder_skips_with_the_claim_kept(self):
         gated = gate(
             entry(kind="resume", row_=row(agent="drive-host-1-x")),
+            agent_states={"drive-host-1-x": (registry.LIVE, 1990.0)},
             agent_roles={"drive-host-1-x": "reviewer"},
         )
         self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
@@ -277,7 +279,41 @@ class ClaimRoutingTest(unittest.TestCase):
     def test_a_fix_behind_a_worker_holder_proceeds(self):
         gated = gate(
             entry(kind="fix", row_=row(agent="drive-host-1-x")),
+            agent_states={"drive-host-1-x": (registry.LIVE, 1990.0)},
             agent_roles={"drive-host-1-x": "worker"},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+
+    def test_a_fix_behind_a_live_reviewer_waits_through_the_ticket_resolver(self):
+        holder, unit = "drive-a1b2c3d4-7", "blue-agent-app-7-r1"
+        gated = gate(
+            entry(kind="fix", row_=row(agent=holder)),
+            agent_states={unit: (registry.LIVE, 1990.0)},
+            agent_tickets={unit: ("app", 7)},
+            agent_roles={unit: "reviewer"},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertIn("waits for release", gated.reason)
+        self.assertIn(holder, gated.reason)
+
+    def test_a_resume_behind_a_live_reviewer_waits_through_the_ticket_resolver(self):
+        holder, unit = "drive-a1b2c3d4-7", "blue-agent-app-7-r1"
+        gated = gate(
+            entry(kind="resume", row_=row(agent=holder)),
+            agent_states={unit: (registry.LIVE, 1990.0)},
+            agent_tickets={unit: ("app", 7)},
+            agent_roles={unit: "reviewer"},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "claim"))
+        self.assertIn("waits for release", gated.reason)
+
+    def test_a_reviewer_role_on_another_ticket_does_not_block_a_fix(self):
+        holder, unit = "drive-a1b2c3d4-7", "blue-agent-app-8-r1"
+        gated = gate(
+            entry(kind="fix", row_=row(agent=holder)),
+            agent_states={unit: (registry.LIVE, 1990.0)},
+            agent_tickets={unit: ("app", 8)},
+            agent_roles={unit: "reviewer"},
         )
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
 

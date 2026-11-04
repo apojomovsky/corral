@@ -350,7 +350,9 @@ relaunches). The loop links the two by ticket (repo, number) through
 one resolver: the newest registry entry for the ticket wins by last
 heartbeat, so a relaunch reads past the generation it replaced and a
 reviewer reads past the worker it took over from. The stuck sweep,
-the finished-claims scan and the fix-round readiness all read that
+the finished-claims scan, the fix-round readiness, the reviewer role
+check that serializes a fix behind a live reviewer, and the
+finished-role carry that frees a reviewed row all read that
 resolver, never a second copy; keying on the holder id instead would
 match no entry and mistake every finished worker for a crash. The takeover releases the worker
 claim and claims a fresh reviewer id in the same handoff, so there is
