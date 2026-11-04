@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, drivehub, hub, paths, registry, settings, trackers
+from corral import board, drive, drivehub, hub, paths, registry, settings, trackers, units
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, FakeStop, claimed
@@ -874,6 +874,28 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         self.assertIn("app#7", logged)
         self.assertEqual(errors, "")
         self.assertEqual(FakeHubClient.built, [])
+
+    def test_plan_with_unreachable_units_treats_finished_rows_as_released(self):
+        seen = {}
+        real_run = drive.run_pass
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real_run(*args, **kwargs)
+
+        with (
+            mock.patch.object(
+                drive, "production_orphan_inputs", side_effect=units.Unreachable("no bus")
+            ),
+            mock.patch.object(drive, "run_pass", side_effect=spy),
+        ):
+            code, logged, errors = self.run_plan()
+        self.assertEqual(code, 0)
+        self.assertIn("cannot read live units", errors)
+        self.assertIn("plan treats finished rows as released", errors)
+        self.assertEqual(seen.get("live_units"), frozenset())
+        self.assertTrue(seen.get("plan"))
+        self.assertIn("app#7", logged)
 
     def test_non_plan_with_unusable_token_path_is_a_usage_error(self):
         with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
