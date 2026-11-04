@@ -296,6 +296,59 @@ class ReleaseReviewedTest(unittest.TestCase):
         assert found is not None
         self.assertEqual(found.agent, "drive-host-1-19999-acme--app-7")
 
+    def test_a_store_error_on_one_row_keeps_it_and_releases_the_other(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        other = "drive-host-1-16000-acme--app-8"
+        claimed(store, "app", 8, agent=other)
+        original = store.release
+
+        def flaky(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7):
+                raise board.StoreError("disk away")
+            return original(repo, number, agent, epoch, now=now)
+
+        store.release = flaky  # type: ignore[method-assign]
+        out = io.StringIO()
+        try:
+            released = drive.release_reviewed(
+                store,
+                claims={("app", 7): AGENT, ("app", 8): other},
+                live_units=frozenset(),
+                now=NOW,
+                out=out,
+            )
+        finally:
+            store.release = original  # type: ignore[method-assign]
+        self.assertEqual(released, {("app", 8): other})
+        text = out.getvalue()
+        self.assertIn("app#7: finished release refused (disk away), left held", text)
+        self.assertIn("app#8", text)
+        self.assertIn("released finished reviewer", text)
+        kept = store.claim_of("app", 7)
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertEqual((kept.agent, kept.epoch), (made.agent, made.epoch))
+        self.assertIsNone(store.claim_of("app", 8))
+
+    def test_live_stale_and_unknown_holders_are_left_alone(self):
+        store = stored(
+            self.db,
+            [("app", 1, "open"), ("app", 2, "open"), ("app", 3, "open"), ("app", 4, "open")],
+        )
+        self.addCleanup(store.close)
+        for number in (1, 2, 3):
+            claimed(store, "app", number)
+        claimed(store, "app", 4, agent="manual-9")
+        states = {
+            AGENT: (registry.LIVE, NOW - 10.0),
+        }
+        self.assertEqual(drive.finished_holders(store, agent_states=states), {})
+        for number, want in ((1, AGENT), (2, AGENT), (3, AGENT), (4, "manual-9")):
+            row, _ = store.item("app", number, now=NOW)
+            self.assertEqual(row.agent, want)
+
     def test_a_changed_claim_is_left_held(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -728,6 +781,64 @@ class FinishedPassTest(unittest.TestCase):
         self.assertEqual(stop.calls, [])
         self.assertEqual(launcher.calls, [])
         self.assertIsNone(store.claim_of("app", 7))
+
+    def test_a_failed_finished_release_still_releases_the_other_finished_claim(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        other = "drive-host-1-16000-acme--app-8"
+        claimed(store, "app", 8, agent=other)
+        original = store.release
+
+        def flaky(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7):
+                raise board.StoreError("disk away")
+            return original(repo, number, agent, epoch, now=now)
+
+        store.release = flaky  # type: ignore[method-assign]
+        stop, restarter, launcher = FakeStop(), FakeLauncher(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                **wants(self.policies, ("app", 7), ("app", 8)),
+                agent_states={
+                    AGENT: (registry.FINISHED, OLD + 10.0),
+                    other: (registry.FINISHED, OLD + 10.0),
+                },
+                finished_for={
+                    ("app", 7): (AGENT, "reviewer"),
+                    ("app", 8): (other, "reviewer"),
+                },
+                live_units=frozenset(),
+                restarts_path=self.budget,
+                stop_unit=stop,
+                restarter=restarter,
+                launcher=launcher,
+            )
+        finally:
+            store.release = original  # type: ignore[method-assign]
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: finished release refused (disk away), left held", text)
+        self.assertIn("released finished reviewer", text)
+        self.assertIn("finished, not stuck, claim kept", text)
+        self.assertNotIn("released dead claim", text)
+        self.assertNotIn("restarted", text)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(restarter.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        kept = store.claim_of("app", 7)
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertEqual((kept.agent, kept.epoch), (made.agent, made.epoch))
+        fresh = store.claim_of("app", 8)
+        self.assertIsNotNone(fresh)
+        assert fresh is not None
+        self.assertNotEqual(fresh.agent, other)
 
     def test_a_finished_holder_with_a_live_unit_is_kept_with_the_reason(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -2132,6 +2243,112 @@ class RestartEligibilityTest(unittest.TestCase):
         self.assertIn("claim released", text)
         self.assertIsNone(store.claim_of("app", 7))
         self.assertEqual(drive.load_restarts(self.budget), {})
+
+    def test_every_refusal_branch_is_greppable_as_not_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        row, _ = store.item("app", 7, now=NOW)
+
+        def failing(kind, repo, number):
+            raise RuntimeError("labels away")
+
+        cases = [
+            drive.restart_refusal(
+                replace(row, state="closed"),
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                requested={("app", 7)},
+            ),
+            drive.restart_refusal(
+                replace(row, external=True),
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                requested={("app", 7)},
+            ),
+            drive.restart_refusal(row, read_labels=None, hold_label="hold", requested={("app", 7)}),
+            drive.restart_refusal(
+                row, read_labels=failing, hold_label="hold", requested={("app", 7)}
+            ),
+            drive.restart_refusal(
+                row,
+                read_labels=lambda kind, repo, number: ["hold"],
+                hold_label="hold",
+                requested={("app", 7)},
+            ),
+            drive.restart_refusal(
+                replace(row, labels=[NEEDS_DECISION]),
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                requested={("app", 7)},
+            ),
+            drive.restart_refusal(
+                row,
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                requested=frozenset(),
+            ),
+        ]
+        self.assertEqual(len(cases), 7)
+        for refusal in cases:
+            self.assertIsNotNone(refusal)
+            assert refusal is not None
+            reason, _keep = refusal
+            self.assertIn("app#7", reason)
+            self.assertIn("not restarted", reason)
+
+    def test_keep_branches_carry_the_greppable_marker_word_for_word(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        row, _ = store.item("app", 7, now=NOW)
+        refusal = drive.restart_refusal(
+            row, read_labels=None, hold_label="hold", requested={("app", 7)}
+        )
+        self.assertIsNotNone(refusal)
+        assert refusal is not None
+        self.assertEqual(
+            refusal,
+            (
+                "app#7: hold labels unreadable (no label reader), restart deferred, not restarted",
+                True,
+            ),
+        )
+
+        def failing(kind, repo, number):
+            raise RuntimeError("labels away")
+
+        refusal = drive.restart_refusal(
+            row, read_labels=failing, hold_label="hold", requested={("app", 7)}
+        )
+        self.assertIsNotNone(refusal)
+        assert refusal is not None
+        self.assertEqual(
+            refusal,
+            (
+                "app#7: hold unreadable on app#7 (labels away): "
+                "no resume until the labels read again, "
+                "restart deferred, not restarted",
+                True,
+            ),
+        )
+
+    def test_a_finished_holder_is_never_restarted(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        (restarted, capped), text, _, stop, launcher = self.sweep(
+            store,
+            agent_states={AGENT: (registry.FINISHED, OLD + 10.0)},
+        )
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        self.assertIn("app#7", text)
+        self.assertIn("finished, not stuck, claim kept", text)
+        self.assertNotIn("restarted", text)
+        found = store.claim_of("app", 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (made.agent, made.epoch))
 
     def test_a_closed_ticket_is_released_never_restarted(self):
         store = stored(self.db, [("app", 7, "open")])
