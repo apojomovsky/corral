@@ -348,6 +348,42 @@ class ReleaseReviewedTest(unittest.TestCase):
         self.assertEqual((kept.agent, kept.epoch), (made.agent, made.epoch))
         self.assertIsNone(store.claim_of("app", 8))
 
+    def test_a_sqlite_error_on_one_row_keeps_it_and_releases_the_other(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        other = "drive-host-1-16000-acme--app-8"
+        claimed(store, "app", 8, agent=other)
+        original = store.release
+
+        def flaky(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7):
+                raise sqlite3.Error("database is locked")
+            return original(repo, number, agent, epoch, now=now)
+
+        store.release = flaky  # type: ignore[method-assign]
+        out = io.StringIO()
+        try:
+            released = drive.release_reviewed(
+                store,
+                claims={("app", 7): AGENT, ("app", 8): other},
+                live_units=frozenset(),
+                now=NOW,
+                out=out,
+            )
+        finally:
+            store.release = original  # type: ignore[method-assign]
+        self.assertEqual(released, {("app", 8): other})
+        text = out.getvalue()
+        self.assertIn("app#7: finished release refused (database is locked), left held", text)
+        self.assertIn("app#8", text)
+        self.assertIn("released finished reviewer", text)
+        kept = store.claim_of("app", 7)
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertEqual((kept.agent, kept.epoch), (made.agent, made.epoch))
+        self.assertIsNone(store.claim_of("app", 8))
+
     def test_live_stale_and_unknown_holders_are_left_alone(self):
         store = stored(
             self.db,
@@ -910,6 +946,64 @@ class FinishedPassTest(unittest.TestCase):
         text = out.getvalue()
         self.assertEqual(code, 0)
         self.assertIn("app#7: finished release refused (disk away), left held", text)
+        self.assertIn("released finished reviewer", text)
+        self.assertIn("finished, not stuck, claim kept", text)
+        self.assertNotIn("released dead claim", text)
+        self.assertNotIn("restarted", text)
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(restarter.calls, [])
+        self.assertEqual(drive.load_restarts(self.budget), {})
+        kept = store.claim_of("app", 7)
+        self.assertIsNotNone(kept)
+        assert kept is not None
+        self.assertEqual((kept.agent, kept.epoch), (made.agent, made.epoch))
+        fresh = store.claim_of("app", 8)
+        self.assertIsNotNone(fresh)
+        assert fresh is not None
+        self.assertNotEqual(fresh.agent, other)
+
+    def test_a_locked_finished_release_still_releases_the_other_finished_claim(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        made = claimed(store, "app", 7)
+        other = "drive-host-1-16000-acme--app-8"
+        claimed(store, "app", 8, agent=other)
+        original = store.release
+
+        def flaky(repo, number, agent, epoch, *, now):
+            if (repo, number) == ("app", 7):
+                raise sqlite3.Error("database is locked")
+            return original(repo, number, agent, epoch, now=now)
+
+        store.release = flaky  # type: ignore[method-assign]
+        stop, restarter, launcher = FakeStop(), FakeLauncher(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        try:
+            code = stuck_pass(
+                store,
+                self.lock,
+                out,
+                err,
+                **wants(self.policies, ("app", 7), ("app", 8)),
+                agent_states={
+                    AGENT: (registry.FINISHED, OLD + 10.0),
+                    other: (registry.FINISHED, OLD + 10.0),
+                },
+                finished_for={
+                    ("app", 7): (AGENT, "reviewer"),
+                    ("app", 8): (other, "reviewer"),
+                },
+                live_units=frozenset(),
+                restarts_path=self.budget,
+                stop_unit=stop,
+                restarter=restarter,
+                launcher=launcher,
+            )
+        finally:
+            store.release = original  # type: ignore[method-assign]
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: finished release refused (database is locked), left held", text)
         self.assertIn("released finished reviewer", text)
         self.assertIn("finished, not stuck, claim kept", text)
         self.assertNotIn("released dead claim", text)
