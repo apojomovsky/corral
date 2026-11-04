@@ -343,13 +343,25 @@ def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.T
     raise ValueError(f"unknown tracker variant {variant!r} (want one of {want})")
 
 
-def board_schema_for(board_config, *, run, pacer=None) -> BoardSchema:
-    """One board's resolved schema through the injected seam.
+def board_snapshot_for(board_config, *, run, pacer=None) -> iface.BoardSnapshot:
+    """One board's read-only doctor shape through the injected seam.
 
-    The doctor's fetch: the same construction the factory uses, but only
-    the schema is read. Tests pass a fake; production passes the raw runner.
+    The doctor's fetch: the same construction the factory uses, but the
+    raw field list, the live title and the owner's board list are read
+    instead of the resolved schema, so field-level rows name names.
+    Tests pass a fake; production passes the raw runner.
     """
-    return BoardReader(board_config, run, pacer=pacer).schema()
+    return BoardReader(board_config, run, pacer=pacer).snapshot()
+
+
+def board_issue_refs_for(board_config, *, run, pacer=None) -> set[tuple[str, int]]:
+    """``(repo, number)`` on one board through the injected seam.
+
+    The doctor's second fetch: membership only, no field values and no
+    REST reads, diffed against the store's open rows. Tests pass a
+    fake; production passes the raw runner.
+    """
+    return BoardReader(board_config, run, pacer=pacer).issue_refs()
 
 
 def production_board_provisioner(*, run=None, pacer=None) -> GithubBoardProvisioner:

@@ -559,11 +559,40 @@ class LiveOption(NamedTuple):
 
 
 class LiveField(NamedTuple):
-    """One live board field as plain data: name, kind and options."""
+    """One live board field as plain data: name, kind and options.
+
+    The planner and the doctor share this shape: the planner matches
+    spec names against it, and the doctor compares the raw list against
+    the config, duplicates kept, so an ambiguity refuses instead of
+    resolving to a pick.
+    """
 
     name: str
     kind: str  # "text" | "single_select" | whatever the provider reports
     options: tuple[LiveOption, ...] = ()
+
+
+class OwnerBoard(NamedTuple):
+    """One board under an owner: its per-owner number and live title."""
+
+    number: int
+    title: str
+
+
+class BoardSnapshot(NamedTuple):
+    """One board's read-only shape for the doctor, as plain data.
+
+    ``fields`` is the live raw field list the field comparison runs
+    over; ``title`` is the configured board's live title and
+    ``owner_boards`` every board under the same owner, for the
+    duplicate-title warn. The fetch seam returns this beside nothing
+    else: the comparison derives every row from it, so no caller
+    re-reads the board to recover a name.
+    """
+
+    title: str
+    fields: tuple[LiveField, ...]
+    owner_boards: tuple[OwnerBoard, ...]
 
 
 class FieldPlan(NamedTuple):
