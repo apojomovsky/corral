@@ -69,14 +69,18 @@ class FakeForge:
     def merge(self, repo, number, *, head_sha, method):
         """Squash-merge a canned PR, refusing like the adapter does.
 
-        A refused merge is ``ForgeRefused``; anything else unusable is
-        ``ForgeError``. The merged PR is stamped ``merged`` with
-        ``MERGE_SHA`` so tests can verify the post-merge read.
+        A refused merge is ``ForgeRefused``; a malformed repo, head, or
+        method is ``ForgeError``, raised before any lookup, as in the
+        adapter. The merged PR is stamped ``merged`` with ``MERGE_SHA``
+        so tests can verify the post-merge read.
         """
         self.calls.append(("merge", repo, number, head_sha, method))
         self._fail("merge")
         if method != "squash":
             raise forge.ForgeError(f"unsupported merge method {method!r}")
+        if not ghforge.is_repo_name(repo):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        ghforge._sha(head_sha, "head sha")
         try:
             pr = self.pulls[(repo, number)]
         except KeyError:
@@ -459,6 +463,34 @@ class MergeSeamTest(unittest.TestCase):
         with self.assertRaises(forge.ForgeError):
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
 
+    def test_merge_refusal_at_put_is_forge_refused(self):
+        for message in (
+            "gh: Pull Request is not mergeable (HTTP 405)",
+            "gh: Head branch was modified. Review and try the merge again. (HTTP 409)",
+        ):
+            with self.subTest(message=message):
+                run = MergeRun([pr_payload()], RuntimeError(message))
+                with self.assertRaises(forge.ForgeRefused):
+                    ghforge.GithubForge(run).merge(
+                        "acme/lib", 7, head_sha=HEAD_SHA, method="squash"
+                    )
+
+    def test_other_put_failures_are_forge_error_not_refused(self):
+        for message in (
+            "connection refused",
+            "gh: Not Found (HTTP 404)",
+            "gh: Forbidden (HTTP 403)",
+            "gh: Validation Failed (HTTP 422)",
+            "failed to connect to 127.0.0.1 port 4050: Connection refused",
+        ):
+            with self.subTest(message=message):
+                run = MergeRun([pr_payload()], RuntimeError(message))
+                with self.assertRaises(forge.ForgeError) as ctx:
+                    ghforge.GithubForge(run).merge(
+                        "acme/lib", 7, head_sha=HEAD_SHA, method="squash"
+                    )
+                self.assertNotIsInstance(ctx.exception, forge.ForgeRefused)
+
     def test_unaccepted_merge_answer_is_forge_error(self):
         for put in ({"merged": False, "sha": MERGE_SHA}, {"merged": True, "sha": "short"}):
             with self.subTest(put=put):
@@ -508,6 +540,14 @@ class FakeForgeMergeTest(unittest.TestCase):
         fake = FakeForge(pulls=[make_pr()])
         with self.assertRaises(forge.ForgeError):
             fake.merge("acme/lib", 9, head_sha=HEAD_SHA, method="squash")
+
+    def test_merge_rejects_bad_shapes_like_the_adapter(self):
+        fake = FakeForge(pulls=[make_pr()])
+        for repo, head in (("not-a-repo", HEAD_SHA), ("acme/lib", "short")):
+            with self.subTest(repo=repo, head=head):
+                with self.assertRaises(forge.ForgeError) as ctx:
+                    fake.merge(repo, 7, head_sha=head, method="squash")
+                self.assertNotIsInstance(ctx.exception, forge.ForgeRefused)
 
     def test_fail_names_raise_forge_error(self):
         fake = FakeForge(pulls=[make_pr()], fail={"merge"})

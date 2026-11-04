@@ -199,6 +199,20 @@ def _is_already_exists(err):
     return "already exists" in str(err).lower()
 
 
+#: The merge endpoint's refusal answers. The provider documents 405 (the
+#: merge cannot be performed: the PR was merged or closed, or a rule
+#: blocks it) and 409 (a sha was sent and the head no longer matches)
+#: for ``PUT pulls/{n}/merge``. Anything else (a dead connection, a 403,
+#: a 404, a 422) reads as unreachable, never as a refusal. The status
+#: matches inside its parentheses, so a port number never reads as one.
+_MERGE_REFUSED_RE = re.compile(r"\(HTTP (405|409)\)", re.IGNORECASE)
+
+
+def _is_merge_refused(err):
+    """Whether a failed merge PUT is a provider refusal (else unreachable)."""
+    return _MERGE_REFUSED_RE.search(str(err)) is not None
+
+
 class GithubForge:
     """``corral.forge.Forge`` over ``gh api`` REST calls."""
 
@@ -336,6 +350,8 @@ class GithubForge:
                 ]
             )
         except Exception as err:
+            if _is_merge_refused(err):
+                raise forge.ForgeRefused(f"PR {number} merge refused: {err}") from err
             raise forge.ForgeError(f"forge unreachable during merge of PR {number}: {err}") from err
         try:
             payload = json.loads(raw)
