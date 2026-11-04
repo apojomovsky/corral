@@ -788,6 +788,7 @@ def _plan(target, rendered, label, branch, opts, git, plan_text, repo, adopted):
         else:
             sys.stdout.write(f"would run {plan_text}\n")
         sys.stdout.write(f"would ensure labels on {repo}\n")
+        sys.stdout.write(f"would ensure board on {repo}\n")
     else:
         sys.stdout.write(plan_text + "\n")
     if os.path.isdir(target) and not needs_init:

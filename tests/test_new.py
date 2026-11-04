@@ -1391,6 +1391,48 @@ class BoardEnsure(unittest.TestCase):
         self.assertEqual(len(provisioner.calls), 1)
         self.assertIn("unknown owner", err)
 
+    def test_board_factory_value_error_is_exit_4(self):
+        git = FakeGit(root=self.parent, status="?? README.md\n")
+        forge = FakeForge(user="operator")
+
+        def boom():
+            raise ValueError("no provisioner for this adapter")
+
+        code, _, err = run_new(
+            path=self.parent,
+            git=git,
+            forge=forge,
+            tracker=FakeTracker(),
+            provisioner_factory=boom,
+            create_remote=True,
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("no provisioner for this adapter", err)
+
+    def test_board_provisioner_without_ensure_is_exit_4(self):
+        class NotCallable:
+            ensure_board = "yes"
+
+        for bad in (object(), NotCallable()):
+            with self.subTest(bad=type(bad).__name__):
+                parent = tempfile.mkdtemp(prefix="corral-new-")
+                self.addCleanup(shutil.rmtree, parent, True)
+                cfg = tempfile.mkdtemp(prefix="corral-config-")
+                self.addCleanup(shutil.rmtree, cfg, True)
+                patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+                patcher.start()
+                self.addCleanup(patcher.stop)
+                code, _, err = run_new(
+                    path=parent,
+                    git=FakeGit(root=parent, status="?? README.md\n"),
+                    forge=FakeForge(user="operator"),
+                    tracker=FakeTracker(),
+                    provisioner_factory=lambda bad=bad: bad,
+                    create_remote=True,
+                )
+                self.assertEqual(code, 4)
+                self.assertIn("this tracker does not provision boards", err)
+
     def test_without_create_remote_never_builds_a_provisioner(self):
         git = FakeGit(root=self.parent)
         forge = FakeForge()
@@ -1452,6 +1494,7 @@ class RemotePlan(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn(f"would run gh repo create operator/{FIXTURE} --private", out)
         self.assertIn(f"would ensure labels on operator/{FIXTURE}", out)
+        self.assertIn(f"would ensure board on operator/{FIXTURE}", out)
         self.assertFalse(os.path.exists(self.target()))
 
     def test_plan_with_resume_notes_adoption(self):
@@ -1473,6 +1516,7 @@ class RemotePlan(unittest.TestCase):
         self.assertIn(f"would adopt operator/{FIXTURE} when empty", out)
         self.assertNotIn("would run gh repo create", out)
         self.assertIn(f"would ensure labels on operator/{FIXTURE}", out)
+        self.assertIn(f"would ensure board on operator/{FIXTURE}", out)
         self.assertFalse(os.path.exists(self.target()))
 
 
