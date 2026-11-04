@@ -133,33 +133,35 @@ class RateLimitKindTest(unittest.TestCase):
 
 
 class ClassifyTest(unittest.TestCase):
-    """_classify reads the diagnosis, never the repo name."""
+    """classify_error reads the diagnosis, never the repo name."""
 
     def test_scope_repo_404_is_other(self):
         err = "gh: Could not resolve to a repository with the name 'acme/scope-tool' (HTTP 404)"
-        self.assertEqual(gh._classify(err), "other")
+        self.assertEqual(gh.classify_error(err), "other")
 
     def test_timeout_repo_404_is_other(self):
         err = "gh: repo owner/timeout-helper not found (HTTP 404)"
-        self.assertEqual(gh._classify(err), "other")
+        self.assertEqual(gh.classify_error(err), "other")
 
     def test_issue_number_matching_a_status_code_is_other(self):
-        self.assertEqual(gh._classify("gh: issue #502 not found"), "other")
+        self.assertEqual(gh.classify_error("gh: issue #502 not found"), "other")
 
     def test_status_code_in_repo_url_is_other(self):
         err = "gh: Not Found (https://api.github.com/repos/o/504-gateway) (HTTP 404)"
-        self.assertEqual(gh._classify(err), "other")
+        self.assertEqual(gh.classify_error(err), "other")
 
     def test_scope_list_still_needs_scope(self):
         err = "The 'project' field requires one of the following scopes: ['read:project']"
-        self.assertEqual(gh._classify(err), "scope")
+        self.assertEqual(gh.classify_error(err), "scope")
 
     def test_insufficient_still_needs_scope(self):
-        self.assertEqual(gh._classify("gh: insufficient scopes to execute this query"), "scope")
+        self.assertEqual(
+            gh.classify_error("gh: insufficient scopes to execute this query"), "scope"
+        )
 
     def test_go_timeout_diagnosis_is_unavailable(self):
         self.assertEqual(
-            gh._classify(
+            gh.classify_error(
                 "Post https://api.github.com/graphql: "
                 "Client.Timeout exceeded while awaiting headers"
             ),
@@ -168,13 +170,13 @@ class ClassifyTest(unittest.TestCase):
 
     def test_http_503_is_unavailable(self):
         self.assertEqual(
-            gh._classify("gh: HTTP 503 Service Unavailable (https://api.github.com/graphql)"),
+            gh.classify_error("gh: HTTP 503 Service Unavailable (https://api.github.com/graphql)"),
             "unavailable",
         )
 
     def test_marker_as_repo_owner_is_other(self):
         err = "gh: Could not resolve to a repository with the name 'scope/timeout-tool' (HTTP 404)"
-        self.assertEqual(gh._classify(err), "other")
+        self.assertEqual(gh.classify_error(err), "other")
 
 
 class GraphqlTest(unittest.TestCase):
