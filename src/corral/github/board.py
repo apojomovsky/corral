@@ -244,7 +244,7 @@ class BoardReader:
             after = end
 
     def _owner_boards(self, login) -> tuple:
-        """``(number, title)`` for every board under ``login``, paged.
+        """Every board under ``login`` as ``OwnerBoard``, paged.
 
         The same title list provisioning searches, read through the
         one page validation, so the two cannot fork.
@@ -257,7 +257,9 @@ class BoardReader:
             else:
                 payload = self._graphql(_TITLES, login=login, after=after)
             entries, info = _titles_entries(payload)
-            boards.extend((number, title) for _, number, title in entries)
+            boards.extend(
+                iface.OwnerBoard(number=number, title=title) for _, number, title in entries
+            )
             after, more = _titles_next(info)
             if not more:
                 return tuple(boards)

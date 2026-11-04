@@ -381,7 +381,15 @@ def _check_site(site: BoardSite, *, store: board.Store, fetch, board_items) -> B
     except Exception as err:
         return _unresolvable_row(site, err)
     findings = list(compare_fields(site.repo, site.board, snapshot.fields))
-    title_warn = duplicate_title_warn(site.repo, snapshot)
+    try:
+        title_warn = duplicate_title_warn(site.repo, snapshot)
+    except Exception as err:
+        return BoardRow(
+            name,
+            "fail",
+            f"{site.repo}: the board title check failed: {err}",
+            "re-run `corral doctor`",
+        )
     if title_warn is not None:
         findings.append(title_warn)
     try:

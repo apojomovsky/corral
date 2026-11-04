@@ -447,6 +447,87 @@ class DuplicateTitle(unittest.TestCase):
         self.assertEqual(doctor.exit_code([doctor.Check(*row)]), 0)
 
 
+class AdapterDuplicateTitle(unittest.TestCase):
+    """The real reader snapshot all the way through the warn and the rows.
+
+    The snapshot comes from canned GraphQL bodies through the real
+    ``BoardReader``, never from a fake that already returns
+    ``OwnerBoard`` objects, so a shape fork between the adapter and
+    ``duplicate_title_warn`` fails here instead of in production.
+    """
+
+    BOARD_TITLE = "Board"
+
+    def snapshot_run(self, *titles):
+        run = BoardFakeRun().script("BoardSchemaByNumber", [schema_payload(*full_schema_fields())])
+        run.script("ProvisionBoardTitles", [titles_payload(*titles)])
+        return run
+
+    def snapshot_via_reader(self, *titles):
+        from corral.github import board as boardreader
+
+        return boardreader.BoardReader(
+            config(), self.snapshot_run(*titles), pacer=FakePacer()
+        ).snapshot()
+
+    def fetch_via_reader(self, *titles):
+        run = self.snapshot_run(*titles)
+        from corral.github import board as boardreader
+
+        def fetch(board_config):
+            return boardreader.BoardReader(board_config, run, pacer=FakePacer()).snapshot()
+
+        return fetch
+
+    def test_adapter_owner_boards_are_ownerboard_entries(self):
+        snap = self.snapshot_via_reader(("PVT_1", 3, self.BOARD_TITLE))
+        for entry in snap.owner_boards:
+            self.assertIsInstance(entry, iface.OwnerBoard)
+        self.assertEqual(snap.owner_boards, (iface.OwnerBoard(number=3, title=self.BOARD_TITLE),))
+
+    def test_adapter_snapshot_with_two_boards_of_one_title_warns(self):
+        snap = self.snapshot_via_reader(
+            ("PVT_1", 3, self.BOARD_TITLE), ("PVT_2", 7, self.BOARD_TITLE)
+        )
+        finding = boarddoctor.duplicate_title_warn(REPO, snap)
+        self.assertIsNotNone(finding)
+        assert finding is not None
+        self.assertEqual(finding.severity, "warn")
+        self.assertIn(self.BOARD_TITLE, finding.detail)
+        self.assertIn("3", finding.detail)
+        self.assertIn("7", finding.detail)
+
+    def test_adapter_snapshot_with_distinct_titles_stays_ok(self):
+        snap = self.snapshot_via_reader(("PVT_1", 3, self.BOARD_TITLE), ("PVT_2", 7, "Other board"))
+        self.assertIsNone(boarddoctor.duplicate_title_warn(REPO, snap))
+
+    def test_adapter_snapshot_duplicate_title_warns_the_doctor_row(self):
+        fetch = self.fetch_via_reader(
+            ("PVT_1", 3, self.BOARD_TITLE), ("PVT_2", 7, self.BOARD_TITLE)
+        )
+        (row,) = check([site()], fetch=fetch)
+        self.assertEqual(row.status, "warn")
+        self.assertIn(self.BOARD_TITLE, row.detail)
+        self.assertIn("3", row.detail)
+        self.assertIn("7", row.detail)
+
+    def test_adapter_snapshot_without_a_duplicate_stays_ok(self):
+        fetch = self.fetch_via_reader(("PVT_1", 3, self.BOARD_TITLE), ("PVT_2", 7, "Other board"))
+        (row,) = check([site()], fetch=fetch)
+        self.assertEqual(row.status, "ok")
+
+    def test_an_unexpected_title_check_failure_is_a_fail_row_not_a_crash(self):
+        snap = iface.BoardSnapshot(
+            title=TITLE,
+            fields=tuple(full_live_fields()),
+            owner_boards=(("unusable",),),  # ty: ignore[invalid-argument-type]
+        )
+        rows = check([site()], snap=snap)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "fail")
+        self.assertIn(REPO, rows[0].detail)
+
+
 class ScopeRow(unittest.TestCase):
     SCOPE_TEXT = (
         "board unreachable: The 'project' field requires one of the"
