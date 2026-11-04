@@ -70,10 +70,25 @@ user.slice
 
 The launch path extends the existing `units.unit_argv` builder (which already
 emits `--property=` lines) with `Slice=`, `MemoryMax=`, `CPUQuota=` and
-`TasksMax=` for the agent unit, and creates parent slices with their own
-limits first. Slice creation goes through the same injected `run` seam as
-every other subprocess; tests assert on argv strings, never on a live
-manager.
+`TasksMax=` for the agent unit, and starts the host slice and the project
+slice with their own limits first. Slice creation goes through the same
+injected `run` seam as every other subprocess; tests assert on argv strings,
+never on a live manager.
+
+Verified on one host while fixing slice creation (systemd 255, user
+manager): slices are created with `systemctl --user start <name>.slice`
+(exit 0 fresh and already active) and limited with `systemctl --user
+set-property --runtime <name>.slice MemoryMax=512M CPUQuota=50%` (exit 0;
+`show` then reports `MemoryMax=536870912`,
+`CPUQuotaPerSecUSec=500ms`). A dashed name nests by itself: starting
+`X-child.slice` activates `X.slice` and `show` reports `Slice=X.slice`,
+so project slices need no parent flag. A refused assignment answers exit 1
+(`Unknown assignment: BogusProp=1`, mapped to exit 4). The earlier
+`systemd-run --user --unit=<x>.slice --remain-after-exit /bin/true` form
+fails with `Cannot set property RemainAfterExit, or unknown property`,
+because a slice unit cannot carry that service-only property. Probe units
+were created and stopped in the same step; the real slice names stayed
+untouched.
 
 Controllers: **required** are `cpu`, `memory` and `pids`; **optional** are
 `cpuset` and `io`, which are often not delegated to the user manager (on the
@@ -306,13 +321,13 @@ any future reaper (a pressure-triggered pauser or killer takes its stop
 function as a required argument and fails closed without one). This design
 adds no pauser or killer; backoff applies to launches only.
 
-Changed limits reach running slices only by an operator refresh. Launch
-creation sets each slice's limits once and never rewrites a slice under
-a live agent, so after the operator lowers a number the admission gate
-and the kernel enforcement disagree until the operator refreshes the
-slices: stop the slice, or run `systemctl --user daemon-reload` and
-restart the affected units. That refresh is an operator action, not a
-launch step. The doctor ticket gains a row reporting the drift.
+Changed limits reconcile on the next launch. Slice creation starts the
+slice (a no-op when already active) and re-applies its limits as runtime
+properties, so after the operator changes a number the admission gate
+and the kernel enforcement agree again once an agent of that project
+launches; between the change and that launch the doctor drift row warns.
+Clearing a budget (unsetting `[resources.host]`) applies nothing: stale
+limits stay until the operator stops the slice by hand.
 
 ## 7. Testing
 
@@ -323,7 +338,7 @@ external touch, mirroring the existing seams:
 | Behavior | Seam (fake) |
 | --- | --- |
 | `unit_argv` carries `Slice=`, `MemoryMax=`, `CPUQuota=`, `TasksMax=`; unknown controller skipped | pure argv builder, string assertions |
-| Slice creation order (parents before children) and property-refusal mapping | fake `run` recording argv |
+| Slice creation argv per shape (host start, project start, runtime properties, parents before children) and the exists/unreachable/refused buckets | fake `run` recording argv |
 | Pure `resources.admit`: weights, floors, ceilings, role costs, foreign subtraction, staleness bounds | plain data, no seam |
 | Ledger read-modify-write under the timed lock; corrupt file refused, never reset; guard refuses a foreign state dir | temp-dir store path plus fake `now` and a fake monotonic clock for the lock deadline |
 | `paths.host_ledger_path()` is the only ledger resolver; result matches the documented location with overrides set | env-matrix unit test (the copies-agree rule) |
