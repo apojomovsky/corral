@@ -9,6 +9,10 @@ The policy follows the eligibility contract in `docs/04-dispatch-loop.md`
 section 2: it is pure, reading only the rows and `now` it is given, and
 returns one `StartRequest` of kind `start` per startable ticket. Weight
 carries the board priority rank so the drive loop orders heaviest first.
+A claimed row the project still wants is requested too: a `start`
+request on an already-claimed row is a gate no-op, so requesting
+in-flight rows changes no start verdict and only keeps the restart path
+open for them.
 """
 
 import re
@@ -44,8 +48,8 @@ def _weight(priority: str) -> int:
 def _selectable(row: eligibility.TicketRow) -> bool:
     """Whether basic returns a start request for this row. Pure.
 
-    Open, unclaimed, unheld, unblocked, with no open linked pull: a
-    missing or non-string title reads as empty and a non-tuple labels
+    Open, unheld, unblocked, with no open linked pull, claimed or not:
+    a missing or non-string title reads as empty and a non-tuple labels
     value reads as none, so odd data selects or skips without raising.
     """
     if row.state != "open":
@@ -57,8 +61,6 @@ def _selectable(row: eligibility.TicketRow) -> bool:
         return False
     title = row.title if isinstance(row.title, str) else ""
     if _HOLD_TITLE_RE.search(title):
-        return False
-    if row.agent:
         return False
     extra = row.extra if isinstance(row.extra, dict) else {}
     if extra.get("blocked_by"):
