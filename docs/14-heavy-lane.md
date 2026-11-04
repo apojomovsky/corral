@@ -124,7 +124,7 @@ Arguments: `[--timeout SECS] [--role NAME] [--bypass REASON]
 [--json] [--plan] -- CMD [ARGS...]`. `--` is required:
 everything past it is the command, and a missing command is
 exit 4. `--timeout` caps this wait only and overrides the
-computed wait deadline for the run (section 6); zero times
+computed wait deadline for the run (section 6.4); zero times
 out at once when no slot is free; a negative value is exit
 4 (the `coord wait` precedent). `--role` names the caller
 for the ledger (`takeoff` when takeoff routes through the
@@ -137,7 +137,10 @@ Behavior: join the queue with the request's weight (section
 run the command in a transient scope
 (`systemd-run --user --scope --unit=heavy-<id>` with
 `MemoryMax=` and `CPUQuota=` from the request's limits, on
-the `units.unit_argv` precedent), wait for it, capture the
+the `units.unit_argv` precedent; when no budget is
+configured the scope is still created for measurement but
+carries neither property: no `MemoryMax=`, no `CPUQuota=`,
+so full CPU and no memory cap), wait for it, capture the
 per-cgroup measurement (section 6), append the ledger row,
 release the slot, and exit with the command's verdict: the
 process exit equals the command's exit when that exit is
@@ -147,9 +150,12 @@ codes: 75 the wait passed the limit, 3 the scope could not
 be created (the user manager unreachable, the existing
 `Unreachable` path), 4 usage or configuration.
 
-JSON shape (`--json`): one document, printed once at the end
-(plus the command's own output, which passes through
-untouched):
+JSON shape (`--json`): one compact single-line document,
+written to stderr after the command exits. Stdout stays the
+command's output: in `--json` mode the command's stderr is
+merged into stdout, so stderr carries only the verdict line
+and a reader separates the two with a redirect. Without
+`--json`, both streams pass through untouched:
 
 ```json
 {"schema_version": 1, "command": ["make", "check"],
@@ -159,10 +165,13 @@ untouched):
  "measured": {"cpu_m": 2450, "memory_mb": 5100}}
 ```
 
+(Shown pretty-printed; on stderr it is one line.)
+
 `admitted` is true whenever the run held a slot, including
 when no lane budget is configured (section 7): then every
-request fits, the command runs at once in a scope with
-default limits, and its cost is still recorded. The JSON
+request fits, the command runs at once in a scope with the
+default limits (no `MemoryMax=`, no `CPUQuota=`), and its
+cost is still recorded. The JSON
 document always carries the raw command exit in
 `exit_code`, so a reader can tell a 75 from the lane
 (never admitted) from a 75 from the command (admitted):
@@ -170,9 +179,8 @@ a bare retry loop on 75 retries both, and the precise loop
 in section 11 checks `.admitted` first. `measured` is null
 when the scope vanished before the read (section 6); the
 weight then stays where it was. Without `--json`, one
-line names the outcome
-(`heavy: ran in 42.5s after a 38.1s wait, exit 0`), and the
-command's stdout and stderr pass through as today.
+line names the outcome to stderr
+(`heavy: ran in 42.5s after a 38.1s wait, exit 0`).
 
 ### 3.2 `corral heavy status` (PROPOSED)
 
@@ -200,8 +208,10 @@ JSON shape (`--json`):
 ```
 
 Cost keys carry the repo, the argv hash and the role in one
-string so `jq` can index them; the argv hash is hex of the
-command list, and section 6 defines the key and every
+string so `jq` can index them; the argv hash is the sha256
+hex of the NUL-joined argv (each element terminated by one
+NUL byte, so `["a b", "c"]` and `["a", "b c"]` hash
+differently), and section 6 defines the key and every
 estimated field. Holder and waiter `eta_s` are the
 section 6 predictions (remaining run time, queued wait);
 both are approximate and may be null when the key has no
@@ -246,11 +256,11 @@ Purpose: regenerate the portable per-key summary
 (section 6.5) from the raw ledger files.
 
 Arguments: `[--out PATH]`. Standard output always carries
-the rollup JSON document; `--out` writes it atomically to
-the given path instead. Exit 0 with an empty key set when
-the ledger is empty (nothing learned yet, not a failure),
-4 on usage. The verb never commits; the operator commits
-the copy it points at.
+the rollup JSON document; `--out PATH` additionally writes
+the same bytes atomically to the given path. Exit 0 with
+an empty key set when the ledger is empty (nothing learned
+yet, not a failure), 4 on usage. The verb never commits;
+the operator commits the copy it points at.
 
 ## 4. State: files and single resolvers
 
@@ -310,13 +320,17 @@ and file touch through injected seams faked in tests.
 
 **Join.** Under the exclusive lock, append one waiter row:
 `{id, pid, command, argv_hash, weight, arrived_at,
-skipped}`. `id` is a uuid; `pid` is a liveness hint only,
-never identity (section 5, stale detection).
+deadline_at, skipped}`. `id` is a uuid; `pid` is a
+liveness hint only, never identity (section 5, stale
+detection). `deadline_at` is `arrived_at` plus the
+effective wait timeout for this run: the explicit
+`--timeout` when given, else the computed wait deadline
+(section 6.4). An explicit zero stores a deadline equal
+to `arrived_at` (time out at once when no slot is free).
 
 **Admit loop.** The waiter polls every `HEAVY_POLL_S`
-(1.0 second, the `SUITE_LOCK_POLL_S` precedent) against a
-monotonic deadline of `--timeout` or the computed wait
-deadline (section 6):
+(1.0 second, the `SUITE_LOCK_POLL_S` precedent) against
+its stored `deadline_at`:
 
 1. Read pressure (section 7). Saturated means nobody is
    admitted this round: sleep and recheck. Pressure delays
@@ -355,14 +369,14 @@ the holder died; the lane only repairs its own accounting,
 never signals a process.
 
 **Stale waiters.** A waiter is stale when its pid is dead or
-its `arrived_at` is older than the wait timeout plus a grace
-bound: a live waiter would have exited 75 and removed
-itself by then, so an older row belongs to a dead process.
-Admit passes reap stale waiters under the lock the same way
-as dead holders. Pid reuse cannot resurrect real state: at
-worst a reused pid keeps a dead waiter listed until its age
-bound fires, and the row only ever blocks backfill, never
-admission of the fitting.
+now exceeds its stored `deadline_at` plus a grace bound: a
+live waiter would have exited 75 and removed itself by its
+deadline, so an older row belongs to a dead process. Admit
+passes reap stale waiters under the lock the same way as
+dead holders. Pid reuse cannot resurrect real state: at
+worst a reused pid keeps a dead waiter listed until its
+deadline plus grace fires, and the row only ever blocks
+backfill, never admission of the fitting.
 
 **No daemon.** Waiters poll; nothing wakes them. Reads take
 the shared lock and each poll is one small JSON read, so a
@@ -459,18 +473,28 @@ A row (keys stable under `schema_version`, section 6.5):
  "throttled_us": 12000, "cpu_pressure_us": 8400000,
  "mem_pressure_us": 0, "starved": false, "exit": 0,
  "waited_s": 38.1, "weight": {"cpu_m": 3000, "memory_mb": 6144},
- "host_pressure": {"load_per_cpu": 0.4, "mem_avail_pct": 62.0}}
+ "host_pressure": {"load_per_cpu": 0.4, "mem_avail_pct": 62.0,
+  "psi_cpu_some_avg10": 2.5, "psi_mem_some_avg10": 0.8}}
 ```
 
 `repo` comes from the one resolver both callers share,
 `heavy.repo_key(cwd)`: the enclosing checkout's
-`corral.toml` `project.name` when present, else the
-checkout top directory name. Takeoff and a hand `heavy
-run` resolve the same key through it; a test asserts both
-callers agree (one fact, one place). `role` is `takeoff`
+`corral.toml` repo entry name when present, else the
+checkout top directory name. This key is intentionally
+distinct from registration identity (`init.project_name`,
+the origin slug's repo else the directory name): the
+ledger key never consults git, so takeoff and a hand
+`heavy run` resolve it identically with no network or
+history access, while registration may prefer the origin
+slug. Takeoff and a hand `heavy run` resolve the same key
+through it; a test asserts both callers agree (one fact,
+one place). `argv_hash` uses the section 3.2 encoding, so
+a changed command really cold-starts. `role` is `takeoff`
 or `hand` in version one. `host_pressure` is the lane's
 admission-time reading (load per CPU, available memory
-percent), so a later reader sees what the queue saw.
+percent, plus the PSI cpu and memory `some` avg10 pair
+admission uses), so a later reader sees what the queue
+saw.
 
 ### 6.3 The estimator
 
@@ -497,11 +521,11 @@ a hand reader with `jq` can reproduce them. Rules:
   upper bound: unknown jobs queue safely, and the first
   measurement corrects them.
 - A changed command is a new key: any change to the
-  command list changes the argv hash and cold starts. This
-  over-learns at first and never misprices. A role with
-  fewer than 3 rows falls back to the role-agnostic key
-  `(repo, argv-hash)`; roles never borrow peaks across
-  different commands.
+  command list changes the NUL-joined argv hash and cold
+  starts. This over-learns at first and never misprices.
+  A role with fewer than 3 rows falls back to the
+  role-agnostic key `(repo, argv-hash)`; roles never
+  borrow peaks across different commands.
 - Bounds and rounding: predictions round to integers and
   clamp to `[1, lane cap]` per dimension, so a weight can
   never exceed what the lane could admit and never rounds
@@ -625,7 +649,9 @@ configured cap must fit inside the host budget or settings
 refuse with exit 4. When no host budget is configured at
 all, the lane still queues (order without numbers is still
 order) but every request fits: the run executes at once in
-a scope with default limits, and its row is still recorded.
+a scope with the default limits (no `MemoryMax=`, no
+`CPUQuota=`: full CPU, no memory cap, scope kept so the
+run is still measured), and its row is still recorded.
 Learning never needs enforcement to measure.
 
 **Pressure.** Before the fit check, read pressure through
@@ -782,11 +808,16 @@ A coordinator rebuilds "run the suite when it fits" in
 about ten lines of shell. Names below are stand-ins.
 
 Run the suite when it fits (a 75 the lane refused waits
-and retries; a 75 from the command itself does not):
+and retries; a 75 from the command itself does not). The
+verdict goes to stderr and the command keeps stdout, so
+the recipe redirects stderr to a file while the command's
+output flows through:
 
 ```sh
 while true; do
-  row=$(corral heavy run --json -- make check); code=$?
+  errf=$(mktemp)
+  corral heavy run --json -- make check 2>"$errf"; code=$?
+  row=$(cat "$errf"); rm -f "$errf"
   [ $code -eq 75 ] && [ "$(echo "$row" | jq -r .admitted)" = "false" ] \
     && sleep 60 && continue
   exit $code
@@ -830,24 +861,22 @@ dependency; one injectable seam), plus what adoption
 would cost (a new host program in `system_deps.toml`, a
 new seam, a new failure mode). Nothing was installed to
 test any of them; installing on a host needs the
-maintainer's go-ahead. Behavioral claims below are
-UNVERIFIED except where the cited probe already runs in
-this design. pueue's group parallelism and task-spooler's
-slot count were confirmed against their published docs in
-this session; the rest is judged from stable documented
-behavior and marked UNVERIFIED where a version could
-prove it wrong.
+maintainer's go-ahead. Each row carries its basis:
+VERIFIED means confirmed against the tool's own docs in
+this session or by a probe in section 10; UNVERIFIED
+means it was not. Every cell not confirmed against the
+tool's own docs in-session is marked UNVERIFIED.
 
-| Candidate | Meets | Fails | Adopt cost |
-| --- | --- | --- | --- |
-| pueue (queue daemon, per-group parallel limits) | queue, order, surviving restarts | count only, no memory weight; no learned cost; no PSI admission; daemon decides (status shows, policy hidden); new Rust binary in `system_deps.toml` plus a daemon seam and daemon-down failure mode | high: host program, daemon lifecycle, second queue beside the lane |
-| task-spooler (one-slot spooler, `-S` slots) | tiny queue, FIFO order | count only; no weights, no learning, no pressure, no memory limit; server process owns state (UNVERIFIED on current release) | medium: host program, server-owned queue corral cannot read as plain files |
-| GNU make jobserver (named FIFO token pool) | shares a CPU budget across `make -j` | make-only (leaks via `MAKEFLAGS` to nested makes); token census needs a reaper: a second queue with its own crash states (section 2, point 6) | medium: FIFO lifecycle seam, lost-token failure mode, no memory story |
-| Ninja pools | depth-limited pools for heavy steps | build-system only; no queue, no learning, no pressure, no CLI status of holders | medium: only helps Ninja builds, nothing else |
-| `make --load-average` | one-line CPU backoff | no queue, no memory, no learning, no status; load only, blind to cgroup and PSI (UNVERIFIED against PSI-masked hosts) | low but buys almost nothing |
-| systemd scopes with cgroup limits | per-job CPU and memory caps, kernel-enforced | no queue, no weights, no learning, no pressure admission | none: already the lane's enforcement primitive (doc 09) |
-| PSI with a watcher such as systemd-oomd | host-wide pressure signal | oomd kills on pressure; it never queues, never learns, never admits | none as a signal; wrong tool as a policy (killer, not lane) |
-| Slurm, Kueue as models | weighted fair-share, backfill, learned sizing | cluster daemons with their own state, accounts and network; a host fleet is not a cluster | out of scope: adopt nothing, borrow backfill and fair-share shape only |
+| Candidate | Meets | Fails | Adopt cost | Basis |
+| --- | --- | --- | --- | --- |
+| pueue (queue daemon, per-group parallel limits) | queue, order, surviving restarts | count only, no memory weight; no learned cost; no PSI admission; daemon decides (status shows, policy hidden); new binary in `system_deps.toml` plus a daemon seam and daemon-down failure mode | high: host program, daemon lifecycle, second queue beside the lane | UNVERIFIED: docs not re-read in this session |
+| task-spooler (one-slot spooler) | tiny queue, FIFO order | count only; no weights, no learning, no pressure, no memory limit; server process owns state | medium: host program, server-owned queue corral cannot read as plain files | UNVERIFIED: docs not re-read in this session |
+| GNU make jobserver (named FIFO token pool) | shares a CPU budget across `make -j` | make-only (leaks via `MAKEFLAGS` to nested makes); token census needs a reaper: a second queue with its own crash states (section 2, point 6) | medium: FIFO lifecycle seam, lost-token failure mode, no memory story | UNVERIFIED: docs not re-read in this session |
+| Ninja pools | depth-limited pools for heavy steps | build-system only; no queue, no learning, no pressure, no CLI status of holders | medium: only helps Ninja builds, nothing else | UNVERIFIED: docs not re-read in this session |
+| `make --load-average` | one-line CPU backoff | no queue, no memory, no learning, no status; load only, blind to cgroup and PSI | low but buys almost nothing | UNVERIFIED: docs not re-read in this session |
+| systemd scopes with cgroup limits | per-job CPU and memory caps, kernel-enforced | no queue, no weights, no learning, no pressure admission | none: already the lane's enforcement primitive (doc 09) | VERIFIED: section 10 probes on the target host |
+| PSI with a watcher such as systemd-oomd | host-wide pressure signal | oomd kills on pressure; it never queues, never learns, never admits | none as a signal; wrong tool as a policy (killer, not lane) | Signal VERIFIED (section 10); watcher behavior UNVERIFIED |
+| Slurm, Kueue as models | weighted fair-share, backfill, learned sizing | cluster daemons with their own state, accounts and network; a host fleet is not a cluster | out of scope: adopt nothing, borrow backfill and fair-share shape only | UNVERIFIED: models only, nothing adopted |
 
 Verdict: build the thin lane on the primitives (flock
 queue, systemd scopes, PSI signal, JSONL ledger) and
