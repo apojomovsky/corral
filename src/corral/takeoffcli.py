@@ -1,8 +1,9 @@
 """`corral takeoff`: the project-level gate before a PR.
 
 Exit codes: 0 every check ok or skipped, 1 a check failed, 3 the remote
-could not be read, 4 usage or configuration error, 75 another takeoff
-held the full-suite lock past the wait.
+could not be read, 4 usage or configuration error (including an unknown
+or identity `--skip` name), 75 another takeoff held the full-suite lock
+past the wait.
 """
 
 import argparse
@@ -27,6 +28,7 @@ def cmd_takeoff(args, *, ls_remote=None, run_cmd=None):
             body_file=args.body,
             with_test=args.test,
             ops_dir=args.ops,
+            skips=args.skip or [],
             ls_remote=ls_remote,
             run_cmd=run_cmd,
         )
@@ -45,6 +47,7 @@ def cmd_takeoff(args, *, ls_remote=None, run_cmd=None):
                             "status": check.status,
                             "detail": check.detail,
                             "fix": check.fix,
+                            "skipped_by": check.skipped_by,
                         }
                         for check in result.checks
                     ],
@@ -75,9 +78,20 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
         "the review record and the configured takeoff commands. Exit 0 when "
         "every check is ok or skipped, 1 when one failed, 3 when the remote "
         "could not be read, 4 on usage or configuration error, 75 when "
-        "another takeoff holds the full-suite lock past the wait.",
+        "another takeoff holds the full-suite lock past the wait. "
+        "A repeatable --skip NAME waives one policy check and records it; "
+        "an unknown name or an identity check is exit 4.",
     )
     p.add_argument("--body", default=None, metavar="FILE", help="the PR body file")
+    p.add_argument(
+        "--skip",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="waive one policy check and record the skip (repeatable): "
+        "commits, em-dash, body, leak, review or checks; "
+        "base and worktree cannot be skipped",
+    )
     p.add_argument(
         "--test",
         action="store_true",
