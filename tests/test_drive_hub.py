@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, drivehub, hub, paths, registry, settings
+from corral import board, drive, drivehub, hub, paths, registry, settings, trackers
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, FakeStop, claimed
@@ -762,7 +762,7 @@ class HubClientForTest(unittest.TestCase):
 
 
 class CmdDriveHubBuildTest(unittest.TestCase):
-    """`cmd_drive` hub setup over a real temporary root.
+    """`cmd_drive` hub setup over a real temporary root: plan prints, hub claims.
 
     The store, host config, project registry and ops root are real
     files in temporary directories; the seeded rows stand for
@@ -770,8 +770,9 @@ class CmdDriveHubBuildTest(unittest.TestCase):
     systemd seam reads empty through a stubbed `units.list_units`,
     and agent state reads empty from the fresh temp state dir. With
     no hub configured no hub client is ever built; with `hub.url`
-    set the plan still makes zero hub calls, through a recording
-    fake standing at the client seam. A non-plan pass maps hub
+    set the plan still makes zero hub calls, while the claiming pass
+    proposes through a recording fake standing at the client seam,
+    with stubbed tracker and launch seams. A non-plan pass maps hub
     setup failures to exit 4 and closes the store it opened.
     """
 
@@ -825,14 +826,20 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def recording_open_store(self):
-        """`board.open_store` double that records `close` on the real store."""
+        """`board.open_store` double that records `close` on the real store.
+
+        The spy wraps the real store's bound `close`, so the recording
+        sees the close whether the pass calls it directly or the store's
+        context manager calls it while unwinding an early return.
+        """
         opened = []
         real_open = board.open_store
 
         def spy(*args, **kwargs):
-            wrapper = mock.MagicMock(wraps=real_open(*args, **kwargs))
-            opened.append(wrapper)
-            return wrapper
+            real = real_open(*args, **kwargs)
+            real.close = mock.MagicMock(wraps=real.close)
+            opened.append(real)
+            return real
 
         patcher = mock.patch.object(board, "open_store", side_effect=spy)
         patcher.start()
@@ -913,6 +920,99 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         self.assertEqual(logged, "")
         self.assertEqual(len(opened), 1)
         opened[0].close.assert_called_once_with()
+
+    def test_non_plan_with_hub_configured_claims_through_the_hub(self):
+        url, host_id = "http://host-1:8000", "host-1"
+        with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write(f'[hub]\nurl = "{url}"\nhost_id = "{host_id}"\n')
+        fake_tracker = FakeTracker(
+            [reading(repo="app", number=7, author="operator", updated_at=1900.0)]
+        )
+        launcher = FakeLauncher()
+
+        class RecordingHub(FakeHub):
+            built = []
+            instance = None
+
+            def __init__(self, url, hub_host_id, token_path, **kwargs):
+                super().__init__(host_id=hub_host_id)
+                RecordingHub.built.append((url, hub_host_id, token_path))
+                RecordingHub.instance = self
+                self.receipts[("app", 7)] = 5
+
+        entry = trackers.RepoTracker(
+            name="app",
+            tracker_repo="app",
+            operators=["operator"],
+            variant="labels",
+            tracker=fake_tracker,
+        )
+        modes = []
+        real_mode = drivehub.HubMode
+
+        class RecordingMode(real_mode):
+            def __init__(self, client, mode_host_id):
+                super().__init__(client, mode_host_id)
+                modes.append(self)
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drivehub.hubmod, "HubClient", RecordingHub),
+            mock.patch.object(drivehub, "HubMode", RecordingMode),
+            mock.patch.object(
+                drive, "production_operators", return_value=({"app": ["operator"]}, None)
+            ),
+            mock.patch.object(trackers, "production_trackers", return_value=({"app": entry}, None)),
+            mock.patch.object(drive, "production_launcher", return_value=launcher),
+            mock.patch.object(drive, "production_stopper", return_value=FakeStop()),
+            mock.patch.object(drive.sys, "stdout", out),
+            mock.patch.object(drive.sys, "stderr", err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(err.getvalue(), "")
+        self.assertEqual(
+            RecordingHub.built, [(url, host_id, os.path.join(self.config, "hub-token"))]
+        )
+        self.assertEqual(len(modes), 1)
+        self.assertEqual(modes[0].host_id, host_id)
+        hub_fake = RecordingHub.instance
+        assert hub_fake is not None
+        self.assertIs(modes[0].client, hub_fake)
+        proposes = [call for call in hub_fake.calls if call[0] == "propose"]
+        self.assertEqual(len(proposes), 1)
+        agent = proposes[0][3]
+        store = board.open_store(os.path.join(self.state, "board.sqlite"))
+        try:
+            found = store.claim_of("app", 7)
+        finally:
+            store.close()
+        assert found is not None
+        self.assertEqual((found.agent, found.epoch), (agent, 5))
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][1:4], ("app", 7, "start"))
+        self.assertEqual(
+            [call for call in fake_tracker.calls if call[0] == "write"],
+            [("write", "app", 7, "agent", agent)],
+        )
+
+    def test_non_plan_with_hub_url_but_no_host_id_is_a_usage_error(self):
+        with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[hub]\nurl = "http://host-1:8000"\n')
+
+        class BombClient:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("no client without a host id")
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drivehub.hubmod, "HubClient", BombClient),
+            mock.patch.object(drive.sys, "stdout", out),
+            mock.patch.object(drive.sys, "stderr", err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        self.assertEqual(code, 4)
+        self.assertIn("host_id", err.getvalue())
 
 
 class HubVersionMappingTest(unittest.TestCase):

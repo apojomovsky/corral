@@ -29,6 +29,13 @@ class RunTest(unittest.TestCase):
         with mock.patch("subprocess.Popen", return_value=_popen(stdout="hello")):
             self.assertEqual(gh.run(["api", "x"]), "hello")
 
+    def test_failed_run_carries_stdout_on_the_error(self):
+        body = '{"data":{"user":null},"errors":[]}'
+        with mock.patch("subprocess.Popen", return_value=_popen(1, stdout=body, stderr="boom")):
+            with self.assertRaises(gh.GhError) as caught:
+                gh.run(["api", "graphql"])
+        self.assertEqual(caught.exception.output, body)
+
     def test_missing_scope_is_classified(self):
         err = "error: your authentication token is missing required scopes [read:project]"
         with mock.patch("subprocess.Popen", return_value=_popen(1, stderr=err)):
@@ -256,6 +263,36 @@ class GraphqlTest(unittest.TestCase):
         args = run.call_args[0][0]
         self.assertIn("-F", args)
         self.assertIn("enabled=true", args)
+
+    def test_list_of_scalars_uses_bracket_syntax(self):
+        payload = json.dumps({"data": {}})
+        with mock.patch("subprocess.Popen", return_value=_popen(stdout=payload)) as run:
+            gh.graphql("query($ids:[ID!]!){x}", ids=["a", "b"])
+        args = run.call_args[0][0]
+        self.assertIn("ids[]=a", args)
+        self.assertIn("ids[]=b", args)
+
+    def test_list_of_dicts_groups_bracketed_subkeys(self):
+        payload = json.dumps({"data": {}})
+        options = [
+            {"name": "Urgent", "color": "GRAY"},
+            {"name": "High", "color": "BLUE"},
+        ]
+        with mock.patch("subprocess.Popen", return_value=_popen(stdout=payload)) as run:
+            gh.graphql("query($o:[X!]){x}", o=options)
+        args = run.call_args[0][0]
+        flags = [entry for entry in args if entry.startswith("o[][")]
+        self.assertEqual(
+            flags,
+            ["o[][name]=Urgent", "o[][color]=GRAY", "o[][name]=High", "o[][color]=BLUE"],
+        )
+
+    def test_dict_value_uses_subkey_syntax(self):
+        payload = json.dumps({"data": {}})
+        with mock.patch("subprocess.Popen", return_value=_popen(stdout=payload)) as run:
+            gh.graphql("query($f:X){x}", f={"name": "a"})
+        args = run.call_args[0][0]
+        self.assertIn("f[name]=a", args)
 
 
 class NormalizePrBodyTest(unittest.TestCase):
