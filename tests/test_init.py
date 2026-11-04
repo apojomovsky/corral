@@ -1559,5 +1559,75 @@ class RegistrationConflictsCase(unittest.TestCase):
         init._registration_conflicts(self.directory, "target", "new", "new-agent-", "/elsewhere")
 
 
+MAPPING_TABLE = """\
+[repo.board]
+project_owner = "operator"  # board owner, written by corral github setup
+project_number = 7
+agent_field = "Agent"
+"""
+
+
+class BoardTableConvergence(unittest.TestCase):
+    """`init` converges on files carrying setup's board mapping table.
+
+    The mapping table is setup's to write and the doctor's to judge;
+    `init` (and through it, `new` reruns) treats a file that matches its
+    render except for that one block as up to date instead of refusing.
+    """
+
+    def inputs(self):
+        return init.PlanInputs(
+            name="demo",
+            path=".",
+            default_branch="main",
+            test_command="make test",
+            extra=(),
+        )
+
+    def test_inline_render_plus_mapping_table_converges(self):
+        rendered = init.render(self.inputs())
+        current = rendered.rstrip("\n") + "\n\n" + MAPPING_TABLE
+        self.assertTrue(init._board_table_only_difference(current, rendered, "demo"))
+
+    def test_inline_hand_edit_besides_the_table_still_refuses(self):
+        rendered = init.render(self.inputs())
+        current = rendered.rstrip("\n") + "\n\n" + MAPPING_TABLE
+        current = current.replace('test = "make test"', 'test = "make check"')
+        self.assertFalse(init._board_table_only_difference(current, rendered, "demo"))
+
+    def test_inline_settings_only_board_block_still_refuses(self):
+        rendered = init.render(self.inputs())
+        current = rendered.rstrip("\n") + "\n\n" + '[repo.board]\nready = "triage"\n'
+        self.assertFalse(init._board_table_only_difference(current, rendered, "demo"))
+
+    def test_inline_file_without_a_table_never_converges(self):
+        rendered = init.render(self.inputs())
+        self.assertFalse(
+            init._board_table_only_difference(rendered + "# hand note\n", rendered, "demo")
+        )
+
+    def test_split_change_ignores_the_mapping_table(self):
+        rendered = init.render(self.inputs())
+        target = os.path.join(tempfile.mkdtemp(prefix="corral-init-"), "corral.toml")
+        self.addCleanup(shutil.rmtree, os.path.dirname(target), True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(rendered.rstrip("\n") + "\n\n" + MAPPING_TABLE)
+        text, noop = init._split_toml_change(target, self.inputs())
+        self.assertEqual((text, noop), (None, True))
+
+    def test_split_change_still_refuses_a_different_owned_value(self):
+        rendered = init.render(self.inputs())
+        target = os.path.join(tempfile.mkdtemp(prefix="corral-init-"), "corral.toml")
+        self.addCleanup(shutil.rmtree, os.path.dirname(target), True)
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(
+                rendered.replace('test = "make test"', 'test = "make check"').rstrip("\n")
+                + "\n\n"
+                + MAPPING_TABLE
+            )
+        with self.assertRaises(init.InitError):
+            init._split_toml_change(target, self.inputs())
+
+
 if __name__ == "__main__":
     unittest.main()
