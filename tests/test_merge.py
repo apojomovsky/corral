@@ -1,0 +1,420 @@
+"""Tests for `korapy merge`: the serialized, verified squash-merge verb.
+
+Real git repositories in temp dirs (local only, no network); `origin`
+remotes name a forge repo but are never contacted. The forge is always
+an in-memory fake; no test calls a real `gh`. Records live under
+`KORAPY_SESSIONS` and locks under `KORAPY_STATE`, both pointed at temp
+dirs, never the host's.
+"""
+
+import argparse
+import fcntl
+import io
+import json
+import os
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from typing import Any
+from unittest import mock
+
+from korapy import forge, merge, mergecli, paths, reviewrecord
+from tests.test_forge import MERGE_SHA, FakeForge, make_pr
+from tests.test_reviewrecord import git_in
+
+REPO = "lib"
+TICKET = 1
+FORGE_REPO = "acme/lib"
+PR = 7
+
+
+class UnverifiedForge(FakeForge):
+    """A forge whose merge answers a SHA no later read shows."""
+
+    def merge(self, repo, number, *, head_sha, method):
+        self.calls.append(("merge", repo, number, head_sha, method))
+        return MERGE_SHA
+
+
+class RacedForge(FakeForge):
+    """The PR closes between the pre-read and the merge (a lost race)."""
+
+    def merge(self, repo, number, *, head_sha, method):
+        self.calls.append(("merge", repo, number, head_sha, method))
+        pr = self.pulls[(repo, number)]
+        self.pulls[(repo, number)] = pr._replace(state=forge.CLOSED)
+        raise forge.ForgeRefused(f"PR {number} is closed: nothing to merge")
+
+
+class MergeCase(unittest.TestCase):
+    def setUp(self):
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        for name in [n for n in os.environ if n.startswith("GIT_")]:
+            del os.environ[name]
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-merge-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        os.environ["KORAPY_STATE"] = os.path.join(self.tmp, "state")
+        os.environ["KORAPY_SESSIONS"] = os.path.join(self.tmp, "sessions")
+        self.dir = os.path.join(self.tmp, "clone")
+        os.makedirs(self.dir)
+        self.git("init", "-q", "-b", "master")
+        self.write("a.txt", "one\ntwo\nthree\n")
+        self.commit("init")
+        self.git("checkout", "-q", "-b", "feat/1-x")
+        self.write("feature.txt", "feature\n")
+        self.commit("feature work")
+        self.head = self.rev("HEAD")
+        self.base = self.rev("master")
+        self.approve(self.head)
+        here = os.getcwd()
+        os.chdir(self.dir)
+        self.addCleanup(os.chdir, here)
+
+    def git(self, *cmd):
+        return git_in(self.dir, *cmd)
+
+    def rev(self, ref):
+        return self.git("rev-parse", ref)
+
+    def write(self, name, text):
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def commit(self, message):
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", message)
+
+    def approve(self, commit, verdict="approve"):
+        reviewrecord.write_record(
+            REPO,
+            TICKET,
+            commit,
+            reviewer="reviewer-1",
+            author="author-1",
+            verdict=verdict,
+            sessions_root=os.environ["KORAPY_SESSIONS"],
+        )
+
+    def fake(self, **overrides):
+        fields = {
+            "repo": FORGE_REPO,
+            "number": PR,
+            "base_sha": self.base,
+            "head_sha": self.head,
+        }
+        fields.update(overrides)
+        return FakeForge(pulls=[make_pr(**fields)])
+
+    def do_merge(self, fake=None, **overrides):
+        params: dict[str, Any] = {
+            "head_sha": self.head,
+            "forge": fake or self.fake(),
+            "cwd": self.dir,
+        }
+        params.update(overrides)
+        return merge.run_merge(REPO, TICKET, FORGE_REPO, PR, **params)
+
+    def row(self, result, name):
+        for check in result.checks:
+            if check.name == name:
+                return check
+        self.fail(f"no check named {name!r}")
+
+    def hold_lock(self):
+        """Hold the per-repo merge lock the way another merger would."""
+        path = merge.lock_path(FORGE_REPO)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fd
+
+
+class CoreTest(MergeCase):
+    def test_lock_path_is_the_one_place_for_the_per_repo_lock(self):
+        self.assertEqual(
+            merge.lock_path(FORGE_REPO),
+            os.path.join(os.environ["KORAPY_STATE"], "merges", "acme+lib.lock"),
+        )
+
+    def test_success_merges_and_verifies(self):
+        fake = self.fake()
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.merged)
+        self.assertEqual(result.merge_sha, MERGE_SHA)
+        self.assertEqual(
+            [check.name for check in result.checks],
+            ["lock", "open", "head", "review", "checks", "fork"],
+        )
+        for check in result.checks:
+            self.assertEqual(check.status, "ok", check.name)
+        self.assertEqual(result.skipped, [])
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "squash")])
+
+    def test_lock_race_is_exit_2_without_merging(self):
+        fake = self.fake()
+        self.hold_lock()
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 2)
+        self.assertFalse(result.merged)
+        self.assertIsNone(result.merge_sha)
+        self.assertEqual(self.row(result, "lock").status, "fail")
+        self.assertEqual(fake.calls, [])
+
+    def test_plan_with_a_held_lock_is_informational(self):
+        fake = self.fake()
+        self.hold_lock()
+        result = self.do_merge(fake, plan=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.merged)
+        self.assertIn("held", self.row(result, "lock").detail)
+        self.assertEqual(fake.calls, [])
+
+    def test_plan_reports_without_merging(self):
+        fake = self.fake()
+        result = self.do_merge(fake, plan=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.merged)
+        self.assertIsNone(result.merge_sha)
+        for check in result.checks:
+            self.assertEqual(check.status, "ok", check.name)
+        self.assertEqual(fake.calls, [])
+
+    def test_plan_with_a_failing_row_is_exit_1_without_merging(self):
+        fake = self.fake(checks_state="failing")
+        result = self.do_merge(fake, plan=True)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "checks").status, "fail")
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+
+    def test_moved_head_refuses(self):
+        fake = self.fake(head_sha="c" * 40)
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("no longer the tip", self.row(result, "head").detail)
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+
+    def test_closed_and_merged_prs_refuse(self):
+        for state in ("closed", "merged"):
+            with self.subTest(state=state):
+                fake = self.fake(state=state)
+                result = self.do_merge(fake)
+                self.assertEqual(result.exit_code, 1)
+                self.assertIn(state, self.row(result, "open").detail)
+                self.assertFalse(result.merged)
+                self.assertEqual(fake.calls, [])
+
+    def test_fork_refuses(self):
+        fake = self.fake(from_fork=True)
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("fork", self.row(result, "fork").detail)
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+
+    def test_missing_review_refuses(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        result = self.do_merge(self.fake(head_sha=head), head_sha=head)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("no approving review record", self.row(result, "review").detail)
+        self.assertFalse(result.merged)
+
+    def test_block_review_refuses(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        self.approve(head, verdict="block")
+        result = self.do_merge(self.fake(head_sha=head), head_sha=head)
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("block", self.row(result, "review").detail)
+        self.assertFalse(result.merged)
+
+    def test_inherited_review_across_a_clean_merge_up_passes(self):
+        self.git("checkout", "-q", "master")
+        self.write("master.txt", "master\n")
+        self.commit("master work")
+        master = self.rev("master")
+        self.git("checkout", "-q", "feat/1-x")
+        self.git("merge", "-q", "--no-ff", "-m", "merge up", "master")
+        head = self.rev("HEAD")
+        result = self.do_merge(self.fake(base_sha=master, head_sha=head), head_sha=head)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("inherited from", self.row(result, "review").detail)
+        self.assertTrue(result.merged)
+
+    def test_pending_and_failing_checks_refuse(self):
+        for state in ("pending", "failing"):
+            with self.subTest(state=state):
+                result = self.do_merge(self.fake(checks_state=state))
+                self.assertEqual(result.exit_code, 1)
+                self.assertEqual(self.row(result, "checks").status, "fail")
+                self.assertFalse(result.merged)
+
+    def test_skip_checks_waives_a_failing_row(self):
+        result = self.do_merge(self.fake(checks_state="failing"), skips=["checks"])
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "checks").status, "skipped")
+        self.assertEqual(result.skipped, ["checks"])
+        self.assertTrue(result.merged)
+
+    def test_skip_of_anything_but_checks_is_usage(self):
+        for name in ("lock", "open", "head", "review", "fork", "bogus"):
+            with self.subTest(name=name):
+                with self.assertRaises(merge.MergeError):
+                    self.do_merge(self.fake(), skips=[name])
+
+    def test_bad_method_is_usage(self):
+        with self.assertRaises(merge.MergeError):
+            self.do_merge(self.fake(), method="rebase")
+
+    def test_missing_head_is_usage(self):
+        for head in (None, "", "short"):
+            with self.subTest(head=head):
+                with self.assertRaises(merge.MergeError):
+                    self.do_merge(self.fake(), head_sha=head)
+
+    def test_bad_ticket_is_usage(self):
+        with self.assertRaises(merge.MergeError):
+            merge.run_merge("", TICKET, FORGE_REPO, PR, head_sha=self.head, forge=self.fake())
+        with self.assertRaises(merge.MergeError):
+            merge.run_merge(REPO, 0, FORGE_REPO, PR, head_sha=self.head, forge=self.fake())
+
+    def test_missing_pr_is_forge_error(self):
+        with self.assertRaises(forge.ForgeError):
+            self.do_merge(FakeForge())
+
+    def test_verify_mismatch_fails_closed(self):
+        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+        fake = UnverifiedForge(pulls=pulls)
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(result.merged)
+        self.assertIsNone(result.merge_sha)
+        self.assertEqual(self.row(result, "verify").status, "fail")
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_merge_time_refusal_reports_the_failing_row(self):
+        fake = RacedForge(
+            pulls=[make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+        )
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(result.merged)
+        self.assertEqual(self.row(result, "open").status, "fail")
+        self.assertEqual(len(fake.calls), 1)
+
+
+class CliTest(MergeCase):
+    def args(self, **overrides):
+        base = {
+            "repo": REPO,
+            "number": TICKET,
+            "pr": PR,
+            "forge_repo": FORGE_REPO,
+            "head": self.head,
+            "method": "squash",
+            "skip": [],
+            "json": False,
+            "plan": False,
+        }
+        base.update(overrides)
+        return argparse.Namespace(**base)
+
+    def call(self, args, fake):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = mergecli.cmd_merge(args, forge=fake)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_json_document_shape(self):
+        code, out, _ = self.call(self.args(json=True), self.fake())
+        self.assertEqual(code, 0)
+        doc = json.loads(out)
+        self.assertEqual(
+            set(doc),
+            {
+                "schema_version",
+                "repo",
+                "pr",
+                "head",
+                "method",
+                "checks",
+                "skipped",
+                "merged",
+                "merge_sha",
+            },
+        )
+        self.assertEqual(doc["schema_version"], 1)
+        self.assertEqual(doc["repo"], FORGE_REPO)
+        self.assertEqual(doc["pr"], PR)
+        self.assertEqual(doc["head"], self.head)
+        self.assertEqual(doc["method"], "squash")
+        self.assertTrue(doc["merged"])
+        self.assertEqual(doc["merge_sha"], MERGE_SHA)
+        for row in doc["checks"]:
+            self.assertEqual(set(row), {"name", "status", "detail"})
+
+    def test_text_output_names_each_row_and_the_outcome(self):
+        code, out, _ = self.call(self.args(), self.fake())
+        self.assertEqual(code, 0)
+        self.assertIn("merge open: ok", out)
+        self.assertIn(f"merged {MERGE_SHA}", out)
+
+    def test_refusal_text_names_the_failing_row(self):
+        code, out, _ = self.call(self.args(), self.fake(from_fork=True))
+        self.assertEqual(code, 1)
+        self.assertIn("merge fork: fail", out)
+        self.assertIn("not merged", out)
+
+    def test_missing_pr_is_usage(self):
+        code, _, err = self.call(self.args(pr=None), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("--pr", err)
+
+    def test_missing_head_is_usage(self):
+        code, _, err = self.call(self.args(head=None), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("--head", err)
+
+    def test_bad_forge_repo_is_usage(self):
+        code, _, err = self.call(self.args(forge_repo="not-a-repo"), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("--forge-repo", err)
+
+    def test_no_origin_and_no_flag_is_usage(self):
+        code, _, err = self.call(self.args(forge_repo=None), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("--forge-repo", err)
+
+    def test_origin_remote_supplies_the_forge_repo(self):
+        self.git("remote", "add", "origin", "git@github.com:acme/lib.git")
+        code, out, _ = self.call(self.args(forge_repo=None), self.fake())
+        self.assertEqual(code, 0)
+        self.assertIn("approved by", out)
+
+    def test_skip_of_anything_but_checks_is_usage(self):
+        code, _, err = self.call(self.args(skip=["review"]), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("review", err)
+
+    def test_unreachable_forge_is_exit_3(self):
+        code, _, err = self.call(self.args(), FakeForge())
+        self.assertEqual(code, 3)
+        self.assertIn("forge unreachable", err)
+
+    def test_plan_passes_through(self):
+        code, out, _ = self.call(self.args(plan=True), self.fake())
+        self.assertEqual(code, 0)
+        self.assertIn("not merged", out)
+
+
+if __name__ == "__main__":
+    unittest.main()
