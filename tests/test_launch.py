@@ -25,7 +25,7 @@ from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import accounts, cli, hold, host_ledger, launch, launchcli, models, paths
+from corral import accounts, board, cli, hold, host_ledger, launch, launchcli, models, paths
 from corral import pressure, profiles, registry, resources, runtimes
 from corral import settings, units
 from corral.runtimes import muse, omp
@@ -1001,6 +1001,43 @@ class LaunchTest(OpsCase):
             self.start("omp")
         self.assertEqual(self.worktrees_of("lib"), [])
 
+    def test_a_bad_profile_beats_a_full_host(self):
+        self.system.units["corral-agent-my-repo-6"] = "active"
+        self.system.units["corral-agent-my-repo-7"] = "active"
+        with self.assertRaises(settings.SettingsError) as caught:
+            self.start("omp", profile="nope")
+        self.assertIn("nope", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.session("lib", 5)))
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_bad_profile_beats_a_live_ticket(self):
+        self.system.units["corral-agent-lib-5"] = "active"
+        with self.assertRaises(settings.SettingsError) as caught:
+            self.start("omp", profile="nope")
+        self.assertIn("nope", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+        self.assertEqual(self.system.started, [])
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_corrupt_store_with_no_profiles_still_launches(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            '[profile]\ndefault = "default"\n\n[profiles.default]\nruntime = "omp"\n\n', ""
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        path = board.db_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"not a database")
+        unit, workdir = self.start("omp")
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertTrue(os.path.isdir(workdir))
+
     def test_an_unreachable_service_manager_is_exit_3(self):
         def down(prefix):
             raise units.Unreachable("no bus")
@@ -1283,9 +1320,6 @@ class FakeAdapter:
 
     def options_schema(self):
         return {}
-
-    def activity_file(self, session_dir):
-        return None
 
 
 class ReviewerWiringTest(OpsCase):

@@ -175,6 +175,13 @@ class SelectionGate(unittest.TestCase):
         self.assertEqual(found.runtime, profiles.BUILTIN_DEFAULT.runtime)
         self.assertEqual(found.provenance.layer, 6)
 
+    def test_no_declarations_and_no_flag_never_touches_the_store(self):
+        tgt = target(resolve(project={}))
+        store = FakeStore(error=sqlite3.DatabaseError("file is not a database"))
+        found = select(tgt, store=store)
+        self.assertEqual(found.profile, profiles.BUILTIN_DEFAULT)
+        self.assertEqual(store.calls, [])
+
     def test_a_flag_with_no_declarations_still_refuses_an_unknown_name(self):
         tgt = target(resolve(project={}))
         with self.assertRaises(profiles.ProfileError):

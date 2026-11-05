@@ -595,11 +595,11 @@ def select_profile(
     The declarations validate (exit 4), the six layers resolve, and the
     `--model`/`--runtime` refinements apply to the winner for this run
     only, noted in the provenance source. With no `[profiles.*]` table
-    declared and no flag, the layers fall through to the built-in default.
-    The resolver runs before the caller makes anything, so a bad profile
-    fails before any worktree or unit exists. `store` is the board store
-    (or a fake with `.item`); `tracker` re-reads stale rows live, and
-    None trusts the cached row.
+    declared and no flag, the layers fall through to the built-in default
+    without touching the board store. The resolver runs before the caller
+    makes anything, so a bad profile fails before any worktree or unit
+    exists. `store` is the board store (or a fake with `.item`); `tracker`
+    re-reads stale rows live, and None trusts the cached row.
     """
     pool = accounts.providers() if pool is None else pool
     parsed = profiles.validate(tgt.resolved.profiles, pool)
@@ -607,7 +607,13 @@ def select_profile(
     ledger = quota_ledger.load() if ledger is None else ledger
     if selections is None:
         selections = profiles.load_selections()
-    if isinstance(flag, str) and flag in parsed:
+    if not tgt.resolved.profiles and flag is None:
+        # No profiles declared and no flag names one: the built-in
+        # default wins without reading the board store, so a corrupt
+        # store never blocks a launch that resolves no layer from it.
+        name, source = None, ""
+        tracker = None
+    elif isinstance(flag, str) and flag in parsed:
         name, source = None, ""
         tracker = None
     else:
@@ -796,40 +802,45 @@ def launch(
     pool = (pool_fn or accounts.providers)()
     ledger = (ledger_fn or quota_ledger.load)()
     moment = (now_fn or time.time)()
-    # Gate order is documented on `admit`: disk, count and budget refuse
-    # before the provider quota does, so the first admission runs before
-    # the profile (whose chains carry the quota check) resolves. Closing
-    # previous generations only drops dead entries, so it stays first.
-    _close_previous(tgt, number, list_fn)
-
-    with units.spawn_lock():
-        decided = admit(
+    # The profile resolves before any gate: a bad profile fails exit 4
+    # before a full host (75) or a live ticket (2) refuses, and nothing
+    # is made for it. The provider quota refuses only after the count
+    # and budget gates do, so an exhausted chain waits for the first
+    # admission: its refusal wins there instead. Closing previous
+    # generations only drops dead entries, so it stays outside the
+    # spawn locks with the profile.
+    try:
+        selection = select_profile(
             tgt,
             number,
-            list_fn=list_fn,
-            usage=usage,
-            host_ledger_fn=host_ledger_fn,
-            role=role,
-            now_fn=now_fn,
-            pressure_fn=pressure_fn,
-            controllers_read=controllers_read,
+            role=session_role,
+            flag=profile,
+            model=model,
+            runtime=runtime,
+            selections=selections,
+            store=store,
+            tracker=tracker,
+            pool=pool,
+            ledger=ledger,
+            now=moment,
         )
-    selection = select_profile(
-        tgt,
-        number,
-        role=session_role,
-        flag=profile,
-        model=model,
-        runtime=runtime,
-        selections=selections,
-        store=store,
-        tracker=tracker,
-        pool=pool,
-        ledger=ledger,
-        now=moment,
-    )
+    except models.Exhausted:
+        with units.spawn_lock():
+            admit(
+                tgt,
+                number,
+                list_fn=list_fn,
+                usage=usage,
+                host_ledger_fn=host_ledger_fn,
+                role=role,
+                now_fn=now_fn,
+                pressure_fn=pressure_fn,
+                controllers_read=controllers_read,
+            )
+        raise
     adapter = _adapter(selection.runtime)
     session_runtime = selection.runtime
+    _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
         decided = admit(
