@@ -514,6 +514,22 @@ class RunVerb(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertIn("boom", err)
 
+    def test_show_with_a_rejected_tracker_read_is_exit_1(self):
+        class RejectingTracker(FakeTracker):
+            def item(self, repo, number):
+                raise iface.TrackerRejected("tracker rejected: gh: Validation Failed (HTTP 422)")
+
+        store = FakeStore(found=row(labels=["profile:fast"]), fresh=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            code, _, err = self.run_cli(
+                ["profile", "show", "--repo", "myrepo", "--ticket", "7"],
+                tmp,
+                store=store,
+                tracker=RejectingTracker([]),
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", err)
+
     def test_set_writes_through_and_show_reads_it_back(self):
         with tempfile.TemporaryDirectory() as tmp:
             code, out, _ = self.run_cli(["profile", "set", "--global", "fast"], tmp)

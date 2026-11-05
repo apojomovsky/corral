@@ -5,7 +5,10 @@ Runs the incremental feed for the ops root's repositories (each
 origin), with ``--resync`` for a full rebuild and ``--audit N`` for
 the rolling re-read of the N rows verified least recently. Exit codes:
 0 synced, 1 nothing changed, 3 tracker unreachable, 4 usage or
-configuration error. Corrupt stored rows are usage errors: a sync that
+configuration error. A read the tracker answers with a validation
+rejection is refused, not unreachable: its line is reported and the
+repo keeps its cursor, and a pass whose only failures are refused
+reads exits 1. Corrupt stored rows are usage errors: a sync that
 failed only on those (and synced nothing) exits 4, while tracker
 failures with nothing synced exit 3. When one pass has both tracker
 failures and corrupt rows with nothing synced, the store check runs
@@ -129,6 +132,9 @@ def _board_step(store, tracker, tracker_repo, *, operators, now):
     """
     try:
         schema = tracker.board_schema()
+    except iface.TrackerRejected as err:
+        old = store.get_cursor(tracker_repo, sync.BOARD_CURSOR_NAME)
+        return sync.SyncResult(0, old, (), refused=(f"{tracker_repo}: {err}",))
     except (iface.TrackerError, settings.SettingsError) as err:
         old = store.get_cursor(tracker_repo, sync.BOARD_CURSOR_NAME)
         return sync.SyncResult(0, old, (f"{tracker_repo}: {err}",))
@@ -245,12 +251,14 @@ def sync_root(
             return USAGE
         board_seen = board_result.items_seen if board_result is not None else 0
         board_errors = list(board_result.errors) if board_result is not None else []
+        board_refused = list(board_result.refused) if board_result is not None else []
         board_store_errors = list(board_result.store_errors) if board_result is not None else []
         results[name] = {
             "tracker": tracker_repo,
             "seen": result.items_seen + board_seen,
             "cursor": result.cursor,
             "errors": list(result.errors) + board_errors,
+            "refused": list(result.refused) + board_refused,
             "store_errors": list(result.store_errors) + board_store_errors,
             "conflicts": list(result.conflicts),
         }
@@ -261,6 +269,10 @@ def sync_root(
         for line in result.errors:
             _err(line, err)
         for line in board_errors:
+            _err(line, err)
+        for line in result.refused:
+            _err(line, err)
+        for line in board_refused:
             _err(line, err)
         for line in result.store_errors:
             _err(line, err)
