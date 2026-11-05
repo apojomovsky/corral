@@ -1429,14 +1429,14 @@ def sync_all(store, tracker_factory, *, operators, now):
 
     ``tracker_factory`` maps a tracker repo to its tracker (labels or
     board, built by the one factory); board repos run the feed step then
-    the board step. Returns (seen, errors, store_errors): the rows
-    applied, one line per tracker/outage failure (refused reads ride
-    along as error lines, worded as rejected), and one line per
-    corrupt stored row. A failed repo keeps its rows and its cursor
-    (that is `sync_repo`'s contract) and the pass moves on to the next
-    repo; a repo the factory does not know is an error line, never a
-    silent skip. With no factory there is nothing to sync from: no rows
-    move and no errors are reported.
+    the board step. Returns (seen, errors, store_errors, refused): the
+    rows applied, one line per tracker/outage failure, one line per
+    corrupt stored row, and one line per refused read (a validation
+    rejection the tracker answered, toward exit 1, never 3). A failed
+    repo keeps its rows and its cursor (that is `sync_repo`'s contract)
+    and the pass moves on to the next repo; a repo the factory does not
+    know is an error line, never a silent skip. With no factory there
+    is nothing to sync from: no rows move and no errors are reported.
 
     The repo list itself parses no row JSON (`Store.repos`), so one
     corrupt row cannot hide the healthy repos; each repo's rows are then
@@ -1448,14 +1448,15 @@ def sync_all(store, tracker_factory, *, operators, now):
     read setup aborts earlier with exit 4 on a corrupt row anyway.
     """
     if tracker_factory is None:
-        return 0, [], []
+        return 0, [], [], []
     seen = 0
     errors = []
     store_errors = []
+    refused = []
     try:
         repos = store.repos()
     except (board.StoreError, sqlite3.Error) as err:
-        return 0, [], [f"store repo listing unreadable: {err}"]
+        return 0, [], [f"store repo listing unreadable: {err}"], []
     for repo in sorted(repos):
         try:
             tracker = tracker_factory(repo)
@@ -1478,12 +1479,15 @@ def sync_all(store, tracker_factory, *, operators, now):
         )
         seen += result.items_seen
         errors.extend(result.errors)
-        errors.extend(result.refused)
+        refused.extend(result.refused)
         store_errors.extend(result.store_errors)
         if not trackers.is_board_tracker(tracker):
             continue
         try:
             schema = tracker.board_schema()
+        except iface.TrackerRejected as err:
+            refused.append(f"{repo}: {err}")
+            continue
         except (iface.TrackerError, settings.SettingsError) as err:
             errors.append(f"{repo}: {err}")
             continue
@@ -1498,9 +1502,9 @@ def sync_all(store, tracker_factory, *, operators, now):
         )
         seen += board_result.items_seen
         errors.extend(board_result.errors)
-        errors.extend(board_result.refused)
+        refused.extend(board_result.refused)
         store_errors.extend(board_result.store_errors)
-    return seen, errors, store_errors
+    return seen, errors, store_errors, refused
 
 
 def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_after):
@@ -3858,8 +3862,11 @@ def _launching_pass(
     drain continue. A unit listing failure skips recovery only: the
     pass continues, since a claim the pass cannot prove dead is left
     held. A tracker outage aborts the sync step only: prior rows and the
-    old cursor stand, and the pass continues on store data. A claim whose
-    stale row cannot be re-read live fails closed instead. The stuck
+    old cursor stand, and the pass continues on store data. A read the
+    tracker answers with a validation rejection is refused, not
+    unreachable: its line is reported and the pass continues on store
+    data. A claim whose stale row cannot be re-read live fails closed
+    instead. The stuck
     sweep restarts or gives up on managed claims the registry has lost,
     after the fresh claims launch, spending the day budget the fresh
     claims leave over (floored at zero): each
@@ -3867,8 +3874,9 @@ def _launching_pass(
     held. The mirror drains whatever the
     outbox holds, old backlog and new claims alike; what it cannot push
     stays queued for the next healthy pass. A pass that synced nothing
-    at all exits 3 on tracker failures, and 4 when only corrupt stored
-    rows failed; a pass that launched nothing because the service
+    at all exits 3 on tracker failures, 1 when the only failures are
+    refused reads, and 4 when only corrupt stored rows failed; a pass
+    that launched nothing because the service
     manager was unreachable exits 3 too. The stuck sweep re-checks
     row eligibility before restarting (a held, closed, externally owned,
     needs-decision or withdrawn row is released, never restarted).
@@ -3918,7 +3926,7 @@ def _launching_pass(
     if journal_path is not None:
         journal_write({"event": "pass_start", "at": now, "host": host or ""})
     try:
-        seen, sync_errors, sync_store_errors = sync_all(
+        seen, sync_errors, sync_store_errors, sync_refused = sync_all(
             store, tracker_factory, operators=operators, now=now
         )
     except board.StoreError as problem:
@@ -3927,7 +3935,7 @@ def _launching_pass(
     except sqlite3.Error as problem:
         print(f"corral drive: cannot read the store: {problem}", file=err)
         return finish(USAGE)
-    for line in sync_errors + sync_store_errors:
+    for line in sync_errors + sync_store_errors + sync_refused:
         print(f"corral drive: {line}", file=err)
     if hub is not None:
         if not getattr(hub, "host_id", ""):
@@ -4225,6 +4233,8 @@ def _launching_pass(
         return finish(UNREACHABLE, started=started, skipped=skipped)
     if blocked and started == 0:
         return finish(UNREACHABLE, started=started, skipped=skipped)
+    if sync_refused and seen == 0:
+        return finish(NO, started=started, skipped=skipped)
     if capped:
         return finish(NO, started=started, skipped=skipped)
     return finish(OK, started=started, skipped=skipped)

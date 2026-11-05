@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 from corral import admission, board, cli, drive, drivehub, launch, quota_ledger, settings
+from corral import tracker
 from corral import projects as projects_mod
 from tests.test_tracker import FakeTracker, reading
 
@@ -651,6 +652,51 @@ class DriveSyncExitTest(unittest.TestCase):
         )
         self.assertEqual(code, 4)
         self.assertIn("acme/app#7", err.getvalue())
+
+    def test_refused_only_sync_exits_1(self):
+        store = stored(self.db, [("acme/app", 7, "open")])
+        self.addCleanup(store.close)
+
+        class RejectingTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=False,
+            tracker_factory=lambda repo: RejectingTracker([]),
+            now=2000.0,
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", err.getvalue())
+
+    def test_refused_plus_outage_exits_3(self):
+        store = stored(self.db, [("acme/app", 7, "open"), ("acme/api", 2, "open")])
+        self.addCleanup(store.close)
+
+        class MixedTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                if repo == "acme/app":
+                    raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+                raise tracker.TrackerError("connection refused")
+
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=False,
+            tracker_factory=lambda repo: MixedTracker([]),
+            now=2000.0,
+        )
+        self.assertEqual(code, 3)
+        self.assertIn("tracker rejected", err.getvalue())
+        self.assertIn("connection refused", err.getvalue())
 
 
 if __name__ == "__main__":

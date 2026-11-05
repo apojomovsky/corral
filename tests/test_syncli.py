@@ -136,6 +136,28 @@ class ExitCodeTest(SyncRootCase):
         self.assertIn("tracker rejected", self.err.getvalue())
         self.assertIn("connection refused", self.err.getvalue())
 
+    def test_rejected_board_schema_exits_1_and_keeps_cursor(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\ntracker.variant = "board"\n'
+            )
+        old = tracker.format_cursor(T0 - 100)
+        self.store.set_cursor(REPO, sync.BOARD_CURSOR_NAME, old)
+
+        class RejectingBoardTracker(FakeTracker):
+            board_poll_pages = 5
+
+            def board_schema(self):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+            def poll(self, schema, *, after=None, max_pages=5):
+                return [], None
+
+        code = self.run_sync(RejectingBoardTracker())
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+        self.assertEqual(self.store.get_cursor(REPO, sync.BOARD_CURSOR_NAME), old)
+
     def test_partial_errors_still_exit_0(self):
         fake = FakeTracker(
             [
