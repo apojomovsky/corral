@@ -1,7 +1,7 @@
 """Coordinator event queue and `coord wait`/`ack`.
 
 Offline: every test gets its own state dir (explicit `root` for API
-tests, `CORRAL_STATE` for CLI tests); the clock, event ids
+tests, `KORAPY_STATE` for CLI tests); the clock, event ids
 and sleeps are injected fakes. No GitHub calls, no network, no real
 state dir.
 """
@@ -14,9 +14,9 @@ import unittest
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
-from corral import cli, coordcli
-from corral import coord
-from corral import coordevents as events
+from korapy import cli, coordcli
+from korapy import coord
+from korapy import coordevents as events
 
 
 def ids(*values):
@@ -798,7 +798,7 @@ class CoordEventsCliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name, "CORRAL_PROJECT": "demo"})
+        env = mock.patch.dict(os.environ, {"KORAPY_STATE": tmp.name, "KORAPY_PROJECT": "demo"})
         env.start()
         self.addCleanup(env.stop)
         for name, fake in (("_coord_snapshot", lambda: {}), ("_coord_human_prs", lambda: [])):
@@ -832,7 +832,7 @@ class CoordEventsCliTest(unittest.TestCase):
     def test_wait_then_ack_round_trip(self):
         code, out, _ = self._run(["coord", "wait", "--timeout", "0"])
         self.assertEqual(code, cli.NO)
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         live.record(
             [{"kind": "supply", "ref": "fleet", "evidence": "slots free, queue empty"}], now=1000.0
@@ -866,7 +866,7 @@ class CoordEventsCliTest(unittest.TestCase):
         )
 
     def test_events_text_lists_unresolved_only(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         live.record(
             [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD: baseline"}],
@@ -884,7 +884,7 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertEqual(out, "ccccdddd supply fleet slots free\n")
 
     def test_events_all_includes_resolved(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         live.record(
             [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD: baseline"}],
@@ -897,7 +897,7 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertEqual(out, "aaaabbbb held-merge lib#1 HOLD: baseline\n")
 
     def test_events_json_envelope_carries_schema_and_project(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         live.record(
             [{"kind": "supply", "ref": "fleet", "evidence": "slots free"}],
@@ -915,7 +915,7 @@ class CoordEventsCliTest(unittest.TestCase):
         )
 
     def test_events_drops_malformed_lines(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         path = live.events_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -939,7 +939,7 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertEqual(out, "aaaabbbb supply fleet slots free\n")
 
     def test_wait_and_events_share_one_row_format(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         row = {
             "id": "aaaabbbb",
@@ -978,7 +978,7 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertNotIn("None", coordcli._format_event_row({}))
 
     def test_events_all_json_carries_open_and_resolved(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         live.record(
             [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD: baseline"}],
@@ -1003,7 +1003,7 @@ class CoordEventsCliTest(unittest.TestCase):
         self.assertIsNone(by_id["ccccdddd"]["resolved_at"])
 
     def test_brief_carries_events_section(self):
-        from corral import coordevents as live
+        from korapy import coordevents as live
 
         live.record(
             [{"kind": "held-merge", "ref": "lib#1", "evidence": "HOLD"}],
@@ -1226,7 +1226,7 @@ class FollowCliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name, "CORRAL_PROJECT": "demo"})
+        env = mock.patch.dict(os.environ, {"KORAPY_STATE": tmp.name, "KORAPY_PROJECT": "demo"})
         env.start()
         self.addCleanup(env.stop)
         for name, fake in (("_coord_snapshot", lambda: {}), ("_coord_human_prs", lambda: [])):
@@ -1361,7 +1361,7 @@ class FollowCliTest(unittest.TestCase):
         boom = _Boom()
         rows = [{"id": "aaaabbbb", "kind": "supply", "ref": "fleet", "evidence": "slots free"}]
         captured = []
-        with mock.patch.dict(sys.modules, {"corral.tracker": boom, "corral.forge": boom}):
+        with mock.patch.dict(sys.modules, {"korapy.tracker": boom, "korapy.forge": boom}):
             with mock.patch.object(events, "follow_events", self._fake_follow(rows, captured)):
                 code, out, _ = self._run(["coord", "events", "--follow"])
         self.assertEqual(code, cli.OK)

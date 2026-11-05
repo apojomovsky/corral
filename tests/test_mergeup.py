@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import unittest
 
-from corral import mergeup, reviewrecord
+from korapy import mergeup, reviewrecord
 
 from tests.test_reviewrecord import git_in
 
@@ -73,7 +73,7 @@ class MergeUpTest(unittest.TestCase):
                 "-c",
                 "user.name=suite",
                 "-c",
-                "user.email=suite@corral.invalid",
+                "user.email=suite@korapy.invalid",
                 "merge",
                 "--no-ff",
                 "-m",

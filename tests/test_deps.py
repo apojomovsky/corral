@@ -9,7 +9,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from corral import cli, deps
+from korapy import cli, deps
 
 
 def fake(outputs):
@@ -102,7 +102,7 @@ class MuseTripwire(unittest.TestCase):
     def entry(self):
         return next(d for d in deps.load() if d.name == "muse")
 
-    def test_corral_deps_reports_muse(self):
+    def test_korapy_deps_reports_muse(self):
         self.assertEqual(self.entry().probe, ("muse", "--version"))
         outputs = {d.probe[0]: f"{d.name} 1.0 Linger=yes systemd 255" for d in deps.load()}
         outputs["uv"] = "uv 0.13.5"
@@ -138,7 +138,7 @@ class OmpTripwire(unittest.TestCase):
     def entry(self):
         return next(d for d in deps.load() if d.name == "omp")
 
-    def test_corral_deps_reports_omp(self):
+    def test_korapy_deps_reports_omp(self):
         self.assertEqual(self.entry().probe, ("omp", "--version"))
 
     def test_canned_18x_output_passes(self):
@@ -182,8 +182,8 @@ class Command(unittest.TestCase):
     def run_cli(self, outputs):
         out = io.StringIO()
         with (
-            tempfile.TemporaryDirectory(prefix="corral-deps-") as directory,
-            mock.patch.dict(os.environ, {"CORRAL_CONFIG": directory}),
+            tempfile.TemporaryDirectory(prefix="korapy-deps-") as directory,
+            mock.patch.dict(os.environ, {"KORAPY_CONFIG": directory}),
             mock.patch.object(deps, "run_probe", fake(outputs)),
             redirect_stdout(out),
         ):

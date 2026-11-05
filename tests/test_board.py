@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 from typing import Any
 
-from corral import board
+from korapy import board
 
 
 def reading(repo="app", number=7, **over: Any):
@@ -35,7 +35,7 @@ def reading(repo="app", number=7, **over: Any):
 
 class TempStoreTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-")
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -583,9 +583,9 @@ class EnqueueTest(TempStoreTest):
 
 class OpenTest(unittest.TestCase):
     def test_file_created_owner_only_in_state_dir(self):
-        with tempfile.TemporaryDirectory(prefix="corral-state-") as state:
-            old = os.environ.get("CORRAL_STATE")
-            os.environ["CORRAL_STATE"] = state
+        with tempfile.TemporaryDirectory(prefix="korapy-state-") as state:
+            old = os.environ.get("KORAPY_STATE")
+            os.environ["KORAPY_STATE"] = state
             try:
                 self.assertEqual(board.db_path(), os.path.join(state, "board.sqlite"))
                 with board.open_store() as store:
@@ -594,12 +594,12 @@ class OpenTest(unittest.TestCase):
                 self.assertEqual(mode, 0o600)
             finally:
                 if old is None:
-                    del os.environ["CORRAL_STATE"]
+                    del os.environ["KORAPY_STATE"]
                 else:
-                    os.environ["CORRAL_STATE"] = old
+                    os.environ["KORAPY_STATE"] = old
 
     def test_preexisting_loose_file_tightened_on_open(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             with board.open_store(path):
                 pass
@@ -609,7 +609,7 @@ class OpenTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
 
     def test_newer_schema_fails_closed(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             conn = sqlite3.connect(path)
             conn.execute("PRAGMA user_version=999")
@@ -619,7 +619,7 @@ class OpenTest(unittest.TestCase):
                 board.open_store(path)
 
     def test_corrupt_file_fails_closed(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             with open(path, "wb") as handle:
                 handle.write(b"not a database at all")
@@ -632,7 +632,7 @@ class OpenTest(unittest.TestCase):
         self.assertEqual(board.StoreError.exit_code, 4)
 
     def test_version_1_migrates_forward_keeping_rows(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             conn = sqlite3.connect(path)
             conn.executescript(
@@ -696,7 +696,7 @@ class OpenTest(unittest.TestCase):
                 conn.close()
             return row[0] if row else None
 
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             fresh = os.path.join(tmp, "fresh.sqlite")
             board.open_store(fresh).close()
             migrated = os.path.join(tmp, "migrated.sqlite")
@@ -711,7 +711,7 @@ class OpenTest(unittest.TestCase):
             self.assertEqual(cursors_sql(fresh), cursors_sql(migrated))
 
     def test_unknown_version_fails_closed(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             conn = sqlite3.connect(path)
             conn.execute("PRAGMA user_version=3")
@@ -721,7 +721,7 @@ class OpenTest(unittest.TestCase):
                 board.open_store(path)
 
     def test_absent_mark_is_dirty_without_deleting(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             with board.open_store(path) as store:
                 store.upsert_item(reading(title="Gone"), operators=["alice"], now=1000.0)

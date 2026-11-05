@@ -2,7 +2,7 @@
 
 Covers ticket H1 of docs/08-hub-multihost.md section 10: the SQLite
 store behind one transaction, the Bearer token check, the loopback
-HTTP service with grant and conflict paths, `corral hub add-host`,
+HTTP service with grant and conflict paths, `korapy hub add-host`,
 the `hub.*` settings, and the non-private bind warning. Every server
 test binds 127.0.0.1 on an ephemeral port and speaks to it in-process;
 no test touches the network, a real state dir, or another project.
@@ -19,11 +19,11 @@ import tempfile
 import threading
 import unittest
 
-from corral import hub, paths, settings
+from korapy import hub, paths, settings
 
 
 def temp_db():
-    tmp = tempfile.TemporaryDirectory(prefix="corral-hub-")
+    tmp = tempfile.TemporaryDirectory(prefix="korapy-hub-")
     return tmp, os.path.join(tmp.name, "hub.sqlite")
 
 
@@ -345,7 +345,7 @@ class ClaimRouteTest(ServerCase):
         status, payload = self.call("POST", "/v1/claims", {"repo": "app"}, token="wrong")
         self.assertEqual(status, 401)
         self.assertEqual(payload, {"error": payload["error"]})
-        with self.assertLogs("corral.hub", level="WARNING") as logs:
+        with self.assertLogs("korapy.hub", level="WARNING") as logs:
             self.call("POST", "/v1/claims", {"repo": "app"}, token="s3cret-token")
         self.assertTrue(any("401" in line or "rejected" in line for line in logs.output))
         self.assertFalse(any("s3cret-token" in line for line in logs.output))
@@ -451,7 +451,7 @@ class IPv6LoopbackTest(unittest.TestCase):
 
         if not socket_module.has_ipv6:
             self.skipTest("this host has no IPv6")
-        tmp = tempfile.TemporaryDirectory(prefix="corral-hub-ipv6-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-hub-ipv6-")
         self.addCleanup(tmp.cleanup)
         db = os.path.join(tmp.name, "hub.sqlite")
         store = hub.open_db(db)
@@ -490,12 +490,12 @@ class HubPathsTest(unittest.TestCase):
         )
 
     def test_hub_state_override_wins(self):
-        env = {"CORRAL_HUB_STATE": "/o/hub"}
+        env = {"KORAPY_HUB_STATE": "/o/hub"}
         self.assertEqual(paths.hub_db_path(env), os.path.join("/o/hub", "hub.sqlite"))
 
     def test_a_relative_hub_state_is_refused(self):
         with self.assertRaises(paths.PathError):
-            paths.hub_db_path({"CORRAL_HUB_STATE": "relative/hub"})
+            paths.hub_db_path({"KORAPY_HUB_STATE": "relative/hub"})
 
     def test_no_second_resolver_for_the_file_name(self):
         self.assertFalse(hasattr(hub, "DB_NAME"))
@@ -510,29 +510,29 @@ class HubSettingsTest(unittest.TestCase):
         self.assertEqual(resolved["hub.lease_ttl_s"], 3 * resolved["hub.heartbeat_s"])
 
     def test_env_overrides_and_provider_is_listed(self):
-        resolved = settings.resolve(project={}, env={"CORRAL_HUB_URL": "http://host-1:8080"})
+        resolved = settings.resolve(project={}, env={"KORAPY_HUB_URL": "http://host-1:8080"})
         self.assertEqual(resolved["hub.url"], "http://host-1:8080")
-        self.assertIn("corral.hub", settings.PROVIDERS)
+        self.assertIn("korapy.hub", settings.PROVIDERS)
 
 
 class AddHostCommandTest(unittest.TestCase):
     def run_hub(self, *argv):
         from unittest import mock
 
-        from corral import cli
+        from korapy import cli
 
         args = cli.build_parser().parse_args(["hub", *argv])
-        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 return args.func(args), state
 
     def test_add_host_mints_and_prints_the_token_once(self):
         from unittest import mock
 
-        from corral import cli
+        from korapy import cli
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 args = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
                 self.assertEqual(args.func(args), 0)
                 store = hub.open_db(paths.hub_db_path())
@@ -547,10 +547,10 @@ class AddHostCommandTest(unittest.TestCase):
     def test_add_host_twice_is_a_usage_error(self):
         from unittest import mock
 
-        from corral import cli
+        from korapy import cli
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 first = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
                 self.assertEqual(first.func(first), 0)
                 second = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
@@ -565,17 +565,17 @@ class AddHostCommandTest(unittest.TestCase):
         from contextlib import redirect_stdout
         from unittest import mock
 
-        from corral import cli
+        from korapy import cli
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 args = cli.build_parser().parse_args(["hub", "add-host", "--id", "host-1"])
                 out = io.StringIO()
                 with redirect_stdout(out):
                     self.assertEqual(args.func(args), 0)
                 token = out.getvalue().strip()
                 self.assertTrue(token)
-                store = hub.open_db(paths.hub_db_path({"CORRAL_HUB_STATE": state}))
+                store = hub.open_db(paths.hub_db_path({"KORAPY_HUB_STATE": state}))
                 try:
                     self.assertEqual(hub.verify_token(store, token), "host-1")
                 finally:
@@ -584,7 +584,7 @@ class AddHostCommandTest(unittest.TestCase):
 
 class ServeCommandTest(unittest.TestCase):
     def parse(self, *argv):
-        from corral import cli
+        from korapy import cli
 
         return cli.build_parser().parse_args(["hub", "serve", *argv])
 
@@ -598,10 +598,10 @@ class ServeCommandTest(unittest.TestCase):
         import socket
         from unittest import mock
 
-        from corral import settings
+        from korapy import settings
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-serve-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 with mock.patch.object(
                     settings, "load", return_value={"hub.lease_ttl_s": 90, "hub.stale_after_s": 90}
                 ):
@@ -620,8 +620,8 @@ class ServeCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr, redirect_stdout
         from unittest import mock
 
-        from corral import hub as hub_module
-        from corral import settings
+        from korapy import hub as hub_module
+        from korapy import settings
 
         class FakeServer:
             server_address = ("0.0.0.0", 4321)
@@ -636,8 +636,8 @@ class ServeCommandTest(unittest.TestCase):
                 pass
 
         fake = FakeServer()
-        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-serve-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 with mock.patch.object(
                     settings, "load", return_value={"hub.lease_ttl_s": 90, "hub.stale_after_s": 90}
                 ):
@@ -656,15 +656,15 @@ class ServeCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr
         from unittest import mock
 
-        from corral import paths
-        from corral import settings
+        from korapy import paths
+        from korapy import settings
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
-            db_path = paths.hub_db_path({"CORRAL_HUB_STATE": state})
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-serve-") as state:
+            db_path = paths.hub_db_path({"KORAPY_HUB_STATE": state})
             os.makedirs(os.path.dirname(db_path), exist_ok=True)
             with open(db_path, "wb") as handle:
                 handle.write(b"this is not a database")
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 with mock.patch.object(
                     settings, "load", return_value={"hub.lease_ttl_s": 90, "hub.stale_after_s": 90}
                 ):
@@ -672,7 +672,7 @@ class ServeCommandTest(unittest.TestCase):
                     err = io.StringIO()
                     with redirect_stderr(err):
                         self.assertEqual(args.func(args), 4)
-        self.assertIn("corral:", err.getvalue())
+        self.assertIn("korapy:", err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
     def test_nonpositive_lease_ttl_is_a_usage_error_naming_the_setting(self):
@@ -680,13 +680,13 @@ class ServeCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr
         from unittest import mock
 
-        from corral import hub as hub_module
-        from corral import settings
+        from korapy import hub as hub_module
+        from korapy import settings
 
         for ttl in (0, -5):
             with self.subTest(ttl=ttl):
-                with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
-                    with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with tempfile.TemporaryDirectory(prefix="korapy-hub-serve-") as state:
+                    with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                         with mock.patch.object(
                             settings,
                             "load",
@@ -705,13 +705,13 @@ class ServeCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr
         from unittest import mock
 
-        from corral import hub as hub_module
-        from corral import settings
+        from korapy import hub as hub_module
+        from korapy import settings
 
         for horizon in (0, -5):
             with self.subTest(horizon=horizon):
-                with tempfile.TemporaryDirectory(prefix="corral-hub-serve-") as state:
-                    with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+                with tempfile.TemporaryDirectory(prefix="korapy-hub-serve-") as state:
+                    with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                         with mock.patch.object(
                             settings,
                             "load",
@@ -956,7 +956,7 @@ class RenewReleaseRouteTest(ServerCase):
         self.assertEqual(status, 401)
         status, _ = self.call("POST", "/v1/claims/release", {"repo": "app"}, token="wrong")
         self.assertEqual(status, 401)
-        with self.assertLogs("corral.hub", level="WARNING") as logs:
+        with self.assertLogs("korapy.hub", level="WARNING") as logs:
             self.call("POST", "/v1/claims/renew", {"repo": "app"}, token="s3cret-token")
         self.assertFalse(any("s3cret-token" in line for line in logs.output))
 
@@ -1224,15 +1224,15 @@ class ImportClosureTest(unittest.TestCase):
             source = handle.read()
         reached = set()
         for line in source.splitlines():
-            match = re.match(r"\s*from\s+(corral[a-z0-9_.]*)\s+import\s+(.+)", line)
+            match = re.match(r"\s*from\s+(korapy[a-z0-9_.]*)\s+import\s+(.+)", line)
             if not match:
                 continue
             module, names = match.group(1), match.group(2)
-            if module == "corral":
-                reached.update(f"corral.{name.strip()}" for name in names.split(","))
+            if module == "korapy":
+                reached.update(f"korapy.{name.strip()}" for name in names.split(","))
             else:
                 reached.add(module)
-        self.assertEqual(reached, {"corral.paths", "corral.settings", "corral.netbind"})
+        self.assertEqual(reached, {"korapy.paths", "korapy.settings", "korapy.netbind"})
 
 
 class ReadPathClosureTest(unittest.TestCase):
@@ -1248,7 +1248,7 @@ class ReadPathClosureTest(unittest.TestCase):
             match = re.match(r"\s*(?:import|from)\s+([a-z0-9_.]+)", line)
             if match:
                 reached.add(match.group(1))
-        self.assertNotIn("corral.hub", reached)
+        self.assertNotIn("korapy.hub", reached)
 
 
 class ExportImportTest(StoreCase):
@@ -1687,7 +1687,7 @@ class StoreUnavailableTest(ServerCase):
 
 class HubOperationsCommandTest(unittest.TestCase):
     def parse(self, *argv):
-        from corral import cli
+        from korapy import cli
 
         return cli.build_parser().parse_args(["hub", *argv])
 
@@ -1696,8 +1696,8 @@ class HubOperationsCommandTest(unittest.TestCase):
         from contextlib import redirect_stdout
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 add = self.parse("add-host", "--id", "host-1")
                 self.assertEqual(add.func(add), 0)
                 store = hub.open_db(paths.hub_db_path())
@@ -1718,8 +1718,8 @@ class HubOperationsCommandTest(unittest.TestCase):
         from contextlib import redirect_stdout
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-") as first:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": first}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-") as first:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": first}):
                 add = self.parse("add-host", "--id", "host-1")
                 self.assertEqual(add.func(add), 0)
                 store = hub.open_db(paths.hub_db_path())
@@ -1732,8 +1732,8 @@ class HubOperationsCommandTest(unittest.TestCase):
                 with redirect_stdout(out):
                     self.assertEqual(args.func(args), 0)
                 exported = out.getvalue()
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-") as second:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": second}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-") as second:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": second}):
                 export_file = os.path.join(second, "hub-export.json")
                 with open(export_file, "w", encoding="utf-8") as handle:
                     handle.write(exported)
@@ -1757,8 +1757,8 @@ class HubOperationsCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr, redirect_stdout
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 add = self.parse("add-host", "--id", "host-1")
                 self.assertEqual(add.func(add), 0)
                 store = hub.open_db(paths.hub_db_path())
@@ -1773,15 +1773,15 @@ class HubOperationsCommandTest(unittest.TestCase):
                 err = io.StringIO()
                 with redirect_stderr(err), redirect_stdout(io.StringIO()):
                     self.assertEqual(args.func(args), 4)
-                self.assertIn("corral:", err.getvalue())
+                self.assertIn("korapy:", err.getvalue())
 
     def test_import_of_a_missing_or_broken_file_is_a_usage_error(self):
         import io
         from contextlib import redirect_stderr, redirect_stdout
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 args = self.parse("import", "--file", os.path.join(state, "absent.json"))
                 err = io.StringIO()
                 with redirect_stderr(err), redirect_stdout(io.StringIO()):
@@ -1798,8 +1798,8 @@ class HubOperationsCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr, redirect_stdout
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 add = self.parse("add-host", "--id", "host-1")
                 self.assertEqual(add.func(add), 0)
                 dest = os.path.join(state, "hub-backup.sqlite")
@@ -1811,7 +1811,7 @@ class HubOperationsCommandTest(unittest.TestCase):
                 err = io.StringIO()
                 with redirect_stderr(err), redirect_stdout(io.StringIO()):
                     self.assertEqual(args.func(args), 4)
-                self.assertIn("corral:", err.getvalue())
+                self.assertIn("korapy:", err.getvalue())
 
 
 if __name__ == "__main__":

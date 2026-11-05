@@ -18,12 +18,12 @@ from . import suiteguard
 
 suiteguard.install()
 
-SUITE_TMP_ROOT = tempfile.mkdtemp(prefix="corral-suite-tmp-")
+SUITE_TMP_ROOT = tempfile.mkdtemp(prefix="korapy-suite-tmp-")
 os.environ["TMPDIR"] = SUITE_TMP_ROOT
 tempfile.tempdir = SUITE_TMP_ROOT
 atexit.register(shutil.rmtree, SUITE_TMP_ROOT, True)
 
-for _var in ("CORRAL_STATE", "CORRAL_SESSIONS", "CORRAL_CONFIG", "CORRAL_CACHE"):
+for _var in ("KORAPY_STATE", "KORAPY_SESSIONS", "KORAPY_CONFIG", "KORAPY_CACHE"):
     os.environ[_var] = tempfile.mkdtemp(prefix=_var.lower() + "-")
 
 

@@ -7,9 +7,9 @@ import tempfile
 import unittest
 from typing import Any
 
-from corral import board, mirror, mirrorcli, sync, syncli, tracker
-from corral.github import gh as ghmod
-from corral.github import tracker as ghtracker
+from korapy import board, mirror, mirrorcli, sync, syncli, tracker
+from korapy.github import gh as ghmod
+from korapy.github import tracker as ghtracker
 from tests.test_syncli import git_ok
 from tests.test_tracker import FakeRun, FakeTracker, item_payload, reading
 
@@ -59,7 +59,7 @@ class SettleRegressionTest(unittest.TestCase):
     """Section 0: tracker readings carry agent/status and settle queues."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-mirror-settle-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-mirror-settle-")
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -153,7 +153,7 @@ class SettleRegressionTest(unittest.TestCase):
 
 class SyncPassthroughTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-mirror-sync-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-mirror-sync-")
         self.addCleanup(self.tmp.cleanup)
         self.store = board.open_store(os.path.join(self.tmp.name, "board.sqlite"))
         self.addCleanup(self.store.close)
@@ -332,7 +332,7 @@ class AdapterWriteTest(unittest.TestCase):
 
 class PushTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-mirror-push-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-mirror-push-")
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -492,10 +492,10 @@ class PushTest(unittest.TestCase):
 
 class MirrorCliTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-mirrorcli-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-mirrorcli-")
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[[repo]]\nname = "app"\nclone.path = "clone"\ntracker.repo = "acme/app"\n'
             )
@@ -565,7 +565,7 @@ class MirrorCliTest(unittest.TestCase):
         self.assertEqual(self.run_mirror(fake), 0)
 
     def test_no_repo_entries_exits_4(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write("")
         self.assertEqual(self.run_mirror(MirrorTracker()), 4)
 
@@ -594,10 +594,10 @@ class MirrorCliTest(unittest.TestCase):
 
 class SyncPushTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-syncpush-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-syncpush-")
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[[repo]]\nname = "app"\nclone.path = "clone"\ntracker.operators = ["alice"]\n'
             )

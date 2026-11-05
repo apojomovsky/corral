@@ -12,7 +12,7 @@ In scope is the tool's own code, for example:
 - a secret logged or stored (a token, credential or quota payload beyond usage numbers);
 - a path escaping a declared root (a state, session, cache or ops root, or the worktree layout).
 
-Out of scope are the agent runtimes, the providers' quota APIs, and any particular deployment of corral.
+Out of scope are the agent runtimes, the providers' quota APIs, and any particular deployment of korapy.
 
 ## Supported versions
 

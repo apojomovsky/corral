@@ -3,7 +3,7 @@
 Tests use stub policy modules written to a temporary directory (loaded
 by dotted name through an added `sys.path` entry, or by file path) and
 fixture board items. No tracker, no network, no subprocess, no real
-state or config dir: the registry dir is a temporary `CORRAL_CONFIG`.
+state or config dir: the registry dir is a temporary `KORAPY_CONFIG`.
 """
 
 import dataclasses
@@ -14,7 +14,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from corral import board, eligibility, projects
+from korapy import board, eligibility, projects
 
 
 def item(repo="app", number=7, **fields):
@@ -49,7 +49,7 @@ def eligible(rows, *, now):
 
 
 def make(repo, number, kind, weight=0.0):
-    from corral.eligibility import StartRequest
+    from korapy.eligibility import StartRequest
 
     return StartRequest(repo=repo, number=number, kind=kind, weight=weight)
 """
@@ -117,7 +117,7 @@ class TypesTest(unittest.TestCase):
 
 class LoaderTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-"))
         with open(os.path.join(self.tmp, "stub_policy.py"), "w", encoding="utf-8") as handle:
             handle.write(STUB_MODULE)
         self.path_entry = os.path.join(self.tmp, "stub_policy.py") + ":eligible"
@@ -171,7 +171,7 @@ class LoaderTest(unittest.TestCase):
         with open(module_path, "w", encoding="utf-8") as handle:
             handle.write(
                 "def eligible(rows, *, now):\n"
-                "    from corral.eligibility import StartRequest\n"
+                "    from korapy.eligibility import StartRequest\n"
                 "    return [StartRequest(repo='app', number=1, kind='merge')]\n"
             )
         policy = eligibility.load_policy(module_path + ":eligible", project="blue")
@@ -194,7 +194,7 @@ class LoaderTest(unittest.TestCase):
         module_path = os.path.join(self.tmp, "boom.py")
         with open(module_path, "w", encoding="utf-8") as handle:
             handle.write(
-                "from corral.eligibility import EligibilityError\n"
+                "from korapy.eligibility import EligibilityError\n"
                 'raise EligibilityError("top-level boom")\n'
             )
         entry = module_path + ":eligible"
@@ -224,7 +224,7 @@ class LoaderTest(unittest.TestCase):
             os.path.join(ops_root, "policies", "blue_policy.py"), "w", encoding="utf-8"
         ) as handle:
             handle.write("def eligible(rows, *, now):\n    return []\n")
-        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-cwd-"))
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-cwd-"))
         old = os.getcwd()
         os.chdir(elsewhere)
         try:
@@ -385,7 +385,7 @@ class PureCallTest(unittest.TestCase):
 
 class ForProjectTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-"))
         with open(os.path.join(self.tmp, "stub_policy.py"), "w", encoding="utf-8") as handle:
             handle.write(STUB_MODULE)
         self.entry = os.path.join(self.tmp, "stub_policy.py") + ":eligible"
@@ -438,7 +438,7 @@ class ForProjectTest(unittest.TestCase):
             root=ops_root,
             eligibility="policies/blue_policy.py:eligible",
         )
-        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-cwd-"))
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-cwd-"))
         old = os.getcwd()
         os.chdir(elsewhere)
         try:
@@ -451,9 +451,9 @@ class ForProjectTest(unittest.TestCase):
 
 class RegistrationTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-reg-"))
-        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
-        env = dict(kept, CORRAL_CONFIG=os.path.join(self.tmp, "config"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-reg-"))
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
+        env = dict(kept, KORAPY_CONFIG=os.path.join(self.tmp, "config"))
         self.enterContext(mock.patch.dict(os.environ, env, clear=True))
 
     def write_project(self, name, text):
@@ -529,7 +529,7 @@ class RegistrationTest(unittest.TestCase):
             f'root = "{ops_root}"\n'
             'eligibility = "policies/blue_policy.py:eligible"\n',
         )
-        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-elig-cwd-"))
+        elsewhere = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-cwd-"))
         old = os.getcwd()
         os.chdir(elsewhere)
         try:

@@ -9,11 +9,11 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import admission, cli, launch, projects, registry, settings, units
+from korapy import admission, cli, launch, projects, registry, settings, units
 from tests.test_reviewrecord import git_in
 
 
-def corral_toml(cap):
+def korapy_toml(cap):
     return f"""\
 [agents]
 cap = {cap}
@@ -33,19 +33,19 @@ class HostCase(unittest.TestCase):
     """Two ops roots, a temp config/state tree, and a fake service manager."""
 
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-projects-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-projects-"))
         self.roots = {}
         for name in ("project-a", "project-b"):
             self.roots[name] = os.path.join(self.tmp, "roots", name)
         self.units = {}
 
-        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
         env = dict(kept)
         env.update(
-            CORRAL_STATE=os.path.join(self.tmp, "state"),
-            CORRAL_SESSIONS=os.path.join(self.tmp, "sessions"),
-            CORRAL_CONFIG=os.path.join(self.tmp, "config"),
-            CORRAL_CACHE=os.path.join(self.tmp, "cache"),
+            KORAPY_STATE=os.path.join(self.tmp, "state"),
+            KORAPY_SESSIONS=os.path.join(self.tmp, "sessions"),
+            KORAPY_CONFIG=os.path.join(self.tmp, "config"),
+            KORAPY_CACHE=os.path.join(self.tmp, "cache"),
         )
         self.enterContext(mock.patch.dict(os.environ, env, clear=True))
 
@@ -70,11 +70,11 @@ class HostCase(unittest.TestCase):
             git_in(seed, "push", "-q", "origin", "main")
             git_in(self.tmp, "clone", "-q", origin, clone)
         with open(os.path.join(root, settings.PROJECT_FILE), "w", encoding="utf-8") as h:
-            h.write(corral_toml(cap))
+            h.write(korapy_toml(cap))
         return root
 
     def write_host(self, total_cap):
-        config = os.path.join(os.environ["CORRAL_CONFIG"], "config.toml")
+        config = os.path.join(os.environ["KORAPY_CONFIG"], "config.toml")
         os.makedirs(os.path.dirname(config), exist_ok=True)
         with open(config, "w", encoding="utf-8") as h:
             h.write(f"[admission]\ntotal_cap = {total_cap}\n")
@@ -452,7 +452,7 @@ class AdmitWithoutRegistrationTest(HostCase):
             usage=roomy,
             host_ledger_fn=lambda: {},
         )
-        self.add_units("corral-agent-", 6, 7)
+        self.add_units("korapy-agent-", 6, 7)
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(
                 self.target("project-a"),

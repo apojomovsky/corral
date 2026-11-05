@@ -12,9 +12,9 @@ import os
 import tempfile
 import unittest
 
-from corral import board as store
-from corral import boarddoctor, doctor
-from corral import tracker as iface
+from korapy import board as store
+from korapy import boarddoctor, doctor
+from korapy import tracker as iface
 from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
     BoardFakeRun,
@@ -94,7 +94,7 @@ def items_on(*refs):
 
 
 def tempdir():
-    return tempfile.mkdtemp(prefix="corral-boarddoctor-")
+    return tempfile.mkdtemp(prefix="korapy-boarddoctor-")
 
 
 def check(sites, *, snap=None, refs=(), fetch=None, store_dir=None, board_items=None):
@@ -243,7 +243,7 @@ class SnapshotResolution(unittest.TestCase):
         self.assertIn("3", row.detail)
         self.assertIn("does not resolve", row.detail)
         self.assertIn("remove the table", row.fix)
-        self.assertIn("corral github setup", row.fix)
+        self.assertIn("korapy github setup", row.fix)
 
     def test_a_board_addressed_by_id_names_the_id(self):
         by_id = config(project_number=None, project_id="PVT_1")
@@ -262,7 +262,7 @@ class SnapshotResolution(unittest.TestCase):
         self.assertIn(REPO, row.detail)
         self.assertIn("[repo.board]", row.detail)
         self.assertIn("[repo.board]", row.fix)
-        self.assertIn("corral github setup", row.fix)
+        self.assertIn("korapy github setup", row.fix)
 
     def test_a_missing_mapped_field_is_a_failure_naming_repo_concept_and_field(self):
         fields = [f for f in full_live_fields() if f.name != "Priority"]
@@ -272,7 +272,7 @@ class SnapshotResolution(unittest.TestCase):
         self.assertIn("Priority", row.detail)
         self.assertIn("priority", row.detail)
         self.assertIn("missing", row.detail)
-        self.assertIn("corral github setup", row.fix)
+        self.assertIn("korapy github setup", row.fix)
 
     def test_a_wrong_kind_field_is_a_failure_naming_concept_field_and_both_kinds(self):
         fields = [live_field("Priority") if f.name == "Priority" else f for f in full_live_fields()]
@@ -284,7 +284,7 @@ class SnapshotResolution(unittest.TestCase):
         self.assertIn("text", row.detail)
         self.assertIn("single_select", row.detail)
         self.assertIn("rename or delete", row.fix)
-        self.assertIn("corral github setup", row.fix)
+        self.assertIn("korapy github setup", row.fix)
 
     def test_a_rate_limited_board_read_is_a_transient_budget_row(self):
         def fetch(board_config):
@@ -464,7 +464,7 @@ class AdapterDuplicateTitle(unittest.TestCase):
         return run
 
     def snapshot_via_reader(self, *titles):
-        from corral.github import board as boardreader
+        from korapy.github import board as boardreader
 
         return boardreader.BoardReader(
             config(), self.snapshot_run(*titles), pacer=FakePacer()
@@ -472,7 +472,7 @@ class AdapterDuplicateTitle(unittest.TestCase):
 
     def fetch_via_reader(self, *titles):
         run = self.snapshot_run(*titles)
-        from corral.github import board as boardreader
+        from korapy.github import board as boardreader
 
         def fetch(board_config):
             return boardreader.BoardReader(board_config, run, pacer=FakePacer()).snapshot()
@@ -577,7 +577,7 @@ class MissingFromBoard(unittest.TestCase):
         self.assertEqual(row.status, "fail")
         self.assertIn("1 open issue", row.detail)
         self.assertIn("9", row.detail)
-        self.assertIn("corral github setup --populate", row.fix)
+        self.assertIn("korapy github setup --populate", row.fix)
 
     def test_missing_numbers_name_the_first_few_then_count_the_rest(self):
         directory = tempdir()
@@ -802,7 +802,7 @@ class ParityReport(unittest.TestCase):
 
 class SitesFromSettings(unittest.TestCase):
     def write(self, directory, text):
-        with open(os.path.join(directory, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(directory, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def test_only_board_mode_repos_become_sites(self):
@@ -816,7 +816,7 @@ class SitesFromSettings(unittest.TestCase):
             '[[repo]]\nname = "plain"\n'
             '[repo.tracker]\nrepo = "example/plain"\n',
         )
-        sites, error = boarddoctor.sites_from_settings(root, env={"CORRAL_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
         self.assertIsNone(error)
         self.assertEqual(len(sites), 1)
         self.assertEqual(sites[0].repo, "example/demo")
@@ -835,7 +835,7 @@ class SitesFromSettings(unittest.TestCase):
             '[repo.tracker]\nrepo = "example/plain"\n'
             '[repo.board]\nproject_owner = "example"\nproject_number = 3\n',
         )
-        sites, error = boarddoctor.sites_from_settings(root, env={"CORRAL_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
         self.assertIsNone(error)
         self.assertEqual(len(sites), 1)
         self.assertEqual(sites[0].repo, "example/plain")
@@ -846,7 +846,7 @@ class SitesFromSettings(unittest.TestCase):
         root = tempdir()
         config_dir = tempdir()
         self.write(root, '[[repo]]\nname = "app"\n[repo.board]\nproject_number = 3\n')
-        sites, error = boarddoctor.sites_from_settings(root, env={"CORRAL_CONFIG": config_dir})
+        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
         self.assertEqual(sites, [])
         self.assertIsNotNone(error)
         self.assertIn("app", error or "")
@@ -856,7 +856,7 @@ class AdapterSnapshot(unittest.TestCase):
     """The snapshot and membership reads over canned GraphQL payloads."""
 
     def reader(self, run):
-        from corral.github import board as boardreader
+        from korapy.github import board as boardreader
 
         return boardreader.BoardReader(config(), run, pacer=FakePacer())
 
@@ -933,7 +933,7 @@ class AdapterSnapshot(unittest.TestCase):
             self.reader(run).snapshot()
 
     def test_snapshot_rate_limit_maps_to_tracker_rate_limited(self):
-        from corral.github import gh
+        from korapy.github import gh
 
         run = BoardFakeRun().script(
             "BoardSchemaByNumber",

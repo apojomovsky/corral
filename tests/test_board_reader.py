@@ -16,11 +16,11 @@ import tempfile
 import unittest
 from typing import Any
 
-from corral import board as store
-from corral import settings
-from corral import tracker as iface
-from corral.github import board as boardreader
-from corral.github import gh
+from korapy import board as store
+from korapy import settings
+from korapy import tracker as iface
+from korapy.github import board as boardreader
+from korapy.github import gh
 from tests.test_board_fields import FakePacer
 from tests.test_tracker import item_payload, pull_payload
 
@@ -590,7 +590,7 @@ class PollItemsTest(unittest.TestCase):
         )
         self.assertNotIn("priority", found.extra)
 
-    def test_corral_text_fields_become_agent_and_status(self):
+    def test_korapy_text_fields_become_agent_and_status(self):
         run = BoardFakeRun()
         found = self.poll_one(
             run,
@@ -737,7 +737,7 @@ class PollItemsTest(unittest.TestCase):
         self.assertIsNot(found[0].extra, found[1].extra)
 
     def test_store_round_trip_keeps_board_concepts(self):
-        from corral import sync
+        from korapy import sync
 
         run = BoardFakeRun()
         found = self.poll_one(
@@ -747,7 +747,7 @@ class PollItemsTest(unittest.TestCase):
                 text_value("F_blocked", "Blocked by", "example/demo#1"),
             ],
         )
-        tmpdir = tempfile.mkdtemp(prefix="corral-board-reader-")
+        tmpdir = tempfile.mkdtemp(prefix="korapy-board-reader-")
         self.addCleanup(shutil.rmtree, tmpdir, True)
         with store.open_store(os.path.join(tmpdir, "board.sqlite")) as db:
             db.upsert_item(sync._reading(found), operators=["alice"], now=found.updated_at)
@@ -758,18 +758,18 @@ class PollItemsTest(unittest.TestCase):
 
 class MilestoneOfTest(unittest.TestCase):
     def test_title(self):
-        from corral.github.tracker import milestone_of
+        from korapy.github.tracker import milestone_of
 
         self.assertEqual(milestone_of(item_payload(7, milestone={"title": "M1"})), "M1")
 
     def test_missing_or_null_is_none(self):
-        from corral.github.tracker import milestone_of
+        from korapy.github.tracker import milestone_of
 
         self.assertIsNone(milestone_of(item_payload(7)))
         self.assertIsNone(milestone_of(item_payload(7, milestone=None)))
 
     def test_malformed_milestones_fail(self):
-        from corral.github.tracker import milestone_of
+        from korapy.github.tracker import milestone_of
 
         for milestone in ("M1", {"title": ""}, {"title": 3}, {"name": "M1"}):
             with self.subTest(milestone=milestone):

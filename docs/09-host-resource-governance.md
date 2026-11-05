@@ -1,7 +1,7 @@
 # 09: host resource governance across projects on one host
 
 Status: approved 2026-11-01, re-scoped after review round 1 to one
-corral per machine. Implemented by the tickets in section 9.
+korapy per machine. Implemented by the tickets in section 9.
 
 Admission today counts agents (`admission.admit`, `registry.counted_tickets`).
 It knows nothing about CPU or memory. Test suites and builds run by agents
@@ -10,7 +10,7 @@ fleets. This doc designs the budget layer that sits next to the count layer:
 a host budget divided per project and per agent, enforced by the kernel
 through nested systemd slices.
 
-One corral per machine: one state directory, one host-wide ledger that every
+One korapy per machine: one state directory, one host-wide ledger that every
 project on the host registers to. Coordination between separate state
 directories on the same host is not a goal; a guard refuses a second
 instance pointed at a different state directory (section 2). The host is the
@@ -63,9 +63,9 @@ Enforcement maps to nested slices under the user manager:
 
 ```text
 user.slice
-  corral.slice                          host budget (MemoryMax, CPUQuota)
-    corral-<project>.slice              project share
-      corral-agent-<repo>-<n>           per-agent unit (MemoryMax, CPUQuota, TasksMax)
+  korapy.slice                          host budget (MemoryMax, CPUQuota)
+    korapy-<project>.slice              project share
+      korapy-agent-<repo>-<n>           per-agent unit (MemoryMax, CPUQuota, TasksMax)
 ```
 
 The launch path extends the existing `units.unit_argv` builder (which already
@@ -120,16 +120,16 @@ no per-instance layer: no instance shares, no instance weights, no
 cross-instance heartbeats, no peer expiry.
 
 **Location.** The ledger lives at
-`<xdg-state-base>/corral/host-resources.json`, resolved by a new
+`<xdg-state-base>/korapy/host-resources.json`, resolved by a new
 `paths.host_ledger_path()` helper built on
 `_xdg_base("XDG_STATE_HOME", "~/.local/state", env)` on the `config_home()`
-precedent: the XDG state base directly, never `CORRAL_STATE`, and never read
+precedent: the XDG state base directly, never `KORAPY_STATE`, and never read
 straight from the environment by any caller. This is the one deliberate
 exception to the override rule, documented next to the resolver: an
 override-sensitive path could never be shared, and a shared path must not
 move under a running fleet. A test asserts the copies agree: the helper is
 the only resolver, and its result matches the documented location even with
-`CORRAL_STATE` set.
+`KORAPY_STATE` set.
 
 **Guard.** A canonical state-directory marker sits beside the ledger, in the
 same directory: a small file holding the state dir that created this host's
@@ -168,8 +168,8 @@ doctor warn row, never held against the pool.
 
 **Same user only.** Several login users on one host are out of scope. The
 user manager, the delegation and the `$HOME`-relative ledger path are all
-per-user; spanning users would need system slices and root, which corral
-never touches (`make bootstrap` never uses sudo). Two users running corral on
+per-user; spanning users would need system slices and root, which korapy
+never touches (`make bootstrap` never uses sudo). Two users running korapy on
 one host today simply do not see each other; the foreign-claim mechanism
 (section 4) is the only bridge offered, declared by hand.
 
@@ -225,7 +225,7 @@ any layer stay exit 4 and are evaluated before any gate.
 
 ## 4. Foreign load
 
-Load corral does not control (another fleet, the desktop) is measured, never
+Load korapy does not control (another fleet, the desktop) is measured, never
 managed. Two readings, each through an injected reader seam faked in tests:
 
 - **Host pressure:** `/proc/loadavg` and `/proc/meminfo` (`MemAvailable`),
@@ -249,7 +249,7 @@ a name and an explicit CPU and memory reservation. Foreign claims subtract
 from the pool exactly like a project share and expire under the same
 `gone_s` bound; an expired foreign claim is ignored with a doctor warn row,
 never held against the pool. The claim is advisory and self-reported:
-corral cannot verify it, so it trusts the declarer and shows the numbers in
+korapy cannot verify it, so it trusts the declarer and shows the numbers in
 the doctor row for a human to audit. The write channel is an open decision
 (section 10, O5).
 
@@ -279,7 +279,7 @@ memory_mb = 1024
 ```
 
 There is no `[resources.instance]` table and no instance weight: with one
-corral per machine the host budget divides directly between projects.
+korapy per machine the host budget divides directly between projects.
 
 Defaults: no host budget configured means no enforcement. The budget gate
 passes everything and the doctor warns that host limits are unset. This is
@@ -308,7 +308,7 @@ than running unlimited.
 | Failure | Behavior | Exit |
 | --- | --- | --- |
 | Manager refuses a property, or a required controller is not delegated | Refuse, stderr naming the property or controller and the doctor row to run | 4 |
-| Ledger present but corrupt, or version newer than this corral | Refuse, stderr naming the file | 4 |
+| Ledger present but corrupt, or version newer than this korapy | Refuse, stderr naming the file | 4 |
 | State dir differs from the marker beside the ledger | Refuse, stderr naming both dirs and the marker | 4 |
 | User manager bus unreachable | Refuse, existing `Unreachable` path | 3 |
 | Host or project budget exhausted, or host saturated | Refuse, reason with the numbers | 75 |
@@ -351,12 +351,12 @@ external touch, mirroring the existing seams:
 
 Resource limits do not need containers. The kernel already enforces CPU,
 memory and pids through cgroups. UNVERIFIED: that systemd slices compose
-with the transient units corral already starts; learn on a scratch host
+with the transient units korapy already starts; learn on a scratch host
 with `systemd-run --user --slice=test-gov.slice
 --property=MemoryMax=1G ...` and read the leaf `cgroup.controllers`.
 A container would add image builds,
 layer storage, a daemon dependency and a second identity scheme for no new
-enforcement primitive. Docker stays what it is in corral: a seam for
+enforcement primitive. Docker stays what it is in korapy: a seam for
 placement (attached hardware, a daemon a project needs), not for limits.
 
 Containers belong when the need is isolation rather than accounting: code
@@ -440,7 +440,7 @@ Options:
 O5. Foreign claim write channel:
 Options:
 1. Drop-in JSON dir merged at read (recommended)
-2. New `corral resources` verb family
+2. New `korapy resources` verb family
 3. Environment variables on launch
 4. Hand-edited ledger section
 

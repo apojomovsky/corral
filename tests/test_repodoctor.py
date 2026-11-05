@@ -1,6 +1,6 @@
 """Doctor rows for the remote-dependent project checks.
 
-`docs/06-corral-new.md`, section 6: a fresh `new` tree has no remote,
+`docs/06-korapy-new.md`, section 6: a fresh `new` tree has no remote,
 so the rows that need one warn instead of failing; once a remote exists
 the rows are strict. Readings arrive as `repodoctor.RepoSite` data and
 `doctor.run_checks` only renders them; `doctor.load_repo_sites`
@@ -15,8 +15,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from corral import doctor, repodoctor, settings
-from corral import tracker as iface
+from korapy import doctor, repodoctor, settings
+from korapy import tracker as iface
 from tests.test_doctor import env
 from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
@@ -61,9 +61,9 @@ class PreRemoteWarnings(unittest.TestCase):
 
     def test_no_remote_fixes_name_the_manual_next_steps(self):
         found = by_name(rows(site()))
-        self.assertIn("corral github setup", found["remote:demo"].fix)
+        self.assertIn("korapy github setup", found["remote:demo"].fix)
         self.assertIn("--create-remote", found["remote:demo"].fix)
-        self.assertIn("corral github setup", found["labels:demo"].fix)
+        self.assertIn("korapy github setup", found["labels:demo"].fix)
 
     def test_readings_are_ignored_without_an_origin(self):
         checks = rows(site(branch="missing", labels="missing"))
@@ -93,7 +93,7 @@ class StrictRemote(unittest.TestCase):
         checks = rows(site(origin="https://example.com/o/demo.git", labels="missing"))
         found = by_name(checks)
         self.assertEqual(found["labels:demo"].status, "fail")
-        self.assertIn("corral github setup", found["labels:demo"].fix)
+        self.assertIn("korapy github setup", found["labels:demo"].fix)
         self.assertEqual(doctor.exit_code(checks), 1)
 
     def test_refused_labels_fails_with_the_owner_fix(self):
@@ -131,7 +131,7 @@ class RowOrder(unittest.TestCase):
 def write_ops(root, name="demo", body=None):
     """An ops root with one `[[repo]]` entry pointing at a `clone` dir."""
     os.makedirs(os.path.join(root, "clone"), exist_ok=True)
-    with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+    with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
         handle.write(body or f'[[repo]]\nname = "{name}"\nclone.path = "clone"\n')
     return os.path.join(root, "clone")
 
@@ -144,7 +144,7 @@ def chdir(test, path):
 
 class LoadRepoSites(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-repodoctor-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-repodoctor-")
         self.addCleanup(tmp.cleanup)
         self.root = tmp.name
         self.clone = write_ops(self.root)
@@ -169,7 +169,7 @@ class LoadRepoSites(unittest.TestCase):
         )
 
     def test_no_root_means_no_sites(self):
-        bare = tempfile.mkdtemp(prefix="corral-repodoctor-bare-")
+        bare = tempfile.mkdtemp(prefix="korapy-repodoctor-bare-")
         self.addCleanup(lambda: os.rmdir(bare))
         chdir(self, bare)
         self.assertEqual(self.load(), ())
@@ -180,9 +180,9 @@ class LoadRepoSites(unittest.TestCase):
         found = by_name(rows(*sites))
         self.assertEqual(found["remote:demo"].status, "warn")
         self.assertIn("--create-remote", found["remote:demo"].fix)
-        self.assertIn("corral github setup", found["remote:demo"].fix)
+        self.assertIn("korapy github setup", found["remote:demo"].fix)
         self.assertEqual(found["labels:demo"].status, "warn")
-        self.assertIn("corral github setup", found["labels:demo"].fix)
+        self.assertIn("korapy github setup", found["labels:demo"].fix)
         self.assertEqual(doctor.exit_code(rows(*sites)), 0)
 
     def test_origin_read_is_local_only(self):
@@ -311,7 +311,7 @@ class LoadRepoSites(unittest.TestCase):
         self.assertEqual(sites[0].labels, "missing")
         found = by_name(rows(*sites))
         self.assertEqual(found["labels:demo"].status, "fail")
-        self.assertIn("corral github setup", found["labels:demo"].fix)
+        self.assertIn("korapy github setup", found["labels:demo"].fix)
         self.assertEqual(doctor.exit_code(rows(*sites)), 1)
 
     def test_unreachable_tracker_warns_naming_the_repo_and_the_cause(self):
@@ -373,7 +373,7 @@ class LoadRepoSites(unittest.TestCase):
 
 class FreshScaffoldEndToEnd(unittest.TestCase):
     def test_a_fresh_scaffold_shows_the_pre_remote_rows(self):
-        parent = tempfile.mkdtemp(prefix="corral-repodoctor-new-")
+        parent = tempfile.mkdtemp(prefix="korapy-repodoctor-new-")
         self.addCleanup(shutil.rmtree, parent, True)
         isolated_config(self)
         code, _, err = run_new(name=FIXTURE, path=parent, git=FakeGit(root=parent))
@@ -391,11 +391,11 @@ class FreshScaffoldEndToEnd(unittest.TestCase):
         found = by_name(checks)
         self.assertEqual(found[f"remote:{FIXTURE}"].status, "warn")
         self.assertEqual(found[f"labels:{FIXTURE}"].status, "warn")
-        self.assertIn("corral github setup", found[f"labels:{FIXTURE}"].fix)
+        self.assertIn("korapy github setup", found[f"labels:{FIXTURE}"].fix)
         self.assertEqual(doctor.exit_code(checks), 0)
 
     def test_after_create_remote_and_setup_doctor_shows_no_warning(self):
-        parent = tempfile.mkdtemp(prefix="corral-repodoctor-setup-")
+        parent = tempfile.mkdtemp(prefix="korapy-repodoctor-setup-")
         self.addCleanup(shutil.rmtree, parent, True)
         isolated_config(self)
         forge = FakeForge(user="operator")

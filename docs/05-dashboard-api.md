@@ -1,7 +1,7 @@
-# 05: the dashboard API (`corral serve`)
+# 05: the dashboard API (`korapy serve`)
 
 Status: design, not built. This doc fixes a read-only HTTP API over the
-fleet state corral already keeps, served by a new `corral serve` verb
+fleet state korapy already keeps, served by a new `korapy serve` verb
 from the standard library only. Nothing here changes the snapshot
 schema, the registry, the board store, the coordinator files, quota,
 admission, exit codes, or any existing CLI verb, so `README.md` needs
@@ -9,7 +9,7 @@ no change. The only index change is the row for this doc in
 `docs/README.md`.
 
 Conventions: "dashboard" means any UI owned by a project or a user,
-never by corral. Field names below reuse the existing builders
+never by korapy. Field names below reuse the existing builders
 (`snapshot.build`, `quotacli.snapshot`, `board.Store`,
 `coord.read_entries`, `coordevents.read_events`, `launch.tail`) so the
 API has no second resolver for any fact. Shapes quoted from those
@@ -24,7 +24,7 @@ identity, cursors, Bearer token) without designing the hub.
 
 ## 0. Where it fits
 
-One new module, `src/corral/serve.py`, plus a `serve` section in
+One new module, `src/korapy/serve.py`, plus a `serve` section in
 `settings.py` and a token path helper in `paths.py`. The server is
 `http.server.ThreadingHTTPServer` from the standard library, GET only,
 on loopback by default. Every endpoint reads the same local files the
@@ -34,7 +34,7 @@ touched by a read (section 6).
 
 ## 1. What the API serves, and what it does not
 
-The single source of truth is the `corral snapshot --json` document
+The single source of truth is the `korapy snapshot --json` document
 (schema version 2 today): `schema_version`, `fleet_header` (host, now,
 live/stale/finished counts), `agents` rows (id, project, repo, number,
 runtime, role, profile, model, state, started_at, last_seen, note),
@@ -87,7 +87,7 @@ the snapshot only summarizes:
 - `GET /v1/tail?repo=&number=&last=`: one ticket's rendered agent
   activity via `launch.tail`, plain text, bounded by a server side
   maximum (default 200 lines, see section 6). This is activity lines
-  only, the same output `corral tail` prints.
+  only, the same output `korapy tail` prints.
 - `GET /v1/stream?topics=&cursor=`: Server-Sent Events (section 2)
   over the journal, the event queue, and a snapshot generation
   counter. The `events` and `journal` topics follow one project
@@ -125,7 +125,7 @@ What is NOT served in v1:
 
 ## 2. Transport: loopback HTTP, polling plus SSE
 
-Decision: `corral serve` runs a read-only HTTP server on loopback by
+Decision: `korapy serve` runs a read-only HTTP server on loopback by
 default, using only `http.server` and `json` from the standard
 library. Two alternatives were considered and rejected:
 
@@ -187,9 +187,9 @@ registry that does not exist yet.
   cannot be read is a configuration error instead (exit 4, section 4),
   on loopback too: failing closed keeps a broken credential from
   reading as no credential. This matches the milestone 2
-  rule corral already records: host plus Bearer token, never the
+  rule korapy already records: host plus Bearer token, never the
   network layer, is the authentication.
-- Token file permissions: created `0600` when `corral serve
+- Token file permissions: created `0600` when `korapy serve
   --new-token` mints one (the only write the verb ever does, to its
   own file); a token file readable beyond its owner warns on stderr
   and, on a non-loopback bind, refuses to start (exit 4).
@@ -359,7 +359,7 @@ takes injected views):
   handler runs, so the test must never assert the count at the instant
   of refusal).
 - Import closure: a test walks the transitive closure of `serve.py`
-  through every `corral` import edge and fails on `hub` or `forge`,
+  through every `korapy` import edge and fails on `hub` or `forge`,
   and asserts the `(module, seam)` bindings to `subprocess` or
   `socket` across that closure equal an explicit allowlist, one
   one-line reason per entry (hostname reads, the loopback bind
@@ -380,20 +380,20 @@ takes injected views):
 ## 8. Implementation tickets
 
 Each is one agent of work with its own tests; none changes a public
-interface beyond adding `corral serve` and its settings. Order
+interface beyond adding `korapy serve` and its settings. Order
 matters: each ticket builds on the previous one's tests.
 
 - S1: routes and the snapshot. Build `serve.py` with the request
   router, `GET /v1/snapshot` from `snapshot.build`, `/v1/version`,
   `/v1/health`, the JSON error shape, and the `405`/`404` rules.
   Acceptance: the route, snapshot-equality, and import-closure tests
-  pass; `corral snapshot --json` output unchanged; `make check`
+  pass; `korapy snapshot --json` output unchanged; `make check`
   green.
 - S2: settings, bind rules, and the verb. Register `serve.bind`
   (default `127.0.0.1`), `serve.port` (default `0`), `serve origins`
   (default empty), `serve.snapshot_ttl_s`, `serve.tail_max`,
   `serve.max_streams`; add
-  `paths.api_token_path`; wire `corral serve [--bind] [--port]
+  `paths.api_token_path`; wire `korapy serve [--bind] [--port]
   [--allow-remote] [--allow-origin] [--new-token]` through the CLI
   with the section 3 refusal order and the section 4 exit codes.
   Acceptance: the bind/token/CORS tests pass; the token is read at
@@ -422,6 +422,6 @@ matters: each ticket builds on the previous one's tests.
   `ETag`; `make check` green.
 - S6: takeoff. Full suite with `TEST=1`, `make check`, and the takeoff
   ritual on a branch, then review. Acceptance: green gates and a
-  review record; a README Commands row for `corral serve` (a new
+  review record; a README Commands row for `korapy serve` (a new
   user-visible verb, so README freshness applies), with the reason
   recorded in the PR body.

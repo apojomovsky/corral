@@ -9,7 +9,7 @@ builds off-DOM and swaps once, and the `isErrorSection` mirror is
 pinned on both sides.
 
 Offline: a real HTTP server on a loopback ephemeral port with injected
-fakes, plus source-discipline reads over the packaged `corral/web/`
+fakes, plus source-discipline reads over the packaged `korapy/web/`
 files. No `gh`, no network beyond loopback, no real state dirs.
 """
 
@@ -19,12 +19,12 @@ import re
 import unittest
 from importlib import resources
 
-from corral import snapshot
+from korapy import snapshot
 from tests.test_serve import FakeBuilder, ServeCase, healthy_doc
 
 
 def web_text(name):
-    return resources.files("corral").joinpath(f"web/{name}").read_text(encoding="utf-8")
+    return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
 
 
 def js_body(text, signature):

@@ -15,8 +15,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, drive, snapshot
-from corral import projects as projects_mod
+from korapy import admission, drive, snapshot
+from korapy import projects as projects_mod
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 
@@ -40,7 +40,7 @@ def journal_lines(path):
 
 class JournalTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-safety-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-safety-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -160,7 +160,7 @@ class JournalTest(unittest.TestCase):
 
 class PauseTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-pause-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-pause-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -227,7 +227,7 @@ class PauseTest(unittest.TestCase):
 
 class DayCapTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-cap-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-cap-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -330,7 +330,7 @@ class DayCapTest(unittest.TestCase):
 
 class RotationTest(unittest.TestCase):
     def test_past_the_max_oldest_lines_move_to_a_dated_archive(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-drive-journal-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-journal-")
         self.addCleanup(tmp.cleanup)
         path = os.path.join(tmp.name, "drive", "journal.jsonl")
         for seq in range(drive.JOURNAL_MAX + 5):
@@ -384,7 +384,7 @@ class DriveShowTest(unittest.TestCase):
 
 class DriveStatusTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-status-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-status-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -530,7 +530,7 @@ class DriveStatusTest(unittest.TestCase):
 
 class CheckLockTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-check-lock-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-check-lock-")
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "drive.lock")
         with open(self.path, "w", encoding="utf-8"):
@@ -567,9 +567,9 @@ class CheckLockTest(unittest.TestCase):
 
 class DriveSettingsTest(unittest.TestCase):
     def test_max_starts_per_day_defaults_to_fifty(self):
-        from corral import settings
+        from korapy import settings
 
-        self.assertIn("corral.drive", settings.PROVIDERS)
+        self.assertIn("korapy.drive", settings.PROVIDERS)
         resolved = settings.resolve(host={}, project={}, env={})
         self.assertEqual(resolved["drive.max_starts_per_day"], 50)
 

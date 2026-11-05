@@ -1,4 +1,4 @@
-"""`corral profile`: operator verbs over the local selections.
+"""`korapy profile`: operator verbs over the local selections.
 
 Offline: declarations validate against the real runtime adapters with an
 injected provider pool, selections round-trip through a temp file, and
@@ -14,8 +14,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
 
-from corral import accounts, board, profiles, settings
-from corral import tracker as iface
+from korapy import accounts, board, profiles, settings
+from korapy import tracker as iface
 from tests.test_profiles_launch import FakeStore, row
 from tests.test_tracker import FakeTracker, reading
 
@@ -51,7 +51,7 @@ def resolved(project=None, host=None):
 
 class ListRows(unittest.TestCase):
     def test_lists_every_profile_sorted_with_runtime_chains_and_source(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         rows = profilecli.list_rows(parsed(), {"default": "proj", "fast": "host"}, {})
         self.assertEqual(
@@ -77,19 +77,19 @@ class ListRows(unittest.TestCase):
         )
 
     def test_a_shadowed_name_carries_the_losing_source(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         rows = profilecli.list_rows(parsed(), {"fast": "host"}, {"fast": "proj"})
         self.assertEqual(rows[1]["source"], "host")
         self.assertEqual(rows[1]["shadowed"], "proj")
 
     def test_no_declarations_list_as_empty(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         self.assertEqual(profilecli.list_rows({}, {}, {}), [])
 
     def test_text_names_the_runtime_source_and_shadow(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         text = profilecli.render_list(
             profilecli.list_rows(parsed(), {"default": "proj", "fast": "host"}, {"fast": "proj"}),
@@ -101,12 +101,12 @@ class ListRows(unittest.TestCase):
         self.assertIn("provider-a/model-x", text)
 
     def test_text_with_no_profiles_says_so(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         self.assertIn("no profiles declared", profilecli.render_list([], json_mode=False))
 
     def test_json_shape(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         doc = json.loads(
             profilecli.render_list(
@@ -121,7 +121,7 @@ class ListRows(unittest.TestCase):
 
 class ShowDocument(unittest.TestCase):
     def test_flag_layer_wins_with_provenance(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         doc = profilecli.show_document(
             parsed(),
@@ -143,7 +143,7 @@ class ShowDocument(unittest.TestCase):
         self.assertEqual([(entry["layer"], entry["profile"]) for entry in winner], [(1, "fast")])
 
     def test_ticket_layer_from_assignment(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         doc = profilecli.show_document(
             parsed(),
@@ -162,7 +162,7 @@ class ShowDocument(unittest.TestCase):
         self.assertEqual(doc["provenance"]["layer_name"], "ticket")
 
     def test_tracker_and_pin_disagreement_refuses_naming_both(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         selections = profiles.Selections(pins={profiles.pin_key("myrepo", 7): "default"})
         with self.assertRaises(settings.SettingsError) as ctx:
@@ -182,7 +182,7 @@ class ShowDocument(unittest.TestCase):
         self.assertIn("default", str(ctx.exception))
 
     def test_winning_unknown_name_refuses(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         with self.assertRaises(settings.SettingsError) as ctx:
             profilecli.show_document(
@@ -199,7 +199,7 @@ class ShowDocument(unittest.TestCase):
         self.assertIn("nope", str(ctx.exception))
 
     def test_json_shape_carries_provenance_and_layers(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         doc = json.loads(
             profilecli.render_show(
@@ -222,7 +222,7 @@ class ShowDocument(unittest.TestCase):
         self.assertEqual([entry["layer"] for entry in doc["layers"]], [1, 2, 3, 4, 5, 6])
 
     def test_text_names_the_winner_and_the_full_chain(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         text = profilecli.render_show(
             profilecli.show_document(
@@ -247,7 +247,7 @@ class ShowDocument(unittest.TestCase):
 
 class SetSelection(unittest.TestCase):
     def test_global_project_role_and_ticket_write_their_slots(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         fresh = profiles.empty_selections()
         updated, message = profilecli.set_selection(fresh, scope="global", name="fast", now=T0)
@@ -270,7 +270,7 @@ class SetSelection(unittest.TestCase):
         self.assertIn("myrepo#7", message)
 
     def test_temp_writes_an_override_with_scope_and_until(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         updated, message = profilecli.set_selection(
             profiles.empty_selections(),
@@ -289,7 +289,7 @@ class SetSelection(unittest.TestCase):
         self.assertIn("until", message)
 
     def test_until_takes_epoch_seconds(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         updated, _ = profilecli.set_selection(
             profiles.empty_selections(),
@@ -302,7 +302,7 @@ class SetSelection(unittest.TestCase):
         self.assertEqual(updated.override.until, T0 + 60)
 
     def test_setting_over_an_override_replaces_it_and_names_what_stood(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         first, _ = profilecli.set_selection(
             profiles.empty_selections(), scope="global", name="slow", temp="1h", now=T0
@@ -316,7 +316,7 @@ class SetSelection(unittest.TestCase):
         self.assertIn("replaced", message)
 
     def test_temp_with_ticket_is_refused_naming_layer_2_and_the_fix(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         with self.assertRaises(settings.SettingsError) as ctx:
             profilecli.set_selection(
@@ -333,7 +333,7 @@ class SetSelection(unittest.TestCase):
         self.assertIn("pin", text)
 
     def test_temp_and_until_together_are_refused(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         with self.assertRaises(settings.SettingsError):
             profilecli.set_selection(
@@ -346,7 +346,7 @@ class SetSelection(unittest.TestCase):
             )
 
     def test_a_bad_duration_is_refused_naming_the_value(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         with self.assertRaises(settings.SettingsError) as ctx:
             profilecli.set_selection(
@@ -355,7 +355,7 @@ class SetSelection(unittest.TestCase):
         self.assertIn("2x", str(ctx.exception))
 
     def test_an_empty_name_is_refused(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         with self.assertRaises(settings.SettingsError):
             profilecli.set_selection(profiles.empty_selections(), scope="global", name="", now=T0)
@@ -363,7 +363,7 @@ class SetSelection(unittest.TestCase):
 
 class ResetSelection(unittest.TestCase):
     def test_each_scope_clears_its_slot(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         full = profiles.Selections(
             default="fast",
@@ -385,7 +385,7 @@ class ResetSelection(unittest.TestCase):
         self.assertIn("override", message)
 
     def test_reset_with_nothing_stored_exits_1_naming_the_piece(self):
-        from corral import profilecli
+        from korapy import profilecli
 
         empty = profiles.empty_selections()
         with self.assertRaises(profilecli.EmptyReset) as ctx:
@@ -406,7 +406,7 @@ class ResetSelection(unittest.TestCase):
 
 
 def seams(tmp, **over):
-    from corral import profilecli
+    from korapy import profilecli
 
     path = os.path.join(tmp, "profiles.toml")
     current = {"selections": profiles.empty_selections()}
@@ -440,7 +440,7 @@ def seams(tmp, **over):
 
 class RunVerb(unittest.TestCase):
     def run_cli(self, argv, tmp, **over):
-        from corral import profilecli
+        from korapy import profilecli
 
         out, err = StringIO(), StringIO()
         with redirect_stdout(out), redirect_stderr(err):
@@ -448,7 +448,7 @@ class RunVerb(unittest.TestCase):
         return code, out.getvalue(), err.getvalue()
 
     def test_list_reports_declared_profiles_with_sources(self):
-        from corral import profilecli  # noqa: F401
+        from korapy import profilecli  # noqa: F401
 
         with tempfile.TemporaryDirectory() as tmp:
             code, out, _ = self.run_cli(["profile", "list"], tmp)

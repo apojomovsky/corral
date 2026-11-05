@@ -1,4 +1,4 @@
-"""Tests for corral.gc: the plan-only hygiene audit.
+"""Tests for korapy.gc: the plan-only hygiene audit.
 
 Every fixture is a real temp git repo (local only, no network, no real
 clones, no gh). The forge and removal seams are fakes; a guard test pins
@@ -25,8 +25,8 @@ from collections.abc import Callable
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import diffscope, forge, gc, gccli, worktrees
-from corral.gitenv import clean_env
+from korapy import diffscope, forge, gc, gccli, worktrees
+from korapy.gitenv import clean_env
 from tests.test_forge import FakeForge, make_pr
 
 BASE = "master"

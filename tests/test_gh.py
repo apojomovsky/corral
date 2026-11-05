@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral.github import gh
+from korapy.github import gh
 
 
 def _popen(returncode=0, stdout="", stderr=""):

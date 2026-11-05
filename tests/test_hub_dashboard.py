@@ -20,7 +20,7 @@ import threading
 import unittest
 from unittest import mock
 
-from corral import hub, settings
+from korapy import hub, settings
 from tests.test_hub import temp_db
 
 
@@ -599,7 +599,7 @@ class PushClientTest(DashboardCase):
         self.assertEqual(payload["hosts"][0]["snapshot"], doc)
 
     def test_push_to_a_dark_port_is_unreachable(self):
-        with tempfile.TemporaryDirectory(prefix="corral-hub-dark-") as state:
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-dark-") as state:
             dark = os.path.join(state, "hub.sqlite")
         closed = hub.make_server("127.0.0.1", 0, dark)
         port = closed.server_address[1]
@@ -707,7 +707,7 @@ class SliceProjectTest(unittest.TestCase):
 
 class HostReadPathClosure(unittest.TestCase):
     def test_serve_snapshot_and_drive_import_no_hub(self):
-        from corral import drive, serve, snapshot
+        from korapy import drive, serve, snapshot
 
         bad = []
         for module in (serve, snapshot, drive):
@@ -717,16 +717,16 @@ class HostReadPathClosure(unittest.TestCase):
                 if isinstance(node, ast.Import):
                     names = [alias.name for alias in node.names]
                     if any(
-                        name == "corral.hub" or name.startswith("corral.hub.") for name in names
+                        name == "korapy.hub" or name.startswith("korapy.hub.") for name in names
                     ):
                         bad.append(f"{module.__name__}: import {names}")
                 elif isinstance(node, ast.ImportFrom):
-                    if node.module == "corral.hub" or (node.module or "").startswith("corral.hub."):
+                    if node.module == "korapy.hub" or (node.module or "").startswith("korapy.hub."):
                         bad.append(f"{module.__name__}: from {node.module} import ...")
-                    elif node.module == "corral" and any(
+                    elif node.module == "korapy" and any(
                         alias.name == "hub" for alias in node.names
                     ):
-                        bad.append(f"{module.__name__}: from corral import hub")
+                        bad.append(f"{module.__name__}: from korapy import hub")
         self.assertEqual(bad, [])
 
 
@@ -737,7 +737,7 @@ class HubStaleSettingTest(unittest.TestCase):
         self.assertEqual(resolved["hub.stale_after_s"], 3 * resolved["hub.heartbeat_s"])
 
     def test_env_overrides_the_stale_horizon(self):
-        resolved = settings.resolve(project={}, env={"CORRAL_HUB_STALE_AFTER_S": "30"})
+        resolved = settings.resolve(project={}, env={"KORAPY_HUB_STALE_AFTER_S": "30"})
         self.assertEqual(resolved["hub.stale_after_s"], 30)
 
 

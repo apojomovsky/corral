@@ -17,8 +17,8 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import agentcli, cli, launch, projects, prompts, registry, resources, settings, units
-from corral.runtimes import muse
+from korapy import agentcli, cli, launch, projects, prompts, registry, resources, settings, units
+from korapy.runtimes import muse
 from tests.test_launch import OpsCase, roomy
 from tests.test_prompts import FULL
 from tests.test_reviewrecord import git_in
@@ -57,7 +57,7 @@ class PrefixTest(PrefixOps):
     def test_projects_unit_prefix_is_the_single_place(self):
         resolved = settings.load(root=self.root, repo="lib")
         self.assertEqual(projects.unit_prefix(self.root, resolved), "ops-agent-")
-        self.assertEqual(projects.unit_prefix(self.root, resolved, registered=[]), "corral-agent-")
+        self.assertEqual(projects.unit_prefix(self.root, resolved, registered=[]), "korapy-agent-")
 
     def test_a_registered_prefix_without_a_separator_gains_one(self):
         (found,) = projects.load_all()
@@ -177,14 +177,14 @@ class SnapshotCapTest(PrefixOps):
         os.chdir(cwd)
         try:
             with (
-                mock.patch("corral.accounts.providers", return_value=[]),
-                mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
-                mock.patch("corral.units.list_units", side_effect=self.units_for),
+                mock.patch("korapy.accounts.providers", return_value=[]),
+                mock.patch("korapy.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
+                mock.patch("korapy.units.list_units", side_effect=self.units_for),
                 mock.patch(
-                    "corral.resources.read_pressure",
+                    "korapy.resources.read_pressure",
                     return_value=(resources.Pressure(), []),
                 ),
-                mock.patch("corral.snapshot.default_measured", return_value=None),
+                mock.patch("korapy.snapshot.default_measured", return_value=None),
                 redirect_stdout(out),
             ):
                 self.assertEqual(cli.main(["snapshot", "--json"]), 0)
@@ -305,13 +305,13 @@ class HeartbeatForEveryPromptTest(PrefixOps):
     def test_no_builtin_carries_its_own_heartbeat_copy(self):
         for role in prompts.ROLES:
             with self.subTest(role=role):
-                self.assertNotIn("corral agent heartbeat", prompts._builtin_text(role))
+                self.assertNotIn("korapy agent heartbeat", prompts._builtin_text(role))
 
     def test_the_worker_prompt_carries_the_heartbeat(self):
         text = self.launched_text(prompts.render("worker", dict(FULL), ops_root=self.root))
-        self.assertIn("corral agent heartbeat", text)
-        self.assertIn("corral agent done", text)
-        self.assertIn("CORRAL_AGENT_ID", text)
+        self.assertIn("korapy agent heartbeat", text)
+        self.assertIn("korapy agent done", text)
+        self.assertIn("KORAPY_AGENT_ID", text)
 
     def test_the_reviewer_prompt_carries_the_heartbeat(self):
         text = self.launched_text(
@@ -319,9 +319,9 @@ class HeartbeatForEveryPromptTest(PrefixOps):
             number=6,
             repo="my-repo",
         )
-        self.assertIn("corral agent heartbeat", text)
-        self.assertIn("corral agent done", text)
-        self.assertIn("CORRAL_AGENT_ID", text)
+        self.assertIn("korapy agent heartbeat", text)
+        self.assertIn("korapy agent done", text)
+        self.assertIn("KORAPY_AGENT_ID", text)
 
     def test_the_triage_prompt_carries_the_heartbeat(self):
         text = self.launched_text(
@@ -329,15 +329,15 @@ class HeartbeatForEveryPromptTest(PrefixOps):
             number=7,
             repo="my-repo",
         )
-        self.assertIn("corral agent heartbeat", text)
-        self.assertIn("corral agent done", text)
-        self.assertIn("CORRAL_AGENT_ID", text)
+        self.assertIn("korapy agent heartbeat", text)
+        self.assertIn("korapy agent done", text)
+        self.assertIn("KORAPY_AGENT_ID", text)
 
     def test_a_prompt_file_carries_the_heartbeat(self):
         text = self.launched_text("do the thing")
-        self.assertIn("corral agent heartbeat", text)
-        self.assertIn("corral agent done", text)
-        self.assertIn("CORRAL_AGENT_ID", text)
+        self.assertIn("korapy agent heartbeat", text)
+        self.assertIn("korapy agent done", text)
+        self.assertIn("KORAPY_AGENT_ID", text)
 
 
 class StopClosesEveryEntryTest(PrefixOps):
@@ -399,14 +399,14 @@ class SnapshotOutsideTreeTest(PrefixOps):
         os.chdir(cwd)
         try:
             with (
-                mock.patch("corral.accounts.providers", return_value=[]),
-                mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
-                mock.patch("corral.units.list_units", side_effect=self.units_for),
+                mock.patch("korapy.accounts.providers", return_value=[]),
+                mock.patch("korapy.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
+                mock.patch("korapy.units.list_units", side_effect=self.units_for),
                 mock.patch(
-                    "corral.resources.read_pressure",
+                    "korapy.resources.read_pressure",
                     return_value=(resources.Pressure(), []),
                 ),
-                mock.patch("corral.snapshot.default_measured", return_value=None),
+                mock.patch("korapy.snapshot.default_measured", return_value=None),
                 redirect_stdout(out),
             ):
                 self.assertEqual(cli.main(["snapshot", "--json"]), 0)

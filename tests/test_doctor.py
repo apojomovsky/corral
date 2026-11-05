@@ -1,4 +1,4 @@
-"""Read-only health report: `corral doctor`, over fakes at every seam."""
+"""Read-only health report: `korapy doctor`, over fakes at every seam."""
 
 import io
 import json
@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from corral import cli, deps, doctor, registry, units
+from korapy import cli, deps, doctor, registry, units
 
 
 def proc(stdout="", returncode=0):
@@ -48,7 +48,7 @@ def env(**overrides):
         "settings_error": None,
         "state_error": None,
         "user": "tester",
-        "unit_prefix": "corral-agent-",
+        "unit_prefix": "korapy-agent-",
         "run": fake_run(),
         "list_fn": lambda prefix: [],
         "reader_errors": (),
@@ -211,7 +211,7 @@ class EachCheckFailingAlone(unittest.TestCase):
 
     def test_listed_units_are_counted(self):
         checks = doctor.run_checks(
-            env(list_fn=lambda prefix: [("corral-agent-demo-7", "active", "running")])
+            env(list_fn=lambda prefix: [("korapy-agent-demo-7", "active", "running")])
         )
         found = [check for check in checks if check.name == "user-manager"]
         self.assertEqual([check.status for check in found], ["ok"])
@@ -276,33 +276,33 @@ class Rendering(unittest.TestCase):
 
 class StateDirs(unittest.TestCase):
     def test_missing_dirs_are_created_and_the_probe_is_removed(self):
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
         env_map = {
-            "CORRAL_STATE": os.path.join(root, "state"),
-            "CORRAL_CONFIG": os.path.join(root, "config"),
+            "KORAPY_STATE": os.path.join(root, "state"),
+            "KORAPY_CONFIG": os.path.join(root, "config"),
         }
         self.assertIsNone(doctor.check_state_dirs(env_map))
         leftovers = []
-        for base in (env_map["CORRAL_STATE"], env_map["CORRAL_CONFIG"]):
+        for base in (env_map["KORAPY_STATE"], env_map["KORAPY_CONFIG"]):
             leftovers += os.listdir(base)
         self.assertEqual(leftovers, [])
 
     def test_a_file_where_a_dir_belongs_is_an_error(self):
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
         blocked = os.path.join(root, "state")
         with open(blocked, "w", encoding="utf-8") as handle:
             handle.write("in the way")
         error = doctor.check_state_dirs(
-            {"CORRAL_STATE": blocked, "CORRAL_CONFIG": os.path.join(root, "config")}
+            {"KORAPY_STATE": blocked, "KORAPY_CONFIG": os.path.join(root, "config")}
         )
         self.assertIsNotNone(error)
         self.assertIn(blocked, error or "")
 
     def test_a_missing_probe_on_unlink_still_passes(self):
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
         env_map = {
-            "CORRAL_STATE": os.path.join(root, "state"),
-            "CORRAL_CONFIG": os.path.join(root, "config"),
+            "KORAPY_STATE": os.path.join(root, "state"),
+            "KORAPY_CONFIG": os.path.join(root, "config"),
         }
         with mock.patch.object(doctor.os, "unlink", side_effect=FileNotFoundError("gone")):
             self.assertIsNone(doctor.check_state_dirs(env_map))
@@ -315,10 +315,10 @@ class StateDirs(unittest.TestCase):
             seen.append(path)
             return real(path, text)
 
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
         env_map = {
-            "CORRAL_STATE": os.path.join(root, "state"),
-            "CORRAL_CONFIG": os.path.join(root, "config"),
+            "KORAPY_STATE": os.path.join(root, "state"),
+            "KORAPY_CONFIG": os.path.join(root, "config"),
         }
         with mock.patch.object(doctor.paths, "atomic_write_text", side_effect=spy):
             self.assertIsNone(doctor.check_state_dirs(env_map))
@@ -332,33 +332,33 @@ class SettingsResolution(unittest.TestCase):
             handle.write(text)
 
     def test_a_broken_ops_file_is_an_error(self):
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
-        config = tempfile.mkdtemp(prefix="corral-doctor-")
-        self.write(root, "corral.toml", "agents = 42\n")
-        error = doctor.check_settings(root, {"CORRAL_CONFIG": config})
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
+        config = tempfile.mkdtemp(prefix="korapy-doctor-")
+        self.write(root, "korapy.toml", "agents = 42\n")
+        error = doctor.check_settings(root, {"KORAPY_CONFIG": config})
         self.assertIsNotNone(error)
-        self.assertIn("corral.toml", error or "")
+        self.assertIn("korapy.toml", error or "")
 
     def test_a_clean_host_and_root_resolve(self):
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
-        config = tempfile.mkdtemp(prefix="corral-doctor-")
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
+        config = tempfile.mkdtemp(prefix="korapy-doctor-")
         self.write(
             root,
-            "corral.toml",
+            "korapy.toml",
             '[profiles.default]\nruntime = "omp"\n'
             "[profiles.default.models.default]\nchain = ['pool/model']\n",
         )
-        self.assertIsNone(doctor.check_settings(root, {"CORRAL_CONFIG": config}))
+        self.assertIsNone(doctor.check_settings(root, {"KORAPY_CONFIG": config}))
 
     def test_old_models_and_runtime_keys_are_errors_naming_profiles(self):
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
-        config = tempfile.mkdtemp(prefix="corral-doctor-")
-        self.write(root, "corral.toml", "[models.default]\nchain = ['pool/model']\n")
-        error = doctor.check_settings(root, {"CORRAL_CONFIG": config})
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
+        config = tempfile.mkdtemp(prefix="korapy-doctor-")
+        self.write(root, "korapy.toml", "[models.default]\nchain = ['pool/model']\n")
+        error = doctor.check_settings(root, {"KORAPY_CONFIG": config})
         self.assertIsNotNone(error)
         self.assertIn("profiles", error or "")
-        self.write(root, "corral.toml", '[agents]\nruntime = "omp"\n')
-        error = doctor.check_settings(root, {"CORRAL_CONFIG": config})
+        self.write(root, "korapy.toml", '[agents]\nruntime = "omp"\n')
+        error = doctor.check_settings(root, {"KORAPY_CONFIG": config})
         self.assertIsNotNone(error)
         self.assertIn("profiles", error or "")
 
@@ -385,7 +385,7 @@ class ProductionGathering(unittest.TestCase):
 
     def test_a_deleted_working_directory_is_a_settings_failure(self):
         here = os.getcwd()
-        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        root = tempfile.mkdtemp(prefix="korapy-doctor-")
         os.chdir(root)
         try:
             os.rmdir(root)
@@ -511,21 +511,21 @@ class DriveRows(unittest.TestCase):
         checks = doctor.run_checks(env(timer_state="enabled"))
         found = [check for check in checks if check.name == "drive-timer"]
         self.assertEqual([check.status for check in found], ["ok"])
-        self.assertIn("corral-drive.timer", found[0].detail)
+        self.assertIn("korapy-drive.timer", found[0].detail)
         self.assertEqual(doctor.exit_code(checks), 0)
 
     def test_a_missing_timer_warns_with_the_install_command(self):
         checks = doctor.run_checks(env(timer_state="missing"))
         found = [check for check in checks if check.name == "drive-timer"]
         self.assertEqual([check.status for check in found], ["warn"])
-        self.assertIn("corral drive install-timer", found[0].fix)
+        self.assertIn("korapy drive install-timer", found[0].fix)
         self.assertEqual(doctor.exit_code(checks), 0)
 
     def test_a_disabled_timer_warns_with_the_install_command(self):
         checks = doctor.run_checks(env(timer_state="disabled"))
         found = [check for check in checks if check.name == "drive-timer"]
         self.assertEqual([check.status for check in found], ["warn"])
-        self.assertIn("corral drive install-timer", found[0].fix)
+        self.assertIn("korapy drive install-timer", found[0].fix)
         self.assertEqual(doctor.exit_code(checks), 0)
 
     def test_a_masked_timer_warns_with_the_unmask_command(self):
@@ -681,13 +681,13 @@ class ProductionHubGathering(unittest.TestCase):
         self.assertIsNone(doctor.load_hub_auth(""))
         self.assertIsNone(doctor.load_hub_probe(None, None))
         self.assertIsNone(doctor.load_hub_probe("", None))
-        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-auth-") as config:
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config}):
                 self.assertIsNone(doctor.read_hub_token())
 
     def test_missing_token_file_is_missing(self):
-        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-auth-") as config:
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config}):
                 auth = doctor.load_hub_auth(HUB_URL)
                 self.assertIsNotNone(auth)
                 assert auth is not None
@@ -696,13 +696,13 @@ class ProductionHubGathering(unittest.TestCase):
                 self.assertIsNone(doctor.read_hub_token())
 
     def test_owner_only_token_file_is_ok(self):
-        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-auth-") as config:
             path = os.path.join(config, "hub-token")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("s3cret\n")
             os.chmod(path, 0o600)
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config}):
                 auth = doctor.load_hub_auth(HUB_URL)
                 self.assertIsNotNone(auth)
                 assert auth is not None
@@ -710,26 +710,26 @@ class ProductionHubGathering(unittest.TestCase):
                 self.assertEqual(doctor.read_hub_token(), "s3cret")
 
     def test_group_readable_token_file_is_bad(self):
-        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-auth-") as config:
             path = os.path.join(config, "hub-token")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("s3cret\n")
             os.chmod(path, 0o640)
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config}):
                 auth = doctor.load_hub_auth(HUB_URL)
                 self.assertIsNotNone(auth)
                 assert auth is not None
                 self.assertEqual(auth.status, "bad")
 
     def test_empty_token_file_is_bad(self):
-        with tempfile.TemporaryDirectory(prefix="corral-hub-auth-") as config:
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-auth-") as config:
             path = os.path.join(config, "hub-token")
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("\n")
             os.chmod(path, 0o600)
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config}):
                 auth = doctor.load_hub_auth(HUB_URL)
                 self.assertIsNotNone(auth)
                 assert auth is not None
@@ -739,9 +739,9 @@ class ProductionHubGathering(unittest.TestCase):
     def test_probe_of_a_live_loopback_hub_is_ok_with_versions(self):
         import threading
 
-        from corral import hub
+        from korapy import hub
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-probe-") as state:
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-probe-") as state:
             db = os.path.join(state, "hub.sqlite")
             store = hub.open_db(db)
             store.close()
@@ -774,7 +774,7 @@ class ProductionHubGathering(unittest.TestCase):
         import urllib.error
         from email.message import Message
 
-        from corral import hub
+        from korapy import hub
 
         body = json.dumps(
             {
@@ -820,9 +820,9 @@ class ProductionHubGathering(unittest.TestCase):
     def test_probe_never_logs_the_token(self):
         import threading
 
-        from corral import hub
+        from korapy import hub
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-probe-") as state:
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-probe-") as state:
             db = os.path.join(state, "hub.sqlite")
             store = hub.open_db(db)
             token = hub.add_host(store, "host-1")
@@ -842,7 +842,7 @@ class ProductionHubGathering(unittest.TestCase):
                 def emit(self, record: logging.LogRecord) -> None:
                     records.append(record.getMessage())
 
-            logger = logging.getLogger("corral.hub")
+            logger = logging.getLogger("korapy.hub")
             capture = Capture()
             logger.addHandler(capture)
             level = logger.level

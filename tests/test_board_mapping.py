@@ -15,7 +15,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import init, settings, tracker as iface
+from korapy import init, settings, tracker as iface
 
 
 BASE_INLINE = """\
@@ -36,7 +36,7 @@ test = "make check"
 
 GOLDEN_TABLE = """\
 [repo.board]
-project_owner = "example"  # board owner, written by corral github setup
+project_owner = "example"  # board owner, written by korapy github setup
 project_number = 3
 agent_field = "Agent"
 status_field = "Agent state"
@@ -104,9 +104,9 @@ def board_config(**over):
 
 
 def write_tmp(text):
-    """A scratch ``corral.toml`` holding ``text``."""
+    """A scratch ``korapy.toml`` holding ``text``."""
     tmp = tempfile.TemporaryDirectory()
-    target = os.path.join(tmp.name, "corral.toml")
+    target = os.path.join(tmp.name, "korapy.toml")
     with open(target, "w", encoding="utf-8") as handle:
         handle.write(text)
     return tmp, target
@@ -238,16 +238,16 @@ class ChangeTests(unittest.TestCase):
     def test_a_missing_file_names_init_as_the_fix(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        target = os.path.join(tmp.name, "corral.toml")
+        target = os.path.join(tmp.name, "korapy.toml")
         spec = spec_for()
         with self.assertRaises(init.InitError) as ctx:
             init.board_table_change(target, "demo", spec, standard_provision(spec))
-        self.assertIn("corral init", str(ctx.exception))
+        self.assertIn("korapy init", str(ctx.exception))
 
     def test_split_layout_writes_the_ops_file_and_leaves_the_clone_alone(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        ops_target = os.path.join(tmp.name, "corral.toml")
+        ops_target = os.path.join(tmp.name, "korapy.toml")
         clone_target = os.path.join(tmp.name, "clone.toml")
         with open(ops_target, "w", encoding="utf-8") as handle:
             handle.write(BASE_INLINE)
@@ -268,7 +268,7 @@ class ChangeTests(unittest.TestCase):
     def test_rendered_table_round_trips_through_settings_load(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        target = os.path.join(tmp.name, "corral.toml")
+        target = os.path.join(tmp.name, "korapy.toml")
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(BASE_INLINE)
         spec = spec_for()
@@ -278,7 +278,7 @@ class ChangeTests(unittest.TestCase):
             new_text, _ = init.board_table_change(target, "demo", spec, provision)
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(new_text)
-        resolved = settings.load(root=tmp.name, repo="demo", env={"CORRAL_CONFIG": tmp.name})
+        resolved = settings.load(root=tmp.name, repo="demo", env={"KORAPY_CONFIG": tmp.name})
         board = resolved.board
         self.assertIsNotNone(board)
         assert board is not None

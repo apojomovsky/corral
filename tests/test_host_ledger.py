@@ -17,8 +17,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from corral import host_ledger as hl
-from corral import paths
+from korapy import host_ledger as hl
+from korapy import paths
 
 STATE = "/o/state"
 OTHER = "/other/state"
@@ -26,7 +26,7 @@ OTHER = "/other/state"
 
 class LedgerCase(unittest.TestCase):
     def setUp(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-host-ledger-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-host-ledger-")
         self.addCleanup(tmp.cleanup)
         self.dir = tmp.name
         self.path = os.path.join(self.dir, "host-resources.json")
@@ -407,22 +407,22 @@ class Guard(LedgerCase):
 class Defaults(unittest.TestCase):
     def test_ledger_path_comes_from_paths_host_ledger_path(self):
         with mock.patch.object(
-            paths, "host_ledger_path", return_value="/x/state/corral/host-resources.json"
+            paths, "host_ledger_path", return_value="/x/state/korapy/host-resources.json"
         ) as ledger:
-            self.assertEqual(hl.ledger_path(), "/x/state/corral/host-resources.json")
+            self.assertEqual(hl.ledger_path(), "/x/state/korapy/host-resources.json")
             ledger.assert_called_once_with()
 
     def test_marker_path_sits_beside_the_ledger(self):
         self.assertEqual(
-            hl.marker_path("/x/state/corral/host-resources.json"),
-            os.path.join("/x/state/corral", hl.MARKER_NAME),
+            hl.marker_path("/x/state/korapy/host-resources.json"),
+            os.path.join("/x/state/korapy", hl.MARKER_NAME),
         )
 
     def test_marker_path_defaults_to_the_resolved_ledger(self):
         with mock.patch.object(
-            paths, "host_ledger_path", return_value="/x/state/corral/host-resources.json"
+            paths, "host_ledger_path", return_value="/x/state/korapy/host-resources.json"
         ):
-            self.assertEqual(hl.marker_path(), os.path.join("/x/state/corral", hl.MARKER_NAME))
+            self.assertEqual(hl.marker_path(), os.path.join("/x/state/korapy", hl.MARKER_NAME))
 
 
 class DropIns(LedgerCase):
@@ -554,12 +554,12 @@ class DropIns(LedgerCase):
 class NoLiveSeams(unittest.TestCase):
     def test_the_module_imports_no_live_seam(self):
         root = Path(__file__).resolve().parent.parent
-        source = root / "src" / "corral" / "host_ledger.py"
+        source = root / "src" / "korapy" / "host_ledger.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         allowed = {
             "collections.abc",
             "contextlib",
-            "corral",
+            "korapy",
             "errno",
             "fcntl",
             "json",

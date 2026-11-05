@@ -16,11 +16,11 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, disk, drive, drivehub, sync, tracker
-from corral import host_ledger
-from corral import projects as projects_mod
-from corral import registry, units
-from corral.runtimes import omp
+from korapy import admission, board, disk, drive, drivehub, sync, tracker
+from korapy import host_ledger
+from korapy import projects as projects_mod
+from korapy import registry, units
+from korapy.runtimes import omp
 from tests.test_drive import policy_source, stored
 from tests.test_reviewrecord import git_in
 from tests.test_syncli import git_ok
@@ -140,7 +140,7 @@ class MintTest(unittest.TestCase):
 
 class ClaimLaunchTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-claims-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-claims-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -239,7 +239,7 @@ class ClaimLaunchTest(unittest.TestCase):
 
 class OperatorsAgreementTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-driveops-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-driveops-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -291,7 +291,7 @@ class OperatorsAgreementTest(unittest.TestCase):
     def test_production_operators_resolve_configured_logins_per_repo(self):
         root = os.path.join(self.tmp.name, "ops")
         os.makedirs(root)
-        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\ntracker.operators = ["bot"]\n'
             )
@@ -303,7 +303,7 @@ class OperatorsAgreementTest(unittest.TestCase):
     def test_production_operators_default_to_the_owner(self):
         root = os.path.join(self.tmp.name, "ops-owner")
         os.makedirs(root)
-        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n')
         project = projects_mod.Project(name="blue", unit_prefix="blue-agent", root=root)
         mapping, problem = drive.production_operators([project], git_ok())
@@ -313,7 +313,7 @@ class OperatorsAgreementTest(unittest.TestCase):
 
 class RaceTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-race-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-race-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -360,7 +360,7 @@ class RaceTest(unittest.TestCase):
 
 class LaunchFailureTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-launchfail-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-launchfail-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -368,7 +368,7 @@ class LaunchFailureTest(unittest.TestCase):
         os.makedirs(self.policies)
 
     def test_a_live_unit_race_is_recorded_and_the_claim_is_kept(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -392,7 +392,7 @@ class LaunchFailureTest(unittest.TestCase):
         self.assertTrue(row.agent.startswith("drive-"))
 
     def test_an_unreachable_service_manager_exits_three_when_nothing_starts(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -414,7 +414,7 @@ class LaunchFailureTest(unittest.TestCase):
         self.assertIn("no bus", out.getvalue())
 
     def test_an_admission_refusal_releases_the_fresh_claim(self):
-        from corral import launch
+        from korapy import launch
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -438,7 +438,7 @@ class LaunchFailureTest(unittest.TestCase):
         self.assertIsNone(store.claim_of("app", 7))
 
     def test_a_released_claim_fences_the_next_claim(self):
-        from corral import launch
+        from korapy import launch
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -480,7 +480,7 @@ class LaunchFailureTest(unittest.TestCase):
 
 class ProductionLauncherTest(unittest.TestCase):
     def test_an_unknown_kind_is_refused(self):
-        from corral import launch
+        from korapy import launch
 
         launcher = drive.production_launcher([])
         with self.assertRaises(launch.LaunchError) as ctx:
@@ -488,7 +488,7 @@ class ProductionLauncherTest(unittest.TestCase):
         self.assertIn("reboot", str(ctx.exception))
 
     def test_a_review_without_an_author_is_refused_before_any_launch(self):
-        from corral import launch
+        from korapy import launch
 
         launcher = drive.production_launcher([])
         with self.assertRaises(launch.LaunchError) as ctx:
@@ -496,7 +496,7 @@ class ProductionLauncherTest(unittest.TestCase):
         self.assertIn("author", str(ctx.exception))
 
     def test_a_resume_without_the_hold_check_is_refused(self):
-        from corral import launch
+        from korapy import launch
 
         launcher = drive.production_launcher([])
         with self.assertRaises(launch.LaunchError) as ctx:
@@ -504,7 +504,7 @@ class ProductionLauncherTest(unittest.TestCase):
         self.assertIn("hold check", str(ctx.exception))
 
     def test_unknown_project_is_a_launch_error(self):
-        from corral import launch
+        from korapy import launch
 
         launcher = drive.production_launcher([])
         with self.assertRaises(launch.LaunchError) as ctx:
@@ -512,20 +512,20 @@ class ProductionLauncherTest(unittest.TestCase):
         self.assertIn("blue", str(ctx.exception))
 
     def test_an_entry_name_is_not_a_repo_mapping(self):
-        from corral import launch
+        from korapy import launch
 
-        with tempfile.TemporaryDirectory(prefix="corral-drive-localrepo-") as root:
-            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with tempfile.TemporaryDirectory(prefix="korapy-drive-localrepo-") as root:
+            with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/other"\n')
             with self.assertRaises(launch.LaunchError) as ctx:
                 drive._local_repo(root, "app")
         self.assertIn("app", str(ctx.exception))
 
     def test_a_problem_entry_is_surfaced(self):
-        from corral import launch
+        from korapy import launch
 
-        with tempfile.TemporaryDirectory(prefix="corral-drive-localrepo-") as root:
-            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with tempfile.TemporaryDirectory(prefix="korapy-drive-localrepo-") as root:
+            with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write('[[repo]]\nname = "app"\ntracker.repo = "not-a-repo"\n')
             with self.assertRaises(launch.LaunchError) as ctx:
                 drive._local_repo(root, "acme/other")
@@ -542,7 +542,7 @@ class ProductionLauncherStartTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-launch-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-launch-")
         self.addCleanup(self.tmp.cleanup)
         self.root = os.path.join(self.tmp.name, "ops")
         os.makedirs(os.path.join(self.root, "clones"))
@@ -560,19 +560,19 @@ class ProductionLauncherStartTest(unittest.TestCase):
             origin,
             os.path.join(self.root, "clones", "app"),
         )
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[[repo]]\nname = "app"\nclone = { path = "clones/app" }\n'
                 'tracker.repo = "acme/app"\n'
             )
         config = os.path.join(self.tmp.name, "config")
-        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
         env = dict(kept)
         env.update(
-            CORRAL_STATE=os.path.join(self.tmp.name, "state"),
-            CORRAL_SESSIONS=os.path.join(self.tmp.name, "sessions"),
-            CORRAL_CONFIG=config,
-            CORRAL_CACHE=os.path.join(self.tmp.name, "cache"),
+            KORAPY_STATE=os.path.join(self.tmp.name, "state"),
+            KORAPY_SESSIONS=os.path.join(self.tmp.name, "sessions"),
+            KORAPY_CONFIG=config,
+            KORAPY_CACHE=os.path.join(self.tmp.name, "cache"),
         )
         self.enterContext(mock.patch.dict(os.environ, env, clear=True))
         os.makedirs(os.path.join(config, "projects.d"))
@@ -616,7 +616,7 @@ class ProductionLauncherStartTest(unittest.TestCase):
 
 class OutageTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-outage-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-outage-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -827,7 +827,7 @@ class OutageTest(unittest.TestCase):
 
 class MirrorBacklogTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-backlog-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-backlog-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -885,7 +885,7 @@ class BoardExtraRefreshTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-boardextra-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-boardextra-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -988,7 +988,7 @@ class ClaimSqliteTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-claimsqlite-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-claimsqlite-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1113,7 +1113,7 @@ class MirrorSqliteTest(unittest.TestCase):
     """A raw sqlite error from a store touch inside the mirror step exits 4."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-mirrorsqlite-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-mirrorsqlite-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1142,7 +1142,7 @@ class MirrorSqliteTest(unittest.TestCase):
             launcher=launcher,
         )
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err.getvalue())
+        self.assertIn("korapy drive:", err.getvalue())
 
     def test_push_store_touch_sqlite_error_is_exit_four(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -1170,7 +1170,7 @@ class MirrorSqliteTest(unittest.TestCase):
         finally:
             store.mark_sent = original_sent
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err.getvalue())
+        self.assertIn("korapy drive:", err.getvalue())
 
 
 class AgentHostTest(unittest.TestCase):
@@ -1183,7 +1183,7 @@ class AgentHostTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-agenthost-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-agenthost-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1219,13 +1219,13 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn("raw-host-9", minted)
 
     def test_agent_host_setting_defaults_to_empty(self):
-        from corral import settings
+        from korapy import settings
 
         resolved = settings.resolve(host={}, project={}, env={})
         self.assertEqual(resolved["drive.agent_host"], "")
 
     def run_pass_without_host(self, agent_host):
-        from corral import settings
+        from korapy import settings
 
         real_load = settings.load
 

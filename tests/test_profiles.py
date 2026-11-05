@@ -7,7 +7,7 @@ runtime adapter's options schema. No files, no subprocesses, no network.
 import unittest
 from unittest import mock
 
-from corral import models, profiles, runtimes, settings
+from korapy import models, profiles, runtimes, settings
 
 
 def raw_profile(runtime="muse", **overrides):

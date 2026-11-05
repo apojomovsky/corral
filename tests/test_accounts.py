@@ -12,7 +12,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import accounts, cli, deps
+from korapy import accounts, cli, deps
 
 
 class OkReader:
@@ -49,7 +49,7 @@ def write_config(directory, text):
 
 
 def config_with(text):
-    directory = tempfile.mkdtemp(prefix="corral-accounts-")
+    directory = tempfile.mkdtemp(prefix="korapy-accounts-")
     return write_config(directory, text)
 
 
@@ -68,14 +68,14 @@ reader = "tests.test_accounts:FailingReader"
 
 class MissingFile(unittest.TestCase):
     def test_a_missing_file_is_an_empty_pool(self):
-        with tempfile.TemporaryDirectory(prefix="corral-accounts-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-accounts-") as directory:
             self.assertEqual(accounts.providers(directory), [])
             self.assertEqual(accounts.check(directory), [])
 
     def test_providers_defaults_to_the_config_dir(self):
-        with tempfile.TemporaryDirectory(prefix="corral-accounts-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-accounts-") as directory:
             write_config(directory, OK_FILE)
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": directory}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": directory}):
                 found = accounts.providers()
         self.assertEqual([provider.name for provider in found], ["provider-a"])
 
@@ -219,8 +219,8 @@ class Readers(unittest.TestCase):
         self.assertIn("provider-a", problems[0])
 
     def test_a_module_that_raises_at_import_is_a_configuration_error(self):
-        name = "corral_boom_reader_for_test"
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        name = "korapy_boom_reader_for_test"
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, f"{name}.py"), "w", encoding="utf-8") as handle:
             handle.write("raise RuntimeError('boom at import')\n")
         sys.path.insert(0, directory)
@@ -245,11 +245,11 @@ class ExitCode(unittest.TestCase):
         def probe(argv, paths):
             return outputs.get(argv[0])
 
-        with tempfile.TemporaryDirectory(prefix="corral-accounts-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-accounts-") as directory:
             write_config(directory, config_text)
             out, err = io.StringIO(), io.StringIO()
             with (
-                mock.patch.dict(os.environ, {"CORRAL_CONFIG": directory}),
+                mock.patch.dict(os.environ, {"KORAPY_CONFIG": directory}),
                 mock.patch.object(deps, "run_probe", probe),
                 redirect_stdout(out),
                 mock.patch("sys.stderr", err),
@@ -275,14 +275,14 @@ class ExitCode(unittest.TestCase):
         self.assertEqual(err, "")
 
     def test_a_missing_reader_path_fails_deps_with_exit_4(self):
-        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-readers")
+        missing = os.path.join(tempfile.mkdtemp(prefix="korapy-accounts-"), "no-such-readers")
         code, _, err = self.run_deps(f'reader_path = ["{missing}"]\n' + OK_FILE)
         self.assertEqual(code, 4)
         self.assertIn(missing, err)
 
 
 FAKE_READER_MODULE = '''\
-from corral import accounts
+from korapy import accounts
 
 
 class PathReader:
@@ -307,7 +307,7 @@ MARKER = "sibling-ok"
 """
 
 SIBLING_READER_MODULE = '''\
-from corral import accounts
+from korapy import accounts
 
 
 class SiblingReader:
@@ -327,7 +327,7 @@ class SiblingReader:
 
 SHADOW_READER_MODULE = '''\
 import shadowed
-from corral import accounts
+from korapy import accounts
 
 
 class ShadowReader:
@@ -350,7 +350,7 @@ def write_module(directory, name, source):
 
 
 def config_with_reader_path(readers_dir, reader="fakereader:PathReader", name="provider-a"):
-    directory = tempfile.mkdtemp(prefix="corral-accounts-")
+    directory = tempfile.mkdtemp(prefix="korapy-accounts-")
     with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
         handle.write(
             f'reader_path = ["{readers_dir}"]\n[[provider]]\nname = "{name}"\nreader = "{reader}"\n'
@@ -360,7 +360,7 @@ def config_with_reader_path(readers_dir, reader="fakereader:PathReader", name="p
 
 class ReaderPath(unittest.TestCase):
     def test_a_reader_on_reader_path_loads_with_no_sys_path_setup(self):
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         write_reader_module(readers)
         directory = config_with_reader_path(readers)
         before = list(sys.path)
@@ -375,7 +375,7 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("fakereader", None)
 
     def test_loading_restores_sys_path_on_failure(self):
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         directory = config_with_reader_path(readers, reader="fakereader:NoSuchReader")
         before = list(sys.path)
         try:
@@ -386,7 +386,7 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("fakereader", None)
 
     def test_check_restores_sys_path(self):
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         write_reader_module(readers)
         directory = config_with_reader_path(readers)
         before = list(sys.path)
@@ -397,11 +397,11 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("fakereader", None)
 
     def test_a_tilde_entry_expands(self):
-        home = tempfile.mkdtemp(prefix="corral-home-")
+        home = tempfile.mkdtemp(prefix="korapy-home-")
         readers = os.path.join(home, "readers")
         os.makedirs(readers)
         write_reader_module(readers)
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 'reader_path = ["~/readers"]\n'
@@ -417,7 +417,7 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("fakereader", None)
 
     def test_a_relative_entry_is_a_configuration_error(self):
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 'reader_path = ["ops/readers"]\n'
@@ -430,7 +430,7 @@ class ReaderPath(unittest.TestCase):
         self.assertIn("ops/readers", problems[0])
 
     def test_a_missing_reader_path_is_reported_naming_it(self):
-        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-readers")
+        missing = os.path.join(tempfile.mkdtemp(prefix="korapy-accounts-"), "no-such-readers")
         directory = config_with_reader_path(missing)
         with self.assertRaises(accounts.AccountsError):
             accounts.providers(directory)
@@ -439,7 +439,7 @@ class ReaderPath(unittest.TestCase):
         self.assertIn(missing, problems[0])
 
     def test_a_non_list_reader_path_is_a_configuration_error(self):
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
             handle.write('reader_path = "/tmp/readers"\n')
         with self.assertRaises(accounts.AccountsError):
@@ -447,7 +447,7 @@ class ReaderPath(unittest.TestCase):
         self.assertTrue(accounts.check(directory))
 
     def test_a_non_string_reader_path_entry_is_a_configuration_error(self):
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
             handle.write("reader_path = [42]\n")
         with self.assertRaises(accounts.AccountsError):
@@ -455,9 +455,9 @@ class ReaderPath(unittest.TestCase):
         self.assertTrue(accounts.check(directory))
 
     def test_doctor_load_readers_uses_reader_path(self):
-        from corral import doctor
+        from korapy import doctor
 
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         write_reader_module(readers)
         directory = config_with_reader_path(readers)
         before = list(sys.path)
@@ -468,7 +468,7 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("fakereader", None)
 
     def test_a_constructor_may_import_a_sibling_module_from_reader_path(self):
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         write_module(readers, "sibling_helper", SIBLING_HELPER_MODULE)
         write_module(readers, "siblingreader", SIBLING_READER_MODULE)
         directory = config_with_reader_path(readers, reader="siblingreader:SiblingReader")
@@ -483,9 +483,9 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("sibling_helper", None)
 
     def test_load_reader_reuses_already_resolved_dirs(self):
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         write_reader_module(readers)
-        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-dir")
+        missing = os.path.join(tempfile.mkdtemp(prefix="korapy-accounts-"), "no-such-dir")
         before = list(sys.path)
         try:
             reader = accounts.load_reader("fakereader:PathReader", missing, reader_dirs=[readers])
@@ -495,12 +495,12 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("fakereader", None)
 
     def test_earlier_reader_path_entries_shadow_later_ones(self):
-        first = tempfile.mkdtemp(prefix="corral-readers-first-")
-        second = tempfile.mkdtemp(prefix="corral-readers-second-")
+        first = tempfile.mkdtemp(prefix="korapy-readers-first-")
+        second = tempfile.mkdtemp(prefix="korapy-readers-second-")
         write_module(first, "shadowed", "USED = 10.0\n")
         write_module(second, "shadowed", "USED = 90.0\n")
         write_module(first, "shadowreader", SHADOW_READER_MODULE)
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 f'reader_path = ["{first}", "{second}"]\n'
@@ -516,17 +516,17 @@ class ReaderPath(unittest.TestCase):
             sys.modules.pop("shadowed", None)
 
     def test_a_dollar_var_entry_expands(self):
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         write_reader_module(readers)
-        directory = tempfile.mkdtemp(prefix="corral-accounts-")
+        directory = tempfile.mkdtemp(prefix="korapy-accounts-")
         with open(os.path.join(directory, "accounts.toml"), "w", encoding="utf-8") as handle:
             handle.write(
-                'reader_path = ["$CORRAL_TEST_READERS"]\n'
+                'reader_path = ["$KORAPY_TEST_READERS"]\n'
                 '[[provider]]\nname = "provider-a"\nreader = "fakereader:PathReader"\n'
             )
         before = list(sys.path)
         try:
-            with mock.patch.dict(os.environ, {"CORRAL_TEST_READERS": readers}):
+            with mock.patch.dict(os.environ, {"KORAPY_TEST_READERS": readers}):
                 reader = accounts.load_reader("fakereader:PathReader", directory)
                 self.assertEqual(reader.read(1700000000.0).windows["weekly"].used_pct, 10.0)
         finally:
@@ -536,7 +536,7 @@ class ReaderPath(unittest.TestCase):
     def test_an_unreadable_reader_path_is_a_configuration_error(self):
         if os.geteuid() == 0:
             self.skipTest("root reads everything")
-        readers = tempfile.mkdtemp(prefix="corral-readers-")
+        readers = tempfile.mkdtemp(prefix="korapy-readers-")
         os.chmod(readers, 0)
         try:
             directory = config_with_reader_path(readers)
@@ -549,16 +549,16 @@ class ReaderPath(unittest.TestCase):
             os.chmod(readers, 0o755)
 
     def test_doctor_names_a_bad_reader_path(self):
-        from corral import doctor
+        from korapy import doctor
 
-        missing = os.path.join(tempfile.mkdtemp(prefix="corral-accounts-"), "no-such-readers")
+        missing = os.path.join(tempfile.mkdtemp(prefix="korapy-accounts-"), "no-such-readers")
         directory = config_with_reader_path(missing)
         errors = doctor.load_readers(directory)
         self.assertEqual(len(errors), 1)
         self.assertIn(missing, errors[0][2])
 
     def test_only_accounts_touches_sys_path(self):
-        root = os.path.join(os.path.dirname(__file__), "..", "src", "corral")
+        root = os.path.join(os.path.dirname(__file__), "..", "src", "korapy")
         offenders = []
         for name in sorted(os.listdir(root)):
             if not name.endswith(".py"):

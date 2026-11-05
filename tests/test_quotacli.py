@@ -1,4 +1,4 @@
-"""`corral quota`: one view of the pool and ledger, refresh, marks and the tail hook.
+"""`korapy quota`: one view of the pool and ledger, refresh, marks and the tail hook.
 
 Offline: fake readers through injected seams, temp state and config dirs,
 no real reader and no network.
@@ -12,7 +12,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import accounts, cli, launch, models, quota_ledger, quotacli, settings
+from korapy import accounts, cli, launch, models, quota_ledger, quotacli, settings
 from tests.test_launch import OpsCase, TOML, roomy
 
 T0 = 1_800_000_000.0
@@ -100,13 +100,13 @@ def loader(readers):
 
 class SnapshotView(unittest.TestCase):
     def view(self, names, seen, now=T0, **kw):
-        from corral import quotacli
+        from korapy import quotacli
 
         kw.setdefault("low_pct", 90)
         return quotacli.snapshot(pool(*names), seen, now, **kw)
 
     def test_an_empty_pool_is_an_empty_view(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         view = quotacli.snapshot([], ledger(), T0, low_pct=90)
         self.assertEqual(view, {"now": T0, "providers": {}})
@@ -164,7 +164,7 @@ class SnapshotView(unittest.TestCase):
 
 class Refresh(unittest.TestCase):
     def test_a_successful_read_is_recorded(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         fresh, results = quotacli.refresh(
             pool("provider-a"), ledger(), T0, load_reader=loader({"provider-a": OkReader()})
@@ -177,7 +177,7 @@ class Refresh(unittest.TestCase):
         self.assertEqual(fresh["readings"]["provider-a"]["read_at"], T0)
 
     def test_a_reader_error_is_recorded_never_raised(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         fresh, results = quotacli.refresh(
             pool("provider-a"),
@@ -191,7 +191,7 @@ class Refresh(unittest.TestCase):
         self.assertNotIn("windows", entry)
 
     def test_an_unknown_only_name_is_a_quota_error(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         with self.assertRaises(quotacli.QuotaError):
             quotacli.refresh(
@@ -203,7 +203,7 @@ class Refresh(unittest.TestCase):
             )
 
     def test_only_runs_the_named_provider(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         fresh, results = quotacli.refresh(
             pool("provider-a", "provider-b"),
@@ -216,7 +216,7 @@ class Refresh(unittest.TestCase):
         self.assertNotIn("provider-a", fresh["readings"])
 
     def test_a_reader_that_does_not_build_leaves_the_ledger_alone(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         seen = ledger()
         with self.assertRaises(accounts.AccountsError):
@@ -226,7 +226,7 @@ class Refresh(unittest.TestCase):
 
 class MarkProvider(unittest.TestCase):
     def test_an_omitted_until_uses_the_cooldown(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         providers = [accounts.Provider(name="provider-a", reader="fake:x", cooldown_s=60.0)]
         fresh, moved = quotacli.mark_provider(ledger(), providers, "provider-a", T0)
@@ -235,7 +235,7 @@ class MarkProvider(unittest.TestCase):
         self.assertEqual(fresh["marks"]["provider-a"]["source"], "manual")
 
     def test_an_earlier_until_than_the_stored_mark_is_a_no_op(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         seen = ledger(**{"provider-a": ("mark", mark(T0 + 600))})
         fresh, moved = quotacli.mark_provider(
@@ -245,13 +245,13 @@ class MarkProvider(unittest.TestCase):
         self.assertEqual(fresh["marks"]["provider-a"]["until"], T0 + 600)
 
     def test_an_unknown_provider_is_a_quota_error(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         with self.assertRaises(quotacli.QuotaError):
             quotacli.mark_provider(ledger(), pool("provider-a"), "provider-b", T0)
 
     def test_a_bad_until_is_a_quota_error(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         with self.assertRaises(quotacli.QuotaError):
             quotacli.mark_provider(ledger(), pool("provider-a"), "provider-a", T0, until="soon")
@@ -259,7 +259,7 @@ class MarkProvider(unittest.TestCase):
 
 class NoteLimitError(unittest.TestCase):
     def test_a_parsed_error_posts_a_tail_mark(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         fresh, marked = quotacli.note_limit_error(
             ledger(),
@@ -273,7 +273,7 @@ class NoteLimitError(unittest.TestCase):
         self.assertEqual(fresh["marks"]["provider-a"]["source"], "tail")
 
     def test_an_unrecognized_text_posts_nothing(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         fresh, marked = quotacli.note_limit_error(
             ledger(),
@@ -286,7 +286,7 @@ class NoteLimitError(unittest.TestCase):
         self.assertEqual(fresh, ledger())
 
     def test_every_provider_is_consulted(self):
-        from corral import quotacli
+        from korapy import quotacli
 
         fresh, marked = quotacli.note_limit_error(
             ledger(),
@@ -423,7 +423,7 @@ class QuotaVerbs(OpsCase):
 
 
 class LaunchGate(OpsCase):
-    """`corral launch` stays gated: an exhausted chain refuses with exit 75."""
+    """`korapy launch` stays gated: an exhausted chain refuses with exit 75."""
 
     def setUp(self):
         super().setUp()
@@ -470,7 +470,7 @@ class TailHook(OpsCase):
             handle.write("".join(lines))
 
     def note(self, readers):
-        from corral import quotacli
+        from korapy import quotacli
 
         return lambda ledger, pool, text, now: quotacli.note_limit_error(
             ledger, pool, text, now, load_reader=loader(readers)

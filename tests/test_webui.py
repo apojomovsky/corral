@@ -2,7 +2,7 @@
 
 Offline: a real HTTP server on a loopback ephemeral port, spoken to
 with `http.client`, plus source-discipline reads over the packaged
-`corral/web/` files. No `gh`, no network beyond loopback, no real
+`korapy/web/` files. No `gh`, no network beyond loopback, no real
 state dirs.
 """
 
@@ -16,7 +16,7 @@ import unittest
 from contextlib import redirect_stderr
 from importlib import resources
 
-from corral import serve
+from korapy import serve
 
 CSP = (
     "default-src 'self'; script-src 'self'; style-src 'self'; "
@@ -38,7 +38,7 @@ CONTENT_TYPES = {
 
 
 def web_bytes(name):
-    return resources.files("corral").joinpath(f"web/{name}").read_bytes()
+    return resources.files("korapy").joinpath(f"web/{name}").read_bytes()
 
 
 def trivial_doc():
@@ -75,7 +75,7 @@ class WebCase(unittest.TestCase):
 
 class AssetTable(unittest.TestCase):
     def test_every_expected_file_loads_non_empty_utf8(self):
-        from corral import webui
+        from korapy import webui
 
         assets = webui.load_assets()
         want = ["/"] + [f"/ui/{name}" for name in WEB_FILES if name != "index.html"]
@@ -85,7 +85,7 @@ class AssetTable(unittest.TestCase):
             asset.data.decode("utf-8")
 
     def test_content_types_are_exact(self):
-        from corral import webui
+        from korapy import webui
 
         assets = webui.load_assets()
         for name, want in CONTENT_TYPES.items():
@@ -93,7 +93,7 @@ class AssetTable(unittest.TestCase):
             self.assertEqual(assets[key].content_type, want, key)
 
     def test_etag_is_the_truncated_content_hash(self):
-        from corral import webui
+        from korapy import webui
 
         assets = webui.load_assets()
         for path, asset in assets.items():
@@ -101,7 +101,7 @@ class AssetTable(unittest.TestCase):
             self.assertEqual(asset.etag, want, path)
 
     def test_config_body_carries_mode_and_api_only(self):
-        from corral import webui
+        from korapy import webui
 
         body = json.loads(webui.config_body(serve.API_VERSION))
         self.assertEqual(body, {"mode": "host", "api": serve.API_VERSION})
@@ -110,11 +110,11 @@ class AssetTable(unittest.TestCase):
         import pathlib
         from importlib.util import find_spec
 
-        from corral import webui
+        from korapy import webui
 
         self.assertEqual(webui.CONFIG_PATH, "/ui/config.json")
         self.assertTrue(webui.is_ui_path(webui.CONFIG_PATH))
-        spec = find_spec("corral.serve")
+        spec = find_spec("korapy.serve")
         assert spec is not None and spec.origin is not None
         text = pathlib.Path(spec.origin).read_text()
         self.assertIn("webui.CONFIG_PATH", text)
@@ -312,8 +312,8 @@ class SourceDiscipline(unittest.TestCase):
         found = set()
         for name in ("app.js", "api.js", "fmt.js", "views.js"):
             text = web_bytes(name).decode("utf-8")
-            found.update(re.findall(r"corral\.[A-Za-z_]+", text))
-        self.assertEqual(found, {"corral.token"})
+            found.update(re.findall(r"korapy\.[A-Za-z_]+", text))
+        self.assertEqual(found, {"korapy.token"})
 
     def test_volatile_keys_match_the_server(self):
         text = web_bytes("fmt.js").decode("utf-8")
@@ -476,7 +476,7 @@ class SourceDiscipline(unittest.TestCase):
         self.assertEqual(app.count("renderOverview("), 2)
 
     def test_shell_schema_expectation_matches_the_server(self):
-        from corral import snapshot
+        from korapy import snapshot
 
         app = web_bytes("app.js").decode("utf-8")
         found = re.search(r"const EXPECTED_SCHEMA_VERSION = (\d+);", app)

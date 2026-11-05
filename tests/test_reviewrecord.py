@@ -1,4 +1,4 @@
-"""Review records, and the `corral review` verbs.
+"""Review records, and the `korapy review` verbs.
 
 Offline: records land in temp session roots; commit resolution runs real
 git against throwaway repositories in temp dirs.
@@ -13,7 +13,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, mergeup, paths, reviewcli, reviewrecord
+from korapy import cli, mergeup, paths, reviewcli, reviewrecord
 from tests.test_forge import FakeForge, make_pr
 
 REPO = "lib"
@@ -26,7 +26,7 @@ def git_in(cwd, *cmd):
             "-c",
             "user.name=suite",
             "-c",
-            "user.email=suite@corral.invalid",
+            "user.email=suite@korapy.invalid",
             "-c",
             "commit.gpgsign=false",
             *cmd,
@@ -59,7 +59,7 @@ class RecordTest(unittest.TestCase):
         )
 
     def test_the_default_root_is_the_sessions_dir(self):
-        with mock.patch.dict(os.environ, {"CORRAL_SESSIONS": self.root}):
+        with mock.patch.dict(os.environ, {"KORAPY_SESSIONS": self.root}):
             path = reviewrecord.write_record(
                 REPO, 1, "abc123", reviewer="r", verdict="approve", author="a"
             )
@@ -168,7 +168,7 @@ class ResolveCommitTest(unittest.TestCase):
 
     def test_an_ambiguous_prefix_is_refused(self):
         stream = "".join(
-            f"commit refs/heads/bulk\ncommitter t <t@corral.invalid> {i} +0000\n"
+            f"commit refs/heads/bulk\ncommitter t <t@korapy.invalid> {i} +0000\n"
             f"data {len(f'c{i}') + 1}\nc{i}\n\n"
             for i in range(1, 2001)
         )
@@ -202,7 +202,7 @@ class VerbTest(unittest.TestCase):
         self.repo = os.path.join(tmp.name, "repo")
         os.makedirs(self.repo)
         self.head = make_repo(self.repo)
-        env = mock.patch.dict(os.environ, {"CORRAL_SESSIONS": self.sessions, "CORRAL_AGENT_ID": ""})
+        env = mock.patch.dict(os.environ, {"KORAPY_SESSIONS": self.sessions, "KORAPY_AGENT_ID": ""})
         env.start()
         self.addCleanup(env.stop)
         old = os.getcwd()
@@ -267,7 +267,7 @@ class VerbTest(unittest.TestCase):
         self.assertIn("no review record", err)
 
     def test_the_reviewer_comes_from_the_agent_id(self):
-        with mock.patch.dict(os.environ, {"CORRAL_AGENT_ID": "agent-9"}):
+        with mock.patch.dict(os.environ, {"KORAPY_AGENT_ID": "agent-9"}):
             self.assertEqual(self.record("HEAD")[0], 0)
         record = reviewrecord.read_record(REPO, 7, self.head)
         self.assertEqual(record["reviewer"], "agent-9")

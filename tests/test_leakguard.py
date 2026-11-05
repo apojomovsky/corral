@@ -4,10 +4,10 @@ import os
 import tempfile
 import unittest
 
-from corral import leakguard, settings
+from korapy import leakguard, settings
 
-TERM = leakguard.Term("term", "Acme Client", "corral.toml")
-PATTERN = leakguard.Term("pattern", "acme-[0-9]+", "corral.toml")
+TERM = leakguard.Term("term", "Acme Client", "korapy.toml")
+PATTERN = leakguard.Term("pattern", "acme-[0-9]+", "korapy.toml")
 
 
 def terms(*items):
@@ -44,19 +44,19 @@ class ScanTest(unittest.TestCase):
 
 class TermsTest(unittest.TestCase):
     def test_configured_terms_come_first_with_their_source(self):
-        with tempfile.TemporaryDirectory(prefix="corral-leak-") as ops:
-            with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with tempfile.TemporaryDirectory(prefix="korapy-leak-") as ops:
+            with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write('[private]\nterms = ["Acme Client"]\npatterns = ["acme-[0-9]+"]\n')
             found = leakguard.terms(
                 ops, host="host-1.example.com", home="/users/someone", ops_name="ops-root"
             )
         kinds = [(term.kind, term.text, term.source) for term in found]
-        self.assertIn(("term", "Acme Client", "corral.toml"), kinds)
-        self.assertIn(("pattern", "acme-[0-9]+", "corral.toml"), kinds)
+        self.assertIn(("term", "Acme Client", "korapy.toml"), kinds)
+        self.assertIn(("pattern", "acme-[0-9]+", "korapy.toml"), kinds)
 
     def test_builtins_cover_the_ops_name_root_host_and_home(self):
-        with tempfile.TemporaryDirectory(prefix="corral-leak-") as ops:
-            with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with tempfile.TemporaryDirectory(prefix="korapy-leak-") as ops:
+            with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write("")
             found = leakguard.terms(
                 ops,
@@ -85,8 +85,8 @@ class TermsTest(unittest.TestCase):
         )
 
     def test_a_bad_pattern_is_a_configuration_error_naming_the_pattern(self):
-        with tempfile.TemporaryDirectory(prefix="corral-leak-") as ops:
-            with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with tempfile.TemporaryDirectory(prefix="korapy-leak-") as ops:
+            with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write('[private]\npatterns = ["acme-([0-9]+"]\n')
             with self.assertRaisesRegex(settings.SettingsError, r"acme-\(\[0-9\]\+"):
                 leakguard.terms(ops, host="host-1", home="/users/someone", ops_name="ops")
@@ -100,7 +100,7 @@ class TargetsTest(unittest.TestCase):
         self.assertEqual(finding.term, TERM)
 
     def test_branch_body_and_diff_each_report_their_where(self):
-        dashed = leakguard.Term("term", "acme-client", "corral.toml")
+        dashed = leakguard.Term("term", "acme-client", "korapy.toml")
         (branch,) = leakguard.check_branch("feat/acme-client-x", terms(dashed))
         self.assertEqual(branch.where, "branch")
         (body,) = leakguard.check_body("ships Acme Client", terms(TERM))
@@ -119,7 +119,7 @@ class TargetsTest(unittest.TestCase):
 
     def test_added_lines_without_a_path_header_still_flag(self):
         diff = "@@ -0,0 +1,2 @@\n+fine\n+Acme Client plans\n"
-        found = leakguard.check_diff(diff, [leakguard.Term("term", "Acme Client", "corral.toml")])
+        found = leakguard.check_diff(diff, [leakguard.Term("term", "Acme Client", "korapy.toml")])
         self.assertEqual([f.where for f in found], ["diff unknown:2"])
 
     def test_the_diff_ignores_context_removed_and_header_lines(self):
@@ -164,7 +164,7 @@ class TargetsTest(unittest.TestCase):
         self.assertEqual(hit.column, 3)
 
     def test_a_second_files_header_is_not_scanned_as_content(self):
-        dashed = leakguard.Term("term", "acme-client", "corral.toml")
+        dashed = leakguard.Term("term", "acme-client", "korapy.toml")
         diff = (
             "diff --git a/a.txt b/a.txt\n"
             "--- a/a.txt\n"

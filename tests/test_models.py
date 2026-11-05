@@ -3,8 +3,8 @@
 import os
 import unittest
 
-from corral import accounts, launch, launchcli, models, quota, settings
-from corral.runtimes import omp
+from korapy import accounts, launch, launchcli, models, quota, settings
+from korapy.runtimes import omp
 from tests.test_launch import TOML, OpsCase, roomy
 
 T0 = 1_800_000_000.0

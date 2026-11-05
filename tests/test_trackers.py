@@ -7,9 +7,9 @@ runners through ``build_tracker`` defaults.
 
 import unittest
 
-from corral import settings
-from corral import tracker as iface
-from corral import trackers
+from korapy import settings
+from korapy import tracker as iface
+from korapy import trackers
 from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
     BoardFakeRun,
@@ -44,7 +44,7 @@ class VariantsTest(unittest.TestCase):
 
 class BuildTrackerTest(unittest.TestCase):
     def test_labels_builds_the_rest_tracker(self):
-        from corral.github.tracker import GithubTracker
+        from korapy.github.tracker import GithubTracker
 
         tracker = trackers.build_tracker(
             variant="labels", board=None, max_pages=5, run=lambda args: "{}"

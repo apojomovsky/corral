@@ -1,4 +1,4 @@
-"""The README Commands table names every `corral` verb, and no phantom ones.
+"""The README Commands table names every `korapy` verb, and no phantom ones.
 
 Pure: builds the argparse parser the way `cli.main` does and reads
 `README.md` off disk. Building the parser constructs the production seams
@@ -14,10 +14,10 @@ import re
 import unittest
 from pathlib import Path
 
-from corral import cli, host_ledger, pressure, prompts, resources, runtimes, snapshot, takeoff
+from korapy import cli, host_ledger, pressure, prompts, resources, runtimes, snapshot, takeoff
 
 SPAN_RE = re.compile(r"`([^`]*)`")
-COMMAND_RE = re.compile(r"\bcorral ([a-z][a-z0-9-]*)")
+COMMAND_RE = re.compile(r"\bkorapy ([a-z][a-z0-9-]*)")
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -37,13 +37,13 @@ def commands_section():
 
 
 def table_tokens(section):
-    """Every `corral <name>` token in a Commands-table Command cell."""
+    """Every `korapy <name>` token in a Commands-table Command cell."""
     found = set()
     for line in section.splitlines():
         if not line.startswith("|"):
             continue
         cells = re.split(r"(?<!\\)\|", line)
-        if len(cells) < 3 or "corral " not in cells[1]:
+        if len(cells) < 3 or "korapy " not in cells[1]:
             continue
         for span in SPAN_RE.findall(cells[1]):
             found.update(COMMAND_RE.findall(span))
@@ -147,7 +147,7 @@ class Table(unittest.TestCase):
         section = (
             "| Command | What it does |\n"
             "| --- | --- |\n"
-            "| `corral deps` | check the host programs, and the `corral quota` ledger |\n"
+            "| `korapy deps` | check the host programs, and the `korapy quota` ledger |\n"
         )
         self.assertEqual(table_tokens(section), {"deps"})
 
@@ -155,9 +155,9 @@ class Table(unittest.TestCase):
         section = (
             "| Command | What it does |\n"
             "| --- | --- |\n"
-            "| `corral deps` | check the host programs |\n"
+            "| `korapy deps` | check the host programs |\n"
             "\n"
-            "Compare a | b with `corral nosuchverb` | x for details.\n"
+            "Compare a | b with `korapy nosuchverb` | x for details.\n"
         )
         self.assertEqual(table_tokens(section), {"deps"})
 

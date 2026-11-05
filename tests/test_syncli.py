@@ -1,4 +1,4 @@
-"""`corral sync`: feed the board store from the tracker. Fakes only."""
+"""`korapy sync`: feed the board store from the tracker. Fakes only."""
 
 import argparse
 import io
@@ -10,7 +10,7 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from corral import board, cli, settings, sync, syncli, tracker
+from korapy import board, cli, settings, sync, syncli, tracker
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -54,10 +54,10 @@ clone.path = "clone"
 
 class SyncRootCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-synccli-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-synccli-")
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML)
         self.store = board.open_store(os.path.join(self.root, "board.sqlite"))
         self.addCleanup(self.store.close)
@@ -119,7 +119,7 @@ class ExitCodeTest(SyncRootCase):
         self.assertIn("tracker rejected", self.err.getvalue())
 
     def test_refused_plus_unreachable_exits_3(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n'
                 '[[repo]]\nname = "lib"\ntracker.repo = "acme/lib"\n'
@@ -137,7 +137,7 @@ class ExitCodeTest(SyncRootCase):
         self.assertIn("connection refused", self.err.getvalue())
 
     def test_rejected_board_schema_exits_1_and_keeps_cursor(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\ntracker.variant = "board"\n'
             )
@@ -255,14 +255,14 @@ class ExitCodeTest(SyncRootCase):
         self.assertEqual(self.run_sync(FakeTracker(), names=["nope"]), 4)
 
     def test_no_repo_entries_exits_4(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write("")
         self.assertEqual(self.run_sync(FakeTracker()), 4)
 
 
 class WiringTest(SyncRootCase):
     def test_tracker_repo_setting_skips_origin(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML + 'tracker.repo = "acme/other"\n')
         git = git_ok()
         fake = FakeTracker([reading(repo="acme/other", number=1, updated_at=T0)])
@@ -294,7 +294,7 @@ class WiringTest(SyncRootCase):
         self.assertTrue(stranger.external)
 
     def test_operators_setting_names_trusted_logins(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML + 'tracker.operators = ["mallory"]\n')
         fake = FakeTracker([reading(number=2, author="mallory", updated_at=T0)])
         self.assertEqual(self.run_sync(fake), 0)
@@ -387,7 +387,7 @@ class ParserTest(unittest.TestCase):
             cli.build_parser().parse_args(["sync", "--resync", "--audit", "3"])
 
     def test_cmd_sync_without_root_exits_4(self):
-        empty = tempfile.mkdtemp(prefix="corral-sync-noroot-")
+        empty = tempfile.mkdtemp(prefix="korapy-sync-noroot-")
         self.addCleanup(lambda: os.rmdir(empty))
         namespace = argparse.Namespace(
             repo=[], resync=False, audit=None, json=False, func=syncli.cmd_sync
@@ -396,8 +396,8 @@ class ParserTest(unittest.TestCase):
             self.assertEqual(syncli.cmd_sync(namespace), 4)
 
     def test_cmd_sync_rejects_bad_audit_limit(self):
-        with tempfile.TemporaryDirectory(prefix="corral-sync-root-") as root:
-            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with tempfile.TemporaryDirectory(prefix="korapy-sync-root-") as root:
+            with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write(TOML)
             namespace = argparse.Namespace(
                 repo=[], resync=False, audit=0, json=False, func=syncli.cmd_sync
@@ -408,14 +408,14 @@ class ParserTest(unittest.TestCase):
 
 class ProvidersTest(unittest.TestCase):
     def test_sync_registers_tracker_settings(self):
-        self.assertIn("corral.sync", settings.PROVIDERS)
+        self.assertIn("korapy.sync", settings.PROVIDERS)
         self.assertEqual(settings.REGISTRY["tracker.repo"].default, "")
         self.assertEqual(settings.REGISTRY["tracker.operators"].default, [])
 
 
 class RepoOperatorsTest(SyncRootCase):
     def test_configured_operators_resolve_per_entry(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML + 'tracker.operators = ["mallory"]\n')
         entries, problem = syncli.repo_operators(self.root, ["app"], git_ok())
         self.assertIsNone(problem)
@@ -427,7 +427,7 @@ class RepoOperatorsTest(SyncRootCase):
         self.assertEqual(entries, {"app": ("acme/app", ["acme"])})
 
     def test_a_bad_entry_returns_the_problem(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML + 'tracker.repo = "not-a-repo"\n')
         entries, problem = syncli.repo_operators(self.root, ["app"], git_ok())
         self.assertIsNone(entries)

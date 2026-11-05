@@ -13,8 +13,8 @@ import unittest
 import uuid
 from unittest import mock
 
-from corral import runtimes as rt
-from corral.runtimes import muse
+from korapy import runtimes as rt
+from korapy.runtimes import muse
 
 PROMPT = "do the thing"
 SESSION_ID = "12345678-1234-5678-1234-567812345678"
@@ -23,7 +23,7 @@ EXISTING_ID = "87654321-4321-8765-4321-876543218765"
 
 class SessionCase(unittest.TestCase):
     def setUp(self):
-        self.root = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-muse-"))
+        self.root = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-muse-"))
         self.sdir = os.path.join(self.root, "session")
         os.makedirs(self.sdir)
         binary = mock.patch.object(muse, "binary", return_value="/fake/muse")
@@ -521,15 +521,15 @@ class BinaryResolution(unittest.TestCase):
         self.addCleanup(muse.binary.cache_clear)
 
     def test_the_binary_on_path_wins(self):
-        with mock.patch("corral.runtimes.muse.shutil.which", return_value="/opt/bin/muse"):
+        with mock.patch("korapy.runtimes.muse.shutil.which", return_value="/opt/bin/muse"):
             self.assertEqual(muse.binary(), "/opt/bin/muse")
 
     def test_without_one_on_path_the_usual_install_location_is_used(self):
-        with mock.patch("corral.runtimes.muse.shutil.which", return_value=None):
+        with mock.patch("korapy.runtimes.muse.shutil.which", return_value=None):
             self.assertEqual(muse.binary(), os.path.expanduser("~/.local/bin/muse"))
 
     def test_the_binary_is_found_once(self):
-        with mock.patch("corral.runtimes.muse.shutil.which", return_value="/opt/bin/muse") as which:
+        with mock.patch("korapy.runtimes.muse.shutil.which", return_value="/opt/bin/muse") as which:
             muse.binary()
             muse.binary()
         self.assertEqual(which.call_count, 1)

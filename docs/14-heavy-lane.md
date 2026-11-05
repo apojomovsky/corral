@@ -56,9 +56,9 @@ a small lint and a full suite each hold the whole host.
 The ticket proposes six points. Five are adopted, one with a
 changed spelling; the sixth is deferred with reasons.
 
-1. **Wrapper verb.** Adopted, spelled `corral heavy run --
-   <cmd>` (a subverb, matching the `corral coord wait` and
-   `corral disk` families) instead of a bare `corral heavy --`
+1. **Wrapper verb.** Adopted, spelled `korapy heavy run --
+   <cmd>` (a subverb, matching the `korapy coord wait` and
+   `korapy disk` families) instead of a bare `korapy heavy --`
    flag form, so `--plan`, `--json` and `--bypass` have a verb
    to hang on. It asks for a slot, waits the turn, runs the
    command in a transient scope with CPU and memory limits
@@ -109,13 +109,13 @@ changed spelling; the sixth is deferred with reasons.
 
 ## 3. The verbs
 
-One PROPOSED verb family, `corral heavy`, with thin parsers
+One PROPOSED verb family, `korapy heavy`, with thin parsers
 over `heavy.py` (pure queue math) and injected seams for the
 clock, sleep, pid liveness, scope control and file reads, on
 the `takeoff.suite_lock` precedent (`_flock`, `_sleep`,
 `_monotonic` assigned fakes in tests).
 
-### 3.1 `corral heavy run` (PROPOSED)
+### 3.1 `korapy heavy run` (PROPOSED)
 
 Purpose: queue one heavy command, run it in a transient scope
 with the lane's limits, report the outcome.
@@ -182,7 +182,7 @@ weight then stays where it was. Without `--json`, one
 line names the outcome to stderr
 (`heavy: ran in 42.5s after a 38.1s wait, exit 0`).
 
-### 3.2 `corral heavy status` (PROPOSED)
+### 3.2 `korapy heavy status` (PROPOSED)
 
 Purpose: the read-only twin the queue needs. Show holders,
 waiters and learned costs, for humans and for scripts.
@@ -250,7 +250,7 @@ command. Abuse (every run bypassed) is visible, not
 prevented: the status view names bypass rows, and the
 project decides what to do about them.
 
-### 3.5 `corral heavy rollup` (PROPOSED)
+### 3.5 `korapy heavy rollup` (PROPOSED)
 
 Purpose: regenerate the portable per-key summary
 (section 6.5) from the raw ledger files.
@@ -306,7 +306,7 @@ settings win, and the next write refreshes the cache.
 
 Cost rows are bounded: keys unused for 30 days are pruned on
 the next write, and `recent[]` keeps the last 50 outcomes.
-Raw ledger files are never pruned by corral; the operator
+Raw ledger files are never pruned by korapy; the operator
 may archive old period files by hand once the rollup
 (section 6) has absorbed them. No other retention: holders
 and waiters are live rows, reaped by the protocol in
@@ -459,7 +459,7 @@ is the opaque stable label from `heavy.host_label()`
 (random hex in `<state>/heavy/host-id`, created once),
 never a hostname or address. The ledger is host-local
 state, never committed; real ledgers never enter the
-public corral repository, which holds only the schema, the
+public korapy repository, which holds only the schema, the
 code, and a synthetic example.
 
 A row (keys stable under `schema_version`, section 6.5):
@@ -479,7 +479,7 @@ A row (keys stable under `schema_version`, section 6.5):
 
 `repo` comes from the one resolver both callers share,
 `heavy.repo_key(cwd)`: the enclosing checkout's
-`corral.toml` repo entry name when present, else the
+`korapy.toml` repo entry name when present, else the
 checkout top directory name. This key is intentionally
 distinct from registration identity (`init.project_name`,
 the origin slug's repo else the directory name): the
@@ -573,11 +573,11 @@ merely does not know.
 The derived per-key summary is a separate small file meant
 to be committed to a project's private ops repository, so
 a fresh clone or a new host starts with warm estimates:
-`corral heavy rollup [--out PATH]` (PROPOSED) regenerates
+`korapy heavy rollup [--out PATH]` (PROPOSED) regenerates
 it from the raw files. The default path resolves through
 `heavy.rollup_path()` (`<state>/heavy/rollup.json`);
 `--out` writes a copy wherever the operator points it, and
-the operator commits it. corral never commits anything
+the operator commits it. korapy never commits anything
 itself. The rollup carries its `schema_version`, its
 source range, and per key the peak p50 and p90, the
 duration p50 and p90, the sample count, the flaky flag,
@@ -664,7 +664,7 @@ saturation for both the launch gate and the lane. A
 saturated reading delays admission for every waiter,
 including the head; an unknown reading (missing files,
 unparsable content) never blocks (the `disk.py`
-precedent). Pressure covers what corral does not manage:
+precedent). Pressure covers what korapy does not manage:
 a desktop eating the host shows up in PSI and load even
 though no holder row names it. Pressure never kills or
 pauses a holder: backoff applies to admission only, the
@@ -689,16 +689,16 @@ Three candidates, one recommendation.
 
 | Surface | How it works | Cost |
 | --- | --- | --- |
-| Prompts and skills | Text tells agents to prefix heavy commands with `corral heavy run --` | Drifts: every prompt copy can differ, and nothing enforces it |
+| Prompts and skills | Text tells agents to prefix heavy commands with `korapy heavy run --` | Drifts: every prompt copy can differ, and nothing enforces it |
 | A wrapper on PATH | A shim dir prepends `make` and friends that queue first | Hides behavior: `make` stops meaning `make`, and hand runs change meaning with PATH |
-| Project check commands | `corral.toml` lists heavy commands; takeoff and agents route them through the lane | One list per project, visible, versioned beside the commands |
+| Project check commands | `korapy.toml` lists heavy commands; takeoff and agents route them through the lane | One list per project, visible, versioned beside the commands |
 
 **Recommendation: project check commands, plus manual
 `heavy run` for the rest.** The project's `[heavy]`
 table names the commands that queue (the suite, the
 build); takeoff routes exactly those through the lane
 (section 9), and an agent with an ad hoc heavy command
-runs `corral heavy run -- <cmd>` by hand, or by one line
+runs `korapy heavy run -- <cmd>` by hand, or by one line
 in the project skill. Prompts stay as documentation of
 the list, never as the mechanism; no wrapper dir is
 added to any PATH. Tradeoff: a new heavy command queues
@@ -816,7 +816,7 @@ output flows through:
 ```sh
 while true; do
   errf=$(mktemp)
-  corral heavy run --json -- make check 2>"$errf"; code=$?
+  korapy heavy run --json -- make check 2>"$errf"; code=$?
   row=$(cat "$errf"); rm -f "$errf"
   [ $code -eq 75 ] && [ "$(echo "$row" | jq -r .admitted)" = "false" ] \
     && sleep 60 && continue
@@ -827,15 +827,15 @@ done
 Watch the lane (holders, waiters, learned costs):
 
 ```sh
-corral heavy status --json | jq '{holders, waiters, costs}'
+korapy heavy status --json | jq '{holders, waiters, costs}'
 ```
 
 Gate the same way takeoff will (plan first, then run;
 config errors abort loudly):
 
 ```sh
-corral heavy run --plan -- make check || exit 1
-corral heavy run -- make check
+korapy heavy run --plan -- make check || exit 1
+korapy heavy run -- make check
 ```
 
 Everything done by hand today stays possible, because the
@@ -844,7 +844,7 @@ state stays open: the same suite runs without the lane
 (`systemd-run --user --scope` with the same properties),
 the queue reads with `cat` and `jq` straight from
 `lane.json`, and one urgent command jumps the queue with
-`corral heavy run --bypass "release fix" -- make check`,
+`korapy heavy run --bypass "release fix" -- make check`,
 leaving its reason in the status view. The verbs are
 conveniences over files, not gates in front of them.
 
@@ -854,7 +854,7 @@ The lane is a thin policy layer, not a scheduler product.
 Each candidate below was judged against the same bar: the
 seven lane requirements (weighted slots in memory and
 CPU; learned per-command cost; admission from pressure
-corral does not manage; plain-file state with a CLI that
+korapy does not manage; plain-file state with a CLI that
 can show every decision; no daemon making decisions the
 CLI cannot show; stdlib only with no new runtime
 dependency; one injectable seam), plus what adoption
@@ -870,7 +870,7 @@ tool's own docs in-session is marked UNVERIFIED.
 | Candidate | Meets | Fails | Adopt cost | Basis |
 | --- | --- | --- | --- | --- |
 | pueue (queue daemon, per-group parallel limits) | queue, order, surviving restarts | count only, no memory weight; no learned cost; no PSI admission; daemon decides (status shows, policy hidden); new binary in `system_deps.toml` plus a daemon seam and daemon-down failure mode | high: host program, daemon lifecycle, second queue beside the lane | UNVERIFIED: docs not re-read in this session |
-| task-spooler (one-slot spooler) | tiny queue, FIFO order | count only; no weights, no learning, no pressure, no memory limit; server process owns state | medium: host program, server-owned queue corral cannot read as plain files | UNVERIFIED: docs not re-read in this session |
+| task-spooler (one-slot spooler) | tiny queue, FIFO order | count only; no weights, no learning, no pressure, no memory limit; server process owns state | medium: host program, server-owned queue korapy cannot read as plain files | UNVERIFIED: docs not re-read in this session |
 | GNU make jobserver (named FIFO token pool) | shares a CPU budget across `make -j` | make-only (leaks via `MAKEFLAGS` to nested makes); token census needs a reaper: a second queue with its own crash states (section 2, point 6) | medium: FIFO lifecycle seam, lost-token failure mode, no memory story | UNVERIFIED: docs not re-read in this session |
 | Ninja pools | depth-limited pools for heavy steps | build-system only; no queue, no learning, no pressure, no CLI status of holders | medium: only helps Ninja builds, nothing else | UNVERIFIED: docs not re-read in this session |
 | `make --load-average` | one-line CPU backoff | no queue, no memory, no learning, no status; load only, blind to cgroup and PSI | low but buys almost nothing | UNVERIFIED: docs not re-read in this session |

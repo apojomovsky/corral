@@ -8,7 +8,7 @@ seams; only ``production_read`` touches ``/proc`` and it never does here.
 import unittest
 from unittest import mock
 
-from corral import pressure as P
+from korapy import pressure as P
 
 LOADAVG = "0.80 0.60 0.40 1/200 12345\n"
 

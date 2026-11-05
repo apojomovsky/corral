@@ -7,7 +7,7 @@ network, no real state or config dirs.
 
 import unittest
 
-from corral import deps, doctor, profiles
+from korapy import deps, doctor, profiles
 
 T0 = 1_800_000_000.0
 
@@ -182,7 +182,7 @@ class ShadowedNames(unittest.TestCase):
             state(
                 parsed=declared(),
                 sources={"fast": "/host/config.toml"},
-                shadowed={"fast": "/ops/corral.toml"},
+                shadowed={"fast": "/ops/korapy.toml"},
             ),
             [dep("muse"), dep("omp")],
         )
@@ -190,7 +190,7 @@ class ShadowedNames(unittest.TestCase):
         note = rows["profiles:fast"]
         self.assertEqual(note.status, "warn")
         self.assertIn("/host/config.toml", note.detail)
-        self.assertIn("/ops/corral.toml", note.detail)
+        self.assertIn("/ops/korapy.toml", note.detail)
         self.assertTrue(note.fix)
         self.assertEqual(rows["profiles"].status, "ok")
         self.assertEqual(doctor.exit_code(checks), 0)

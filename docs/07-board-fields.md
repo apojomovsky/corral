@@ -24,22 +24,22 @@ verb ships, and no exit code changes meaning.
 
 Non-goals: a second provider (GitHub only, per `00-design.md` section 2; a
 later provider is a new adapter), project eligibility policy (projects keep
-it; corral only supplies richer rows), merging and closing (a maintainer
+it; korapy only supplies richer rows), merging and closing (a maintainer
 merges; the loop never closes), and anything the loop deletes.
 
 ## 1. The model: concepts, `TicketRow`, and who owns what
 
-Decision: corral code knows a fixed set of canonical concept keys and
+Decision: korapy code knows a fixed set of canonical concept keys and
 nothing project-specific. All project naming lives in the project's own
-`corral.toml` (section 5). Concepts travel in the store's existing `extra`
+`korapy.toml` (section 5). Concepts travel in the store's existing `extra`
 map (`board.Item.extra`, already persisted as JSON) and reach eligibility
 through one new `TicketRow.extra` mapping, defaulting to `None` and
 normalized to `{}` on build so label-only rows are unchanged.
 
 | Concept | Carries | Owner |
 | --- | --- | --- |
-| `agent` | claim holder id | corral (outbox) |
-| `status` | in-flight state | corral (outbox) |
+| `agent` | claim holder id | korapy (outbox) |
+| `status` | in-flight state | korapy (outbox) |
 | `board_status` | workflow state column | people (read-only) |
 | `priority` | triage rank | people (read-only) |
 | `area` | area or component | people (read-only) |
@@ -76,12 +76,12 @@ Ownership follows `00-design.md` field ownership with no new rule:
   therefore leaves the stored board `extra` untouched. These concepts
   are never enqueued, and the adapter offers no write path for them
   (no method, not a refused one).
-- corral wins `agent` and `status`. A reading only settles queued writes,
+- korapy wins `agent` and `status`. A reading only settles queued writes,
   with the exact label semantics already in `board.py`: a fresher reading
   echoing a queued value marks it sent, a fresher different value drops it
   as `overridden`, an empty value settles nothing, and a stale reading
   (older than the queued write) settles nothing. A person typing into the
-  corral-owned board text fields is therefore handled like a person
+  korapy-owned board text fields is therefore handled like a person
   editing a label: their edit either confirms the queue or loses to a
   newer queued write, and the drop is logged.
 
@@ -93,7 +93,7 @@ present, else the label-derived priority stands. Eligibility keeps reading
 one rank; it never branches on variant.
 
 Relationship cycles (A blocked by B blocked by A) are project policy, not
-corral logic: the store carries the lists verbatim and eligibility, a pure
+korapy logic: the store carries the lists verbatim and eligibility, a pure
 function over rows, decides what a cycle means for that project.
 
 Why not flatten board state into labels on read: the adapter would then
@@ -107,7 +107,7 @@ project-owned file.
 
 Decision: a second adapter module next to `github/tracker.py` with the
 same constructor shape (`run(args)` injected, fakes at that seam only). It
-calls `gh api graphql` through `corral.github.gh.graphql` for board reads
+calls `gh api graphql` through `korapy.github.gh.graphql` for board reads
 and mutations, and the existing REST paths for issues, sub-issues and
 milestones. Nothing outside the two adapters calls `gh` or knows a URL or
 query shape, per the AGENTS.md rule. This needs one small seam change
@@ -227,9 +227,9 @@ Two board-specific cases:
 - An option disappears or is renamed on the board. Reads match by stable
   option id: a stored id with no live option keeps its stored value, logs
   a sync error line, and is flagged by the doctor check (section 5)
-  instead of being mapped to a lookalike. A queued corral-owned write
+  instead of being mapped to a lookalike. A queued korapy-owned write
   whose option id is gone is dropped with reason `unknown-option` plus an
-  error line: corral never invents a mapping. Display-name renames need no
+  error line: korapy never invents a mapping. Display-name renames need no
   handling, since the map is keyed by id and names are comments only; a
   deleted or replaced id is a configuration error surfaced by the doctor,
   not a silent remap.
@@ -248,7 +248,7 @@ precedent: strict concept keys (an unknown concept key is
 `SettingsError`, exit 4) with opaque option-id keys in `priority_map`
 that are never resolved against the registry, and the checked tables
 are exposed as data on the resolved settings for the repo. The board
-slice consumes those resolved tables and never re-reads `corral.toml`,
+slice consumes those resolved tables and never re-reads `korapy.toml`,
 so the file keeps its single resolver.
 
 ```toml
@@ -260,22 +260,22 @@ tracker.variant = "board"   # "labels" (default) or "board"
 [repo.board]
 project_owner = "example"   # board owner login
 project_number = 3          # board number; node id accepted instead
-agent_field = "Agent"       # corral-owned text field for the agent id
-status_field = "Agent state" # corral-owned text field for in-flight status
+agent_field = "Agent"       # korapy-owned text field for the agent id
+status_field = "Agent state" # korapy-owned text field for in-flight status
 status_column = "Status"    # people-owned workflow column (optional)
 priority_column = "Priority"
 area_column = "Area"
 pool_column = "Pool"
 blocked_by_column = "Blocked by"
 
-[repo.board.priority_map]   # stable option id to corral rank; names are comments only
+[repo.board.priority_map]   # stable option id to korapy rank; names are comments only
 "opt-p0-id" = "urgent"  # P0
 "opt-p1-id" = "high"    # P1
 "opt-p2-id" = "normal"  # P2
 "opt-p3-id" = "low"     # P3
 ```
 
-Rules: corral code names concept keys only, never a project's field or
+Rules: korapy code names concept keys only, never a project's field or
 option names; those live in the project's file. The entry `name` is the
 key under the ops root (it keys hooks and ticket records), while
 `tracker.repo` is the `owner/name` the adapter talks to (defaulting to
@@ -306,7 +306,7 @@ labels on the board itself (a people action, reviewable there); flip
 `tracker.variant`; resync; the doctor parity check compares label-derived
 and board-derived concepts per item and reports mismatches. Rollback is
 the same steps in reverse: flip back and resync, after which the mirror
-re-pushes corral-owned values from the store. No new verb ships for any
+re-pushes korapy-owned values from the store. No new verb ships for any
 of this; the variant flip is a config edit plus existing sync and doctor
 verbs.
 
@@ -341,7 +341,7 @@ fails if either real one is touched:
 | Board `updated_at` is the max of issue and board times; board cursor moves on its own reader only and is never compared with the feed cursor | fake `run` with split stamps, temp store cursors |
 | Cursor pair advances independently; failed board step keeps old cursor | fake `run` raising once |
 | `enqueue` refuses people-owned concepts; adapter has no write path for them | temp store |
-| Corral-owned write round-trips through one text field per concept; repeat write leaves one label-free mutation | fake `run` recording mutations |
+| Korapy-owned write round-trips through one text field per concept; repeat write leaves one label-free mutation | fake `run` recording mutations |
 | Fresher person edit drops queued write as `overridden`; newer queue overwrites person edit | temp store plus fake readings |
 | A missing option id drops with `unknown-option` and an error line; a missing field stays queued; rename by id is free | fake schema payloads |
 | Rate-limit answer halts the drain, rows stay queued, cooldown honored | fake `run` rate-limit text, fake pacer |

@@ -2,19 +2,19 @@
 
 | Document | What it is |
 | --- | --- |
-| [`00-design.md`](00-design.md) | the design: the problem, where corral's line falls, and how the pieces fit |
+| [`00-design.md`](00-design.md) | the design: the problem, where korapy's line falls, and how the pieces fit |
 | [`01-onboarding.md`](01-onboarding.md) | onboarding a project in the inline or split layout, and the layout decisions behind it |
 | [`02-accounts-quota.md`](02-accounts-quota.md) | the accounts file, quota readers, the ledger, and the gate over model chains |
 | [`03-muse-runtime.md`](03-muse-runtime.md) | design for the muse runtime adapter: argv, overlay, sessions, resume, errors, quota, sandbox, tests |
 | [`04-dispatch-loop.md`](04-dispatch-loop.md) | the dispatch loop: process model, eligibility, ordering, claims, lifecycle, safety |
 | [`05-dashboard-api.md`](05-dashboard-api.md) | design for the read-only dashboard API: routes, loopback HTTP plus SSE, token rules, schema stability, test plan, tickets |
-| [`06-corral-new.md`](06-corral-new.md) | design for `corral new`: scaffold templates, the `init` writer, the forge side, label bootstrap, idempotence, test plan, tickets |
+| [`06-korapy-new.md`](06-korapy-new.md) | design for `korapy new`: scaffold templates, the `init` writer, the forge side, label bootstrap, idempotence, test plan, tickets |
 | [`07-board-fields.md`](07-board-fields.md) | the board-field tracker variant: project board fields behind the tracker interface, and the tickets to build it |
 | [`08-hub-multihost.md`](08-hub-multihost.md) | the hub design: multi-host claims, leases, the aggregated dashboard, hub operations, and the rollout tickets |
 | [`09-host-resource-governance.md`](09-host-resource-governance.md) | host resource governance: the host budget, per-project shares, the ledger, and the tickets to build them |
 | [`10-agent-profiles.md`](10-agent-profiles.md) | agent profiles: one selectable setup (runtime, model chains, options) with local, project and per-ticket scope, and the tickets to build it |
-| [`11-board-standard.md`](11-board-standard.md) | the standard project board: its fields and options, idempotent provisioning, the `corral.toml` mapping write, adoption, doctor checks, and the tickets to build it |
-| [`12-web-dashboard.md`](12-web-dashboard.md) | design for the web dashboard: a read-only browser UI over `corral serve` and the hub, the stack choice, token handling on arbitrary devices, and the tickets to build it |
+| [`11-board-standard.md`](11-board-standard.md) | the standard project board: its fields and options, idempotent provisioning, the `korapy.toml` mapping write, adoption, doctor checks, and the tickets to build it |
+| [`12-web-dashboard.md`](12-web-dashboard.md) | design for the web dashboard: a read-only browser UI over `korapy serve` and the hub, the stack choice, token handling on arbitrary devices, and the tickets to build it |
 | [`13-agent-ergonomics.md`](13-agent-ergonomics.md) | agent ergonomics: wait, events, the review-report reader, merge, and the gate |
 | [`14-heavy-lane.md`](14-heavy-lane.md) | the heavy lane: weighted slots, learned costs and pressure-aware admission for bursty work |
 | [`adr/`](adr/) | decision records |

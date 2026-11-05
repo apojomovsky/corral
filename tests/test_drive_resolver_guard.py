@@ -32,7 +32,7 @@ import pathlib
 import unittest
 
 
-ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "corral"
+ROOT = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
 FILES = ["drive.py", "drivehub.py"]
 HOLDER_KEYS = {"holder", "agent", "claim.agent"}
 

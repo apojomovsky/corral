@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import accounts, profiles, settings
+from korapy import accounts, profiles, settings
 from tests.test_profiles_resolver import NUMBER, REPO, ROLE, T0, over, parsed, sel
 
 
@@ -22,7 +22,7 @@ def resolve(parsed_profiles, selections=None, **kw):
 
 
 def session_dir():
-    return tempfile.mkdtemp(prefix="corral-session-")
+    return tempfile.mkdtemp(prefix="korapy-session-")
 
 
 class SharedParser(unittest.TestCase):
@@ -92,7 +92,7 @@ class Expiry(unittest.TestCase):
 
     def test_an_expired_override_survives_save_and_load_until_reset(self):
         selections = sel(default="sixth", override=over("global", "fast", T0 - 1, "trying it"))
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             profiles.save_selections(selections, path)
             self.assertEqual(profiles.load_selections(path), selections)
@@ -107,7 +107,7 @@ class Expiry(unittest.TestCase):
 
     def test_clearing_the_override_reads_as_no_override(self):
         selections = sel(default="sixth")
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             profiles.save_selections(selections, path)
             self.assertIsNone(profiles.load_selections(path).override)
@@ -201,7 +201,7 @@ class SessionRecord(unittest.TestCase):
                     profiles.recorded_profile(directory)
 
     def test_a_failed_record_writes_nothing(self):
-        directory = os.path.join(tempfile.mkdtemp(prefix="corral-session-"), "fresh")
+        directory = os.path.join(tempfile.mkdtemp(prefix="korapy-session-"), "fresh")
         bad = profiles.Profile(name="fast", runtime="unknown-rt")
         provenance = profiles.Provenance(
             layer=3, layer_name="temp", source="override", profile="fast"

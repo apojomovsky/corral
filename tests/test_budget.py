@@ -1,4 +1,4 @@
-"""Tests for corral.budget.
+"""Tests for korapy.budget.
 
 The budget is arithmetic over a diff's changed-line count plus one git
 call, so every test either exercises the pure functions directly or stubs
@@ -18,8 +18,8 @@ from contextlib import redirect_stderr, redirect_stdout
 import unittest
 from unittest import mock
 
-from corral import budget as bu
-from corral import settings as S
+from korapy import budget as bu
+from korapy import settings as S
 
 
 def resolve_settings(**kw):
@@ -227,7 +227,7 @@ class DispatchBlockTest(unittest.TestCase):
 
 class CliTest(unittest.TestCase):
     def test_budget_verb_prints_the_block(self):
-        from corral import cli
+        from korapy import cli
 
         proc = subprocess.CompletedProcess([], 0, "4\t0\tsrc/a.rs\n", "")
         out = io.StringIO()
@@ -237,7 +237,7 @@ class CliTest(unittest.TestCase):
         self.assertIn("expected duration:", out.getvalue())
 
     def test_budget_verb_accepts_an_explicit_base(self):
-        from corral import cli
+        from korapy import cli
 
         proc = subprocess.CompletedProcess([], 0, "4\t0\tsrc/a.rs\n", "")
         out = io.StringIO()
@@ -263,7 +263,7 @@ class RegistrationTest(unittest.TestCase):
                 self.assertEqual(S.REGISTRY[key].default, default)
 
     def test_budget_registers_its_settings(self):
-        self.assertIn("corral.budget", S.PROVIDERS)
+        self.assertIn("korapy.budget", S.PROVIDERS)
 
     def test_defaults_resolve_with_no_file(self):
         resolved = resolve_settings()
@@ -301,7 +301,7 @@ class LayersTest(unittest.TestCase):
     def test_env_overrides_a_file(self):
         resolved = resolve_settings(
             project=custom_project(),
-            env={"CORRAL_REVIEW_BUDGET_BASE_MINUTES": "3"},
+            env={"KORAPY_REVIEW_BUDGET_BASE_MINUTES": "3"},
         )
         self.assertEqual(resolved["review.budget.base_minutes"], 3)
 
@@ -315,12 +315,12 @@ class LayersTest(unittest.TestCase):
         self.assertEqual(value.clamped_from, 50)
 
     def test_an_unknown_budget_key_names_the_file_and_key(self):
-        with self.assertRaisesRegex(S.SettingsError, r"corral\.toml.*'review\.budget\.bogus'"):
+        with self.assertRaisesRegex(S.SettingsError, r"korapy\.toml.*'review\.budget\.bogus'"):
             resolve_settings(project={"review": {"budget": {"bogus": 1}}})
 
     def test_a_wrong_type_names_the_file_and_key(self):
         with self.assertRaisesRegex(
-            S.SettingsError, r"corral\.toml.*review\.budget\.base_minutes must be int"
+            S.SettingsError, r"korapy\.toml.*review\.budget\.base_minutes must be int"
         ):
             resolve_settings(project={"review": {"budget": {"base_minutes": "fast"}}})
 
@@ -347,7 +347,7 @@ class RangeSourceTest(unittest.TestCase):
 
     def test_a_non_positive_project_value_names_the_project_file(self):
         with self.assertRaisesRegex(
-            S.SettingsError, r"corral\.toml.*review\.budget\.seconds_per_line"
+            S.SettingsError, r"korapy\.toml.*review\.budget\.seconds_per_line"
         ):
             resolve_settings(project={"review": {"budget": {"seconds_per_line": -2}}})
 
@@ -361,9 +361,9 @@ class RangeSourceTest(unittest.TestCase):
     def test_a_non_positive_env_value_names_the_variable(self):
         with self.assertRaisesRegex(
             S.SettingsError,
-            r"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES.*review\.budget\.floor_minutes",
+            r"KORAPY_REVIEW_BUDGET_FLOOR_MINUTES.*review\.budget\.floor_minutes",
         ):
-            resolve_settings(env={"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES": "0"})
+            resolve_settings(env={"KORAPY_REVIEW_BUDGET_FLOOR_MINUTES": "0"})
 
     def test_a_non_positive_flag_value_names_the_key(self):
         with self.assertRaisesRegex(S.SettingsError, r"flag.*review\.budget\.ceiling_minutes"):
@@ -455,7 +455,7 @@ class NumbersTest(unittest.TestCase):
         # behind each value.
         resolved = resolve_settings(
             project=custom_project(),
-            env={"CORRAL_REVIEW_BUDGET_FLOOR_MINUTES": "30"},
+            env={"KORAPY_REVIEW_BUDGET_FLOOR_MINUTES": "30"},
         )
         with self.assertRaisesRegex(
             S.SettingsError,
@@ -685,19 +685,19 @@ class OneResolverTest(unittest.TestCase):
 
 class BudgetFlagsTest(unittest.TestCase):
     def run_budget(self, argv, project_toml=None):
-        from corral import cli
+        from korapy import cli
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         if project_toml is not None:
-            with open(os.path.join(tmp.name, "corral.toml"), "w", encoding="utf-8") as handle:
+            with open(os.path.join(tmp.name, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write(project_toml)
         config_home = os.path.join(tmp.name, "config")
         os.makedirs(config_home)
         proc = subprocess.CompletedProcess([], 0, "100\t0\tsrc/a.rs\n", "")
         out = io.StringIO()
-        # A hermetic host config: the real ~/.config/corral is never read.
-        with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
+        # A hermetic host config: the real ~/.config/korapy is never read.
+        with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config_home}, clear=True):
             with mock.patch.object(bu, "_git", return_value=proc), redirect_stdout(out):
                 rc = cli.main(["budget", "--root", tmp.name, *argv])
         return rc, out.getvalue()
@@ -727,16 +727,16 @@ class BudgetFlagsTest(unittest.TestCase):
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with open(os.path.join(tmp.name, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(tmp.name, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write("[review.budget]\nbase_minutes = 0\n")
         config_home = os.path.join(tmp.name, "config")
         os.makedirs(config_home)
         proc = subprocess.CompletedProcess([], 128, "", "")
         err, out = StringIO(), StringIO()
-        with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
+        with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config_home}, clear=True):
             with mock.patch.object(bu, "_git", return_value=proc):
                 with contextlib.redirect_stderr(err), redirect_stdout(out):
-                    from corral import cli
+                    from korapy import cli
 
                     rc = cli.main(["budget", "--root", tmp.name])
         self.assertEqual(rc, 4)
@@ -746,9 +746,9 @@ class BudgetFlagsTest(unittest.TestCase):
 class StrictFlagsTest(unittest.TestCase):
     """Both spellings share one parser and one root/repo check.
 
-    Unknown or valueless flags exit 4, and a --root without a corral.toml
-    exits 4, whether the budget runs as `corral budget` or as
-    `python -m corral.budget`. This replaces the lax main_cli test, which
+    Unknown or valueless flags exit 4, and a --root without a korapy.toml
+    exits 4, whether the budget runs as `korapy budget` or as
+    `python -m korapy.budget`. This replaces the lax main_cli test, which
     pinned the old hand-rolled parsing that silently ignored all of these.
     """
 
@@ -756,23 +756,23 @@ class StrictFlagsTest(unittest.TestCase):
         """[(verb rc, out, err), (module rc, out, err)] for the same flags.
 
         A temp dir is the --root when with_root holds; it carries
-        project_toml, or no corral.toml when project_toml is None. The
+        project_toml, or no korapy.toml when project_toml is None. The
         working directory is always the temp dir, so a missing --root never
         accidentally finds a project file uphill.
         """
-        from corral import cli
+        from korapy import cli
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         if project_toml is not None:
-            with open(os.path.join(tmp.name, "corral.toml"), "w", encoding="utf-8") as handle:
+            with open(os.path.join(tmp.name, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write(project_toml)
         flags = ["--root", tmp.name, *argv] if with_root else list(argv)
         config_home = os.path.join(tmp.name, "config")
         os.makedirs(config_home)
         proc = subprocess.CompletedProcess([], 0, "100\t0\tsrc/a.rs\n", "")
         results = []
-        with mock.patch.dict(os.environ, {"CORRAL_CONFIG": config_home}, clear=True):
+        with mock.patch.dict(os.environ, {"KORAPY_CONFIG": config_home}, clear=True):
             with mock.patch.object(bu, "_git", return_value=proc):
                 with mock.patch.object(os, "getcwd", return_value=tmp.name):
                     calls = (lambda: cli.main(["budget", *flags]), lambda: bu.main_cli(flags))
@@ -796,7 +796,7 @@ class StrictFlagsTest(unittest.TestCase):
         for rc, out, err in self.run_both([], project_toml=None):
             with self.subTest(rc=rc, err=err):
                 self.assertEqual(rc, 4)
-                self.assertIn("no corral.toml in --root", err)
+                self.assertIn("no korapy.toml in --root", err)
 
     def test_repo_without_a_root_exits_4_in_both_spellings(self):
         results = self.run_both(["--repo", "a"], project_toml=None, with_root=False)

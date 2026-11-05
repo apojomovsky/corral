@@ -3,10 +3,10 @@
 Status: design, awaiting maintainer approval. No code ships with this doc.
 Implementation waits for approval of the open decisions in section 9.
 
-Every project that uses corral should have a hosted project board, and
-corral itself should have one too. That is the standard this doc designs:
-what the board holds, how corral provisions it idempotently, how the
-provisioned identifiers reach `corral.toml` without a person copying ids
+Every project that uses korapy should have a hosted project board, and
+korapy itself should have one too. That is the standard this doc designs:
+what the board holds, how korapy provisions it idempotently, how the
+provisioned identifiers reach `korapy.toml` without a person copying ids
 by hand, how existing issues are adopted into a new board, and what the
 doctor checks. GitHub Projects v2 is the first and only target today.
 Another forge later is a new adapter behind the same interfaces
@@ -15,7 +15,7 @@ states what the interface must not assume so that adapter fits.
 
 `07-board-fields.md` designed and built the board-field tracker variant:
 reading and writing a board a person made by hand, mapped by hand in
-`corral.toml`. This doc removes the "by hand". It changes no concept, no
+`korapy.toml`. This doc removes the "by hand". It changes no concept, no
 ownership rule and no exit code meaning from that doc.
 
 ## 0. Where this starts: what exists, what does not
@@ -33,18 +33,18 @@ Checked against the code, not against the older docs:
   `ensure_labels(repo)` returning a `LabelReport` (created, kept,
   refused), implemented by `GithubTracker.ensure_labels` and delegated
   by `BoardBackedTracker`. Provisioning on that protocol is therefore
-  an established shape in corral, not a new idea.
-- `corral github setup` is a built verb (`githubcli.cmd_setup` and
+  an established shape in korapy, not a new idea.
+- `korapy github setup` is a built verb (`githubcli.cmd_setup` and
   `githubcli.setup_root`). It runs `ensure_labels` on every named
   `[[repo]]` entry, continuing past a `TrackerError`, and aggregates
   the exit code across entries: any failed repo is 3, else any refused
   label is 1, else 0 only when something was created, else 1. Today
   it creates labels only; no board half exists. `init` prints it as
   its next step and never runs it.
-- `corral new` is built, including `--create-remote` (`new.py`): after
+- `korapy new` is built, including `--create-remote` (`new.py`): after
   creating the remote it bootstraps labels through the same
   `ensure_labels` (`new._bootstrap_labels`); without the flag it
-  prints `next: corral github setup` and runs nothing outward. This
+  prints `next: korapy github setup` and runs nothing outward. This
   doc designs only the board operation those built callers invoke; it
   does not re-design `new` or the label half of `setup`.
 - Nothing creates a board. No `ensure_board` exists anywhere, and
@@ -54,17 +54,17 @@ Checked against the code, not against the older docs:
 Two consequences. First, board provisioning extends the existing
 `github setup` verb and joins the label bootstrap in that one
 operation, so there is still exactly one code path that creates
-outward tracker state (`06-corral-new.md` section 4: "one code path
+outward tracker state (`06-korapy-new.md` section 4: "one code path
 owns this"). No new verb is added, and the label half is not rebuilt.
 Second, board mode today
 assumes a person made the Project, created the fields, read the option
-ids out of the provider, and typed them into `corral.toml`. Every step
+ids out of the provider, and typed them into `korapy.toml`. Every step
 of that is a place to copy the wrong id. Provisioning writes the
 mapping from what the provider returned, so the ids in the file are
 the ids on the board by construction.
 
 Non-goals: views and board layout (grouping, ordering, saved views are
-people's presentation, never corral's contract; the fields are the
+people's presentation, never korapy's contract; the fields are the
 standard, the views are not), provider workflows and automation rules,
 deleting or renaming anything on a board (no delete operation is
 designed anywhere in this doc), backfilling people-owned field values
@@ -73,18 +73,18 @@ second provider (section 6 only keeps the door open).
 
 ## 1. The standard board
 
-Decision: corral ships one standard board specification, as data in one
+Decision: korapy ships one standard board specification, as data in one
 place, naming the seven concepts `07-board-fields.md` section 1 fixed
-and nothing else. corral code keeps naming concept keys only; the
+and nothing else. korapy code keeps naming concept keys only; the
 standard names the default board spelling of each concept. A project's
-`corral.toml` remaps any name, and the remap wins everywhere (section 3
+`korapy.toml` remaps any name, and the remap wins everywhere (section 3
 writes the effective names into the file, so after provisioning the
 file never depends on the defaults again).
 
 | Concept | BoardConfig key | Standard name | Kind | Owner |
 | --- | --- | --- | --- | --- |
-| `agent` | `agent_field` | `Agent` | text | corral (outbox) |
-| `status` | `status_field` | `Agent state` | text | corral (outbox) |
+| `agent` | `agent_field` | `Agent` | text | korapy (outbox) |
+| `status` | `status_field` | `Agent state` | text | korapy (outbox) |
 | `board_status` | `status_column` | `Status` | single-select | people (read-only) |
 | `priority` | `priority_column` | `Priority` | single-select | people (read-only) |
 | `area` | `area_column` | `Area` | single-select | people (read-only) |
@@ -104,10 +104,10 @@ REST issue payload, the edges from the sub-issues endpoints
 
 ### Options
 
-- `Status`: a field corral creates gets at least `Todo`,
+- `Status`: a field korapy creates gets at least `Todo`,
   `In Progress` and `Done`. Those names are creation defaults only:
-  corral assigns them no meaning and never tops up a kept field's
-  options by name (section 2, step 6). corral carries the display
+  korapy assigns them no meaning and never tops up a kept field's
+  options by name (section 2, step 6). korapy carries the display
   name verbatim into `extra["board_status"]` and gives it no meaning; what a status
   allows is project eligibility policy, as today. A new GitHub Project
   ships a built-in `Status` single-select field with exactly these
@@ -137,8 +137,8 @@ REST issue payload, the edges from the sub-issues endpoints
   provisioning time, to build the id map that section 3 writes; a
   display-name rename afterwards is free, a deleted or replaced id is
   a doctor finding, both as today. `urgent` keeps its meaning from
-  AGENTS.md: setting it is the maintainers' alone on corral's own
-  board, and the equivalent people's call elsewhere; corral only
+  AGENTS.md: setting it is the maintainers' alone on korapy's own
+  board, and the equivalent people's call elsewhere; korapy only
   provisions the option.
 - `Area` and `Pool`: the standard names the fields and no options.
   Areas and pools are the project's own vocabulary, and no generic
@@ -148,13 +148,13 @@ REST issue payload, the edges from the sub-issues endpoints
   only when at least one option is declared for them. The only
   declarer in version one is the operator running setup, through
   repeatable `--area NAME` and `--pool NAME` flags on
-  `corral github setup` (decision O6): there is deliberately no
-  `corral.toml` key for the lists, because once the field exists its
+  `korapy github setup` (decision O6): there is deliberately no
+  `korapy.toml` key for the lists, because once the field exists its
   options are people's board state, and a config copy would be a
   second resolver for the same fact. Undeclared and unmapped, the
   concept stays out of the spec, which the reader already treats as
   absent; a later setup run with the flags creates the field then.
-  Once a project's `corral.toml` maps the concept (`area_column` or
+  Once a project's `korapy.toml` maps the concept (`area_column` or
   `pool_column` is set, whether by an earlier flagged setup run or by
   hand), it enters every later spec as **keep-only**: the field must
   exist with the right kind and is then kept exactly as found, and no
@@ -165,22 +165,22 @@ REST issue payload, the edges from the sub-issues endpoints
   plain re-run after a flagged run a no-op: the spec still names the
   concept, the field is kept, and section 3 renders the same table.
 
-### What corral requires, what a team may add
+### What korapy requires, what a team may add
 
 Required for board mode to be healthy (doctor section 5 enforces):
 
 - The Project resolves by owner plus number, or by node id.
 - `Agent` and `Agent state` exist as text fields. Writes need them: an
-  unmapped corral-owned concept raises `UnknownOption` at mirror time
+  unmapped korapy-owned concept raises `UnknownOption` at mirror time
   and the write is dropped, so a standard board maps both.
-- Every concept the project maps in `corral.toml` exists on the board
+- Every concept the project maps in `korapy.toml` exists on the board
   with the kind above, and every option id in `priority_map` exists on
   the live `Priority` field. This is the existing doctor contract.
 
 The standard provisions all seven fields above (subject to the
 `Area`/`Pool` rule). A team may then, without breaking the standard:
 
-- add fields of any kind, for any purpose corral does not know about;
+- add fields of any kind, for any purpose korapy does not know about;
 - add options to people-owned columns. An option on `Priority` that
   `priority_map` does not name reads as concept-absent and keeps the
   stored value, exactly as an unmapped option does today;
@@ -189,11 +189,11 @@ The standard provisions all seven fields above (subject to the
 
 A team breaks the standard, and the doctor says so, by deleting or
 replacing a mapped field or a mapped option id, changing a mapped
-field's kind, or using the two corral-owned text fields for people
+field's kind, or using the two korapy-owned text fields for people
 meaning (a person's edit there is handled by the settlement rules, but
 the meaning is theirs to lose, per `07-board-fields.md` section 1).
 
-Board title: the standard title for a board corral creates is
+Board title: the standard title for a board korapy creates is
 `<repo> board` (for `example/repo`, the title is `repo board`),
 remappable through the same spec (decision O7). The title is how a
 re-run finds a board its config does not address yet (section 2), and
@@ -206,7 +206,7 @@ Decision: provisioning is one ensure operation on tracker-side types,
 implemented once in the GitHub adapter, invoked by name from the
 callers in the table below and from nowhere else. It creates what is
 missing and never alters or deletes what exists, the same contract as
-the label bootstrap in `06-corral-new.md` section 4.
+the label bootstrap in `06-korapy-new.md` section 4.
 
 ### The interface shape
 
@@ -250,7 +250,7 @@ class BoardProvision(NamedTuple):
     created: tuple[str, ...]  # "project", "field:Agent", "option:Priority/High", "link:example/repo"
     kept: tuple[str, ...]
     refused: tuple[str, ...]  # one fix line per refusal
-    priority_map: dict[str, str]  # live option id -> rank, for corral.toml
+    priority_map: dict[str, str]  # live option id -> rank, for korapy.toml
 
 class BoardProvisioner(Protocol):
     def ensure_board(self, spec: BoardSpec) -> BoardProvision: ...
@@ -414,7 +414,7 @@ existing `run=None` defaults are the seam, as in `build_tracker`.
 
 Each step checks its own precondition against the live board, so a
 partial run converges on re-run and the board itself is the state; no
-ledger is kept on disk (the `06-corral-new.md` section 5 rule):
+ledger is kept on disk (the `06-korapy-new.md` section 5 rule):
 
 1. **Resolve the owner.** The owner login comes from the spec. This
    needs a new owner query, not an existing one: `BoardReader._fetch_project`
@@ -455,7 +455,7 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    nodes validated like every other board answer), and only during
    provisioning. Zero title matches means create. Two or more title
    matches raises `ValueError` (exit 4 at the CLI) naming every
-   matching number, before any mutation: corral never picks one (the
+   matching number, before any mutation: korapy never picks one (the
    same ambiguity in `_fetch_single` already fails closed the same
    way).
 3. **Create the Project when missing.** One create mutation with the
@@ -466,7 +466,7 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    Where the API returns the new id form for the owner, the adapter
    prefers it over the legacy node id, which answers with a
    DEPRECATION warning naming `next_global_id`. Visibility: private
-   by default, the `06-corral-new.md` section 3 rule for remotes
+   by default, the `06-korapy-new.md` section 3 rule for remotes
    applied to boards. Create takes no visibility input (VERIFIED:
    section 9, item U4); the design therefore reads the new Project
    back (a new user-owned Project reports `public: false`) and, when
@@ -483,17 +483,17 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    when the update reports success but the board still reads public
    on the re-read, provisioning likewise stops before link and
    fields, with a refused line naming the manual fix (counted as
-   exit 1). Corral never puts fields, links or items on a board it
+   exit 1). Korapy never puts fields, links or items on a board it
    knows is not private as specced; a re-run after the fix converges.
    An existing Project's visibility is never flipped. When an existing
    board the config addresses directly (by number or id) is public
    while the spec asks for private, the report carries a refused line
    with the manual fix and provisioning continues: the config naming
-   that board is the people's decision to use it. When corral found
+   that board is the people's decision to use it. When korapy found
    the board by title search and it is public while the spec wants
    private, provisioning stops before any field step, exit 1 with the
    fix line: adopting a public board a person made, on a title match
-   alone, is not a default corral takes.
+   alone, is not a default korapy takes.
 4. **Link the repository.** When the spec names a repo, link it to the
    Project with `linkProjectV2ToRepository(projectId, repositoryId)`
    (VERIFIED: section 9, item U5). The board reader does not need
@@ -533,7 +533,7 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    Built-in fields the spec does not name (titles, assignees and the
    like) are ignored, like any other team field. A spec field whose
    name matches a built-in of the right kind (the `Status` case,
-   VERIFIED: U1) is kept like any existing field. Corral never
+   VERIFIED: U1) is kept like any existing field. Korapy never
    deletes a field: deleting a built-in is refused by the provider,
    and anything beyond creating and keeping is outside this design
    (section 0 designs no delete operation).
@@ -546,16 +546,16 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    on the field is present, whatever that option is now called; then
    a rank whose standard name is live is present. Only a rank with
    neither a mapped live id nor the standard name is appended, under
-   its standard name. The equivalent rule for `Status`: corral keeps
+   its standard name. The equivalent rule for `Status`: korapy keeps
    no id map for it and gives its names no meaning, so there is no
    evidence by which a missing standard name is missing rather than
-   renamed; corral therefore never appends options to a kept `Status`
+   renamed; korapy therefore never appends options to a kept `Status`
    field at all. Its standard names are creation defaults (section 1),
    and a kept field's options are wholly people's. Keep-only fields
    are never topped up either. The provider's option update
    (`updateProjectV2Field` with `singleSelectOptions`) replaces the
    whole option list (VERIFIED with a refinement: section 9, item
-   U7), so the one append update corral may send (on `Priority`
+   U7), so the one append update korapy may send (on `Priority`
    only) is the existing list, in its existing order, with the
    missing ranks' names appended. Because the whole list is resent,
    the planner's live-schema data carries each existing option's id,
@@ -570,7 +570,7 @@ ledger is kept on disk (the `06-corral-new.md` section 5 rule):
    hand, then re-run"), because resetting people's option colors is
    an alteration step 5 forbids, and rewriting ids would silently
    invalidate every `priority_map` in the wild. Options are never
-   removed and never renamed by corral.
+   removed and never renamed by korapy.
 7. **Read back and report.** One final schema fetch is the truth the
    report and section 3 are built from: project owner, number and node
    id, the live per-concept field names (`BoardProvision.fields`,
@@ -643,7 +643,7 @@ owner sharing the configured board's title and names every number
 (section 5, ticket 6), so the orphan is visible on the next doctor
 run even though every addressed check on the kept board passes.
 An unaddressed setup run also refuses at step 2 naming both
-numbers, and a person deletes one board by hand; corral designs no
+numbers, and a person deletes one board by hand; korapy designs no
 delete for it. Setup is an operator command, not a fleet pass; no
 lock is designed for it, and the failure is closed and visible.
 
@@ -667,11 +667,11 @@ refusal string, until the refusal text is observed.
 
 | Caller | Behavior |
 | --- | --- |
-| `corral github setup` | Runs it (labels first, then the board, then the mapping write). The verb exists (`githubcli`); the board half extends it (ticket 4). The verb is the operator's approval, per `06-corral-new.md` section 3. |
-| `corral new --create-remote` | Runs it after creating the repository and the labels, through the same operation and provisioner factory, never a second implementation. `new` exists; ticket 7 adds the board call after its built `_bootstrap_labels`. |
-| `corral new` without the flag | Prints `corral github setup`, runs nothing outward. |
-| `corral init` | Prints `corral github setup`, exactly as today; never runs it. |
-| `corral doctor` | Prints it as the fix line, never runs it (outward fixes are printed, `01-onboarding.md` section 6). |
+| `korapy github setup` | Runs it (labels first, then the board, then the mapping write). The verb exists (`githubcli`); the board half extends it (ticket 4). The verb is the operator's approval, per `06-korapy-new.md` section 3. |
+| `korapy new --create-remote` | Runs it after creating the repository and the labels, through the same operation and provisioner factory, never a second implementation. `new` exists; ticket 7 adds the board call after its built `_bootstrap_labels`. |
+| `korapy new` without the flag | Prints `korapy github setup`, runs nothing outward. |
+| `korapy init` | Prints `korapy github setup`, exactly as today; never runs it. |
+| `korapy doctor` | Prints it as the fix line, never runs it (outward fixes are printed, `01-onboarding.md` section 6). |
 | `sync`, `mirror`, `drive`, `launch` | Never. A missing field at pass time stays an error line and a doctor finding (`07-board-fields.md` section 4); fleet passes create nothing. |
 
 Which repos setup boards: for each `[[repo]]` entry setup is asked to
@@ -710,28 +710,28 @@ conflict, including an addressed board that no longer resolves).
 Exit codes are a public interface, so a plan that lists creations
 never exits 1 merely because it created nothing.
 
-## 3. Writing the mapping into `corral.toml`
+## 3. Writing the mapping into `korapy.toml`
 
 Decision: the provision's identifiers are written by machine, through
-`init`'s TOML machinery, into the one `corral.toml` that already
+`init`'s TOML machinery, into the one `korapy.toml` that already
 drives the repo entry. No person copies an id, and no second
-`corral.toml` writer appears (`06-corral-new.md` section 1: there is
+`korapy.toml` writer appears (`06-korapy-new.md` section 1: there is
 exactly one writer of that file; this design adds one helper to it,
 not a rival).
 
 ### Which file
 
-The file is the ops root's `corral.toml` for the entry: in the inline
+The file is the ops root's `korapy.toml` for the entry: in the inline
 layout the project's own file, in the split layout the ops root's
-file and never the project clone, where corral writes nothing tracked
+file and never the project clone, where korapy writes nothing tracked
 (R1 in `01-onboarding.md`). The root is the one root the built verb
 already resolves: `settings.find_root` returns the nearest single
-directory at or above the working directory holding a `corral.toml`
+directory at or above the working directory holding a `korapy.toml`
 (it finds one root, never one of several candidates), and
 `githubcli.cmd_setup` runs against that root today. Setup adds no new
 way to find it. No root above the working directory, or an entry name
 that root does not hold, is the built verb's pre-loop exit 4, with
-`corral init` as the fix when there is no root: provisioning never
+`korapy init` as the fix when there is no root: provisioning never
 onboards as a side effect.
 
 ### The write
@@ -744,7 +744,7 @@ says which concepts were asked for, and `provision.fields` (with
 names after the read-back, so the seven names in the rendered table
 come from the provision, never re-derived from defaults, and a
 concept the provision refused renders nothing. `--force` changes none of the rules below. The
-stdlib parses TOML but does not write it, so like every other corral
+stdlib parses TOML but does not write it, so like every other korapy
 edit of this file the change is textual, block-shaped, and every byte
 it does not own is preserved:
 
@@ -776,7 +776,7 @@ depends on defaults silently changing under it:
 
 ```toml
 [repo.board]
-project_owner = "example"    # board owner, written by corral github setup
+project_owner = "example"    # board owner, written by korapy github setup
 project_number = 3
 agent_field = "Agent"
 status_field = "Agent state"
@@ -826,15 +826,15 @@ alone with no board fetch; it changes no pass behavior.
 When the table lands on a labels entry, setup prints the flip as its
 next step, in the `07-board-fields.md` section 6 order: drain the
 outbox, backfill on the board, set `tracker.variant = "board"`,
-resync, `corral doctor`. When it lands on an entry already in board
+resync, `korapy doctor`. When it lands on an entry already in board
 mode (the bootstrap state: variant flipped first, doctor failing on
 the missing table until setup runs), the next step printed is
-`corral doctor`.
+`korapy doctor`.
 
 ## 4. Populating a new board, and the first sync
 
 Decision: adopting existing issues is an explicit, item-add-only step
-of setup (`corral github setup --populate`), separate from ensuring
+of setup (`korapy github setup --populate`), separate from ensuring
 the schema, because it is the one provisioning action whose effect is
 list-length-visible on people's board. `new --create-remote` needs no
 flag: a repository it just created has no issues to adopt.
@@ -851,7 +851,7 @@ returning added, kept and refused lines):
    would double-add or misreport).
 2. List the tracker repo's **open issues** through the REST adapter
    seam. Open issues only: closed issues are history people can add
-   back by hand, and pull requests are never board items corral
+   back by hand, and pull requests are never board items korapy
    creates (the reader tolerates PR items people added; it does not
    put them there). External issues (an author who is not an operator)
    are included: board membership writes to the board, not to the
@@ -862,7 +862,7 @@ returning added, kept and refused lines):
    (VERIFIED: section 9, item U9). The add is idempotent: adding an
    issue already present returns the same item id. An
    already-present answer, if the pre-check raced a person adding the
-   same issue, reads as kept, never as a duplicate corral then tries
+   same issue, reads as kept, never as a duplicate korapy then tries
    to clean up: adoption has no removal path at all. Immediately
    after a link or create, the first adds can answer UNPROCESSABLE
    with a temporary move conflict ("Your attempt to move this item
@@ -871,7 +871,7 @@ returning added, kept and refused lines):
    bounded and classifies them transient, never a refusal.
 
 Adoption sets **no field value on any item**: not `Status`, not
-`Priority`, never the corral-owned texts. It adds items only; it
+`Priority`, never the korapy-owned texts. It adds items only; it
 never moves or edits them. Backfilling people-owned fields from
 labels stays the people action of `07-board-fields.md` section 6,
 reviewable on the board. Partial failure reports added, kept and
@@ -890,7 +890,7 @@ fresh board, stated so nobody has to re-derive it:
   stored board cursor), reads every item the page cap allows per
   pass, and merges concepts per key. Unset fields settle nothing: an
   unset single-select reads as concept-absent and keeps the stored
-  value, and empty corral-owned texts echo nothing, so label-derived
+  value, and empty korapy-owned texts echo nothing, so label-derived
   claims and ranks in the store survive first contact with an
   unbackfilled board (`07-board-fields.md` sections 1 and 3).
 - The resync that follows the flip walks the REST listing as today
@@ -921,19 +921,19 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 
 | Finding | Row | Fix line (printed, never run) |
 | --- | --- | --- |
-| Board mode, no `[repo.board]` table | fail (exists) | `corral github setup` (creates the board and writes the table) |
-| Table names a board that does not resolve (deleted, wrong owner or number, no read access) | fail, naming owner and number | the board in the config no longer exists: remove the table and re-run `corral github setup`, or correct the address by hand (setup refuses the same state with exit 4 and this same line; it never recreates over a stale address) |
+| Board mode, no `[repo.board]` table | fail (exists) | `korapy github setup` (creates the board and writes the table) |
+| Table names a board that does not resolve (deleted, wrong owner or number, no read access) | fail, naming owner and number | the board in the config no longer exists: remove the table and re-run `korapy github setup`, or correct the address by hand (setup refuses the same state with exit 4 and this same line; it never recreates over a stale address) |
 | Token lacks the board scope | fail, naming the missing scope | `gh auth refresh -s project` (scope verified for writes, refusal classification UNVERIFIED, U8; printed for the person, who owns their login) |
-| Board rate-limited during the check | fail (exists, marked transient) | wait for the cooldown, re-run `corral doctor` |
-| Mapped field missing on the live board | fail, naming repo, concept and field name | `corral github setup` (creates the missing field, alters nothing) |
-| Mapped field present with the wrong kind | fail, naming concept, field and both kinds | rename or delete the field on the board, then `corral github setup` |
-| A `priority_map` option id is gone from the board | fail (exists, `check_options`), naming field, id and rank | re-add the option on the board, or delete the board table and re-run `corral github setup` |
+| Board rate-limited during the check | fail (exists, marked transient) | wait for the cooldown, re-run `korapy doctor` |
+| Mapped field missing on the live board | fail, naming repo, concept and field name | `korapy github setup` (creates the missing field, alters nothing) |
+| Mapped field present with the wrong kind | fail, naming concept, field and both kinds | rename or delete the field on the board, then `korapy github setup` |
+| A `priority_map` option id is gone from the board | fail (exists, `check_options`), naming field, id and rank | re-add the option on the board, or delete the board table and re-run `korapy github setup` |
 | A live priority option the map does not name | warn, naming the option's display name | add its id to `priority_map`, or leave it: those items keep their stored rank |
 | Variant flip with queued writes | fail (exists, `flip_refusal`) | drain the outbox, then flip |
 | Label and board priority disagree; unparseable `blocked_by` | fail (exists, `parity_lines`) | backfill on the board, then resync |
 | Board provisioned but variant still `labels` | warn, naming the table | the `07` section 6 flip steps, or remove the table |
-| Another board under the same owner shares the configured board's title | warn, naming the title and every matching number | delete the board the config does not address, by hand (the racing-setups duplicate of section 2; corral deletes no board) |
-| Open issues missing from the board | fail, naming the count and the first few numbers | `corral github setup --populate` (needs the section 8 ticket 6 seam; not in the first doctor ticket) |
+| Another board under the same owner shares the configured board's title | warn, naming the title and every matching number | delete the board the config does not address, by hand (the racing-setups duplicate of section 2; korapy deletes no board) |
+| Open issues missing from the board | fail, naming the count and the first few numbers | `korapy github setup --populate` (needs the section 8 ticket 6 seam; not in the first doctor ticket) |
 
 Six implementation notes, so the rows above are buildable rather
 than aspirational:
@@ -1040,7 +1040,7 @@ assumptions the interface must not bake in:
   to be lists driven by labels, milestones or assignees, with no free
   text field an item can carry (UNVERIFIED). The concept kinds text
   and single-select are the least common denominator: an adapter may
-  back a concept with labels, exactly as corral's own label adapter
+  back a concept with labels, exactly as korapy's own label adapter
   already backs `agent` and `status` with `agent:*` and `status:*`
   labels today. The interface must therefore never promise a field,
   only a concept carried somehow.
@@ -1053,7 +1053,7 @@ assumptions the interface must not bake in:
 - **No stable option id.** When a column is label-backed, its
   "options" are names, renameable by people (UNVERIFIED). The
   priority rank mapping must therefore stay an opaque-string-keyed
-  map owned by config, as `priority_map` already is, and corral code
+  map owned by config, as `priority_map` already is, and korapy code
   outside the adapter must never parse, compare or mint an option key.
   This is today's rule; provisioning must not weaken it by treating
   the keys it harvests as anything more than strings to write down.
@@ -1062,43 +1062,43 @@ assumptions the interface must not bake in:
   the interface must keep runtime addressing free of titles so an
   adapter with no title search can still implement every read.
 
-And the mirror rule for corral itself: nothing outside
+And the mirror rule for korapy itself: nothing outside
 `github/board.py` and its provisioner may learn a mutation name, a
 URL shape or a `dataType` spelling from this work. The day a second
 adapter is needed it is a new module and its tests (`00-design.md`
 section 2), not a fork of the setup CLI.
 
-## 7. Corral's own board
+## 7. Korapy's own board
 
-Corral adopts its own standard board once the provisioning above is
+Korapy adopts its own standard board once the provisioning above is
 built, and not by an agent ticket: creating boards is on the
 AGENTS.md approval-gate list, so the run below happens in a
 maintainer's own session, on the maintainer's explicit go-ahead in
-that session. Nothing in this design creates corral's board, and the
+that session. Nothing in this design creates korapy's board, and the
 rollout in section 8 deliberately ends before this step.
 
 When approved, the steps are the ordinary adoption path with no
 special cases:
 
-1. `corral github setup --board --populate` against corral's own
-   tracker repo, from the root that drives corral. This works on
-   corral's labels entry precisely because the provisioner factory
+1. `korapy github setup --board --populate` against korapy's own
+   tracker repo, from the root that drives korapy. This works on
+   korapy's labels entry precisely because the provisioner factory
    needs no `BoardConfig` (section 2). The mapping lands
-   in whichever `corral.toml` that is: this repository carries no
-   `corral.toml` of its own today, so the file written is the driving
+   in whichever `korapy.toml` that is: this repository carries no
+   `korapy.toml` of its own today, so the file written is the driving
    ops root's, per section 3, and it is committed there like any
    other config change (through a PR, if that root takes PRs).
 2. Drain the outbox through the mirror until empty.
 3. Backfill the people-owned fields from the labels on the board
    itself, a people pass over the open issues, using the doctor
    parity report as the checklist.
-4. Flip `tracker.variant` to `board`, resync, `corral doctor`.
+4. Flip `tracker.variant` to `board`, resync, `korapy doctor`.
 5. Leave the labels in place. Rollback is the flip undone plus a
    resync (`07-board-fields.md` section 6); the board itself is never
-   deleted by corral, and a board abandoned by a roll back stays as a
+   deleted by korapy, and a board abandoned by a roll back stays as a
    people's artifact until a person removes it by hand.
 
-Until then corral stays in label mode, and the standard's first real
+Until then korapy stays in label mode, and the standard's first real
 board is whichever project the maintainer provisions first.
 
 ## 8. Rollout: implementation tickets
@@ -1130,7 +1130,7 @@ ticket.
    showed it, in an amendment to this doc; where a fact is false, the
    affected section above is amended before ticket 2 starts (in
    particular, if U7 fails, section 2 step 6 ships as its refused-line
-   variant). No corral code changes.
+   variant). No korapy code changes.
 1. **Types, the standard spec, and the pure planner.** `tracker.py`
    gains `FieldSpec` (with `keep_only`), `BoardSpec` (with the
    exactly-one-or-none `number`/`project_id` address and the
@@ -1200,7 +1200,7 @@ ticket.
    renders `area_column`, so re-rendering against the file a flagged
    run wrote is identical (the no-op behind the plain re-run's
    exit 1, exercised end to end in ticket 4).
-4. **Extend `corral github setup`, including its production
+4. **Extend `korapy github setup`, including its production
    wiring.** The verb and its label half are built
    (`githubcli.setup_root`, `ensure_labels` on the `Tracker`
    protocol); this ticket adds no verb and rebuilds no label code.
@@ -1263,7 +1263,7 @@ ticket.
    configured board's title and the owner's board list beside the
    schema; another board sharing that exact title warns, naming the
    title and every matching number), fix lines pointing at
-   `corral github setup`; the warn plumbing
+   `korapy github setup`; the warn plumbing
    (`BoardRow.status` gains `"warn"`, passed through to `doctor.Check`,
    fail over warn over ok per row) and the site-inclusion rule (a
    labels entry with a `[repo.board]` table becomes a site answered
@@ -1280,7 +1280,7 @@ ticket.
    it was never called (so it carries no duplicate-title check);
    doctor exit codes unchanged (fail rows exit 1,
    warn-only exits 0); no row runs anything.
-7. **`new --create-remote` wiring.** `corral new` is built; this is a
+7. **`new --create-remote` wiring.** `korapy new` is built; this is a
    small extension of it, not a blocked ticket. In the
    `--create-remote` path, after the built `_bootstrap_labels`, invoke
    the same board ensure (the `production_board_provisioner` factory
@@ -1288,14 +1288,14 @@ ticket.
    entry and write its mapping through ticket 3's writer. Outcomes
    map onto `new`'s existing codes by the `_bootstrap_labels`
    precedent: created counts as changed; refused prints
-   `next: corral github setup` and the run ends 1; `TrackerError`
+   `next: korapy github setup` and the run ends 1; `TrackerError`
    prints the same next step and the run ends 3; a spec `ValueError`
    is a usage error, 4. Without `--create-remote`, print
-   `corral github setup` exactly as today. Acceptance: fake-forge,
+   `korapy github setup` exactly as today. Acceptance: fake-forge,
    fake-tracker and fake-provisioner tests show the one operation
    invoked once, no second provisioning path, the four outcome
    mappings above, and the printed-not-run default unchanged.
-8. **Corral's own adoption.** Not an agent ticket. Held for the
+8. **Korapy's own adoption.** Not an agent ticket. Held for the
    maintainer's go-ahead in their own session, run per section 7.
 
 ## 9. Unverified facts and open decisions
@@ -1425,10 +1425,10 @@ Options:
 2. Create each with one seed option named General
 3. Require at least one option before setup runs
 
-O7. Title for a board corral creates:
+O7. Title for a board korapy creates:
 Options:
 1. "<repo> board" from the tracker repo name (recommended)
-2. The entry name from corral.toml, unchanged
+2. The entry name from korapy.toml, unchanged
 3. No default; setup requires a --board-title flag
 
 O8. External authors' open issues during population:

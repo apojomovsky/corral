@@ -9,8 +9,8 @@ import json
 import unittest
 from unittest import mock
 
-from corral import forge, paths
-from corral.github import forge as ghforge
+from korapy import forge, paths
+from korapy.github import forge as ghforge
 
 BASE_SHA = "a" * 40
 HEAD_SHA = "b" * 40
@@ -1002,7 +1002,7 @@ class OriginRepoTest(unittest.TestCase):
 
 class RepoNameHelper(unittest.TestCase):
     def test_the_cli_and_adapter_share_one_definition(self):
-        from corral import reviewcli
+        from korapy import reviewcli
 
         self.assertFalse(hasattr(reviewcli, "_FORGE_REPO"))
         for good in ("acme/lib", "a-b/c.d"):

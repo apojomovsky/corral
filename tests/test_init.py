@@ -1,4 +1,4 @@
-"""`corral init` and `corral uninit`: files written, exits, idempotency."""
+"""`korapy init` and `korapy uninit`: files written, exits, idempotency."""
 
 import inspect
 import io
@@ -12,8 +12,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
-from corral import cli, detect, init, projects, settings
-from corral.gitenv import clean_env
+from korapy import cli, detect, init, projects, settings
+from korapy.gitenv import clean_env
 
 
 def proc(returncode=0, stdout="", stderr=""):
@@ -150,7 +150,7 @@ class DetectCase(unittest.TestCase):
         self.assertIsNone(detect.default_branch("/repo", failing))
 
     def test_detect_registers_checks_test(self):
-        self.assertIn("corral.detect", settings.PROVIDERS)
+        self.assertIn("korapy.detect", settings.PROVIDERS)
         self.assertEqual(settings.REGISTRY["checks.test"].default, "")
 
 
@@ -283,7 +283,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
-# agents.unit_prefix = "corral-agent-"  # prefix of transient agent unit names
+# agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
 # board.hold_label = "hold"  # label that holds a ticket for a human
@@ -359,7 +359,7 @@ TAIL = """# Defaults: uncomment to override.
 # tracker.variant = "labels"  # tracker source: labels or board (default: labels)
 """
 
-HEAD = """# corral.toml, written by `corral init`. Settings that differ
+HEAD = """# korapy.toml, written by `korapy init`. Settings that differ
 # from the defaults live in [[repo]]; everything else is
 # commented out below with its default.
 [[repo]]
@@ -382,7 +382,7 @@ GOLDEN_RUSTY = HEAD % ("rusty", "cargo test") + TAIL
 GOLDEN_GOPHER = HEAD % ("gopher", "go test ./...") + TAIL
 GOLDEN_DOCSY = HEAD % ("docsy", "make test") + TAIL
 
-GOLDEN_FLAGS = """# corral.toml, written by `corral init`. Settings that differ
+GOLDEN_FLAGS = """# korapy.toml, written by `korapy init`. Settings that differ
 # from the defaults live in [[repo]]; everything else is
 # commented out below with its default.
 [profile]
@@ -417,7 +417,7 @@ commits.conventional = false
 # admission.total_cap = 4  # live plus pending agents the host admits in total
 #
 # [agents]
-# agents.unit_prefix = "corral-agent-"  # prefix of transient agent unit names
+# agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
 # board.hold_label = "hold"  # label that holds a ticket for a human
@@ -503,9 +503,9 @@ class Fixture(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.root = os.path.join(tmp.name, self.name)
         os.makedirs(self.root)
-        cfg = tempfile.mkdtemp(prefix="corral-config-")
+        cfg = tempfile.mkdtemp(prefix="korapy-config-")
         self.addCleanup(shutil.rmtree, cfg, True)
-        patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+        patcher = mock.patch.dict(os.environ, {"KORAPY_CONFIG": cfg})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.config_dir = cfg
@@ -561,7 +561,7 @@ class Fixture(unittest.TestCase):
         return found
 
     def target(self):
-        return os.path.join(self.root, "corral.toml")
+        return os.path.join(self.root, "korapy.toml")
 
 
 class GoldenCase(Fixture):
@@ -601,7 +601,7 @@ class GoldenCase(Fixture):
 
     def test_round_trip_through_settings_load(self):
         self.assertEqual(self.run_cli(*self.extra, self.root)[0], 0)
-        env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
+        env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["checks.test"], self.want_test())
         self.assertEqual(resolved["clone.path"], ".")
@@ -701,7 +701,7 @@ class DocsyCase(GoldenCase):
         self.assertEqual(
             added,
             {
-                "corral.toml",
+                "korapy.toml",
                 "agents.overlay.md",
                 os.path.join(".githooks", "commit-msg"),
                 os.path.join(".githooks", "pre-push"),
@@ -731,7 +731,7 @@ class FlagsCase(Fixture):
         self.assertEqual(code, 0)
         with open(self.target(), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), GOLDEN_FLAGS)
-        env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
+        env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["agents.cap"], 3)
         self.assertEqual(resolved.profiles["default"]["runtime"], "muse")
@@ -746,7 +746,7 @@ class FlagsCase(Fixture):
             text = handle.read()
         self.assertNotIn("[profiles", text)
         self.assertNotIn("[profile]", text)
-        env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
+        env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved.profiles, {})
 
@@ -841,7 +841,7 @@ class ErrorsCase(Fixture):
             text = handle.read()
         self.assertIn('default_branch = "zzz"', text)
         self.assertIn('path = "sub"', text)
-        env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
+        env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["clone.default_branch"], "zzz")
         self.assertEqual(resolved["clone.path"], "sub")
@@ -876,13 +876,13 @@ class ErrorsCase(Fixture):
         code, out, _ = self.run_cli("--test-cmd", "make check", sub)
         self.assertEqual(code, 0, out)
         self.assertTrue(os.path.isfile(self.target()))
-        self.assertFalse(os.path.exists(os.path.join(sub, "corral.toml")))
+        self.assertFalse(os.path.exists(os.path.join(sub, "korapy.toml")))
 
     def test_staging_branch_is_detected(self):
         self.git("checkout", "-qb", "staging")
         code, _, _ = self.run_cli("--test-cmd", "make check", self.root)
         self.assertEqual(code, 0)
-        env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
+        env = {"KORAPY_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["clone.default_branch"], "staging")
 
@@ -985,21 +985,21 @@ class DirectoryNameCase(Fixture):
 
 OVERLAY_GOLDEN = """# Agent overlay
 
-How corral's agents are driven. The project's `AGENTS.md` speaks to
+How korapy's agents are driven. The project's `AGENTS.md` speaks to
 everyone, including contributors and their own agents. This file speaks only
-to the agents corral launches: worktrees, the review gate, takeoff, the
+to the agents korapy launches: worktrees, the review gate, takeoff, the
 decision protocol, house preferences, what is private.
 
-This file is yours to edit after `corral init`: a re-run never overwrites
+This file is yours to edit after `korapy init`: a re-run never overwrites
 it. In the inline layout it is a tracked file in the project, but still
-separate from `AGENTS.md`, so contributors never read corral-only rules.
+separate from `AGENTS.md`, so contributors never read korapy-only rules.
 
 ## Where a new rule goes
 
 The first yes decides:
 
 1. It mentions anything private (the ops side, a client, people, quota, accounts, internal priorities): it goes in the overlay. The leak guard enforces this.
-2. It only makes sense because corral runs the agent: it goes in the overlay.
+2. It only makes sense because korapy runs the agent: it goes in the overlay.
 3. A contributor's PR would be rejected for not following it: it goes in the project `AGENTS.md`.
 4. Otherwise, it is a preference for these agents only: it goes in the overlay.
 
@@ -1013,9 +1013,9 @@ or change the project's `AGENTS.md` in a PR.
 def registration_golden(name, root, cap=1):
     """The registration text `init` writes, as an independent copy."""
     return (
-        "# The host registration for this project, written by `corral init`.\n"
-        "# `corral uninit` removes this file while its content still matches\n"
-        "# what `corral init` would write; edit it and `uninit` leaves it alone.\n"
+        "# The host registration for this project, written by `korapy init`.\n"
+        "# `korapy uninit` removes this file while its content still matches\n"
+        "# what `korapy init` would write; edit it and `uninit` leaves it alone.\n"
         f'name = "{name}"\n'
         f'unit_prefix = "{name}-agent-"\n'
         f'root = "{root}"\n'
@@ -1041,7 +1041,7 @@ class OverlayCase(Fixture):
             text = handle.read()
         for rule in (
             "anything private",
-            "only makes sense because corral runs the agent",
+            "only makes sense because korapy runs the agent",
             "rejected for not following it",
             "a preference for these agents only",
         ):
@@ -1114,10 +1114,10 @@ class HooksCase(Fixture):
 
     def test_a_symlinked_hook_is_blocked_and_never_chmodded(self):
         outside = os.path.join(os.path.dirname(self.root), "outside-hook")
-        from corral import init as corral_init
+        from korapy import init as korapy_init
 
         with open(outside, "wb") as handle:
-            handle.write(corral_init.hook_template("pre-push"))
+            handle.write(korapy_init.hook_template("pre-push"))
         os.chmod(outside, 0o644)
         os.makedirs(os.path.join(self.root, ".githooks"))
         os.symlink(outside, os.path.join(self.root, ".githooks", "pre-push"))
@@ -1344,7 +1344,7 @@ class RegistrationCase(Fixture):
         self.assertIn(f"would write {self.reg_target()}", out)
         self.assertIn("-# edited", out)
         self.assertIn(f"a/{os.path.basename(self.reg_target())}", out)
-        self.assertNotIn("a/corral.toml", out)
+        self.assertNotIn("a/korapy.toml", out)
         self.assertEqual(self.snapshot(), before)
         with open(self.reg_target(), encoding="utf-8") as handle:
             self.assertEqual(handle.read(), edited)
@@ -1416,7 +1416,7 @@ class UninitCase(Fixture):
         code, out, _ = self.run_uninit(self.root)
         self.assertEqual(code, 0, out)
         self.assertIn("kept", out)
-        self.assertIn("modified since `corral init` wrote it", out)
+        self.assertIn("modified since `korapy init` wrote it", out)
         self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "commit-msg")))
         self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks", "pre-push")))
         self.assertFalse(os.path.exists(self.reg_target()))
@@ -1428,7 +1428,7 @@ class UninitCase(Fixture):
             handle.write("# edited\n")
         code, out, _ = self.run_uninit(self.root)
         self.assertEqual(code, 0, out)
-        self.assertIn("differs from what `corral init` would write now", out)
+        self.assertIn("differs from what `korapy init` would write now", out)
         self.assertTrue(os.path.isfile(self.reg_target()))
         self.assertFalse(os.path.exists(os.path.join(self.root, ".githooks")))
         self.assertEqual(self.hooks_path(), "")
@@ -1466,7 +1466,7 @@ class UninitCase(Fixture):
         self.assertEqual(code, 0, out)
         self.assertFalse(os.path.exists(self.reg_target()))
 
-    def test_uninit_without_corral_toml_falls_back_to_the_default(self):
+    def test_uninit_without_korapy_toml_falls_back_to_the_default(self):
         self.assertEqual(self.run_cli("--test-cmd", "make check", self.root)[0], 0)
         os.remove(self.target())
         code, out, _ = self.run_uninit(self.root)
@@ -1480,7 +1480,7 @@ class UninitCase(Fixture):
         self.git("config", "core.hooksPath", ".githooks")
         code, out, _ = self.run_uninit(self.root)
         self.assertEqual(code, 1)
-        self.assertIn("holds files `corral init` did not write", out)
+        self.assertIn("holds files `korapy init` did not write", out)
         self.assertIn("hooks remain", out)
         self.assertTrue(os.path.isfile(os.path.join(self.root, ".githooks", "my-hook")))
         self.assertEqual(self.hooks_path(), ".githooks")
@@ -1577,7 +1577,7 @@ class RegistrationConflictsCase(unittest.TestCase):
 
 MAPPING_TABLE = """\
 [repo.board]
-project_owner = "operator"  # board owner, written by corral github setup
+project_owner = "operator"  # board owner, written by korapy github setup
 project_number = 7
 agent_field = "Agent"
 """
@@ -1624,7 +1624,7 @@ class BoardTableConvergence(unittest.TestCase):
 
     def test_split_change_ignores_the_mapping_table(self):
         rendered = init.render(self.inputs())
-        target = os.path.join(tempfile.mkdtemp(prefix="corral-init-"), "corral.toml")
+        target = os.path.join(tempfile.mkdtemp(prefix="korapy-init-"), "korapy.toml")
         self.addCleanup(shutil.rmtree, os.path.dirname(target), True)
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(rendered.rstrip("\n") + "\n\n" + MAPPING_TABLE)
@@ -1633,7 +1633,7 @@ class BoardTableConvergence(unittest.TestCase):
 
     def test_split_change_still_refuses_a_different_owned_value(self):
         rendered = init.render(self.inputs())
-        target = os.path.join(tempfile.mkdtemp(prefix="corral-init-"), "corral.toml")
+        target = os.path.join(tempfile.mkdtemp(prefix="korapy-init-"), "korapy.toml")
         self.addCleanup(shutil.rmtree, os.path.dirname(target), True)
         with open(target, "w", encoding="utf-8") as handle:
             handle.write(

@@ -4,7 +4,7 @@ Status: accepted (decided by the maintainer in session, ticket 196).
 
 ## Context
 
-`00-design.md` section 4 planned several corral hosts as peers: every
+`00-design.md` section 4 planned several korapy hosts as peers: every
 host holds a full board copy, peers pull each other's logs, and a
 claim needs an ack from every current peer. During a partition no new
 claim is made anywhere.
@@ -14,7 +14,7 @@ and it needs an ack roundtrip per claim across a changing membership.
 
 ## Decision
 
-Multi-host corral is a hub, hosted on one host the maintainer owns,
+Multi-host korapy is a hub, hosted on one host the maintainer owns,
 reachable over a private network. The hub is a small service in front
 of SQLite, standard library only, authenticated per host with bearer
 tokens. Claims are linearizable through one hub database transaction.

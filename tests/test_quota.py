@@ -2,7 +2,7 @@
 
 import unittest
 
-from corral import accounts, quota, quota_ledger as ql, settings
+from korapy import accounts, quota, quota_ledger as ql, settings
 
 T0 = 1_800_000_000.0
 STALE = 900.0
@@ -430,7 +430,7 @@ class QuotaSettings(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["quota.unknown_blocks"].default, False)
 
     def test_quota_registers_its_settings(self):
-        self.assertIn("corral.quota", settings.PROVIDERS)
+        self.assertIn("korapy.quota", settings.PROVIDERS)
 
     def test_a_host_file_may_set_quota_keys(self):
         resolved = settings.resolve(host={"quota": {"low_pct": 95, "unknown_blocks": True}}, env={})

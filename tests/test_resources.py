@@ -11,8 +11,8 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from corral import prompts
-from corral import resources as R
+from korapy import prompts
+from korapy import resources as R
 
 NOW = 1_000_000.0
 

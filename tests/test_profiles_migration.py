@@ -1,6 +1,6 @@
 """Agent profiles, ticket 8: migration cutover.
 
-The old `[models.*]` tables and `agents.runtime` are gone: a corral.toml
+The old `[models.*]` tables and `agents.runtime` are gone: a korapy.toml
 still carrying them fails fast with SettingsError (exit 4) naming the new
 `[profiles.*]` keys. Every launch resolves one profile; the pre-profiles
 path is gone, so a config with no declarations runs the built-in default.
@@ -10,8 +10,8 @@ import os
 import tempfile
 import unittest
 
-from corral import accounts, launch, profiles, projects, settings
-from corral import drive as drive_mod
+from korapy import accounts, launch, profiles, projects, settings
+from korapy import drive as drive_mod
 
 
 def resolve(project=None, host=None, repo=None, env=None, flags=None):
@@ -51,7 +51,7 @@ class OldKeysFail(unittest.TestCase):
 
     def test_the_env_agents_runtime_is_rejected(self):
         with self.assertRaisesRegex(settings.SettingsError, "profiles"):
-            resolve(env={"CORRAL_AGENTS_RUNTIME": "muse"})
+            resolve(env={"KORAPY_AGENTS_RUNTIME": "muse"})
 
     def test_the_agents_runtime_flag_is_rejected(self):
         with self.assertRaisesRegex(settings.SettingsError, "profiles"):
@@ -83,10 +83,10 @@ class SinglePath(unittest.TestCase):
 
 class DriveQuotaFromProfiles(unittest.TestCase):
     def test_project_quota_reads_the_declared_default_profiles_chains(self):
-        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-migration-"))
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-migration-"))
         root = os.path.join(tmp, "ops")
         os.makedirs(root)
-        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[profiles.default]\nruntime = "omp"\n'
                 '[profiles.default.models.default]\nchain = ["tired/model"]\n'
@@ -98,10 +98,10 @@ class DriveQuotaFromProfiles(unittest.TestCase):
         self.assertEqual(source.stale_after, 60.0)
 
     def test_project_quota_rejects_the_old_models_table(self):
-        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-migration-"))
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-migration-"))
         root = os.path.join(tmp, "ops")
         os.makedirs(root)
-        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[models.default]\nchain = ["tired/model"]\n')
         project = projects.Project(name="blue", unit_prefix="blue-agent", root=root)
         with self.assertRaises(settings.SettingsError):

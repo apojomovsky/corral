@@ -9,9 +9,9 @@ a real board.
 import json
 import unittest
 
-from corral import tracker as iface
-from corral.github import gh
-from corral.github.board import GithubBoardProvisioner
+from korapy import tracker as iface
+from korapy.github import gh
+from korapy.github.board import GithubBoardProvisioner
 from tests.test_board_fields import FakePacer
 from tests.test_board_provision import ProvisionFakeRun
 

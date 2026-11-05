@@ -1,11 +1,11 @@
 ---
 name: Bug
-about: Something corral does that it should not
+about: Something korapy does that it should not
 ---
 
 ## Command
 
-The exact `corral` invocation, with flags.
+The exact `korapy` invocation, with flags.
 
 ```
 ```
@@ -14,7 +14,7 @@ The exact `corral` invocation, with flags.
 
 The exit code it returned (`0`, `1`, `2`, `3`, `4` or `75`; see the README).
 
-## `corral doctor --json`
+## `korapy doctor --json`
 
 Redact host names before pasting.
 
@@ -23,4 +23,4 @@ Redact host names before pasting.
 
 ## What happened
 
-What corral did, and what it should have done instead.
+What korapy did, and what it should have done instead.

@@ -11,9 +11,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import settings, units
+from korapy import settings, units
 
-PREFIX = "corral-agent-"
+PREFIX = "korapy-agent-"
 REPOS = ("lib", "my-repo", "repo2", "a-5", "x-r3", "a.b")
 #: Built from parts so this file never holds the production stop's name as a literal.
 STOP_NAME = "".join(["systemctl", "_stop"])
@@ -52,9 +52,9 @@ class Dirs(unittest.TestCase):
 
 class NamesTest(unittest.TestCase):
     def test_unit_name_formats(self):
-        self.assertEqual(units.unit_name(PREFIX, "lib", 5), "corral-agent-lib-5")
-        self.assertEqual(units.unit_name(PREFIX, "lib", 5, 0), "corral-agent-lib-5")
-        self.assertEqual(units.unit_name(PREFIX, "lib", 5, 2), "corral-agent-lib-5-r2")
+        self.assertEqual(units.unit_name(PREFIX, "lib", 5), "korapy-agent-lib-5")
+        self.assertEqual(units.unit_name(PREFIX, "lib", 5, 0), "korapy-agent-lib-5")
+        self.assertEqual(units.unit_name(PREFIX, "lib", 5, 2), "korapy-agent-lib-5-r2")
 
     def test_round_trip_for_several_repos_tickets_and_generations(self):
         for repo in REPOS:
@@ -68,24 +68,24 @@ class NamesTest(unittest.TestCase):
                         )
 
     def test_repo_names_with_hyphens_and_digits_split_correctly(self):
-        self.assertEqual(units.parse_unit(PREFIX, "corral-agent-a-5-7"), ("a-5", 7, 0))
-        self.assertEqual(units.parse_unit(PREFIX, "corral-agent-a-5-7-r2"), ("a-5", 7, 2))
-        self.assertEqual(units.parse_unit(PREFIX, "corral-agent-x-r3-4"), ("x-r3", 4, 0))
-        self.assertEqual(units.parse_unit(PREFIX, "corral-agent-repo2-9-r1"), ("repo2", 9, 1))
+        self.assertEqual(units.parse_unit(PREFIX, "korapy-agent-a-5-7"), ("a-5", 7, 0))
+        self.assertEqual(units.parse_unit(PREFIX, "korapy-agent-a-5-7-r2"), ("a-5", 7, 2))
+        self.assertEqual(units.parse_unit(PREFIX, "korapy-agent-x-r3-4"), ("x-r3", 4, 0))
+        self.assertEqual(units.parse_unit(PREFIX, "korapy-agent-repo2-9-r1"), ("repo2", 9, 1))
 
     def test_other_prefixes_and_malformed_names_do_not_parse(self):
         self.assertIsNone(units.parse_unit(PREFIX, "other-agent-lib-5"))
-        self.assertIsNone(units.parse_unit(PREFIX, "corral-agentlib-5"))
+        self.assertIsNone(units.parse_unit(PREFIX, "korapy-agentlib-5"))
         for bad in (
-            "corral-agent-lib",
-            "corral-agent-lib-0",
-            "corral-agent-lib-05",
-            "corral-agent-lib-5-r0",
-            "corral-agent-lib-5-r",
-            "corral-agent-lib-5-x",
-            "corral-agent--5",
-            "corral-agent-lib-5.timer",
-            "corral-agent-x.git-5",
+            "korapy-agent-lib",
+            "korapy-agent-lib-0",
+            "korapy-agent-lib-05",
+            "korapy-agent-lib-5-r0",
+            "korapy-agent-lib-5-r",
+            "korapy-agent-lib-5-x",
+            "korapy-agent--5",
+            "korapy-agent-lib-5.timer",
+            "korapy-agent-x.git-5",
             "",
         ):
             with self.subTest(bad=bad):
@@ -95,7 +95,7 @@ class NamesTest(unittest.TestCase):
     def test_bad_inputs_are_usage_errors(self):
         for args in (
             ("", "lib", 1, 0),
-            ("corral agent-", "lib", 1, 0),
+            ("korapy agent-", "lib", 1, 0),
             (PREFIX, "../lib", 1, 0),
             (PREFIX, "", 1, 0),
             (PREFIX, "lib.git", 1, 0),
@@ -117,20 +117,20 @@ class NamesTest(unittest.TestCase):
 
     def test_the_prefix_setting_is_registered_with_its_default(self):
         self.assertEqual(settings.REGISTRY["agents.unit_prefix"].default, PREFIX)
-        self.assertIn("corral.units", settings.PROVIDERS)
+        self.assertIn("korapy.units", settings.PROVIDERS)
 
 
 LISTING = "\n".join(
     [
-        "corral-agent-lib-5.service loaded active running Agent lib 5",
-        "corral-agent-lib-5-r1.service loaded inactive dead Agent lib 5 gen 1",
-        "corral-agent-my-repo-7.service loaded failed failed Agent my-repo 7",
-        "corral-agent-a-5-2-r4.service loaded activating start Agent a-5 2",
-        "corral-agent-x-r3-9.service loaded deactivating stop-sigterm Agent",
-        "corral-agent-repo2-1.service loaded reloading reload Agent repo2 1",
+        "korapy-agent-lib-5.service loaded active running Agent lib 5",
+        "korapy-agent-lib-5-r1.service loaded inactive dead Agent lib 5 gen 1",
+        "korapy-agent-my-repo-7.service loaded failed failed Agent my-repo 7",
+        "korapy-agent-a-5-2-r4.service loaded activating start Agent a-5 2",
+        "korapy-agent-x-r3-9.service loaded deactivating stop-sigterm Agent",
+        "korapy-agent-repo2-1.service loaded reloading reload Agent repo2 1",
         "other-agent-lib-5.service loaded active running another fleet",
         "third-agent-3.service loaded active running another fleet",
-        "corral-agent-broken.service loaded active running not one of ours",
+        "korapy-agent-broken.service loaded active running not one of ours",
     ]
 )
 
@@ -142,12 +142,12 @@ class ListTest(unittest.TestCase):
         self.assertEqual(
             found,
             [
-                ("corral-agent-lib-5", "active", "running"),
-                ("corral-agent-lib-5-r1", "inactive", "dead"),
-                ("corral-agent-my-repo-7", "failed", "failed"),
-                ("corral-agent-a-5-2-r4", "activating", "start"),
-                ("corral-agent-x-r3-9", "deactivating", "stop-sigterm"),
-                ("corral-agent-repo2-1", "reloading", "reload"),
+                ("korapy-agent-lib-5", "active", "running"),
+                ("korapy-agent-lib-5-r1", "inactive", "dead"),
+                ("korapy-agent-my-repo-7", "failed", "failed"),
+                ("korapy-agent-a-5-2-r4", "activating", "start"),
+                ("korapy-agent-x-r3-9", "deactivating", "stop-sigterm"),
+                ("korapy-agent-repo2-1", "reloading", "reload"),
             ],
         )
         self.assertEqual(
@@ -157,7 +157,7 @@ class ListTest(unittest.TestCase):
                     "systemctl",
                     "--user",
                     "list-units",
-                    "corral-agent-*",
+                    "korapy-agent-*",
                     "--all",
                     "--no-legend",
                     "--no-pager",
@@ -181,7 +181,7 @@ class ListTest(unittest.TestCase):
             self.assertEqual(caught.exception.exit_code, 3)
 
     def test_a_line_in_an_unknown_shape_is_unreachable_not_no_units(self):
-        for stdout in ("corral-agent-lib-5.service loaded active\n", "garbage\n"):
+        for stdout in ("korapy-agent-lib-5.service loaded active\n", "garbage\n"):
             with self.subTest(stdout=stdout), self.assertRaises(units.Unreachable):
                 units.list_units(PREFIX, run=FakeRun(done([], stdout=stdout)))
 
@@ -194,9 +194,9 @@ class ListTest(unittest.TestCase):
 
     def test_live_tickets_ignores_other_prefixes_and_dead_units(self):
         units_seen = [
-            ("corral-agent-lib-1", "active", "running"),
-            ("corral-agent-lib-2", "inactive", "dead"),
-            ("corral-agent-lib-3", "failed", "failed"),
+            ("korapy-agent-lib-1", "active", "running"),
+            ("korapy-agent-lib-2", "inactive", "dead"),
+            ("korapy-agent-lib-3", "failed", "failed"),
             ("other-agent-lib-4", "active", "running"),
         ]
         self.assertEqual(units.live_tickets(PREFIX, units_seen), {("lib", 1)})
@@ -205,7 +205,7 @@ class ListTest(unittest.TestCase):
 
 class SpawnLockTest(Dirs):
     def test_lock_is_held_inside_and_released_after(self):
-        with mock.patch.dict(os.environ, {"CORRAL_STATE": self.session("state")}):
+        with mock.patch.dict(os.environ, {"KORAPY_STATE": self.session("state")}):
             lock_path = os.path.join(self.tmp, "state", units.SPAWN_LOCK)
             with units.spawn_lock():
                 self.assertTrue(os.path.exists(lock_path))
@@ -221,7 +221,7 @@ class UnitArgvTest(unittest.TestCase):
     def test_exact_argv_with_env_items_and_passthrough(self):
         with mock.patch.dict(os.environ, {"PATH": "/p/bin"}):
             argv = units.unit_argv(
-                "corral-agent-lib-5-r1",
+                "korapy-agent-lib-5-r1",
                 "/work/lib",
                 "/sessions/lib-5",
                 ["omp", "-p", "hi"],
@@ -236,7 +236,7 @@ class UnitArgvTest(unittest.TestCase):
                 "--user",
                 "--collect",
                 "--quiet",
-                "--unit=corral-agent-lib-5-r1",
+                "--unit=korapy-agent-lib-5-r1",
                 "--property=RuntimeMaxSec=3600",
                 "--property=StandardOutput=append:/sessions/lib-5/out.log",
                 "--property=StandardError=append:/sessions/lib-5/err.log",
@@ -308,17 +308,17 @@ class SliceArgvTest(unittest.TestCase):
             ["x"],
             [],
             60,
-            slice="corral-web.slice",
+            slice="korapy-web.slice",
             memory_max=2048,
             cpu_quota=1000,
             tasks_max=100,
         )
-        self.assertIn("--property=Slice=corral-web.slice", argv)
+        self.assertIn("--property=Slice=korapy-web.slice", argv)
         self.assertIn("--property=MemoryMax=2048M", argv)
         self.assertIn("--property=CPUQuota=100%", argv)
         self.assertIn("--property=TasksMax=100", argv)
         self.assertLess(
-            argv.index("--property=Slice=corral-web.slice"),
+            argv.index("--property=Slice=korapy-web.slice"),
             argv.index("--working-directory=/w"),
         )
 
@@ -342,13 +342,13 @@ class SliceArgvTest(unittest.TestCase):
             ["x"],
             [],
             60,
-            slice="corral-web.slice",
+            slice="korapy-web.slice",
             memory_max=2048,
             cpu_quota=1000,
             tasks_max=100,
             controllers={"cpu", "pids"},
         )
-        self.assertIn("--property=Slice=corral-web.slice", argv)
+        self.assertIn("--property=Slice=korapy-web.slice", argv)
         self.assertNotIn("--property=MemoryMax=2048M", argv)
         self.assertIn("--property=CPUQuota=100%", argv)
 
@@ -366,13 +366,13 @@ class SliceArgvTest(unittest.TestCase):
 
 class SliceNamesTest(unittest.TestCase):
     def test_the_host_slice_is_fixed(self):
-        self.assertEqual(units.HOST_SLICE, "corral.slice")
+        self.assertEqual(units.HOST_SLICE, "korapy.slice")
 
     def test_a_project_names_its_slice(self):
-        self.assertEqual(units.project_slice("web"), "corral-web.slice")
+        self.assertEqual(units.project_slice("web"), "korapy-web.slice")
 
     def test_a_prefix_key_names_a_slice(self):
-        self.assertEqual(units.project_slice("corral-agent-"), "corral-corral-agent-.slice")
+        self.assertEqual(units.project_slice("korapy-agent-"), "korapy-korapy-agent-.slice")
 
     def test_a_bad_project_cannot_name_a_slice(self):
         for bad in ("", "a/b", "a b"):
@@ -386,15 +386,15 @@ class SliceCgroupTest(unittest.TestCase):
         self.assertEqual(
             path,
             "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
-            "/corral.slice/corral-web.slice",
+            "/korapy.slice/korapy-web.slice",
         )
 
     def test_an_agent_leaf_maps_under_its_project_slice(self):
-        path = units.agent_cgroup("web", "corral-agent-lib-5", uid=1000)
+        path = units.agent_cgroup("web", "korapy-agent-lib-5", uid=1000)
         self.assertEqual(
             path,
             "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service"
-            "/corral.slice/corral-web.slice/corral-agent-lib-5.service",
+            "/korapy.slice/korapy-web.slice/korapy-agent-lib-5.service",
         )
 
     def test_a_bad_project_or_unit_cannot_name_a_cgroup(self):
@@ -452,18 +452,18 @@ class DelegationTest(unittest.TestCase):
 class SliceStartArgvTest(unittest.TestCase):
     def test_host_slice_starts_by_name(self):
         self.assertEqual(
-            units.slice_start_argv("corral.slice"),
-            ["systemctl", "--user", "start", "corral.slice"],
+            units.slice_start_argv("korapy.slice"),
+            ["systemctl", "--user", "start", "korapy.slice"],
         )
 
     def test_project_slice_carries_no_parent_flag(self):
-        """Hierarchy comes from the name: corral-web.slice nests under corral.slice."""
-        argv = units.slice_start_argv("corral-web.slice")
-        self.assertEqual(argv, ["systemctl", "--user", "start", "corral-web.slice"])
+        """Hierarchy comes from the name: korapy-web.slice nests under korapy.slice."""
+        argv = units.slice_start_argv("korapy-web.slice")
+        self.assertEqual(argv, ["systemctl", "--user", "start", "korapy-web.slice"])
         self.assertFalse([a for a in argv if a.startswith("--slice=")])
 
     def test_a_non_slice_name_is_refused(self):
-        for bad in ("corral.slice.service", ".slice", "corral", "", None, 5):
+        for bad in ("korapy.slice.service", ".slice", "korapy", "", None, 5):
             with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
                 units.slice_start_argv(bad)
 
@@ -471,50 +471,50 @@ class SliceStartArgvTest(unittest.TestCase):
 class SliceSetPropertyArgvTest(unittest.TestCase):
     def test_limits_render_as_runtime_assignments(self):
         self.assertEqual(
-            units.slice_set_property_argv("corral.slice", memory_max=16000, cpu_quota=8000),
+            units.slice_set_property_argv("korapy.slice", memory_max=16000, cpu_quota=8000),
             [
                 "systemctl",
                 "--user",
                 "set-property",
                 "--runtime",
-                "corral.slice",
+                "korapy.slice",
                 "MemoryMax=16000M",
                 "CPUQuota=800%",
             ],
         )
 
     def test_a_fractional_cpu_quota_formats_without_trailing_zeros(self):
-        argv = units.slice_set_property_argv("corral-web.slice", cpu_quota=555)
+        argv = units.slice_set_property_argv("korapy-web.slice", cpu_quota=555)
         self.assertEqual(argv[-1], "CPUQuota=55.5%")
 
     def test_unset_or_zero_limits_mean_no_call(self):
-        self.assertIsNone(units.slice_set_property_argv("corral.slice"))
+        self.assertIsNone(units.slice_set_property_argv("korapy.slice"))
         self.assertIsNone(
-            units.slice_set_property_argv("corral.slice", memory_max=0, cpu_quota=None)
+            units.slice_set_property_argv("korapy.slice", memory_max=0, cpu_quota=None)
         )
 
     def test_a_bad_limit_or_name_is_refused(self):
         for bad in (True, "2048", -1):
             with self.subTest(bad=bad), self.assertRaises(units.UnitsError):
-                units.slice_set_property_argv("corral.slice", memory_max=bad)
+                units.slice_set_property_argv("korapy.slice", memory_max=bad)
         with self.assertRaises(units.UnitsError):
-            units.slice_set_property_argv("corral.slice.service", memory_max=16000)
+            units.slice_set_property_argv("korapy.slice.service", memory_max=16000)
 
 
 class EnsureSliceTest(unittest.TestCase):
     def test_host_slice_starts_then_sets_its_limits(self):
         fake = FakeRun()
-        units.ensure_slice("corral.slice", memory_max=16000, cpu_quota=8000, run=fake)
+        units.ensure_slice("korapy.slice", memory_max=16000, cpu_quota=8000, run=fake)
         self.assertEqual(
             fake.calls,
             [
-                ["systemctl", "--user", "start", "corral.slice"],
+                ["systemctl", "--user", "start", "korapy.slice"],
                 [
                     "systemctl",
                     "--user",
                     "set-property",
                     "--runtime",
-                    "corral.slice",
+                    "korapy.slice",
                     "MemoryMax=16000M",
                     "CPUQuota=800%",
                 ],
@@ -522,17 +522,17 @@ class EnsureSliceTest(unittest.TestCase):
         )
 
     def test_project_slice_needs_no_parent_flag(self):
-        """The name parents it: corral-web.slice starts under corral.slice."""
+        """The name parents it: korapy-web.slice starts under korapy.slice."""
         fake = FakeRun()
-        units.ensure_slice("corral-web.slice", memory_max=2048, cpu_quota=1000, run=fake)
+        units.ensure_slice("korapy-web.slice", memory_max=2048, cpu_quota=1000, run=fake)
         self.assertEqual(len(fake.calls), 2)
-        self.assertEqual(fake.calls[0], ["systemctl", "--user", "start", "corral-web.slice"])
+        self.assertEqual(fake.calls[0], ["systemctl", "--user", "start", "korapy-web.slice"])
         self.assertFalse([a for call in fake.calls for a in call if a.startswith("--slice=")])
 
     def test_a_slice_without_limits_runs_start_only(self):
         fake = FakeRun()
-        units.ensure_slice("corral.slice", run=fake)
-        self.assertEqual(fake.calls, [["systemctl", "--user", "start", "corral.slice"]])
+        units.ensure_slice("korapy.slice", run=fake)
+        self.assertEqual(fake.calls, [["systemctl", "--user", "start", "korapy.slice"]])
 
     def test_an_already_loaded_slice_stays_success(self):
         calls = []
@@ -540,10 +540,10 @@ class EnsureSliceTest(unittest.TestCase):
         def run(argv, timeout=None):
             calls.append(list(argv))
             if len(calls) == 1:
-                return done(argv, 1, "", "Unit corral.slice already exists.")
+                return done(argv, 1, "", "Unit korapy.slice already exists.")
             return done(argv)
 
-        units.ensure_slice("corral.slice", memory_max=16000, cpu_quota=8000, run=run)
+        units.ensure_slice("korapy.slice", memory_max=16000, cpu_quota=8000, run=run)
         self.assertEqual(len(calls), 2)
         self.assertEqual(calls[0][:3], ["systemctl", "--user", "start"])
         self.assertIn("set-property", calls[1])
@@ -551,7 +551,7 @@ class EnsureSliceTest(unittest.TestCase):
     def test_an_unreachable_bus_is_exit_3_on_start_and_on_set_property(self):
         start_down = FakeRun(result=done([], 1, "", "Failed to connect to bus: refused"))
         with self.assertRaises(units.Unreachable) as caught:
-            units.ensure_slice("corral.slice", memory_max=16000, run=start_down)
+            units.ensure_slice("korapy.slice", memory_max=16000, run=start_down)
         self.assertEqual(caught.exception.exit_code, 3)
 
         def run(argv, timeout=None):
@@ -560,7 +560,7 @@ class EnsureSliceTest(unittest.TestCase):
             return done(argv, 1, "", "Failed to connect to bus: no medium found")
 
         with self.assertRaises(units.Unreachable) as caught:
-            units.ensure_slice("corral.slice", memory_max=16000, run=run)
+            units.ensure_slice("korapy.slice", memory_max=16000, run=run)
         self.assertEqual(caught.exception.exit_code, 3)
 
     def test_a_refused_property_names_it_with_exit_4(self):
@@ -570,32 +570,32 @@ class EnsureSliceTest(unittest.TestCase):
             return done(argv, 1, "", "Failed to set property MemoryMax: Access denied")
 
         with self.assertRaisesRegex(units.UnitsError, "MemoryMax") as caught:
-            units.ensure_slice("corral.slice", memory_max=16000, run=run)
+            units.ensure_slice("korapy.slice", memory_max=16000, run=run)
         self.assertEqual(caught.exception.exit_code, 4)
 
     def test_a_failed_start_is_exit_4(self):
-        fake = FakeRun(result=done([], 1, "", "Failed to start corral.slice: bad slice"))
+        fake = FakeRun(result=done([], 1, "", "Failed to start korapy.slice: bad slice"))
         with self.assertRaises(units.UnitsError) as caught:
-            units.ensure_slice("corral.slice", memory_max=16000, run=fake)
+            units.ensure_slice("korapy.slice", memory_max=16000, run=fake)
         self.assertEqual(caught.exception.exit_code, 4)
 
     def test_a_missing_manager_binary_is_exit_4(self):
         fake = FakeRun(error=OSError("no systemctl"))
         with self.assertRaises(units.UnitsError) as caught:
-            units.ensure_slice("corral.slice", run=fake)
+            units.ensure_slice("korapy.slice", run=fake)
         self.assertEqual(caught.exception.exit_code, 4)
 
     def test_a_bad_name_or_limit_runs_nothing(self):
         fake = FakeRun()
         with self.assertRaises(units.UnitsError):
-            units.ensure_slice("corral.slice.service", run=fake)
+            units.ensure_slice("korapy.slice.service", run=fake)
         with self.assertRaises(units.UnitsError):
-            units.ensure_slice("corral.slice", memory_max="2048", run=fake)
+            units.ensure_slice("korapy.slice", memory_max="2048", run=fake)
         self.assertEqual(fake.calls, [])
 
     def test_run_is_required(self):
         with self.assertRaises(TypeError):
-            units.ensure_slice("corral.slice")  # ty: ignore[missing-argument]
+            units.ensure_slice("korapy.slice")  # ty: ignore[missing-argument]
 
 
 class StartTest(Dirs):
@@ -605,24 +605,24 @@ class StartTest(Dirs):
     def test_success_records_the_unit_in_units_log(self):
         session = self.session()
         fake = FakeRun()
-        units.start(self.argv("corral-agent-lib-5"), session, "corral-agent-lib-5", run=fake)
-        units.start(self.argv("corral-agent-lib-5-r1"), session, "corral-agent-lib-5-r1", run=fake)
+        units.start(self.argv("korapy-agent-lib-5"), session, "korapy-agent-lib-5", run=fake)
+        units.start(self.argv("korapy-agent-lib-5-r1"), session, "korapy-agent-lib-5-r1", run=fake)
         self.assertEqual(
-            units.started_units(session), ["corral-agent-lib-5", "corral-agent-lib-5-r1"]
+            units.started_units(session), ["korapy-agent-lib-5", "korapy-agent-lib-5-r1"]
         )
-        self.assertEqual(fake.calls[0], self.argv("corral-agent-lib-5"))
+        self.assertEqual(fake.calls[0], self.argv("korapy-agent-lib-5"))
 
     def test_already_exists_or_already_loaded_is_unit_exists(self):
         session = self.session()
         for stderr in (
-            "Unit corral-agent-lib-5.service already exists.",
-            "Unit corral-agent-lib-5.service Already Loaded",
+            "Unit korapy-agent-lib-5.service already exists.",
+            "Unit korapy-agent-lib-5.service Already Loaded",
         ):
             with self.subTest(stderr=stderr):
                 fake = FakeRun(done([], returncode=1, stderr=stderr))
                 with self.assertRaises(units.UnitExists) as caught:
                     units.start(
-                        self.argv("corral-agent-lib-5"), session, "corral-agent-lib-5", run=fake
+                        self.argv("korapy-agent-lib-5"), session, "korapy-agent-lib-5", run=fake
                     )
                 self.assertEqual(caught.exception.exit_code, 2)
         self.assertEqual(units.started_units(session), [])
@@ -669,7 +669,7 @@ class StartTest(Dirs):
         self.assertEqual(units.started_units(session), [])
         fake = FakeRun()
         for gen in (0, 1, 3):
-            name = units.unit_name("corral-agent-", "a-5", 2, gen)
+            name = units.unit_name("korapy-agent-", "a-5", 2, gen)
             units.start(self.argv(name), session, name, run=fake)
         self.assertEqual(units.next_gen(session), 4)
 
@@ -693,21 +693,21 @@ class StopTest(Dirs):
     def setUp(self):
         super().setUp()
         self.listing = [
-            ("corral-agent-lib-5", "active", "running"),
-            ("corral-agent-lib-5-r1", "activating", "start"),
-            ("corral-agent-lib-5-r2", "inactive", "dead"),
-            ("corral-agent-lib-50", "active", "running"),
-            ("corral-agent-my-repo-5", "active", "running"),
-            ("corral-agent-a-5-5", "active", "running"),
-            ("corral-agent-a-5-5-r1", "deactivating", "stop-sigterm"),
+            ("korapy-agent-lib-5", "active", "running"),
+            ("korapy-agent-lib-5-r1", "activating", "start"),
+            ("korapy-agent-lib-5-r2", "inactive", "dead"),
+            ("korapy-agent-lib-50", "active", "running"),
+            ("korapy-agent-my-repo-5", "active", "running"),
+            ("korapy-agent-a-5-5", "active", "running"),
+            ("korapy-agent-a-5-5-r1", "deactivating", "stop-sigterm"),
             ("other-agent-lib-5", "active", "running"),
         ]
         self.logged = [
-            "corral-agent-lib-5",
-            "corral-agent-lib-5-r1",
-            "corral-agent-lib-5-r2",
-            "corral-agent-a-5-5",
-            "corral-agent-a-5-5-r1",
+            "korapy-agent-lib-5",
+            "korapy-agent-lib-5-r1",
+            "korapy-agent-lib-5-r2",
+            "korapy-agent-a-5-5",
+            "korapy-agent-a-5-5-r1",
         ]
         self.session = self.log(self.logged)
         self.stopped = []
@@ -742,12 +742,12 @@ class StopTest(Dirs):
 
     def test_stops_every_live_logged_generation_of_one_ticket(self):
         found = self.stop("lib", 5)
-        self.assertEqual(found, ["corral-agent-lib-5", "corral-agent-lib-5-r1"])
+        self.assertEqual(found, ["korapy-agent-lib-5", "korapy-agent-lib-5-r1"])
         self.assertEqual(self.stopped, found)
 
     def test_other_repos_and_tickets_are_untouched(self):
-        self.assertEqual(self.stop("a-5", 5), ["corral-agent-a-5-5", "corral-agent-a-5-5-r1"])
-        self.assertEqual(self.stopped, ["corral-agent-a-5-5", "corral-agent-a-5-5-r1"])
+        self.assertEqual(self.stop("a-5", 5), ["korapy-agent-a-5-5", "korapy-agent-a-5-5-r1"])
+        self.assertEqual(self.stopped, ["korapy-agent-a-5-5", "korapy-agent-a-5-5-r1"])
         self.stopped.clear()
         self.assertEqual(self.stop("my-repo", 5), [])
         self.assertEqual(self.stop("lib", 7), [])
@@ -755,11 +755,11 @@ class StopTest(Dirs):
         self.assertEqual(self.stopped, [])
 
     def test_a_colliding_prefix_unit_is_never_stopped_without_proof(self):
-        # With the prefix "corral-agent-", the other fleet's unit parses as
+        # With the prefix "korapy-agent-", the other fleet's unit parses as
         # ("x-repo", 5); only the units.log shows it is not ours.
-        other = "corral-agent-x-repo-5"
+        other = "korapy-agent-x-repo-5"
         self.assertEqual(units.parse_unit(PREFIX, other), ("x-repo", 5, 0))
-        self.assertEqual(units.parse_unit("corral-agent-x-", other), ("repo", 5, 0))
+        self.assertEqual(units.parse_unit("korapy-agent-x-", other), ("repo", 5, 0))
         self.listing.append((other, "active", "running"))
         session = self.log([], name="ticket-x-repo")
         self.assertEqual(self.stop("x-repo", 5, session=session), [])
@@ -778,12 +778,12 @@ class StopTest(Dirs):
         self.assertEqual(self.stopped, [])
         self.assertEqual(
             units.unproven(PREFIX, "lib", 5, session_dir=session, list_fn=self.list_fn),
-            ["corral-agent-lib-5", "corral-agent-lib-5-r1"],
+            ["korapy-agent-lib-5", "korapy-agent-lib-5-r1"],
         )
 
     def test_a_failure_partway_names_the_units_already_stopped(self):
         def failing(unit):
-            if unit == "corral-agent-lib-5-r1":
+            if unit == "korapy-agent-lib-5-r1":
                 raise units.Unreachable("no bus")
             self.stopped.append(unit)
 
@@ -797,9 +797,9 @@ class StopTest(Dirs):
                 stop_fn=failing,
             )
         self.assertEqual(caught.exception.exit_code, 3)
-        self.assertIn("corral-agent-lib-5", str(caught.exception))
-        self.assertIn("corral-agent-lib-5-r1", str(caught.exception))
-        self.assertEqual(self.stopped, ["corral-agent-lib-5"])
+        self.assertIn("korapy-agent-lib-5", str(caught.exception))
+        self.assertIn("korapy-agent-lib-5-r1", str(caught.exception))
+        self.assertEqual(self.stopped, ["korapy-agent-lib-5"])
 
     def test_bad_arguments_are_refused_before_anything_is_listed(self):
         def never(_prefix):
@@ -869,7 +869,7 @@ class SealTest(unittest.TestCase):
 
     def test_src_names_systemctl_and_systemd_run_only_in_their_functions(self):
         found = set()
-        for name, tree in self._modules("src", "corral"):
+        for name, tree in self._modules("src", "korapy"):
             owner = self._owners(tree)
             for node in ast.walk(tree):
                 if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
@@ -896,7 +896,7 @@ class SealTest(unittest.TestCase):
 
     def test_only_systemctl_stop_builds_a_stop_argv_in_src(self):
         found = set()
-        for name, tree in self._modules("src", "corral"):
+        for name, tree in self._modules("src", "korapy"):
             for func in ast.walk(tree):
                 if not isinstance(func, ast.FunctionDef):
                     continue

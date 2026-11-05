@@ -4,7 +4,7 @@ import unittest
 import unittest.mock
 from contextlib import redirect_stdout
 
-from corral import push
+from korapy import push
 
 
 def _proc(rc=0, out="", err=""):
@@ -208,7 +208,7 @@ class HookPathTest(unittest.TestCase):
         import os
         import tempfile
 
-        from corral.gitenv import clean_env
+        from korapy.gitenv import clean_env
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

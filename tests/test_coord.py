@@ -17,9 +17,9 @@ import unittest
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
-from corral import cli
-from corral import coord
-from corral import tracker
+from korapy import cli
+from korapy import coord
+from korapy import tracker
 
 T0 = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
 
@@ -264,7 +264,7 @@ class CoordCliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name, "CORRAL_PROJECT": "demo"})
+        env = mock.patch.dict(os.environ, {"KORAPY_STATE": tmp.name, "KORAPY_PROJECT": "demo"})
         env.start()
         self.addCleanup(env.stop)
 
@@ -354,10 +354,10 @@ class _ProjectCase(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.state = tmp.name
-        env = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name})
+        env = mock.patch.dict(os.environ, {"KORAPY_STATE": tmp.name})
         env.start()
         self.addCleanup(env.stop)
-        os.environ.pop("CORRAL_PROJECT", None)
+        os.environ.pop("KORAPY_PROJECT", None)
 
     def _run(self, argv):
         out, err = io.StringIO(), io.StringIO()
@@ -387,7 +387,7 @@ class PerProjectTest(_ProjectCase):
         self.assertFalse(os.path.exists(os.path.join(self.state, "coord")))
 
     def test_the_env_names_the_project_and_the_flag_wins(self):
-        with mock.patch.dict(os.environ, {"CORRAL_PROJECT": "app"}):
+        with mock.patch.dict(os.environ, {"KORAPY_PROJECT": "app"}):
             self._run(["coord", "acquire", "--holder", "a"])
             code, out, _ = self._run(["coord", "status", "--project", "lib", "--json"])
         self.assertTrue(json.loads(out)["free"])
@@ -396,14 +396,14 @@ class PerProjectTest(_ProjectCase):
     def test_no_project_is_a_usage_error(self):
         code, _, err = self._run(["coord", "status"])
         self.assertEqual(code, cli.USAGE)
-        self.assertIn("CORRAL_PROJECT", err)
+        self.assertIn("KORAPY_PROJECT", err)
         self.assertFalse(os.path.exists(os.path.join(self.state, "projects")))
 
     def test_a_project_name_must_be_one_path_segment(self):
         for bad in ("../x", "a/b", ".", "..", "-x", ""):
             with self.subTest(bad=bad):
                 with self.assertRaises(coord.UsageError):
-                    coord.project_root(bad, env={"CORRAL_STATE": self.state})
+                    coord.project_root(bad, env={"KORAPY_STATE": self.state})
 
 
 class PerProjectSeparationTest(_ProjectCase):
@@ -420,7 +420,7 @@ class PerProjectSeparationTest(_ProjectCase):
         self.assertIn("only in app", out)
 
     def test_events_are_per_project(self):
-        from corral import coordevents
+        from korapy import coordevents
 
         coordevents.record(
             [{"kind": "supply", "ref": "fleet", "evidence": "app only"}],
@@ -442,14 +442,14 @@ class PerProjectSeparationTest(_ProjectCase):
         self._run(["coord", "release", "--project", "app", "--generation", "1"])
         self._run(["coord", "acquire", "--project", "app", "--holder", "a"])  # app is at 2
         self._run(["coord", "acquire", "--project", "lib", "--holder", "b"])  # lib is at 1
-        env = {"CORRAL_PROJECT": "app", "CORRAL_COORD_GENERATION": "2"}
+        env = {"KORAPY_PROJECT": "app", "KORAPY_COORD_GENERATION": "2"}
         with mock.patch.dict(os.environ, env):
             code, _, _ = self._run(["coord", "log", "note", "x"])
             self.assertEqual(code, 0)
             # app's generation 2 must not be checked against lib's lease.
             code, out, err = self._run(["coord", "log", "note", "y", "--project", "lib"])
             self.assertEqual(code, 0, err)
-        with mock.patch.dict(os.environ, {"CORRAL_PROJECT": "lib", "CORRAL_COORD_GENERATION": "2"}):
+        with mock.patch.dict(os.environ, {"KORAPY_PROJECT": "lib", "KORAPY_COORD_GENERATION": "2"}):
             code, _, err = self._run(["coord", "log", "note", "z"])
             self.assertEqual(code, cli.RACE, err)
 

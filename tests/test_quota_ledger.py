@@ -7,7 +7,7 @@ import threading
 import unittest
 from unittest import mock
 
-from corral import paths, quota_ledger as ql
+from korapy import paths, quota_ledger as ql
 
 T0 = 1_800_000_000.0
 

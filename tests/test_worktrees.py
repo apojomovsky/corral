@@ -11,8 +11,8 @@ import shutil
 import tempfile
 import unittest
 
-from corral import settings, worktrees
-from corral.worktrees import WorktreeError
+from korapy import settings, worktrees
+from korapy.worktrees import WorktreeError
 
 from tests.test_reviewrecord import git_in
 

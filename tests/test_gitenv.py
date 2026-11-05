@@ -1,4 +1,4 @@
-"""Tests for corral.gitenv and its hook-env regression guard.
+"""Tests for korapy.gitenv and its hook-env regression guard.
 
 A process born inside another git operation inherits that repo's GIT_*
 vars, and subprocess inherits them by default: a fixture's `git init`
@@ -14,7 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral.gitenv import clean_env
+from korapy.gitenv import clean_env
 
 
 class CleanEnvTest(unittest.TestCase):
@@ -135,7 +135,7 @@ class HookEnvLeakTest(unittest.TestCase):
         self.assertEqual(out.stdout.strip(), "t@t")
 
     def test_product_helpers_resolve_the_fixture_under_hook_env(self):
-        from corral import budget, prose
+        from korapy import budget, prose
 
         fresh = os.path.join(self.tmp.name, "fresh")
         subprocess.run(
@@ -174,13 +174,13 @@ class WorktreeMainCheckoutTest(unittest.TestCase):
         return main, wt
 
     def test_gitfile_resolves_to_main_checkout(self):
-        from corral.gitenv import worktree_main_checkout
+        from korapy.gitenv import worktree_main_checkout
 
         main, wt = self._layout()
         self.assertEqual(worktree_main_checkout(wt), main)
 
     def test_dangling_pointer_is_none(self):
-        from corral.gitenv import worktree_main_checkout
+        from korapy.gitenv import worktree_main_checkout
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -191,7 +191,7 @@ class WorktreeMainCheckoutTest(unittest.TestCase):
         self.assertIsNone(worktree_main_checkout(wt))
 
     def test_git_dir_and_garbage_are_none(self):
-        from corral.gitenv import worktree_main_checkout
+        from korapy.gitenv import worktree_main_checkout
 
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)

@@ -2,7 +2,7 @@
 
 import unittest
 
-from corral import hold, settings
+from korapy import hold, settings
 
 
 def reader(mapping, calls=None, kinds=None):
@@ -106,7 +106,7 @@ class ReasonTest(unittest.TestCase):
 
     def test_hold_label_default(self):
         self.assertEqual(settings.REGISTRY["board.hold_label"].default, "hold")
-        self.assertIn("corral.hold", settings.PROVIDERS)
+        self.assertIn("korapy.hold", settings.PROVIDERS)
 
     def test_unparseable_ticket_ref_is_a_hold(self):
         text = hold.reason(reader({}), None)

@@ -20,12 +20,12 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-import corral
-from corral import cli
-from corral.github import gh, gh_shim, ghshim
+import korapy
+from korapy import cli
+from korapy.github import gh, gh_shim, ghshim
 
-#: Directory holding the `corral` package, for the child interpreter.
-SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(corral.__file__)))
+#: Directory holding the `korapy` package, for the child interpreter.
+SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(korapy.__file__)))
 
 
 def _kill_quietly(pid):
@@ -384,7 +384,7 @@ class ShapeTest(unittest.TestCase):
     def test_summarize_defaults_to_the_live_log(self):
         with (
             tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}),
+            mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}),
         ):
             ghshim.append_call(
                 caller="a@h",
@@ -490,7 +490,7 @@ class PacingCapTest(unittest.TestCase):
 
 class CallerTest(unittest.TestCase):
     def test_agent_id_names_the_caller(self):
-        self.assertEqual(ghshim.caller_name({"CORRAL_AGENT_ID": " agent-1 "}), "agent-1")
+        self.assertEqual(ghshim.caller_name({"KORAPY_AGENT_ID": " agent-1 "}), "agent-1")
 
     def test_missing_agent_id_is_unknown(self):
         self.assertEqual(ghshim.caller_name({}), "unknown")
@@ -610,7 +610,7 @@ class LogPathTest(unittest.TestCase):
     def test_log_lives_in_the_state_dir(self):
         with (
             tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}),
+            mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}),
         ):
             self.assertEqual(ghshim.log_path(), os.path.join(tmp, "gh-calls.jsonl"))
         self.assertEqual(
@@ -661,7 +661,7 @@ class FindOnPathTest(unittest.TestCase):
         )
         self.assertEqual(found, os.path.join(self.bindir, "gh"))
 
-    def test_skips_another_corral_wrapper_in_a_second_shim_dir(self):
+    def test_skips_another_korapy_wrapper_in_a_second_shim_dir(self):
         other = os.path.join(self.root, "other")
         ghshim.install_shim(other, state=self.root)
         found = gh_shim.find_on_path("gh", self.shimdir, path=f"{other}{os.pathsep}{self.bindir}")
@@ -685,8 +685,8 @@ class ShimScriptTest(unittest.TestCase):
             os.environ,
             PATH=os.pathsep.join([self.shimdir, self.bindir]),
             PYTHONPATH=SRC_DIR,
-            CORRAL_STATE=self.tmp.name,
-            CORRAL_AGENT_ID="shim-test@h",
+            KORAPY_STATE=self.tmp.name,
+            KORAPY_AGENT_ID="shim-test@h",
         )
         self.env.pop(gh.PACED_MARKER, None)
         self.env.pop(ghshim.DEPTH_ENV, None)
@@ -784,7 +784,7 @@ class ShimScriptTest(unittest.TestCase):
         block = os.path.join(self.tmp.name, "blocked")
         with open(block, "w", encoding="utf-8") as handle:
             handle.write("not a dir\n")
-        env = dict(self.env, CORRAL_STATE=block)
+        env = dict(self.env, KORAPY_STATE=block)
         proc = self._shim("pr", "list", env=env)
         self.assertEqual(proc.returncode, 7)
         self.assertEqual(proc.stdout, b"ok\n")
@@ -809,7 +809,7 @@ class ShimScriptTest(unittest.TestCase):
 
     def test_missing_caller_is_logged_as_unknown(self):
         self._stub("#!/bin/sh\nexit 0\n")
-        env = {key: value for key, value in self.env.items() if key != "CORRAL_AGENT_ID"}
+        env = {key: value for key, value in self.env.items() if key != "KORAPY_AGENT_ID"}
         proc = self._shim("pr", "list", env=env)
         self.assertEqual(proc.returncode, 0)
         (rec,) = self._log()
@@ -851,7 +851,7 @@ class ShimScriptTest(unittest.TestCase):
         self.assertNotIn(b"ran", proc.stdout)
 
     def test_nested_runs_below_max_depth_pass_through_paced_and_logged(self):
-        self._stub('#!/bin/sh\necho "depth=$CORRAL_GH_SHIM_DEPTH"\nexit 0\n')
+        self._stub('#!/bin/sh\necho "depth=$KORAPY_GH_SHIM_DEPTH"\nexit 0\n')
         for depth in range(ghshim.MAX_DEPTH):
             with self.subTest(depth=depth):
                 env = dict(self.env, **{ghshim.DEPTH_ENV: str(depth)})
@@ -862,7 +862,7 @@ class ShimScriptTest(unittest.TestCase):
         self.assertEqual(len(self._log()), ghshim.MAX_DEPTH)
 
     def test_real_gh_runs_one_level_deeper(self):
-        self._stub('#!/bin/sh\necho "depth=$CORRAL_GH_SHIM_DEPTH"\nexit 0\n')
+        self._stub('#!/bin/sh\necho "depth=$KORAPY_GH_SHIM_DEPTH"\nexit 0\n')
         proc = self._shim("pr", "list")
         self.assertEqual(proc.stdout, b"depth=1\n")
 
@@ -884,7 +884,7 @@ class ShimScriptTest(unittest.TestCase):
     def test_wrapper_exports_the_install_time_state_dir(self):
         self._stub("#!/bin/sh\nexit 0\n")
         elsewhere = os.path.join(self.tmp.name, "elsewhere")
-        env = dict(self.env, CORRAL_STATE=elsewhere)
+        env = dict(self.env, KORAPY_STATE=elsewhere)
         proc = self._shim("pr", "list", env=env)
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(len(self._log()), 1)
@@ -897,7 +897,7 @@ class ShimScriptTest(unittest.TestCase):
             body = handle.read()
         self.assertTrue(body.startswith("#!/bin/sh\n"))
         self.assertIn(ghshim.WRAPPER_MARKER, body)
-        self.assertIn("-m corral.github.gh_shim", body)
+        self.assertIn("-m korapy.github.gh_shim", body)
         self.assertIn(os.path.realpath(self.tmp.name), body)
 
     def test_a_grandchild_holding_stdout_does_not_hang_the_shim(self):
@@ -980,15 +980,15 @@ class TimeoutTest(unittest.TestCase):
             wrapper = ghshim.install_shim(shimdir, state=tmp)
             env = {
                 "PATH": os.pathsep.join([shimdir, bindir]),
-                "CORRAL_STATE": tmp,
-                "CORRAL_GH_SHIM_DIR": shimdir,
-                "CORRAL_AGENT_ID": "timeout-test",
+                "KORAPY_STATE": tmp,
+                "KORAPY_GH_SHIM_DIR": shimdir,
+                "KORAPY_AGENT_ID": "timeout-test",
             }
             self.assertTrue(os.path.isfile(wrapper))
             err = io.TextIOWrapper(io.BytesIO())
             out = io.TextIOWrapper(io.BytesIO())
             # An explicit pacer on the tmp path the default factory would
-            # resolve (CORRAL_STATE is tmp here): the board-fields guard
+            # resolve (KORAPY_STATE is tmp here): the board-fields guard
             # tripwire forbids the default factory in-process, and the
             # cleared env would leave a reach unattributed.
             pacer = gh.GraphqlPacer(os.path.join(tmp, "graphql-pacing.json"))
@@ -1013,7 +1013,7 @@ class GhCallsCommandTest(unittest.TestCase):
     def _state(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        patcher = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name})
+        patcher = mock.patch.dict(os.environ, {"KORAPY_STATE": tmp.name})
         patcher.start()
         self.addCleanup(patcher.stop)
         return tmp.name

@@ -9,8 +9,8 @@ import sqlite3
 import unittest
 from types import SimpleNamespace
 
-from corral import accounts, board, launch, models, profiles, settings
-from corral import tracker as iface
+from korapy import accounts, board, launch, models, profiles, settings
+from korapy import tracker as iface
 from tests.test_tracker import FakeTracker, reading
 
 T0 = 1_800_000_000.0
@@ -110,8 +110,8 @@ class SettingsCarriage(unittest.TestCase):
             project={"profiles": {"fast": {"runtime": "omp"}, "slim": {"runtime": "omp"}}},
             host={"profiles": {"fast": {"runtime": "muse"}}},
         )
-        self.assertEqual(resolved.profile_sources, {"fast": "host config", "slim": "corral.toml"})
-        self.assertEqual(resolved.profile_shadowed, {"fast": "corral.toml"})
+        self.assertEqual(resolved.profile_sources, {"fast": "host config", "slim": "korapy.toml"})
+        self.assertEqual(resolved.profile_shadowed, {"fast": "korapy.toml"})
 
     def test_profile_sources_are_empty_without_declarations(self):
         resolved = resolve(project={})

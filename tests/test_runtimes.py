@@ -11,9 +11,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import models, profiles, runtimes as rt
-from corral import settings
-from corral.runtimes import muse, omp
+from korapy import models, profiles, runtimes as rt
+from korapy import settings
+from korapy.runtimes import muse, omp
 
 PROMPT = "do the thing"
 MODEL = "provider-a/model-1"
@@ -21,7 +21,7 @@ MODEL = "provider-a/model-1"
 
 class SessionCase(unittest.TestCase):
     def setUp(self):
-        self.root = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-runtimes-"))
+        self.root = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-runtimes-"))
         self.sdir = os.path.join(self.root, "session")
         os.makedirs(self.sdir)
 
@@ -91,17 +91,17 @@ class BinaryResolution(unittest.TestCase):
         self.addCleanup(muse.binary.cache_clear)
 
     def test_the_binary_on_path_wins(self):
-        with mock.patch("corral.runtimes.omp.shutil.which", return_value="/opt/bin/omp"):
+        with mock.patch("korapy.runtimes.omp.shutil.which", return_value="/opt/bin/omp"):
             self.assertEqual(omp.binary(), "/opt/bin/omp")
 
     def test_without_one_on_path_the_usual_install_location_is_used(self):
-        with mock.patch("corral.runtimes.omp.shutil.which", return_value=None):
+        with mock.patch("korapy.runtimes.omp.shutil.which", return_value=None):
             self.assertEqual(omp.binary(), os.path.expanduser("~/.local/bin/omp"))
-        with mock.patch("corral.runtimes.muse.shutil.which", return_value=None):
+        with mock.patch("korapy.runtimes.muse.shutil.which", return_value=None):
             self.assertEqual(muse.binary(), os.path.expanduser("~/.local/bin/muse"))
 
     def test_each_binary_is_found_once(self):
-        with mock.patch("corral.runtimes.omp.shutil.which", return_value="/opt/bin/omp") as which:
+        with mock.patch("korapy.runtimes.omp.shutil.which", return_value="/opt/bin/omp") as which:
             omp.binary()
             omp.binary()
         self.assertEqual(which.call_count, 1)
@@ -417,7 +417,7 @@ class OmpSessionFiles(SessionCase):
 class RuntimeSetting(unittest.TestCase):
     def test_the_agents_runtime_setting_is_gone_after_the_cutover(self):
         self.assertNotIn("agents.runtime", settings.REGISTRY)
-        self.assertNotIn("corral.runtimes", settings.PROVIDERS)
+        self.assertNotIn("korapy.runtimes", settings.PROVIDERS)
 
     def test_the_recorded_runtime_fallback_survives(self):
         self.assertEqual(rt.DEFAULT_RUNTIME, "omp")

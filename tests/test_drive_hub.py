@@ -16,7 +16,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, drivehub, hub, paths, registry, settings, trackers, units
+from korapy import board, drive, drivehub, hub, paths, registry, settings, trackers, units
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, FakeStop, claimed
@@ -131,7 +131,7 @@ def hub_pass(
 
 class HubComposeTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-hub-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-hub-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -435,7 +435,7 @@ class HubComposeTest(unittest.TestCase):
 
 class HubReconcileTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-reconcile-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-reconcile-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -640,7 +640,7 @@ class HubReconcileTest(unittest.TestCase):
 
 class HubStuckWiringTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-hub-stuck-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-hub-stuck-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -777,7 +777,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-cmd-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-cmd-")
         self.addCleanup(self.tmp.cleanup)
         self.state = os.path.join(self.tmp.name, "state")
         self.config = os.path.join(self.tmp.name, "config")
@@ -786,7 +786,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         os.makedirs(self.ops)
         store = stored(os.path.join(self.state, "board.sqlite"), [("app", 7, "open")])
         store.close()
-        with open(os.path.join(self.ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write("")
         with open(os.path.join(self.ops, "policy.py"), "w", encoding="utf-8") as handle:
             handle.write(policy_source([("app", 7, "start")]))
@@ -799,11 +799,11 @@ class CmdDriveHubBuildTest(unittest.TestCase):
                 f"root = {self.ops!r}\n"
                 "eligibility = 'policy.py:eligible'\n"
             )
-        env = {"CORRAL_STATE": self.state, "CORRAL_CONFIG": self.config}
+        env = {"KORAPY_STATE": self.state, "KORAPY_CONFIG": self.config}
         self._env_patch = mock.patch.dict(os.environ, env)
         self._env_patch.start()
         self.addCleanup(self._env_patch.stop)
-        units_patch = mock.patch("corral.units.list_units", return_value=[])
+        units_patch = mock.patch("korapy.units.list_units", return_value=[])
         units_patch.start()
         self.addCleanup(units_patch.stop)
 
@@ -900,7 +900,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
     def test_non_plan_with_unusable_token_path_is_a_usage_error(self):
         with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write('[hub]\nurl = "http://host-1:8000"\nhost_id = "host-1"\n')
-        problem = paths.PathError("CORRAL_CONFIG='relative' must be an absolute path")
+        problem = paths.PathError("KORAPY_CONFIG='relative' must be an absolute path")
         opened = self.recording_open_store()
 
         class BombClient:
@@ -913,7 +913,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         ):
             code, logged, errors = self.run_non_plan()
         self.assertEqual(code, 4)
-        self.assertIn("corral drive: CORRAL_CONFIG=", errors)
+        self.assertIn("korapy drive: KORAPY_CONFIG=", errors)
         self.assertEqual(logged, "")
         self.assertEqual(len(opened), 1)
         opened[0].close.assert_called_once_with()
@@ -924,7 +924,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         opened = self.recording_open_store()
         code, logged, errors = self.run_non_plan()
         self.assertEqual(code, 4)
-        self.assertIn("corral drive: hub.url is set but hub.host_id is empty", errors)
+        self.assertIn("korapy drive: hub.url is set but hub.host_id is empty", errors)
         self.assertEqual(logged, "")
         self.assertEqual(len(opened), 1)
         opened[0].close.assert_called_once_with()
@@ -938,7 +938,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         ):
             code, logged, errors = self.run_non_plan()
         self.assertEqual(code, 4)
-        self.assertIn("corral drive: bad settings", errors)
+        self.assertIn("korapy drive: bad settings", errors)
         self.assertEqual(logged, "")
         self.assertEqual(len(opened), 1)
         opened[0].close.assert_called_once_with()

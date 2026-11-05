@@ -17,9 +17,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import admission, board, cli, drive, drivehub, launch, quota_ledger, settings
-from corral import tracker
-from corral import projects as projects_mod
+from korapy import admission, board, cli, drive, drivehub, launch, quota_ledger, settings
+from korapy import tracker
+from korapy import projects as projects_mod
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -53,7 +53,7 @@ def policy_source(wants):
     """A stub policy module naming the given `(repo, number, kind)` wants."""
     lines = [
         "def eligible(rows, *, now):",
-        "    from corral.eligibility import StartRequest",
+        "    from korapy.eligibility import StartRequest",
         "    return [",
     ]
     for repo, number, kind in wants:
@@ -67,7 +67,7 @@ def project_named(name, entry=None, root=None):
     return projects_mod.Project(
         name=name,
         unit_prefix=name + "-agent-",
-        root=root or os.path.join(tempfile.gettempdir(), "corral-drive-ops", name),
+        root=root or os.path.join(tempfile.gettempdir(), "korapy-drive-ops", name),
         eligibility=entry,
     )
 
@@ -204,7 +204,7 @@ class RenderTest(unittest.TestCase):
 
 class PlanTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -324,7 +324,7 @@ class PlanTest(unittest.TestCase):
             plan=False,
         )
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err.getvalue())
+        self.assertIn("korapy drive:", err.getvalue())
         self.assertNotIn("already running", err.getvalue())
 
     def test_corrupt_row_is_exit_four(self):
@@ -340,7 +340,7 @@ class PlanTest(unittest.TestCase):
         self.addCleanup(store.close)
         code, _, err = self.run_pass(store)
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err)
+        self.assertIn("korapy drive:", err)
 
     def test_raw_sqlite_error_is_exit_four(self):
         class BrokenStore:
@@ -350,7 +350,7 @@ class PlanTest(unittest.TestCase):
         out, err = io.StringIO(), io.StringIO()
         code = hermetic_pass(BrokenStore(), self.lock, out, err)
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err.getvalue())
+        self.assertIn("korapy drive:", err.getvalue())
 
     def test_plan_summary_says_plan(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -380,17 +380,17 @@ class PlanTest(unittest.TestCase):
         finally:
             drive._flock = real
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err)
+        self.assertIn("korapy drive:", err)
         self.assertNotIn("already running", err)
 
     def test_unreadable_live_state_is_exit_three(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
-        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
         env = dict(
             kept,
-            CORRAL_CONFIG=os.path.join(self.tmp.name, "config"),
-            CORRAL_STATE=os.path.join(self.tmp.name, "state"),
+            KORAPY_CONFIG=os.path.join(self.tmp.name, "config"),
+            KORAPY_STATE=os.path.join(self.tmp.name, "state"),
         )
 
         def broken(*args, **kwargs):
@@ -416,7 +416,7 @@ class PlanTest(unittest.TestCase):
             out, err = io.StringIO(), io.StringIO()
             code = hermetic_pass(store, self.lock, out, err, projects_fn=lambda: [], ledger=None)
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err.getvalue())
+        self.assertIn("korapy drive:", err.getvalue())
 
     def test_project_registry_load_failure_is_exit_four(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -433,30 +433,30 @@ class PlanTest(unittest.TestCase):
 
 class LockPathTest(unittest.TestCase):
     def test_lock_path_comes_from_the_state_dir(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-drive-state-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-state-")
         self.addCleanup(tmp.cleanup)
-        old = os.environ.get("CORRAL_STATE")
-        os.environ["CORRAL_STATE"] = tmp.name
+        old = os.environ.get("KORAPY_STATE")
+        os.environ["KORAPY_STATE"] = tmp.name
         try:
-            from corral import paths
+            from korapy import paths
 
             self.assertEqual(drive.lock_path(), os.path.join(paths.state_dir(), "drive.lock"))
             self.assertEqual(drive.lock_path(), os.path.join(tmp.name, "drive.lock"))
         finally:
             if old is None:
-                del os.environ["CORRAL_STATE"]
+                del os.environ["KORAPY_STATE"]
             else:
-                os.environ["CORRAL_STATE"] = old
+                os.environ["KORAPY_STATE"] = old
 
 
 class StatePathsTest(unittest.TestCase):
     def test_every_drive_state_path_comes_from_the_state_dir(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-drive-state-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-state-")
         self.addCleanup(tmp.cleanup)
-        old = os.environ.get("CORRAL_STATE")
-        os.environ["CORRAL_STATE"] = tmp.name
+        old = os.environ.get("KORAPY_STATE")
+        os.environ["KORAPY_STATE"] = tmp.name
         try:
-            from corral import paths
+            from korapy import paths
 
             state = paths.state_dir()
             self.assertEqual(drive.lock_path(), os.path.join(state, "drive.lock"))
@@ -467,14 +467,14 @@ class StatePathsTest(unittest.TestCase):
             self.assertEqual(drive.restarts_path(), os.path.join(state, "drive-restarts.json"))
         finally:
             if old is None:
-                del os.environ["CORRAL_STATE"]
+                del os.environ["KORAPY_STATE"]
             else:
-                os.environ["CORRAL_STATE"] = old
+                os.environ["KORAPY_STATE"] = old
 
 
 class HostFullExitTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-full-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-full-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -509,25 +509,25 @@ class HostFullExitTest(unittest.TestCase):
 
 class CmdDriveTest(unittest.TestCase):
     def test_unreadable_store_is_exit_four(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-drive-cmd-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-cmd-")
         self.addCleanup(tmp.cleanup)
         with open(os.path.join(tmp.name, "board.sqlite"), "w") as handle:
             handle.write("not a database")
-        old = os.environ.get("CORRAL_STATE")
-        os.environ["CORRAL_STATE"] = tmp.name
+        old = os.environ.get("KORAPY_STATE")
+        os.environ["KORAPY_STATE"] = tmp.name
         try:
             code = drivehub.cmd_drive(argparse.Namespace(plan=True))
         finally:
             if old is None:
-                del os.environ["CORRAL_STATE"]
+                del os.environ["KORAPY_STATE"]
             else:
-                os.environ["CORRAL_STATE"] = old
+                os.environ["KORAPY_STATE"] = old
         self.assertEqual(code, 4)
 
 
 class HoldLabelWiringTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-hold-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-hold-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -563,8 +563,8 @@ class HoldLabelWiringTest(unittest.TestCase):
         host_settings = settings.resolve(
             env={}, flags={"drive.max_starts_per_day": 50, "board.hold_label": "paused"}
         )
-        old = os.environ.get("CORRAL_STATE")
-        os.environ["CORRAL_STATE"] = self.tmp.name
+        old = os.environ.get("KORAPY_STATE")
+        os.environ["KORAPY_STATE"] = self.tmp.name
         try:
             with (
                 mock.patch.object(drive.board, "open_store", return_value=store),
@@ -588,9 +588,9 @@ class HoldLabelWiringTest(unittest.TestCase):
                 code = drivehub.cmd_drive(argparse.Namespace(plan=plan, drive_verb=None))
         finally:
             if old is None:
-                del os.environ["CORRAL_STATE"]
+                del os.environ["KORAPY_STATE"]
             else:
-                os.environ["CORRAL_STATE"] = old
+                os.environ["KORAPY_STATE"] = old
         return code, seen, launcher_seen, loaded
 
     def test_a_plan_reads_the_hold_label_once_and_passes_it_in(self):
@@ -619,7 +619,7 @@ class DriveSyncExitTest(unittest.TestCase):
     """The claiming pass buckets sync failures: corrupt rows exit 4."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drive-sync-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-sync-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
