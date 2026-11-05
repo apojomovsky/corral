@@ -5,9 +5,9 @@ import json
 import unittest
 from typing import Any
 
-from corral import board, hold, settings, tracker
-from corral.github import gh as ghmod
-from corral.github import tracker as ghtracker
+from korapy import board, hold, settings, tracker
+from korapy.github import gh as ghmod
+from korapy.github import tracker as ghtracker
 
 T0 = calendar.timegm((2026, 10, 28, 12, 0, 0, 0, 0, 0))
 ISO0 = "2026-10-28T12:00:00Z"
@@ -122,7 +122,7 @@ class FakeTracker:
             yield item
 
     def write(self, repo, number, field, value):
-        """Record one corral-owned field write; programmed errors raise."""
+        """Record one korapy-owned field write; programmed errors raise."""
         self.calls.append(("write", repo, number, field, value))
         if (repo, number) in self.write_errors:
             raise self.write_errors[(repo, number)]
@@ -451,7 +451,7 @@ class LabelApi:
 
 
 class BootstrapLabelsTest(unittest.TestCase):
-    """The bootstrap set is exactly the labels the rest of corral reads."""
+    """The bootstrap set is exactly the labels the rest of korapy reads."""
 
     def test_names_follow_the_rank_order(self):
         self.assertEqual(

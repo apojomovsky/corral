@@ -11,9 +11,9 @@ the network, or a real board.
 import json
 import unittest
 
-from corral import tracker as iface
-from corral.github import gh
-from corral.github.board import GithubBoardProvisioner
+from korapy import tracker as iface
+from korapy.github import gh
+from korapy.github.board import GithubBoardProvisioner
 from tests.test_board_fields import FakePacer
 from tests.test_board_planner import spec_for, table
 
@@ -428,7 +428,7 @@ class FindBoardTests(unittest.TestCase):
         self.assertEqual(run.mutations(), [])
 
     def test_title_search_reads_the_set_half_from_one_query(self):
-        from corral.github import board as board_mod
+        from korapy.github import board as board_mod
 
         self.assertFalse(hasattr(board_mod, "_TITLES_USER"))
         self.assertFalse(hasattr(board_mod, "_TITLES_ORG"))
@@ -1189,7 +1189,7 @@ class DryRunTests(unittest.TestCase):
         self.assertEqual(run.mutations(), [])
 
     def test_preview_rejects_an_unknown_concept_before_any_read(self):
-        from corral import tracker as iface_mod
+        from korapy import tracker as iface_mod
 
         run = ProvisionFakeRun()
         provisioner, _ = provisioner_for(run)
@@ -1206,7 +1206,7 @@ class DryRunTests(unittest.TestCase):
 
 class FactoryTests(unittest.TestCase):
     def test_factory_builds_a_provisioner_on_the_injected_seams(self):
-        from corral import trackers
+        from korapy import trackers
 
         run = addressed_run(*standard_field_nodes())
         pacer = FakePacer()
@@ -1228,7 +1228,7 @@ class FactoryTests(unittest.TestCase):
 
 class FieldKindTests(unittest.TestCase):
     def test_one_kind_mapping_serves_read_and_provision_paths(self):
-        from corral.github.board import _field_kind, _want_kind
+        from korapy.github.board import _field_kind, _want_kind
 
         text = {"__typename": "ProjectV2Field", "dataType": "TEXT"}
         select = {"__typename": "ProjectV2SingleSelectField", "dataType": "SINGLE_SELECT"}

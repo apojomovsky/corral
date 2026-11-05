@@ -12,8 +12,8 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
-from corral import doctor, registry, resourcedoctor
-from corral import resources as R
+from korapy import doctor, registry, resourcedoctor
+from korapy import resources as R
 
 
 def readings(**overrides):
@@ -30,11 +30,11 @@ def readings(**overrides):
         "controllers_error": None,
         "ledger": {"version": 1, "host_budget": None, "projects": {}, "foreign": []},
         "ledger_error": None,
-        "ledger_path": "/state/corral/host-resources.json",
+        "ledger_path": "/state/korapy/host-resources.json",
         "marker": "/state",
         "marker_error": None,
         "state_dir": "/state",
-        "marker_path": "/state/corral/host-state-dir",
+        "marker_path": "/state/korapy/host-state-dir",
         "sensor_errors": (),
         "slices": {},
         "config_path": "/config/config.toml",
@@ -47,7 +47,7 @@ def by_name(rows):
     return {row.name: row for row in rows}
 
 
-def live_unit(name="corral-agent-web-3", active="active", sub=""):
+def live_unit(name="korapy-agent-web-3", active="active", sub=""):
     return (name, active, sub)
 
 
@@ -192,7 +192,7 @@ class InvalidTables(unittest.TestCase):
             )
         )
         self.assertEqual(rows["resources"].status, "fail")
-        self.assertIn("/state/corral/host-resources.json", rows["resources"].fix)
+        self.assertIn("/state/korapy/host-resources.json", rows["resources"].fix)
 
 
 class UnpricedRoles(unittest.TestCase):
@@ -226,18 +226,18 @@ class LedgerHealth(unittest.TestCase):
             resourcedoctor.check(
                 readings(
                     ledger=None,
-                    ledger_error="host ledger /state/corral/host-resources.json is corrupt: boom",
+                    ledger_error="host ledger /state/korapy/host-resources.json is corrupt: boom",
                 )
             )
         )
         self.assertEqual(rows["resources-ledger"].status, "fail")
-        self.assertIn("/state/corral/host-resources.json", rows["resources-ledger"].detail)
+        self.assertIn("/state/korapy/host-resources.json", rows["resources-ledger"].detail)
         self.assertIn("never reset", rows["resources-ledger"].fix)
 
     def test_readable_ledger_is_ok(self):
         rows = by_name(resourcedoctor.check(readings()))
         self.assertEqual(rows["resources-ledger"].status, "ok")
-        self.assertIn("/state/corral/host-resources.json", rows["resources-ledger"].detail)
+        self.assertIn("/state/korapy/host-resources.json", rows["resources-ledger"].detail)
 
 
 class GuardMarker(unittest.TestCase):
@@ -246,7 +246,7 @@ class GuardMarker(unittest.TestCase):
         self.assertEqual(rows["resources-marker"].status, "fail")
         self.assertIn("/other-state", rows["resources-marker"].detail)
         self.assertIn("/state", rows["resources-marker"].detail)
-        self.assertIn("/state/corral/host-state-dir", rows["resources-marker"].fix)
+        self.assertIn("/state/korapy/host-state-dir", rows["resources-marker"].fix)
 
     def test_matching_marker_is_ok(self):
         rows = by_name(resourcedoctor.check(readings()))
@@ -374,7 +374,7 @@ class ForeignClaims(unittest.TestCase):
             resourcedoctor.check(readings(foreign=[{"name": "desktop", "claimed_at": "soon"}]))
         )
         self.assertEqual(rows["resources-foreign"].status, "fail")
-        self.assertIn("/state/corral/host-resources.json", rows["resources-foreign"].fix)
+        self.assertIn("/state/korapy/host-resources.json", rows["resources-foreign"].fix)
 
     def test_missing_claimed_at_reads_as_the_gate_default(self):
         self.assertEqual(
@@ -447,14 +447,14 @@ class ForeignClaims(unittest.TestCase):
         row = rows["resources-foreign"]
         self.assertEqual(row.status, "fail")
         self.assertIn(error, row.detail)
-        self.assertIn("/state/corral/host-resources.json", row.fix)
+        self.assertIn("/state/korapy/host-resources.json", row.fix)
 
     def test_unreadable_ledger_reads_as_unknown_not_zero(self):
         rows = by_name(
             resourcedoctor.check(
                 readings(
                     ledger=None,
-                    ledger_error=("host ledger /state/corral/host-resources.json is corrupt: boom"),
+                    ledger_error=("host ledger /state/korapy/host-resources.json is corrupt: boom"),
                     foreign=[],
                 )
             )
@@ -462,7 +462,7 @@ class ForeignClaims(unittest.TestCase):
         row = rows["resources-foreign"]
         self.assertEqual(row.status, "warn")
         self.assertIn("unknown (ledger unreadable)", row.detail)
-        self.assertIn("/state/corral/host-resources.json", row.fix)
+        self.assertIn("/state/korapy/host-resources.json", row.fix)
 
 
 class SliceDrift(unittest.TestCase):
@@ -483,8 +483,8 @@ class SliceDrift(unittest.TestCase):
 
     def test_launch_created_slices_matching_the_budget_are_ok(self):
         launch_slices = {
-            "corral.slice": {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8000000"},
-            "corral-web.slice": {
+            "korapy.slice": {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8000000"},
+            "korapy-web.slice": {
                 "MemoryMax": "16777216000",
                 "CPUQuotaPerSecUSec": "8000000",
             },
@@ -495,8 +495,8 @@ class SliceDrift(unittest.TestCase):
     def test_manager_timespan_rendering_matches_the_budget(self):
         """`systemctl show` renders the quota as a timespan: 800% reads `8s`."""
         launch_slices = {
-            "corral.slice": {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8s"},
-            "corral-web.slice": {
+            "korapy.slice": {"MemoryMax": "16777216000", "CPUQuotaPerSecUSec": "8s"},
+            "korapy-web.slice": {
                 "MemoryMax": "16777216000",
                 "CPUQuotaPerSecUSec": "8s",
             },
@@ -506,12 +506,12 @@ class SliceDrift(unittest.TestCase):
 
     def test_a_tasksmax_on_a_slice_is_not_drift(self):
         slices = {
-            "corral.slice": {
+            "korapy.slice": {
                 "MemoryMax": "16777216000",
                 "CPUQuotaPerSecUSec": "8000000",
                 "TasksMax": "512",
             },
-            "corral-web.slice": {
+            "korapy-web.slice": {
                 "MemoryMax": "16777216000",
                 "CPUQuotaPerSecUSec": "8000000",
             },
@@ -524,7 +524,7 @@ class SliceDrift(unittest.TestCase):
             resourcedoctor.check(
                 readings(
                     slices={
-                        "corral.slice": {
+                        "korapy.slice": {
                             "MemoryMax": "16777216000",
                             "CPUQuotaPerSecUSec": "8000000",
                         }
@@ -539,11 +539,11 @@ class SliceDrift(unittest.TestCase):
             resourcedoctor.check(
                 readings(
                     slices={
-                        "corral.slice": {
+                        "korapy.slice": {
                             "MemoryMax": "17179869184",
                             "CPUQuotaPerSecUSec": "4000000",
                         },
-                        "corral-web.slice": {
+                        "korapy-web.slice": {
                             "MemoryMax": "16777216000",
                             "CPUQuotaPerSecUSec": "8000000",
                         },
@@ -553,7 +553,7 @@ class SliceDrift(unittest.TestCase):
         )
         row = rows["resources-slices"]
         self.assertEqual(row.status, "warn")
-        self.assertIn("corral.slice", row.detail)
+        self.assertIn("korapy.slice", row.detail)
         self.assertIn("MemoryMax", row.detail)
         self.assertIn("CPUQuotaPerSecUSec", row.detail)
         self.assertIn("reconcile on the next launch", row.detail)
@@ -563,7 +563,7 @@ class SliceDrift(unittest.TestCase):
     def test_unset_limit_matches_infinity(self):
         state = readings(
             host=R.Usage(cpu_m=8000, memory_mb=16000, pids=0),
-            slices={"corral.slice": props("16777216000", "8000000", "infinity")},
+            slices={"korapy.slice": props("16777216000", "8000000", "infinity")},
         )
         rows = by_name(resourcedoctor.check(state))
         self.assertEqual(rows["resources-slices"].status, "ok")
@@ -576,7 +576,7 @@ class SliceDrift(unittest.TestCase):
                 "api": R.Share(weight=2.0),
             },
             slices={
-                "corral-web.slice": props(memory_bytes, "2666670", "1366"),
+                "korapy-web.slice": props(memory_bytes, "2666670", "1366"),
             },
         )
         self.assertEqual(by_name(resourcedoctor.check(state))["resources-slices"].status, "ok")
@@ -680,16 +680,16 @@ class LoadLiveRoles(unittest.TestCase):
 
     def test_roles_come_from_live_entries(self):
         roles = resourcedoctor.load_live_roles(
-            ("corral-agent-",),
-            list_fn=lambda prefix: [live_unit("corral-agent-web-3")],
-            entries={"corral-agent-web-3": {"role": "reviewer"}},
+            ("korapy-agent-",),
+            list_fn=lambda prefix: [live_unit("korapy-agent-web-3")],
+            entries={"korapy-agent-web-3": {"role": "reviewer"}},
         )
         self.assertEqual(roles, ("reviewer",))
 
     def test_units_without_an_entry_read_as_worker(self):
         roles = resourcedoctor.load_live_roles(
-            ("corral-agent-",),
-            list_fn=lambda prefix: [live_unit("corral-agent-web-3")],
+            ("korapy-agent-",),
+            list_fn=lambda prefix: [live_unit("korapy-agent-web-3")],
             entries={},
         )
         self.assertEqual(roles, ("worker",))
@@ -698,7 +698,7 @@ class LoadLiveRoles(unittest.TestCase):
         roles = resourcedoctor.load_live_roles(
             ("other-",),
             list_fn=lambda prefix: [
-                live_unit("corral-agent-web-3", active="inactive"),
+                live_unit("korapy-agent-web-3", active="inactive"),
                 live_unit("not-ours"),
             ],
             entries={},
@@ -706,7 +706,7 @@ class LoadLiveRoles(unittest.TestCase):
         self.assertEqual(roles, ())
 
     def test_an_unreachable_manager_reads_as_no_roles(self):
-        from corral import units
+        from korapy import units
 
         def down(prefix):
             raise units.Unreachable("down")
@@ -731,16 +731,16 @@ class LoadSliceActual(unittest.TestCase):
         def run(argv):
             return SimpleNamespace(returncode=0, stdout=show(), stderr="")
 
-        actual = resourcedoctor.load_slice_actual(("corral.slice", "corral-web.slice"), run=run)
+        actual = resourcedoctor.load_slice_actual(("korapy.slice", "korapy-web.slice"), run=run)
         self.assertEqual(
             actual,
             {
-                "corral.slice": {
+                "korapy.slice": {
                     "MemoryMax": "17179869184",
                     "CPUQuotaPerSecUSec": "8000000",
                     "TasksMax": "512",
                 },
-                "corral-web.slice": {
+                "korapy-web.slice": {
                     "MemoryMax": "17179869184",
                     "CPUQuotaPerSecUSec": "8000000",
                     "TasksMax": "512",
@@ -750,20 +750,20 @@ class LoadSliceActual(unittest.TestCase):
 
     def test_never_created_slice_is_absent_not_drift(self):
         def run(argv):
-            if argv[-1] == "corral-web.slice":
+            if argv[-1] == "korapy-web.slice":
                 return SimpleNamespace(returncode=0, stdout=never_created_show(), stderr="")
             return SimpleNamespace(returncode=0, stdout=show(), stderr="")
 
-        actual = resourcedoctor.load_slice_actual(("corral.slice", "corral-web.slice"), run=run)
+        actual = resourcedoctor.load_slice_actual(("korapy.slice", "korapy-web.slice"), run=run)
         self.assertIsNotNone(actual)
         assert actual is not None
-        self.assertEqual(list(actual), ["corral.slice"])
+        self.assertEqual(list(actual), ["korapy.slice"])
 
     def test_never_created_slices_read_as_no_slices_yet(self):
         def run(argv):
             return SimpleNamespace(returncode=0, stdout=never_created_show(), stderr="")
 
-        actual = resourcedoctor.load_slice_actual(("corral.slice", "corral-web.slice"), run=run)
+        actual = resourcedoctor.load_slice_actual(("korapy.slice", "korapy-web.slice"), run=run)
         self.assertEqual(actual, {})
         rows = by_name(resourcedoctor.check(readings(slices=actual)))
         self.assertEqual(rows["resources-slices"].status, "ok")
@@ -773,13 +773,13 @@ class LoadSliceActual(unittest.TestCase):
         def run(argv):
             return SimpleNamespace(returncode=1, stdout="", stderr="gone")
 
-        self.assertIsNone(resourcedoctor.load_slice_actual(("corral.slice",), run=run))
+        self.assertIsNone(resourcedoctor.load_slice_actual(("korapy.slice",), run=run))
 
     def test_an_unreachable_bus_reads_as_no_reading(self):
         def run(argv):
             raise OSError("down")
 
-        self.assertIsNone(resourcedoctor.load_slice_actual(("corral.slice",), run=run))
+        self.assertIsNone(resourcedoctor.load_slice_actual(("korapy.slice",), run=run))
 
 
 class LoadSensorErrors(unittest.TestCase):
@@ -834,19 +834,19 @@ class Wiring(unittest.TestCase):
 
 class ProductionAssembly(unittest.TestCase):
     def test_full_gathering_from_a_temp_host(self):
-        from corral import host_ledger, paths, projects, settings, units
+        from korapy import host_ledger, paths, projects, settings, units
 
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as tmp:
             state = os.path.join(tmp, "state")
             config = os.path.join(tmp, "config")
-            os.makedirs(os.path.join(state, "corral"))
+            os.makedirs(os.path.join(state, "korapy"))
             os.makedirs(config, exist_ok=True)
             with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
                 handle.write(
                     "[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n"
                     "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
                 )
-            ledger_path = os.path.join(state, "corral", "host-resources.json")
+            ledger_path = os.path.join(state, "korapy", "host-resources.json")
             with open(ledger_path, "w", encoding="utf-8") as handle:
                 handle.write(
                     '{"version": 1, "host_budget": null, "projects": {},'
@@ -854,12 +854,12 @@ class ProductionAssembly(unittest.TestCase):
                     ' "memory_mb": 128, "claimed_at": 999999.0}]}'
                 )
             with open(
-                os.path.join(state, "corral", "host-state-dir"), "w", encoding="utf-8"
+                os.path.join(state, "korapy", "host-state-dir"), "w", encoding="utf-8"
             ) as handle:
                 handle.write(state)
             project = projects.Project(
                 name="web",
-                unit_prefix="corral-agent-",
+                unit_prefix="korapy-agent-",
                 root="/ops",
                 floor=0,
                 ceiling=2,
@@ -867,7 +867,7 @@ class ProductionAssembly(unittest.TestCase):
             )
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_STATE": state, "CORRAL_CONFIG": config},
+                {"KORAPY_STATE": state, "KORAPY_CONFIG": config},
                 clear=False,
             ):
                 resolved = settings.load(root=None)
@@ -912,21 +912,21 @@ class ProductionAssembly(unittest.TestCase):
         )
 
     def test_corrupt_ledger_surfaces_as_a_failing_row(self):
-        from corral import host_ledger, paths, projects, settings
+        from korapy import host_ledger, paths, projects, settings
 
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as tmp:
             state = os.path.join(tmp, "state")
             config = os.path.join(tmp, "config")
-            os.makedirs(os.path.join(state, "corral"))
+            os.makedirs(os.path.join(state, "korapy"))
             os.makedirs(config, exist_ok=True)
             with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
                 handle.write("[resources.host]\ncpu_m = 8000\nmemory_mb = 16000\npids = 4096\n")
-            ledger_path = os.path.join(state, "corral", "host-resources.json")
+            ledger_path = os.path.join(state, "korapy", "host-resources.json")
             with open(ledger_path, "w", encoding="utf-8") as handle:
                 handle.write("not json")
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_STATE": state, "CORRAL_CONFIG": config},
+                {"KORAPY_STATE": state, "KORAPY_CONFIG": config},
                 clear=False,
             ):
                 resolved = settings.load(root=None)
@@ -966,22 +966,22 @@ class ProductionGather(unittest.TestCase):
         registered=None,
         claims_mode="ok",
     ):
-        from corral import host_ledger, paths, projects, settings
+        from korapy import host_ledger, paths, projects, settings
 
-        tmp = tempfile.TemporaryDirectory(prefix="corral-gather-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-gather-")
         self.addCleanup(tmp.cleanup)
         state = os.path.join(tmp.name, "state")
-        os.makedirs(os.path.join(state, "corral"))
-        ledger_path = os.path.join(state, "corral", "host-resources.json")
+        os.makedirs(os.path.join(state, "korapy"))
+        ledger_path = os.path.join(state, "korapy", "host-resources.json")
         with open(ledger_path, "w", encoding="utf-8") as handle:
             handle.write(
                 ledger_text
                 if ledger_text is not None
                 else ('{"version": 1, "host_budget": null, "projects": {}, "foreign": []}')
             )
-        with open(os.path.join(state, "corral", "host-state-dir"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(state, "korapy", "host-state-dir"), "w", encoding="utf-8") as handle:
             handle.write(state)
-        claims_dir = os.path.join(state, "corral", host_ledger.FOREIGN_CLAIMS_DIR)
+        claims_dir = os.path.join(state, "korapy", host_ledger.FOREIGN_CLAIMS_DIR)
         if claims_mode == "file":
             with open(claims_dir, "w", encoding="utf-8") as handle:
                 handle.write("not a dir")
@@ -1016,11 +1016,11 @@ class ProductionGather(unittest.TestCase):
             )
 
     def heavy_project(self):
-        from corral import projects
+        from korapy import projects
 
         return projects.Project(
             name="web",
-            unit_prefix="corral-agent-",
+            unit_prefix="korapy-agent-",
             root="/ops",
             resources={"weight": 1, "cpu_floor_m": 9000},
         )
@@ -1032,7 +1032,7 @@ class ProductionGather(unittest.TestCase):
         self.assertEqual(readings.gone_s, R.DEFAULT_GONE_S)
 
     def test_limits_failure_falls_back_to_the_builtin_pressure_caps(self):
-        from corral import pressure
+        from korapy import pressure
 
         readings = self.gather(self.HOST, registered=[self.heavy_project()])
         assert readings is not None

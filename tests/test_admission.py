@@ -2,7 +2,7 @@
 
 import unittest
 
-from corral import admission, settings
+from korapy import admission, settings
 
 A = admission
 
@@ -259,7 +259,7 @@ class Settings(unittest.TestCase):
     def test_admission_registers_its_settings(self):
         self.assertEqual(settings.REGISTRY["admission.total_cap"].default, 4)
         self.assertEqual(settings.REGISTRY["admission.repo_cap"].default, 0)
-        self.assertIn("corral.admission", settings.PROVIDERS)
+        self.assertIn("korapy.admission", settings.PROVIDERS)
 
     def test_a_host_file_may_set_admission_keys(self):
         resolved = settings.resolve(host={"admission": {"total_cap": 6, "repo_cap": 2}}, env={})

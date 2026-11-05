@@ -1,4 +1,4 @@
-"""`corral github setup`: labels, the board ensure, the mapping write.
+"""`korapy github setup`: labels, the board ensure, the mapping write.
 
 Fake entry, tracker and provisioner seams only. No test runs a real
 `gh`, touches the network, or reaches a real board; importing
@@ -13,9 +13,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import cli, githubcli
-from corral import tracker as iface
-from corral import trackers
+from korapy import cli, githubcli
+from korapy import tracker as iface
+from korapy import trackers
 from tests.test_init import FakeGit
 from tests.test_tracker import FakeTracker
 
@@ -220,10 +220,10 @@ def refuse_provisioner():
 
 class SetupRootCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-githubcli-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-githubcli-")
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML)
         self.out = io.StringIO()
         self.err = io.StringIO()
@@ -242,7 +242,7 @@ class SetupRootCase(unittest.TestCase):
             )
 
     def toml_text(self):
-        with open(os.path.join(self.root, "corral.toml"), encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), encoding="utf-8") as handle:
             return handle.read()
 
 
@@ -302,7 +302,7 @@ class ExitCodeTest(SetupRootCase):
         self.assertEqual(self.out.getvalue(), "")
 
     def test_partial_failure_with_a_create_is_3(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
         entries = {"app": entry(), "lib": entry(name="lib", repo="acme/lib")}
         good = FakeTracker()
@@ -313,7 +313,7 @@ class ExitCodeTest(SetupRootCase):
         self.assertIn("acme/lib", self.err.getvalue())
 
     def test_only_a_subset_runs_when_named(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
         entries = {"app": entry(), "lib": entry(name="lib", repo="acme/lib")}
         app = FakeTracker()
@@ -333,7 +333,7 @@ class ExitCodeTest(SetupRootCase):
         self.assertEqual(fake.calls, [])
 
     def test_no_entries_is_exit_4(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[project]\nname = "demo"\n')
         fake = FakeTracker()
         code = self.run_setup({"app": entry()}, {"app": fake}, refuse_provisioner())
@@ -341,7 +341,7 @@ class ExitCodeTest(SetupRootCase):
         self.assertEqual(fake.calls, [])
 
     def test_a_failed_resolution_counts_4_and_the_rest_still_run(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
         entries = {"app": entry(), "lib": entry(name="lib", repo="acme/lib")}
         lib = FakeTracker()
@@ -366,7 +366,7 @@ class ExitCodeTest(SetupRootCase):
         self.assertIn(("ensure_labels", "acme/lib"), lib.calls)
 
     def test_a_failed_construction_counts_4_and_the_rest_still_run(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
         entries = {"app": entry(), "lib": entry(name="lib", repo="acme/lib")}
         lib = FakeTracker()
@@ -393,7 +393,7 @@ class ExitCodeTest(SetupRootCase):
 
 class LabelsOnlyTest(SetupRootCase):
     def test_labels_entries_run_no_board_half_without_the_flag(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO)
         entries = {"app": entry(), "lib": entry(name="lib", repo="acme/lib")}
         app = FakeTracker()
@@ -406,7 +406,7 @@ class LabelsOnlyTest(SetupRootCase):
         self.assertNotIn("[repo.board]", self.toml_text())
 
     def test_the_clone_origin_names_the_tracker_repo(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[[repo]]\nname = "app"\nclone.path = "clone"\n')
         resolved = trackers.setup_entry(
             self.root, "app", git=FakeGit(root=self.root, origin_url="git@github.com:acme/app\n")
@@ -420,7 +420,7 @@ class LabelsOnlyTest(SetupRootCase):
 
 class BoardEnsureTest(SetupRootCase):
     def write(self, text):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def test_a_labels_entry_with_the_flag_provisions_and_writes_the_inert_table(self):
@@ -469,7 +469,7 @@ class BoardEnsureTest(SetupRootCase):
         self.assertEqual(spec.title, "app board")
         text = self.toml_text()
         self.assertIn("[repo.board]", text)
-        self.assertIn("next: corral doctor", self.out.getvalue())
+        self.assertIn("next: korapy doctor", self.out.getvalue())
 
     def test_a_plain_rerun_after_area_and_pool_is_a_noop(self):
         self.write(BOARD_BOOTSTRAP)
@@ -669,7 +669,7 @@ class BoardEnsureTest(SetupRootCase):
 
 class PlanTest(SetupRootCase):
     def write(self, text):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def test_plan_lists_would_create_and_changes_nothing(self):
@@ -792,7 +792,7 @@ class PlanTest(SetupRootCase):
 
 class PopulateWiringTest(SetupRootCase):
     def write(self, text):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def populated_entry(self, plan=False, **flags):
@@ -919,7 +919,7 @@ class ParserTest(unittest.TestCase):
             cli.build_parser().parse_args(["github"])
 
     def test_cmd_setup_without_root_exits_4(self):
-        empty = tempfile.mkdtemp(prefix="corral-github-noroot-")
+        empty = tempfile.mkdtemp(prefix="korapy-github-noroot-")
         self.addCleanup(lambda: os.rmdir(empty))
         namespace = argparse.Namespace(
             repo=[],
@@ -951,7 +951,7 @@ class ProductionWiringTest(SetupRootCase):
             standard_field_nodes,
         )
 
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(BOARD_BOOTSTRAP)
         resolved = trackers.setup_entry(self.root, "app", git=FakeGit(root=self.root))
         self.assertEqual(resolved.variant, "board")
@@ -1034,12 +1034,12 @@ class ProductionWiringTest(SetupRootCase):
         args = cli.build_parser().parse_args(["github", "setup"])
         with (
             mock.patch("os.getcwd", return_value=self.root),
-            mock.patch("corral.github.gh.run", fake_run),
+            mock.patch("korapy.github.gh.run", fake_run),
             # The production factories default to the shared bucket; the
             # suite tripwire forbids it, so the default factory serves
             # the established fake pacer instead. The run and git seams
             # stay the only production seams under test.
-            mock.patch("corral.github.gh._pacer", lambda: FakePacer()),
+            mock.patch("korapy.github.gh._pacer", lambda: FakePacer()),
             contextlib.redirect_stdout(io.StringIO()) as out,
         ):
             self.assertEqual(githubcli.cmd_setup(args), 0)

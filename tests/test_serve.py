@@ -1,4 +1,4 @@
-"""`corral serve` S1: routes and the snapshot.
+"""`korapy serve` S1: routes and the snapshot.
 
 Offline: a real HTTP server on a loopback ephemeral port, spoken to
 with `http.client`. Snapshot builders are fakes or `snapshot.build`
@@ -24,7 +24,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import (
+from korapy import (
     board,
     cli,
     coord,
@@ -342,7 +342,7 @@ class ServerBinding(ServeCase):
 
 class ServerFamilyDedup(unittest.TestCase):
     def test_serve_and_hub_share_one_family_helper(self):
-        from corral import netbind
+        from korapy import netbind
 
         self.assertIs(serve.server_family, netbind.server_family)
         self.assertIs(hub.server_family, netbind.server_family)
@@ -359,7 +359,7 @@ class ServerFamilyBehavior(unittest.TestCase):
     def test_hub_binds_an_ipv6_literal_as_v6(self):
         import socket as _socket
 
-        with tempfile.TemporaryDirectory(prefix="corral-serve-hub-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-hub-") as tmp:
             server = hub.make_server("::1", 0, os.path.join(tmp, "hub.sqlite"))
             self.addCleanup(server.server_close)
             self.assertEqual(server.address_family, _socket.AF_INET6)
@@ -399,49 +399,49 @@ class ImportClosure(unittest.TestCase):
             if isinstance(node, ast.Import):
                 names.extend(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
-                if node.module and node.module != "corral":
+                if node.module and node.module != "korapy":
                     names.append(node.module)
-                if node.module == "corral":
-                    names.extend(f"corral.{alias.name}" for alias in node.names)
+                if node.module == "korapy":
+                    names.extend(f"korapy.{alias.name}" for alias in node.names)
         bad = [name for name in names if set(name.split(".")) & forbidden]
         self.assertEqual(bad, [])
 
     def test_serve_builds_from_snapshot(self):
         with open(serve.__file__, encoding="utf-8") as handle:
             tree = ast.parse(handle.read())
-        from_corral = [
+        from_korapy = [
             alias.name
             for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom) and node.module == "corral"
+            if isinstance(node, ast.ImportFrom) and node.module == "korapy"
             for alias in node.names
         ]
-        self.assertIn("snapshot", from_corral)
+        self.assertIn("snapshot", from_korapy)
 
 
 class CollectDivergence(unittest.TestCase):
     def test_collect_and_helper_cannot_diverge(self):
-        from corral import resources as R
-        from corral import snapshot as snap
+        from korapy import resources as R
+        from korapy import snapshot as snap
 
         registry_view = view((entry("a1"), "live"))
         quota = quota_view()
         resolved = resolved_settings(**{"quota.low_pct": 90, "drive.max_starts_per_day": 4})
         with (
-            mock.patch("corral.snapshot._settings_root", return_value=None),
-            mock.patch("corral.settings.load", return_value=resolved),
-            mock.patch("corral.projects.load_all", return_value=[]),
-            mock.patch("corral.units.list_units", return_value=[]),
-            mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
-            mock.patch("corral.registry.visible", return_value=registry_view),
-            mock.patch("corral.accounts.providers", return_value=["prov-a"]),
-            mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
-            mock.patch("corral.quotacli.snapshot", return_value=quota),
-            mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch("korapy.snapshot._settings_root", return_value=None),
+            mock.patch("korapy.settings.load", return_value=resolved),
+            mock.patch("korapy.projects.load_all", return_value=[]),
+            mock.patch("korapy.units.list_units", return_value=[]),
+            mock.patch("korapy.registry.config", return_value={"count_toward_cap": True}),
+            mock.patch("korapy.registry.visible", return_value=registry_view),
+            mock.patch("korapy.accounts.providers", return_value=["prov-a"]),
+            mock.patch("korapy.quota_ledger.load", return_value={"ledger": True}),
+            mock.patch("korapy.quotacli.snapshot", return_value=quota),
+            mock.patch("korapy.drive.drive_status", return_value=dict(DRIVE)),
             mock.patch(
-                "corral.resources.read_pressure",
+                "korapy.resources.read_pressure",
                 return_value=(R.Pressure(load_per_cpu=0.25), []),
             ),
-            mock.patch("corral.snapshot.default_measured", return_value=None),
+            mock.patch("korapy.snapshot.default_measured", return_value=None),
             mock.patch("shutil.disk_usage", return_value=(1000, 400, 600)),
             mock.patch("time.time", return_value=T0),
             mock.patch("socket.gethostname", return_value=HOST),
@@ -466,12 +466,12 @@ class ServeSettingsTest(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["serve.max_streams"].default, 20)
 
     def test_serve_registers_before_resolve(self):
-        self.assertIn("corral.serve", settings.PROVIDERS)
+        self.assertIn("korapy.serve", settings.PROVIDERS)
 
     def test_host_and_env_layers_reach_serve(self):
         resolved = settings.resolve(host={"serve": {"port": 4321}}, env={})
         self.assertEqual(resolved["serve.port"], 4321)
-        resolved = settings.resolve(env={"CORRAL_SERVE_PORT": "4322"})
+        resolved = settings.resolve(env={"KORAPY_SERVE_PORT": "4322"})
         self.assertEqual(resolved["serve.port"], 4322)
 
     def test_no_setting_holds_a_token(self):
@@ -480,12 +480,12 @@ class ServeSettingsTest(unittest.TestCase):
 
 class ApiTokenPathTest(unittest.TestCase):
     def test_token_lives_beside_the_host_config(self):
-        self.assertEqual(paths.api_token_path({"CORRAL_CONFIG": "/x/config"}), "/x/config/token")
+        self.assertEqual(paths.api_token_path({"KORAPY_CONFIG": "/x/config"}), "/x/config/token")
 
     def test_token_defaults_under_xdg_config(self):
         self.assertEqual(
             paths.api_token_path({"XDG_CONFIG_HOME": "/x/config"}),
-            "/x/config/corral/token",
+            "/x/config/korapy/token",
         )
 
 
@@ -541,7 +541,7 @@ class BindCheckTest(unittest.TestCase):
 
 class TokenFileTest(unittest.TestCase):
     def test_mint_creates_owner_only_hex(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-token-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-token-") as tmp:
             target = os.path.join(tmp, "sub", "token")
             serve.mint_token(target)
             self.assertEqual(oct(os.stat(target).st_mode & 0o777), "0o600")
@@ -549,14 +549,14 @@ class TokenFileTest(unittest.TestCase):
             self.assertTrue(re.fullmatch(r"[0-9a-f]{64}", str(text)))
 
     def test_mint_refuses_when_present(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-token-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-token-") as tmp:
             target = os.path.join(tmp, "token")
             serve.mint_token(target)
             with self.assertRaises(serve.ServeError):
                 serve.mint_token(target)
 
     def test_missing_token_reads_none(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-token-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-token-") as tmp:
             self.assertIsNone(serve.read_token(os.path.join(tmp, "token")))
 
     def test_unreadable_token_raises(self):
@@ -565,7 +565,7 @@ class TokenFileTest(unittest.TestCase):
                 serve.read_token(os.path.join("token"))
 
     def test_world_readable_token_warns(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-token-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-token-") as tmp:
             target = os.path.join(tmp, "token")
             serve.mint_token(target)
             self.assertIsNone(serve.token_file_warning(target))
@@ -739,17 +739,17 @@ class ServeCommandTest(unittest.TestCase):
         return cli.build_parser().parse_args(["serve", *argv])
 
     def run_func(self, argv, config=None, state=None):
-        config_dir = tempfile.mkdtemp(prefix="corral-serve-config-")
+        config_dir = tempfile.mkdtemp(prefix="korapy-serve-config-")
         self.addCleanup(shutil.rmtree, config_dir)
-        state_dir = tempfile.mkdtemp(prefix="corral-serve-state-")
+        state_dir = tempfile.mkdtemp(prefix="korapy-serve-state-")
         self.addCleanup(shutil.rmtree, state_dir)
         if config is not None:
             with open(os.path.join(config_dir, "config.toml"), "w", encoding="utf-8") as handle:
                 handle.write(config)
-        env = {"CORRAL_CONFIG": config_dir, "CORRAL_STATE": state_dir}
+        env = {"KORAPY_CONFIG": config_dir, "KORAPY_STATE": state_dir}
         if state == "missing":
             missing = os.path.join(state_dir, "gone")
-            env["CORRAL_STATE"] = missing
+            env["KORAPY_STATE"] = missing
         args = self.parse(*argv)
         with mock.patch.dict(os.environ, env, clear=False):
             out, err = io.StringIO(), io.StringIO()
@@ -782,13 +782,13 @@ class ServeCommandTest(unittest.TestCase):
             def server_close(self):
                 pass
 
-        with tempfile.TemporaryDirectory(prefix="corral-serve-cmd-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
             with open(os.path.join(tmp, "token"), "w", encoding="utf-8") as handle:
                 handle.write("tok-1\n")
             os.chmod(os.path.join(tmp, "token"), 0o600)
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with mock.patch.object(serve, "make_server", return_value=FakeServer()) as made:
@@ -809,13 +809,13 @@ class ServeCommandTest(unittest.TestCase):
             def server_close(self):
                 pass
 
-        with tempfile.TemporaryDirectory(prefix="corral-serve-cmd-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
             with open(os.path.join(tmp, "token"), "w", encoding="utf-8") as handle:
                 handle.write("tok-1\n")
             os.chmod(os.path.join(tmp, "token"), 0o644)
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with mock.patch.object(serve, "make_server", return_value=FakeServer()):
@@ -827,13 +827,13 @@ class ServeCommandTest(unittest.TestCase):
             self.assertIn("listening on 127.0.0.1:4321", out.getvalue())
 
     def test_world_readable_token_refuses_remote(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-cmd-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
             with open(os.path.join(tmp, "token"), "w", encoding="utf-8") as handle:
                 handle.write("tok-1\n")
             os.chmod(os.path.join(tmp, "token"), 0o644)
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with mock.patch.object(
@@ -845,7 +845,7 @@ class ServeCommandTest(unittest.TestCase):
                     self.assertEqual(args.func(args), 4)
 
     def test_held_loopback_port_is_a_race(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-cmd-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
             holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 holder.bind(("127.0.0.1", 0))
@@ -853,7 +853,7 @@ class ServeCommandTest(unittest.TestCase):
                 port = holder.getsockname()[1]
                 with mock.patch.dict(
                     os.environ,
-                    {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                    {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                     clear=False,
                 ):
                     args = self.parse("--port", str(port))
@@ -889,10 +889,10 @@ class ServeCommandTest(unittest.TestCase):
             def server_close(self):
                 pass
 
-        with tempfile.TemporaryDirectory(prefix="corral-serve-cmd-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with mock.patch.object(serve, "make_server", return_value=FakeServer()):
@@ -908,12 +908,12 @@ class ServeCommandTest(unittest.TestCase):
             self.assertNotIn(minted, err.getvalue())
 
     def test_new_token_refuses_when_present(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-cmd-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
             with open(os.path.join(tmp, "token"), "w", encoding="utf-8") as handle:
                 handle.write("tok-1\n")
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with mock.patch.object(
@@ -927,27 +927,27 @@ class ServeCommandTest(unittest.TestCase):
 
 class CollectWiring(unittest.TestCase):
     def test_collect_uses_snapshot_build_with_local_readers(self):
-        from corral import resources as R
+        from korapy import resources as R
 
         registry_view = view((entry("a1"), "live"))
         quota = quota_view()
         resolved = resolved_settings(**{"quota.low_pct": 90, "drive.max_starts_per_day": 4})
         with (
-            mock.patch("corral.snapshot._settings_root", return_value=None),
-            mock.patch("corral.settings.load", return_value=resolved),
-            mock.patch("corral.projects.load_all", return_value=[]),
-            mock.patch("corral.units.list_units", return_value=[]),
-            mock.patch("corral.registry.config", return_value={"count_toward_cap": True}),
-            mock.patch("corral.registry.visible", return_value=registry_view),
-            mock.patch("corral.accounts.providers", return_value=["prov-a"]),
-            mock.patch("corral.quota_ledger.load", return_value={"ledger": True}),
-            mock.patch("corral.quotacli.snapshot", return_value=quota),
-            mock.patch("corral.drive.drive_status", return_value=dict(DRIVE)),
+            mock.patch("korapy.snapshot._settings_root", return_value=None),
+            mock.patch("korapy.settings.load", return_value=resolved),
+            mock.patch("korapy.projects.load_all", return_value=[]),
+            mock.patch("korapy.units.list_units", return_value=[]),
+            mock.patch("korapy.registry.config", return_value={"count_toward_cap": True}),
+            mock.patch("korapy.registry.visible", return_value=registry_view),
+            mock.patch("korapy.accounts.providers", return_value=["prov-a"]),
+            mock.patch("korapy.quota_ledger.load", return_value={"ledger": True}),
+            mock.patch("korapy.quotacli.snapshot", return_value=quota),
+            mock.patch("korapy.drive.drive_status", return_value=dict(DRIVE)),
             mock.patch(
-                "corral.resources.read_pressure",
+                "korapy.resources.read_pressure",
                 return_value=(R.Pressure(load_per_cpu=0.25), []),
             ),
-            mock.patch("corral.snapshot.build", return_value={"ok": True}) as build,
+            mock.patch("korapy.snapshot.build", return_value={"ok": True}) as build,
         ):
             self.assertEqual(serve.collect(), {"ok": True})
         _, kwargs = build.call_args
@@ -989,7 +989,7 @@ class UnreadableTokenFailsClosed(unittest.TestCase):
 
 class MintCleanup(unittest.TestCase):
     def test_failed_mint_leaves_no_token_file(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-token-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-token-") as tmp:
             target = os.path.join(tmp, "token")
             with mock.patch.object(os, "chmod", side_effect=OSError("denied")):
                 with self.assertRaises(serve.ServeError):
@@ -1030,7 +1030,7 @@ class BoardView(ServeCase):
         return json.loads(body)
 
     def test_board_lists_rows_oldest_first(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_store(
                 tmp,
                 {"number": 7, "fetched_at": T0 + 20},
@@ -1067,7 +1067,7 @@ class BoardView(ServeCase):
         self.assertEqual(seen, [("app", "open", "ready")])
 
     def test_board_reports_confidence_freshness_and_claims(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_store(
                 tmp,
                 {"number": 7, "fetched_at": T0},
@@ -1096,7 +1096,7 @@ class BoardView(ServeCase):
 
         nows = []
 
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             stored_board(
                 os.path.join(tmp, "board.sqlite"),
                 {"number": 7, "fetched_at": T0},
@@ -1147,7 +1147,7 @@ class BoardView(ServeCase):
         return self.open_store(tmp, *specs)
 
     def test_board_defaults_to_the_first_100_with_total(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_many(tmp, 250)
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             payload = self.get_json(server, "/v1/board")
@@ -1157,7 +1157,7 @@ class BoardView(ServeCase):
             self.assertEqual([row["number"] for row in payload["board"]], list(range(1, 101)))
 
     def test_board_limit_clamps_at_the_maximum(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_many(tmp, 250)
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             payload = self.get_json(server, "/v1/board?limit=5000")
@@ -1167,7 +1167,7 @@ class BoardView(ServeCase):
             self.assertEqual(len(payload["board"]), 250)
 
     def test_board_pages_cover_every_row_exactly_once(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_many(tmp, 250)
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             seen = []
@@ -1185,7 +1185,7 @@ class BoardView(ServeCase):
             self.assertEqual(len(seen), 250)
 
     def test_board_bad_paging_is_a_400(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_many(tmp, 3)
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             for target in (
@@ -1200,7 +1200,7 @@ class BoardView(ServeCase):
                     self.assertIn("error", json.loads(body))
 
     def test_board_bad_max_age_is_a_400(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             opener = self.open_many(tmp, 3)
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             for target in (
@@ -1370,7 +1370,7 @@ class TailCapSingleSource(unittest.TestCase):
 
 class BlankNumericsAreInvalid(ServeCase):
     def test_board_blank_paging_is_a_400(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-") as tmp:
             store = BoardView()
             opener = store.open_store(tmp, {"number": 1, "fetched_at": T0})
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
@@ -1398,12 +1398,12 @@ class BlankNumericsAreInvalid(ServeCase):
         self.assertEqual(tail.calls, [])
 
 
-def transitive_corral_modules(start):
-    """Module names reachable from `start` through `corral` imports.
+def transitive_korapy_modules(start):
+    """Module names reachable from `start` through `korapy` imports.
 
-    Follows `import corral.x` and `from corral[.x] import ...` edges at
+    Follows `import korapy.x` and `from korapy[.x] import ...` edges at
     every level of each visited file (a lazy import still binds the
-    seam when the handler runs), cycle-safe. Only `corral.*` edges
+    seam when the handler runs), cycle-safe. Only `korapy.*` edges
     are followed; anything else is a leaf.
     """
     import importlib.util
@@ -1412,7 +1412,7 @@ def transitive_corral_modules(start):
     stack = [start]
     while stack:
         name = stack.pop()
-        if name in seen or not name.startswith("corral"):
+        if name in seen or not name.startswith("korapy"):
             continue
         seen.add(name)
         spec = importlib.util.find_spec(name)
@@ -1424,7 +1424,7 @@ def transitive_corral_modules(start):
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name == "corral" or alias.name.startswith("corral."):
+                    if alias.name == "korapy" or alias.name.startswith("korapy."):
                         stack.append(alias.name)
             elif isinstance(node, ast.ImportFrom):
                 if node.level:
@@ -1433,10 +1433,10 @@ def transitive_corral_modules(start):
                             stack.append(f"{package}.{node.module}")
                         else:
                             stack.append(f"{package}.{alias.name}")
-                elif node.module == "corral":
+                elif node.module == "korapy":
                     for alias in node.names:
-                        stack.append(f"corral.{alias.name}")
-                elif (node.module or "").startswith("corral"):
+                        stack.append(f"korapy.{alias.name}")
+                elif (node.module or "").startswith("korapy"):
                     stack.append(node.module)
     return seen
 
@@ -1691,7 +1691,7 @@ class ProjectsRoute(ServeCase):
             conn.close()
 
     def test_projects_lists_names_sorted(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-projects-") as tmp:
             directory = os.path.join(tmp, projects.PROJECTS_DIR)
             os.makedirs(directory)
             for name, extra in (
@@ -1702,27 +1702,27 @@ class ProjectsRoute(ServeCase):
                     handle.write(
                         f'name = "{name}"\nunit_prefix = "{name}-"\nroot = "/tmp/{name}"\n{extra}'
                     )
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": tmp}):
                 server, _ = self.start_server(FakeBuilder(healthy_doc()))
                 self.assertEqual(
                     self.get_json(server, "/v1/projects"), {"projects": ["alpha", "beta"]}
                 )
 
     def test_projects_missing_registry_is_an_empty_list(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-projects-") as tmp:
             missing = os.path.join(tmp, "absent")
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": missing}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": missing}):
                 server, _ = self.start_server(FakeBuilder(healthy_doc()))
                 self.assertEqual(self.get_json(server, "/v1/projects"), {"projects": []})
 
     def test_projects_bad_file_is_a_generic_500(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-projects-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-projects-") as tmp:
             directory = os.path.join(tmp, projects.PROJECTS_DIR)
             os.makedirs(directory)
             bad = os.path.join(directory, "broken.toml")
             with open(bad, "w", encoding="utf-8") as handle:
                 handle.write('name = "broken"\nunknown_key = 1\n')
-            with mock.patch.dict(os.environ, {"CORRAL_CONFIG": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_CONFIG": tmp}):
                 server, _ = self.start_server(FakeBuilder(healthy_doc()))
                 err = io.StringIO()
                 with redirect_stderr(err):
@@ -1747,7 +1747,7 @@ class ProjectsRoute(ServeCase):
 
 class ProductionProjectReaders(unittest.TestCase):
     def test_events_reader_returns_the_projects_queue_oldest_first(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-events-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-events-") as tmp:
             root = os.path.join(tmp, "projects", "demo")
             written = coordevents.record(
                 [
@@ -1758,15 +1758,15 @@ class ProductionProjectReaders(unittest.TestCase):
                 now=T0,
                 event_id_fn=iter(["a1b2c3d4", "e5f6a7b8"]).__next__,
             )
-            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}):
                 self.assertEqual(serve.read_project_events("demo"), written)
                 self.assertEqual(serve.read_project_events("demo"), coordevents.read_events(root))
-            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}):
                 with self.assertRaises(coord.UsageError):
                     serve.read_project_events("../..")
 
     def test_journal_reader_returns_archives_then_live(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-journal-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-journal-") as tmp:
             root = os.path.join(tmp, "projects", "demo")
             directory = os.path.join(root, coord.LEASE_DIRNAME)
             os.makedirs(directory)
@@ -1797,12 +1797,12 @@ class ProductionProjectReaders(unittest.TestCase):
                 handle.write(json.dumps(archived_old) + "\n")
             with open(os.path.join(directory, coord.JOURNAL_NAME), "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(live) + "\n")
-            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}):
                 self.assertEqual(
                     serve.read_project_journal("demo"), [archived_old, archived_new, live]
                 )
                 self.assertEqual(serve.read_project_journal("quiet"), [])
-            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}):
                 with self.assertRaises(coord.UsageError):
                     serve.read_project_journal("../..")
 
@@ -2181,7 +2181,7 @@ class StreamSettings(unittest.TestCase):
         self.assertEqual(serve.STREAM_HEARTBEAT_S, 15.0)
 
     def test_settings_max_streams_reaches_the_server(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-stream-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-stream-") as tmp:
             config_dir = os.path.join(tmp, "config")
             state_dir = os.path.join(tmp, "state")
             os.makedirs(config_dir)
@@ -2205,7 +2205,7 @@ class StreamSettings(unittest.TestCase):
                 return FakeServer()
 
             with mock.patch.dict(
-                os.environ, {"CORRAL_CONFIG": config_dir, "CORRAL_STATE": state_dir}
+                os.environ, {"KORAPY_CONFIG": config_dir, "KORAPY_STATE": state_dir}
             ):
                 with mock.patch.object(serve, "make_server", side_effect=fake_make):
                     out = io.StringIO()
@@ -2369,16 +2369,16 @@ class ClientGonePeek(unittest.TestCase):
 
 class TransitiveSeamClosure(unittest.TestCase):
     def test_transitive_closure_has_no_hub_or_forge(self):
-        closed = transitive_corral_modules("corral.serve")
-        self.assertIn("corral.serve", closed)
-        self.assertIn("corral.board", closed)
-        self.assertNotIn("corral.hub", closed)
-        self.assertNotIn("corral.forge", closed)
+        closed = transitive_korapy_modules("korapy.serve")
+        self.assertIn("korapy.serve", closed)
+        self.assertIn("korapy.board", closed)
+        self.assertNotIn("korapy.hub", closed)
+        self.assertNotIn("korapy.forge", closed)
 
     def test_transitive_closure_seams_match_allowlist(self):
         import importlib.util
 
-        closed = transitive_corral_modules("corral.serve")
+        closed = transitive_korapy_modules("korapy.serve")
         found = set()
         for name in sorted(closed):
             spec = importlib.util.find_spec(name)
@@ -2398,35 +2398,35 @@ class TransitiveSeamClosure(unittest.TestCase):
                         found.add((name, top))
         allowlist = {
             (
-                "corral.drive",
+                "korapy.drive",
                 "socket",
             ): "socket.gethostname names the agent host segment; no packets",
             (
-                "corral.drive",
+                "korapy.drive",
                 "subprocess",
             ): "timer helpers other verbs call; no request handler reaches them",
             (
-                "corral.github.gh",
+                "korapy.github.gh",
                 "subprocess",
             ): "the gh seam other verbs call; reads inject fakes instead",
             (
-                "corral.launch",
+                "korapy.launch",
                 "socket",
             ): "socket.gethostname names launch records; the tail read never shells out",
-            ("corral.netbind", "socket"): "address-family constants for the loopback bind",
-            ("corral.registry", "socket"): "socket.gethostname tags live-agent rows; local only",
-            ("corral.serve", "socket"): "MSG_PEEK flag for the client-close probe; opens nothing",
-            ("corral.snapshot", "socket"): "socket.gethostname fills the fleet header; local only",
+            ("korapy.netbind", "socket"): "address-family constants for the loopback bind",
+            ("korapy.registry", "socket"): "socket.gethostname tags live-agent rows; local only",
+            ("korapy.serve", "socket"): "MSG_PEEK flag for the client-close probe; opens nothing",
+            ("korapy.snapshot", "socket"): "socket.gethostname fills the fleet header; local only",
             (
-                "corral.syncli",
+                "korapy.syncli",
                 "subprocess",
             ): "sync subprocess seam other verbs call; reads never reach it",
             (
-                "corral.units",
+                "korapy.units",
                 "subprocess",
             ): "unit control seam other verbs call; reads never reach it",
             (
-                "corral.worktrees",
+                "korapy.worktrees",
                 "subprocess",
             ): "git worktree seam other verbs call; reads never reach it",
         }
@@ -2435,7 +2435,7 @@ class TransitiveSeamClosure(unittest.TestCase):
         self.assertEqual(found, set(allowlist))
 
     def test_journal_reader_skips_undated_archives(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-journal-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-journal-") as tmp:
             root = os.path.join(tmp, "projects", "demo")
             directory = os.path.join(root, coord.LEASE_DIRNAME)
             os.makedirs(directory)
@@ -2461,7 +2461,7 @@ class TransitiveSeamClosure(unittest.TestCase):
                 handle.write(json.dumps(stray) + "\n")
             with open(os.path.join(directory, coord.JOURNAL_NAME), "w", encoding="utf-8") as handle:
                 handle.write(json.dumps(live) + "\n")
-            with mock.patch.dict(os.environ, {"CORRAL_STATE": tmp}):
+            with mock.patch.dict(os.environ, {"KORAPY_STATE": tmp}):
                 self.assertEqual(serve.read_project_journal("demo"), [dated, live])
 
 
@@ -2728,10 +2728,10 @@ class SnapshotTtlWiring(ServeCommandTest):
             def server_close(self):
                 pass
 
-        with tempfile.TemporaryDirectory(prefix="corral-serve-ttl-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-ttl-") as tmp:
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with mock.patch.object(serve, "make_server", return_value=FakeServer()) as made:
@@ -2764,10 +2764,10 @@ class SnapshotTtlWiring(ServeCommandTest):
                 pass
 
         config = "[serve]\nsnapshot_ttl_s = 9\n"
-        with tempfile.TemporaryDirectory(prefix="corral-serve-ttl-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-ttl-") as tmp:
             with mock.patch.dict(
                 os.environ,
-                {"CORRAL_CONFIG": tmp, "CORRAL_STATE": tmp},
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
                 clear=False,
             ):
                 with open(os.path.join(tmp, "config.toml"), "w", encoding="utf-8") as handle:

@@ -12,7 +12,7 @@ import copy
 import json
 import unittest
 
-from corral import snapshot
+from korapy import snapshot
 from tests.test_serve import DRIVE, ServeCase, healthy_doc
 from tests.test_snapshot import (
     HOST,

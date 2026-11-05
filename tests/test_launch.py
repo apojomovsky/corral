@@ -1,11 +1,11 @@
-"""corral.launch and its CLI, end to end over fake seams.
+"""korapy.launch and its CLI, end to end over fake seams.
 
-A fake project: a temp ops root with a corral.toml holding several [[repo]]
+A fake project: a temp ops root with a korapy.toml holding several [[repo]]
 entries, a bare repository per repo standing in for origin, and a clone.
 Real git runs in those temp dirs (local remotes only). The service manager
 is an in-memory fake: `list_fn` lists it, `run` starts a unit in it, and
 `stop_fn` stops one. No test runs systemd, the runtimes, or touches the
-real state, config or session dirs; the environment is cleared of CORRAL_*
+real state, config or session dirs; the environment is cleared of KORAPY_*
 and points at temp dirs.
 """
 
@@ -25,10 +25,10 @@ from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import accounts, board, cli, hold, host_ledger, launch, launchcli, models, paths
-from corral import pressure, profiles, registry, resources, runtimes
-from corral import settings, units
-from corral.runtimes import muse, omp
+from korapy import accounts, board, cli, hold, host_ledger, launch, launchcli, models, paths
+from korapy import pressure, profiles, registry, resources, runtimes
+from korapy import settings, units
+from korapy.runtimes import muse, omp
 from tests.test_profiles_launch import FakeStore
 from tests.test_reviewrecord import git_in
 from tests.test_tracker import FakeTracker
@@ -130,20 +130,20 @@ class OpsCase(unittest.TestCase):
     """A temp ops root with two real clones, a fake service manager, and temp dirs."""
 
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-launch-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-launch-"))
         self.root = os.path.join(self.tmp, "ops")
         os.makedirs(os.path.join(self.root, "clones"))
         for name in REPOS:
             self.make_clone(name)
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as h:
             h.write(TOML)
-        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
         env = dict(kept)
         env.update(
-            CORRAL_STATE=os.path.join(self.tmp, "state"),
-            CORRAL_SESSIONS=os.path.join(self.tmp, "sessions"),
-            CORRAL_CONFIG=os.path.join(self.tmp, "config"),
-            CORRAL_CACHE=os.path.join(self.tmp, "cache"),
+            KORAPY_STATE=os.path.join(self.tmp, "state"),
+            KORAPY_SESSIONS=os.path.join(self.tmp, "sessions"),
+            KORAPY_CONFIG=os.path.join(self.tmp, "config"),
+            KORAPY_CACHE=os.path.join(self.tmp, "cache"),
         )
         self.enterContext(mock.patch.dict(os.environ, env, clear=True))
         self.enterContext(mock.patch.object(omp, "binary", return_value="/fake/omp"))
@@ -190,7 +190,7 @@ class TargetTest(OpsCase):
         tgt = self.target("lib")
         self.assertEqual(tgt.clone, os.path.join(self.root, "clones", "lib"))
         self.assertEqual(tgt.default_branch, "main")
-        self.assertEqual(tgt.prefix, "corral-agent-")
+        self.assertEqual(tgt.prefix, "korapy-agent-")
         self.assertEqual(tgt.cap, 2)
         self.assertEqual(tgt.branch_template, "{type}/{issue}-{slug}")
         self.assertEqual(tgt.worktrees_root, ".worktrees/")
@@ -221,7 +221,7 @@ class TargetTest(OpsCase):
     def test_the_clone_settings_and_the_provider_are_registered(self):
         self.assertEqual(settings.REGISTRY["clone.path"].default, "")
         self.assertEqual(settings.REGISTRY["clone.default_branch"].default, "main")
-        self.assertIn("corral.launch", settings.PROVIDERS)
+        self.assertIn("korapy.launch", settings.PROVIDERS)
 
     def test_the_runtime_limit_matches_the_runtime_default(self):
         self.assertEqual(runtimes.DEFAULT_MAX_TIME, "3h")
@@ -239,7 +239,7 @@ class AdmitTest(OpsCase):
         )
 
     def test_a_live_unit_of_this_ticket_is_already_live(self):
-        self.system.units["corral-agent-lib-5"] = "active"
+        self.system.units["korapy-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists) as ctx:
             launch.admit(
                 self.target(),
@@ -251,7 +251,7 @@ class AdmitTest(OpsCase):
         self.assertEqual(ctx.exception.exit_code, 2)
 
     def test_the_same_number_in_another_repo_is_not_live(self):
-        self.system.units["corral-agent-my-repo-5"] = "active"
+        self.system.units["korapy-agent-my-repo-5"] = "active"
         launch.admit(
             self.target("lib"),
             5,
@@ -261,8 +261,8 @@ class AdmitTest(OpsCase):
         )
 
     def test_a_full_host_refuses_with_exit_75(self):
-        self.system.units["corral-agent-lib-6"] = "active"
-        self.system.units["corral-agent-my-repo-7"] = "activating"
+        self.system.units["korapy-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-my-repo-7"] = "activating"
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(
                 self.target(),
@@ -313,17 +313,17 @@ class BudgetWiringTest(OpsCase):
     """The budget gate in `launch.admit` and the slice wiring in `launch`."""
 
     def host_config(self, text=HOST_BUDGET):
-        config = os.environ["CORRAL_CONFIG"]
+        config = os.environ["KORAPY_CONFIG"]
         os.makedirs(config, exist_ok=True)
         with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def register_web(self, share="weight = 1\n"):
-        directory = os.path.join(os.environ["CORRAL_CONFIG"], "projects.d")
+        directory = os.path.join(os.environ["KORAPY_CONFIG"], "projects.d")
         os.makedirs(directory, exist_ok=True)
         with open(os.path.join(directory, "web.toml"), "w", encoding="utf-8") as handle:
             handle.write(
-                'name = "web"\nunit_prefix = "corral-agent-"\nroot = "'
+                'name = "web"\nunit_prefix = "korapy-agent-"\nroot = "'
                 + os.path.realpath(self.root)
                 + '"\n\n[resources]\n'
                 + share
@@ -348,7 +348,7 @@ class BudgetWiringTest(OpsCase):
             usage=roomy,
             host_ledger_fn=self.system.host_ledger_fn,
         )
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertEqual(len(self.system.started), 1)
         self.assertFalse([a for a in self.system.started[0] if "Slice=" in a])
 
@@ -357,7 +357,7 @@ class BudgetWiringTest(OpsCase):
             "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
         )
-        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-lib-6"] = "active"
         with self.assertRaises(launch.CapFull) as caught:
             self.admit()
         self.assertEqual(caught.exception.exit_code, 75)
@@ -371,7 +371,7 @@ class BudgetWiringTest(OpsCase):
             "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
         )
-        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-lib-6"] = "active"
 
         def critical(path):
             return (100 * 1024**3, 99 * 1024**3, 1 * 1024**3)
@@ -385,8 +385,8 @@ class BudgetWiringTest(OpsCase):
             "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
         )
-        self.system.units["corral-agent-lib-6"] = "active"
-        self.system.units["corral-agent-my-repo-7"] = "activating"
+        self.system.units["korapy-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-my-repo-7"] = "activating"
         with self.assertRaises(launch.CapFull) as caught:
             self.admit()
         self.assertIn("ceiling", str(caught.exception))
@@ -400,7 +400,7 @@ class BudgetWiringTest(OpsCase):
         )
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
             handle.write(TOML + "[profiles.default.models.worker]\nchain = ['fresh/model']\n")
-        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-lib-6"] = "active"
         pool = [accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0)]
         quota_ledger = {
             "readings": {
@@ -517,9 +517,9 @@ class BudgetWiringTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             controllers_read=lambda path: "cpu memory pids",
         )
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         agent = self.system.started[-1]
-        self.assertIn("--property=Slice=corral-web.slice", agent)
+        self.assertIn("--property=Slice=korapy-web.slice", agent)
         self.assertIn("--property=MemoryMax=1024M", agent)
 
     def test_no_host_budget_leaves_an_unpriced_role_untouched(self):
@@ -534,7 +534,7 @@ class BudgetWiringTest(OpsCase):
             usage=roomy,
             host_ledger_fn=self.system.host_ledger_fn,
         )
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertEqual(len(self.system.started), 1)
         self.assertFalse([a for a in self.system.started[0] if "Slice=" in a])
 
@@ -544,7 +544,7 @@ class BudgetWiringTest(OpsCase):
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
             "[resources.role.reviewer]\ncpu_m = 500\nmemory_mb = 1024\n"
         )
-        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-lib-6"] = "active"
         with self.assertRaises(launch.CapFull):
             self.admit(role="worker")
         self.admit(role="reviewer")
@@ -608,10 +608,10 @@ class BudgetWiringTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             controllers_read=lambda path: "cpu memory pids",
         )
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertEqual(len(self.system.started), 5)
         host_start, host_props, project_start, project_props, agent = self.system.started
-        self.assertEqual(host_start, ["systemctl", "--user", "start", "corral.slice"])
+        self.assertEqual(host_start, ["systemctl", "--user", "start", "korapy.slice"])
         self.assertEqual(
             host_props,
             [
@@ -619,12 +619,12 @@ class BudgetWiringTest(OpsCase):
                 "--user",
                 "set-property",
                 "--runtime",
-                "corral.slice",
+                "korapy.slice",
                 "MemoryMax=16000M",
                 "CPUQuota=800%",
             ],
         )
-        self.assertEqual(project_start, ["systemctl", "--user", "start", "corral-web.slice"])
+        self.assertEqual(project_start, ["systemctl", "--user", "start", "korapy-web.slice"])
         self.assertEqual(
             project_props,
             [
@@ -632,13 +632,13 @@ class BudgetWiringTest(OpsCase):
                 "--user",
                 "set-property",
                 "--runtime",
-                "corral-web.slice",
+                "korapy-web.slice",
                 "MemoryMax=16000M",
                 "CPUQuota=800%",
             ],
         )
-        self.assertIn("--unit=corral-agent-lib-5", agent)
-        self.assertIn("--property=Slice=corral-web.slice", agent)
+        self.assertIn("--unit=korapy-agent-lib-5", agent)
+        self.assertIn("--property=Slice=korapy-web.slice", agent)
         self.assertIn("--property=MemoryMax=2048M", agent)
         self.assertIn("--property=CPUQuota=100%", agent)
 
@@ -687,7 +687,7 @@ class BudgetWiringTest(OpsCase):
         self.system.finish(unit)
         with open(os.path.join(self.leaf("lib", 5), "chat.jsonl"), "w", encoding="utf-8") as handle:
             handle.write("{}\n")
-        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-lib-6"] = "active"
         self.host_config(
             "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
@@ -733,7 +733,7 @@ class BudgetWiringTest(OpsCase):
             "[resources.host]\ncpu_m = 1000\nmemory_mb = 16000\npids = 4096\n"
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
         )
-        self.system.units["corral-agent-lib-6"] = "active"
+        self.system.units["korapy-agent-lib-6"] = "active"
         code = launchcli.run_verb(
             ["launch", "lib", "5", "--prompt-file", self.prompt_file(), "--root", self.root],
             self.system.seams(),
@@ -761,7 +761,7 @@ class PressureWiringTest(OpsCase):
     """Saturation backoff in `launch.admit`: hot hosts wait with exit 75."""
 
     def host_config(self, text=HOST_BUDGET):
-        config = os.environ["CORRAL_CONFIG"]
+        config = os.environ["KORAPY_CONFIG"]
         os.makedirs(config, exist_ok=True)
         with open(os.path.join(config, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
@@ -826,7 +826,7 @@ class LaunchTest(OpsCase):
 
     def check_full_path(self, runtime):
         unit, workdir = self.start(runtime, model="provider-a/model-1")
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertEqual(
             workdir,
             os.path.realpath(
@@ -839,16 +839,16 @@ class LaunchTest(OpsCase):
         with open(os.path.join(session, "prompt.md"), encoding="utf-8") as h:
             text = h.read()
         self.assertTrue(text.startswith("do the thing\n\n"))
-        self.assertIn("corral agent heartbeat", text)
+        self.assertIn("korapy agent heartbeat", text)
         self.assertEqual(runtimes.recorded(session), runtime)
         self.assertEqual(units.started_units(session), [unit])
 
         argv = self.system.started[-1]
         self.assertIn(f"--unit={unit}", argv)
-        self.assertIn(f"--setenv=CORRAL_AGENT_ID={unit}", argv)
+        self.assertIn(f"--setenv=KORAPY_AGENT_ID={unit}", argv)
         self.assertIn(f"--working-directory={workdir}", argv)
         self.assertTrue(any(item.startswith("do the thing\n\n") for item in argv))
-        self.assertTrue(any("corral agent heartbeat" in item for item in argv))
+        self.assertTrue(any("korapy agent heartbeat" in item for item in argv))
         return session
 
     def test_launch_resume_tail_and_stop_an_omp_agent(self):
@@ -889,7 +889,7 @@ class LaunchTest(OpsCase):
                 usage=roomy,
                 host_ledger_fn=self.system.host_ledger_fn,
             )
-        self.system.finish("corral-agent-lib-5")
+        self.system.finish("korapy-agent-lib-5")
 
         unit, _ = launch.resume(
             self.target("lib"),
@@ -901,7 +901,7 @@ class LaunchTest(OpsCase):
             usage=roomy,
             host_ledger_fn=self.system.host_ledger_fn,
         )
-        self.assertEqual(unit, "corral-agent-lib-5-r1")
+        self.assertEqual(unit, "korapy-agent-lib-5-r1")
         argv = self.system.started[-1]
         self.assertIn("-r", argv)
         self.assertEqual(argv[argv.index("-r") + 1], os.path.join(session, "chat.jsonl"))
@@ -914,7 +914,7 @@ class LaunchTest(OpsCase):
             launch.stop(
                 self.target("lib"), 5, list_fn=self.system.list_fn, stop_fn=self.system.stop_fn
             ),
-            ["corral-agent-lib-5-r1"],
+            ["korapy-agent-lib-5-r1"],
         )
         self.assertEqual(
             launch.stop(
@@ -925,7 +925,7 @@ class LaunchTest(OpsCase):
 
     def test_launch_resume_tail_and_stop_a_muse_agent(self):
         unit, workdir = self.start("muse", model="provider-a/model-1")
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertTrue(os.path.isdir(workdir))
         session = self.leaf("lib", 5)
         self.assertTrue(os.path.exists(os.path.join(session, "muse.json")))
@@ -959,7 +959,7 @@ class LaunchTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.assertEqual(resumed, "corral-agent-lib-5-r1")
+        self.assertEqual(resumed, "korapy-agent-lib-5-r1")
         argv = self.system.started[-1]
         self.assertEqual(argv[argv.index("--session-id") + 1], recorded)
 
@@ -971,7 +971,7 @@ class LaunchTest(OpsCase):
             launch.stop(
                 self.target("lib"), 5, list_fn=self.system.list_fn, stop_fn=self.system.stop_fn
             ),
-            ["corral-agent-lib-5-r1"],
+            ["korapy-agent-lib-5-r1"],
         )
 
     def test_the_runtime_config_is_written_into_the_session(self):
@@ -987,8 +987,8 @@ class LaunchTest(OpsCase):
         self.assertEqual(self.system.started, [])
 
     def test_a_full_host_refuses_before_anything_is_made(self):
-        self.system.units["corral-agent-my-repo-6"] = "active"
-        self.system.units["corral-agent-my-repo-7"] = "active"
+        self.system.units["korapy-agent-my-repo-6"] = "active"
+        self.system.units["korapy-agent-my-repo-7"] = "active"
         with self.assertRaises(launch.CapFull):
             self.start("omp")
         self.assertEqual(self.system.started, [])
@@ -996,14 +996,14 @@ class LaunchTest(OpsCase):
         self.assertEqual(self.worktrees_of("lib"), [])
 
     def test_an_already_live_ticket_is_exit_2_and_makes_nothing(self):
-        self.system.units["corral-agent-lib-5"] = "active"
+        self.system.units["korapy-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists):
             self.start("omp")
         self.assertEqual(self.worktrees_of("lib"), [])
 
     def test_a_bad_profile_beats_a_full_host(self):
-        self.system.units["corral-agent-my-repo-6"] = "active"
-        self.system.units["corral-agent-my-repo-7"] = "active"
+        self.system.units["korapy-agent-my-repo-6"] = "active"
+        self.system.units["korapy-agent-my-repo-7"] = "active"
         with self.assertRaises(settings.SettingsError) as caught:
             self.start("omp", profile="nope")
         self.assertIn("nope", str(caught.exception))
@@ -1013,7 +1013,7 @@ class LaunchTest(OpsCase):
         self.assertEqual(self.worktrees_of("lib"), [])
 
     def test_a_bad_profile_beats_a_live_ticket(self):
-        self.system.units["corral-agent-lib-5"] = "active"
+        self.system.units["korapy-agent-lib-5"] = "active"
         with self.assertRaises(settings.SettingsError) as caught:
             self.start("omp", profile="nope")
         self.assertIn("nope", str(caught.exception))
@@ -1035,7 +1035,7 @@ class LaunchTest(OpsCase):
         with open(path, "wb") as handle:
             handle.write(b"not a database")
         unit, workdir = self.start("omp")
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertTrue(os.path.isdir(workdir))
 
     def test_no_profiles_launches_on_the_shipped_default_runtime(self):
@@ -1048,7 +1048,7 @@ class LaunchTest(OpsCase):
         with open(toml_path, "w", encoding="utf-8") as handle:
             handle.write(text)
         unit, workdir = self.start("omp")
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         self.assertTrue(os.path.isdir(workdir))
         session = self.leaf("lib", 5)
         self.assertEqual(runtimes.recorded(session), runtimes.DEFAULT_RUNTIME)
@@ -1075,7 +1075,7 @@ class LaunchTest(OpsCase):
         self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_a_start_that_loses_the_race_is_exit_2(self):
-        self.system.fail = "Unit corral-agent-lib-5.service already exists."
+        self.system.fail = "Unit korapy-agent-lib-5.service already exists."
         with self.assertRaises(units.UnitExists):
             self.start("omp")
         self.assertFalse(os.path.exists(os.path.join(self.leaf("lib", 5), units.UNITS_LOG)))
@@ -1120,15 +1120,15 @@ class LaunchTest(OpsCase):
             run=self.system.run,
         )
         self.assertNotEqual(self.leaf("lib", 5), self.leaf("my-repo", 5))
-        self.assertEqual(units.started_units(self.leaf("lib", 5)), ["corral-agent-lib-5"])
-        self.assertEqual(units.started_units(self.leaf("my-repo", 5)), ["corral-agent-my-repo-5"])
+        self.assertEqual(units.started_units(self.leaf("lib", 5)), ["korapy-agent-lib-5"])
+        self.assertEqual(units.started_units(self.leaf("my-repo", 5)), ["korapy-agent-my-repo-5"])
         self.assertEqual(
             launch.stop(
                 self.target("lib"), 5, list_fn=self.system.list_fn, stop_fn=self.system.stop_fn
             ),
-            ["corral-agent-lib-5"],
+            ["korapy-agent-lib-5"],
         )
-        self.assertEqual(self.system.units["corral-agent-my-repo-5"], "active")
+        self.assertEqual(self.system.units["korapy-agent-my-repo-5"], "active")
 
 
 class MuseSessionTest(OpsCase):
@@ -1150,7 +1150,7 @@ class MuseSessionTest(OpsCase):
             usage=roomy,
             host_ledger_fn=self.system.host_ledger_fn,
         )
-        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertEqual(unit, "korapy-agent-lib-5")
         session = self.leaf("lib", 5)
         with open(os.path.join(session, "muse_session_id"), encoding="utf-8") as h:
             recorded = h.read().strip()
@@ -1171,7 +1171,7 @@ class MuseSessionTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.assertEqual(resumed, "corral-agent-lib-5-r1")
+        self.assertEqual(resumed, "korapy-agent-lib-5-r1")
         argv = self.system.started[-1]
         self.assertEqual(argv[argv.index("--session-id") + 1], recorded)
         self.assertEqual(argv[argv.index("--prompt-file") + 1], os.path.join(session, "message.md"))
@@ -1413,7 +1413,7 @@ class ReviewerWiringTest(OpsCase):
                 self.system.seams(),
             )
         self.assertEqual(code, 0)
-        (found,) = [e for e in registry.load_all() if e["id"] == "corral-agent-lib-5"]
+        (found,) = [e for e in registry.load_all() if e["id"] == "korapy-agent-lib-5"]
         self.assertEqual(found["role"], "reviewer")
 
     def test_resume_with_an_unknown_recorded_role_is_refused(self):
@@ -1636,7 +1636,7 @@ class MuseReviewerLaunchTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.assertEqual(resumed, "corral-agent-lib-5-r1")
+        self.assertEqual(resumed, "korapy-agent-lib-5-r1")
         self.assertIn("--disable-write", self.system.started[-1])
         (found,) = [e for e in registry.load_all() if e["id"] == resumed]
         self.assertEqual(found["role"], "reviewer")
@@ -1702,7 +1702,7 @@ class ResumeTailTest(OpsCase):
             usage=roomy,
             host_ledger_fn=self.system.host_ledger_fn,
         )
-        self.system.finish("corral-agent-lib-5")
+        self.system.finish("korapy-agent-lib-5")
         before = len(self.system.started)
         stub = mock.Mock()
         stub.name = "stub"
@@ -1776,12 +1776,12 @@ class HoldResumeTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.system.finish("corral-agent-held-5")
+        self.system.finish("korapy-agent-held-5")
         with open(os.path.join(self.leaf("held", 5), "chat.jsonl"), "w", encoding="utf-8") as h:
             h.write("{}\n")
         code, out, _ = self.verb("held", 5, lambda kind, repo, number: [])
         self.assertEqual(code, 0)
-        self.assertIn("resumed as corral-agent-held-5-r1", out)
+        self.assertIn("resumed as korapy-agent-held-5-r1", out)
 
     def test_a_label_read_that_raises_is_exit_1(self):
         def boom(kind, repo, number):
@@ -1904,14 +1904,14 @@ class CliTest(OpsCase):
                 )
         code, out, _ = self.verb("resume", "lib", "5", "--message", "go on")
         self.assertEqual(code, 0)
-        self.assertIn("resumed as corral-agent-lib-5-r2", out)
-        (found,) = [e for e in registry.load_all() if e["id"] == "corral-agent-lib-5-r2"]
+        self.assertIn("resumed as korapy-agent-lib-5-r2", out)
+        (found,) = [e for e in registry.load_all() if e["id"] == "korapy-agent-lib-5-r2"]
         self.assertEqual(found["role"], "worker")
-        self.system.finish("corral-agent-lib-5-r2")
+        self.system.finish("korapy-agent-lib-5-r2")
 
         code, out, _ = self.verb("resume", "lib", "5", "--message", "go on", "--role", "reviewer")
         self.assertEqual(code, 0)
-        self.assertIn("resumed as corral-agent-lib-5-r3", out)
+        self.assertIn("resumed as korapy-agent-lib-5-r3", out)
 
         code, out, _ = self.verb("tail", "lib", "5", "--last", "1")
         self.assertEqual(code, 0)
@@ -1925,11 +1925,11 @@ class CliTest(OpsCase):
         pf = self.prompt_file()
         code, out, _ = self.verb("launch", "lib", "5", "--prompt-file", pf, "--title", "feat: go")
         self.assertEqual(code, 0)
-        self.assertIn("launched corral-agent-lib-5", out)
+        self.assertIn("launched korapy-agent-lib-5", out)
 
         code, out, _ = self.verb("stop", "lib", "5")
         self.assertEqual(code, 0)
-        self.assertIn("stopped corral-agent-lib-5", out)
+        self.assertIn("stopped korapy-agent-lib-5", out)
 
         code, out, _ = self.verb("stop", "lib", "5")
         self.assertEqual(code, 1)
@@ -1937,14 +1937,14 @@ class CliTest(OpsCase):
 
     def test_a_full_host_is_exit_75_and_a_live_ticket_is_exit_2(self):
         pf = self.prompt_file()
-        self.system.units["corral-agent-my-repo-6"] = "active"
-        self.system.units["corral-agent-my-repo-7"] = "active"
+        self.system.units["korapy-agent-my-repo-6"] = "active"
+        self.system.units["korapy-agent-my-repo-7"] = "active"
         code, _, err = self.verb("launch", "lib", "5", "--prompt-file", pf)
         self.assertEqual(code, 75)
         self.assertIn("at 2 of 2 ceiling", err)
 
         self.system.units.clear()
-        self.system.units["corral-agent-lib-5"] = "active"
+        self.system.units["korapy-agent-lib-5"] = "active"
         code, _, _ = self.verb("launch", "lib", "5", "--prompt-file", pf)
         self.assertEqual(code, 2)
 
@@ -1964,7 +1964,7 @@ class CliTest(OpsCase):
         self.assertEqual(self.verb("launch", "lib", "5", "--prompt-file", "/no/such/file")[0], 4)
         self.assertEqual(self.verb("launch", "lib")[0], 4)
 
-    def test_a_root_without_corral_toml_is_exit_4(self):
+    def test_a_root_without_korapy_toml_is_exit_4(self):
         bare = os.path.join(self.tmp, "bare")
         os.makedirs(bare)
         out, errs = io.StringIO(), io.StringIO()
@@ -1999,11 +1999,11 @@ class CliTest(OpsCase):
                 cfg,
             )
         self.assertEqual(code, 4)
-        self.assertTrue(err.startswith("corral: "))
+        self.assertTrue(err.startswith("korapy: "))
         self.assertNotIn("\n", err.strip())
         self.assertEqual(self.system.started, [])
 
-    def test_the_verbs_are_registered_on_the_corral_command(self):
+    def test_the_verbs_are_registered_on_the_korapy_command(self):
         with redirect_stdout(io.StringIO()):
             for verb in ("launch", "resume", "stop", "tail"):
                 self.assertEqual(cli.main([verb, "--help"]), 0, verb)
@@ -2028,7 +2028,7 @@ class RaceTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.system.finish("corral-agent-lib-5")
+        self.system.finish("korapy-agent-lib-5")
         session = self.leaf("lib", 5)
         before = {
             name: _read(os.path.join(session, name))
@@ -2043,7 +2043,7 @@ class RaceTest(OpsCase):
             calls.append(prefix)
             if len(calls) == 1:
                 return []
-            return [("corral-agent-lib-5", "active", "running")]
+            return [("korapy-agent-lib-5", "active", "running")]
 
         with self.assertRaises(units.UnitExists):
             launch.launch(
@@ -2076,7 +2076,7 @@ class RaceTest(OpsCase):
             run=self.system.run,
         )
         session = self.leaf("lib", 5)
-        self.system.finish("corral-agent-lib-5")
+        self.system.finish("korapy-agent-lib-5")
         with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
             handle.write("{}\n")
 
@@ -2101,11 +2101,11 @@ class RaceTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.assertEqual(first, "corral-agent-lib-5-r1")
-        self.assertEqual(second, "corral-agent-lib-5-r2")
+        self.assertEqual(first, "korapy-agent-lib-5-r1")
+        self.assertEqual(second, "korapy-agent-lib-5-r2")
         self.assertEqual(
             units.started_units(session),
-            ["corral-agent-lib-5", "corral-agent-lib-5-r1", "corral-agent-lib-5-r2"],
+            ["korapy-agent-lib-5", "korapy-agent-lib-5-r1", "korapy-agent-lib-5-r2"],
         )
 
 
@@ -2168,11 +2168,11 @@ class RegistryCapTest(OpsCase):
         self.assertEqual(ctx.exception.exit_code, 75)
         self.assertEqual(
             str(ctx.exception),
-            "start corral-agent- lib#5 refused: corral-agent- at 2 of 2 ceiling",
+            "start korapy-agent- lib#5 refused: korapy-agent- at 2 of 2 ceiling",
         )
 
     def test_a_unit_holder_gets_no_registry_note(self):
-        self.system.units["corral-agent-lib-5"] = "active"
+        self.system.units["korapy-agent-lib-5"] = "active"
         with self.assertRaises(units.UnitExists) as ctx:
             launch.admit(
                 self.target(),
@@ -2184,8 +2184,8 @@ class RegistryCapTest(OpsCase):
         self.assertEqual(str(ctx.exception), "#5 of lib already has a live agent")
 
         self.system.units.clear()
-        self.system.units["corral-agent-my-repo-6"] = "active"
-        self.system.units["corral-agent-my-repo-7"] = "active"
+        self.system.units["korapy-agent-my-repo-6"] = "active"
+        self.system.units["korapy-agent-my-repo-7"] = "active"
         with self.assertRaises(launch.CapFull) as ctx:
             launch.admit(
                 self.target(),
@@ -2211,7 +2211,7 @@ class StopUnprovenTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.system.units["corral-agent-lib-5-r7"] = "active"
+        self.system.units["korapy-agent-lib-5-r7"] = "active"
 
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
@@ -2219,15 +2219,15 @@ class StopUnprovenTest(OpsCase):
                 ["stop", "lib", "5", "--root", self.root], self.system.seams()
             )
         self.assertEqual(code, 2)
-        self.assertIn("stopped corral-agent-lib-5", out.getvalue())
+        self.assertIn("stopped korapy-agent-lib-5", out.getvalue())
         self.assertIn(
-            "live but not proven ours, not stopped: corral-agent-lib-5-r7", err.getvalue()
+            "live but not proven ours, not stopped: korapy-agent-lib-5-r7", err.getvalue()
         )
-        self.assertEqual(self.system.stopped, ["corral-agent-lib-5"])
-        self.assertEqual(self.system.units["corral-agent-lib-5-r7"], "active")
+        self.assertEqual(self.system.stopped, ["korapy-agent-lib-5"])
+        self.assertEqual(self.system.units["korapy-agent-lib-5-r7"], "active")
 
     def test_only_an_unproven_unit_live_is_exit_2_with_nothing_stopped(self):
-        self.system.units["corral-agent-lib-5-r7"] = "active"
+        self.system.units["korapy-agent-lib-5-r7"] = "active"
         out, err = io.StringIO(), io.StringIO()
         with mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
             code = launchcli.run_verb(
@@ -2235,7 +2235,7 @@ class StopUnprovenTest(OpsCase):
             )
         self.assertEqual(code, 2)
         self.assertEqual(self.system.stopped, [])
-        self.assertIn("corral-agent-lib-5-r7", err.getvalue())
+        self.assertIn("korapy-agent-lib-5-r7", err.getvalue())
 
     def start_two_roles(self):
         worker_unit, _ = launch.launch(
@@ -2415,8 +2415,8 @@ class RoleSessionIsolationTest(OpsCase):
         worker_unit, _ = self.start("worker")
         self.system.finish(worker_unit)
         reviewer_unit, _ = self.start("reviewer")
-        self.assertEqual(worker_unit, "corral-agent-lib-5")
-        self.assertEqual(reviewer_unit, "corral-agent-lib-5-r1")
+        self.assertEqual(worker_unit, "korapy-agent-lib-5")
+        self.assertEqual(reviewer_unit, "korapy-agent-lib-5-r1")
 
     def test_stop_finds_the_live_unit_whichever_role_holds_it(self):
         worker_unit, _ = self.start("worker")
@@ -2449,7 +2449,7 @@ class RoleSessionIsolationTest(OpsCase):
             host_ledger_fn=self.system.host_ledger_fn,
             run=self.system.run,
         )
-        self.assertEqual(resumed, "corral-agent-lib-5-r1")
+        self.assertEqual(resumed, "korapy-agent-lib-5-r1")
 
 
 class ProfileLaunchCliTest(OpsCase):

@@ -5,7 +5,7 @@ import os
 import tempfile
 import unittest
 
-from corral import paths
+from korapy import paths
 
 HOME = os.path.expanduser("~")
 
@@ -13,11 +13,11 @@ HOME = os.path.expanduser("~")
 class Resolvers(unittest.TestCase):
     def test_defaults_follow_xdg_when_nothing_is_set(self):
         env = {}
-        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/corral"))
-        self.assertEqual(paths.config_dir(env), os.path.join(HOME, ".config/corral"))
-        self.assertEqual(paths.cache_dir(env), os.path.join(HOME, ".cache/corral"))
+        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/korapy"))
+        self.assertEqual(paths.config_dir(env), os.path.join(HOME, ".config/korapy"))
+        self.assertEqual(paths.cache_dir(env), os.path.join(HOME, ".cache/korapy"))
         self.assertEqual(
-            paths.sessions_dir(env), os.path.join(HOME, ".local/state/corral/sessions")
+            paths.sessions_dir(env), os.path.join(HOME, ".local/state/korapy/sessions")
         )
 
     def test_xdg_variables_move_the_defaults(self):
@@ -26,73 +26,73 @@ class Resolvers(unittest.TestCase):
             "XDG_CONFIG_HOME": "/x/config",
             "XDG_CACHE_HOME": "/x/cache",
         }
-        self.assertEqual(paths.state_dir(env), "/x/state/corral")
-        self.assertEqual(paths.config_dir(env), "/x/config/corral")
-        self.assertEqual(paths.cache_dir(env), "/x/cache/corral")
-        self.assertEqual(paths.sessions_dir(env), "/x/state/corral/sessions")
+        self.assertEqual(paths.state_dir(env), "/x/state/korapy")
+        self.assertEqual(paths.config_dir(env), "/x/config/korapy")
+        self.assertEqual(paths.cache_dir(env), "/x/cache/korapy")
+        self.assertEqual(paths.sessions_dir(env), "/x/state/korapy/sessions")
 
     def test_a_relative_xdg_value_is_ignored(self):
         env = {"XDG_STATE_HOME": "relative/state"}
-        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/corral"))
+        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/korapy"))
 
     def test_overrides_win_and_are_used_as_given(self):
         env = {
             "XDG_STATE_HOME": "/x/state",
             "XDG_CONFIG_HOME": "/x/config",
             "XDG_CACHE_HOME": "/x/cache",
-            "CORRAL_STATE": "/o/state",
-            "CORRAL_CONFIG": "/o/config",
-            "CORRAL_CACHE": "/o/cache",
+            "KORAPY_STATE": "/o/state",
+            "KORAPY_CONFIG": "/o/config",
+            "KORAPY_CACHE": "/o/cache",
         }
         self.assertEqual(paths.state_dir(env), "/o/state")
         self.assertEqual(paths.config_dir(env), "/o/config")
         self.assertEqual(paths.cache_dir(env), "/o/cache")
 
     def test_sessions_follow_the_state_override(self):
-        self.assertEqual(paths.sessions_dir({"CORRAL_STATE": "/o/state"}), "/o/state/sessions")
+        self.assertEqual(paths.sessions_dir({"KORAPY_STATE": "/o/state"}), "/o/state/sessions")
 
     def test_the_sessions_override_wins_over_the_state_dir(self):
-        env = {"CORRAL_STATE": "/o/state", "CORRAL_SESSIONS": "/o/sessions"}
+        env = {"KORAPY_STATE": "/o/state", "KORAPY_SESSIONS": "/o/sessions"}
         self.assertEqual(paths.sessions_dir(env), "/o/sessions")
 
     def test_a_tilde_override_expands(self):
-        self.assertEqual(paths.state_dir({"CORRAL_STATE": "~/s"}), os.path.join(HOME, "s"))
+        self.assertEqual(paths.state_dir({"KORAPY_STATE": "~/s"}), os.path.join(HOME, "s"))
 
     def test_a_relative_override_is_a_configuration_error(self):
         for name, fn in (
-            ("CORRAL_STATE", paths.state_dir),
-            ("CORRAL_CONFIG", paths.config_dir),
-            ("CORRAL_CACHE", paths.cache_dir),
-            ("CORRAL_SESSIONS", paths.sessions_dir),
+            ("KORAPY_STATE", paths.state_dir),
+            ("KORAPY_CONFIG", paths.config_dir),
+            ("KORAPY_CACHE", paths.cache_dir),
+            ("KORAPY_SESSIONS", paths.sessions_dir),
         ):
             with self.subTest(name), self.assertRaises(paths.PathError):
                 fn({name: "relative/dir"})
 
     def test_relative_xdg_config_and_cache_are_ignored(self):
         env = {"XDG_CONFIG_HOME": "rel/config", "XDG_CACHE_HOME": "rel/cache"}
-        self.assertEqual(paths.config_dir(env), os.path.join(HOME, ".config/corral"))
-        self.assertEqual(paths.cache_dir(env), os.path.join(HOME, ".cache/corral"))
+        self.assertEqual(paths.config_dir(env), os.path.join(HOME, ".config/korapy"))
+        self.assertEqual(paths.cache_dir(env), os.path.join(HOME, ".cache/korapy"))
 
     def test_the_sessions_override_wins_over_xdg_state(self):
-        env = {"XDG_STATE_HOME": "/x/state", "CORRAL_SESSIONS": "/o/sessions"}
+        env = {"XDG_STATE_HOME": "/x/state", "KORAPY_SESSIONS": "/o/sessions"}
         self.assertEqual(paths.sessions_dir(env), "/o/sessions")
 
     def test_a_relative_state_override_fails_sessions_too_and_names_it(self):
-        with self.assertRaisesRegex(paths.PathError, "CORRAL_STATE"):
-            paths.sessions_dir({"CORRAL_STATE": "relative/state"})
+        with self.assertRaisesRegex(paths.PathError, "KORAPY_STATE"):
+            paths.sessions_dir({"KORAPY_STATE": "relative/state"})
 
     def test_an_empty_override_counts_as_unset(self):
-        env = {"CORRAL_STATE": "", "CORRAL_SESSIONS": ""}
-        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/corral"))
+        env = {"KORAPY_STATE": "", "KORAPY_SESSIONS": ""}
+        self.assertEqual(paths.state_dir(env), os.path.join(HOME, ".local/state/korapy"))
         self.assertEqual(
-            paths.sessions_dir(env), os.path.join(HOME, ".local/state/corral/sessions")
+            paths.sessions_dir(env), os.path.join(HOME, ".local/state/korapy/sessions")
         )
 
     def test_results_are_normalized(self):
-        self.assertEqual(paths.state_dir({"CORRAL_STATE": "/o/state/"}), "/o/state")
-        self.assertEqual(paths.state_dir({"CORRAL_STATE": "/o/../o/state"}), "/o/state")
-        self.assertEqual(paths.sessions_dir({"CORRAL_SESSIONS": "/o/s//x/"}), "/o/s/x")
-        self.assertEqual(paths.config_dir({"XDG_CONFIG_HOME": "/x/./config/"}), "/x/config/corral")
+        self.assertEqual(paths.state_dir({"KORAPY_STATE": "/o/state/"}), "/o/state")
+        self.assertEqual(paths.state_dir({"KORAPY_STATE": "/o/../o/state"}), "/o/state")
+        self.assertEqual(paths.sessions_dir({"KORAPY_SESSIONS": "/o/s//x/"}), "/o/s/x")
+        self.assertEqual(paths.config_dir({"XDG_CONFIG_HOME": "/x/./config/"}), "/x/config/korapy")
 
     def test_the_suite_never_resolves_the_real_dirs(self):
         # tests/__init__.py points these at scratch dirs for the whole run.
@@ -103,7 +103,7 @@ class Resolvers(unittest.TestCase):
 
 class RoleSessions(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-sessions-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-sessions-"))
         self.root = os.path.join(self.tmp, "sessions")
         os.makedirs(self.root)
 
@@ -216,7 +216,7 @@ class RoleSessions(unittest.TestCase):
 
 class LeafTicket(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-leaf-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-leaf-"))
 
     def test_a_legacy_candidate_under_a_ticket_named_sessions_root(self):
         root = os.path.join(self.tmp, "demo-7")
@@ -248,26 +248,26 @@ class HostLedgerPath(unittest.TestCase):
     def test_default_follows_xdg_state(self):
         self.assertEqual(
             paths.host_ledger_path({}),
-            os.path.join(HOME, ".local/state/corral/host-resources.json"),
+            os.path.join(HOME, ".local/state/korapy/host-resources.json"),
         )
 
     def test_xdg_state_home_moves_it(self):
         self.assertEqual(
             paths.host_ledger_path({"XDG_STATE_HOME": "/x/state"}),
-            "/x/state/corral/host-resources.json",
+            "/x/state/korapy/host-resources.json",
         )
 
     def test_a_relative_xdg_value_is_ignored(self):
         self.assertEqual(
             paths.host_ledger_path({"XDG_STATE_HOME": "relative/state"}),
-            os.path.join(HOME, ".local/state/corral/host-resources.json"),
+            os.path.join(HOME, ".local/state/korapy/host-resources.json"),
         )
 
-    def test_corral_state_never_moves_the_shared_ledger(self):
+    def test_korapy_state_never_moves_the_shared_ledger(self):
         for env in (
-            {"CORRAL_STATE": "/o/state"},
-            {"XDG_STATE_HOME": "/x/state", "CORRAL_STATE": "/o/state"},
-            {"XDG_STATE_HOME": "relative/state", "CORRAL_STATE": "/o/state"},
+            {"KORAPY_STATE": "/o/state"},
+            {"XDG_STATE_HOME": "/x/state", "KORAPY_STATE": "/o/state"},
+            {"XDG_STATE_HOME": "relative/state", "KORAPY_STATE": "/o/state"},
         ):
             with self.subTest(env=env):
                 self.assertNotIn("/o/state", paths.host_ledger_path(env))
@@ -277,11 +277,11 @@ class HostLedgerPath(unittest.TestCase):
             {},
             {"XDG_STATE_HOME": "/x/state"},
             {"XDG_STATE_HOME": "relative/state"},
-            {"CORRAL_STATE": "/o/state"},
-            {"XDG_STATE_HOME": "/x/state", "CORRAL_STATE": "/o/state"},
+            {"KORAPY_STATE": "/o/state"},
+            {"XDG_STATE_HOME": "/x/state", "KORAPY_STATE": "/o/state"},
         ):
             with self.subTest(env=env):
-                base_env = {k: v for k, v in env.items() if k != "CORRAL_STATE"}
+                base_env = {k: v for k, v in env.items() if k != "KORAPY_STATE"}
                 self.assertEqual(
                     os.path.dirname(paths.host_ledger_path(env)),
                     paths.state_dir(base_env),
@@ -289,7 +289,7 @@ class HostLedgerPath(unittest.TestCase):
 
     def test_host_ledger_filename_has_one_resolver(self):
         root = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "corral"
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "korapy"
         )
         hits = []
         for name in sorted(os.listdir(root)):
@@ -303,7 +303,7 @@ class HostLedgerPath(unittest.TestCase):
     def test_results_are_normalized(self):
         self.assertEqual(
             paths.host_ledger_path({"XDG_STATE_HOME": "/x/./state/"}),
-            "/x/state/corral/host-resources.json",
+            "/x/state/korapy/host-resources.json",
         )
 
 
@@ -332,10 +332,10 @@ class Cli(unittest.TestCase):
         from contextlib import redirect_stderr
         from unittest import mock
 
-        from corral import cli
+        from korapy import cli
 
         def boom(args):
-            raise paths.PathError("CORRAL_STATE='x' must be an absolute path")
+            raise paths.PathError("KORAPY_STATE='x' must be an absolute path")
 
         err = io.StringIO()
         with mock.patch.object(cli, "cmd_deps", boom), redirect_stderr(err):
@@ -346,7 +346,7 @@ class Cli(unittest.TestCase):
         import io
         from contextlib import redirect_stdout
 
-        from corral import cli
+        from korapy import cli
 
         out = io.StringIO()
         with redirect_stdout(out):
@@ -368,7 +368,7 @@ class Cli(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         target = os.path.join(tmp.name, "nested", "cache")
-        with mock.patch.dict(os.environ, {"CORRAL_CACHE": target}):
+        with mock.patch.dict(os.environ, {"KORAPY_CACHE": target}):
             code, out = self._run(["paths", "cache"])
             self.assertEqual((code, out), (0, target + "\n"))
             self.assertFalse(os.path.exists(target))
@@ -382,21 +382,21 @@ class Cli(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         env = {
-            "CORRAL_STATE": os.path.join(tmp.name, "s"),
-            "CORRAL_CONFIG": os.path.join(tmp.name, "c"),
-            "CORRAL_CACHE": os.path.join(tmp.name, "k"),
-            "CORRAL_SESSIONS": "",
+            "KORAPY_STATE": os.path.join(tmp.name, "s"),
+            "KORAPY_CONFIG": os.path.join(tmp.name, "c"),
+            "KORAPY_CACHE": os.path.join(tmp.name, "k"),
+            "KORAPY_SESSIONS": "",
         }
         with mock.patch.dict(os.environ, env):
             for name, want in (
-                ("state", env["CORRAL_STATE"]),
-                ("config", env["CORRAL_CONFIG"]),
-                ("cache", env["CORRAL_CACHE"]),
-                ("sessions", os.path.join(env["CORRAL_STATE"], "sessions")),
+                ("state", env["KORAPY_STATE"]),
+                ("config", env["KORAPY_CONFIG"]),
+                ("cache", env["KORAPY_CACHE"]),
+                ("sessions", os.path.join(env["KORAPY_STATE"], "sessions")),
             ):
                 self.assertEqual(self._run(["paths", name]), (0, want + "\n"), name)
             own = os.path.join(tmp.name, "own")
-            with mock.patch.dict(os.environ, {"CORRAL_SESSIONS": own}):
+            with mock.patch.dict(os.environ, {"KORAPY_SESSIONS": own}):
                 self.assertEqual(self._run(["paths", "sessions"]), (0, own + "\n"))
             code, _ = self._run(["paths", "--mkdir"])
         self.assertEqual(code, 0)
@@ -409,9 +409,9 @@ class Cli(unittest.TestCase):
         from unittest import mock
 
         err = io.StringIO()
-        with mock.patch.dict(os.environ, {"CORRAL_CACHE": "rel/cache"}), redirect_stderr(err):
+        with mock.patch.dict(os.environ, {"KORAPY_CACHE": "rel/cache"}), redirect_stderr(err):
             self.assertEqual(self._run(["paths", "cache"]), (4, ""))
-        self.assertIn("CORRAL_CACHE", err.getvalue())
+        self.assertIn("KORAPY_CACHE", err.getvalue())
 
     def test_a_directory_that_cannot_be_made_exits_4(self):
         import io
@@ -425,7 +425,7 @@ class Cli(unittest.TestCase):
             handle.write("x")
         err = io.StringIO()
         target = os.path.join(blocker, "cache")
-        with mock.patch.dict(os.environ, {"CORRAL_CACHE": target}), redirect_stderr(err):
+        with mock.patch.dict(os.environ, {"KORAPY_CACHE": target}), redirect_stderr(err):
             self.assertEqual(self._run(["paths", "cache", "--mkdir"]), (4, ""))
         self.assertIn("cannot create", err.getvalue())
 
@@ -441,7 +441,7 @@ class Cli(unittest.TestCase):
         with open(os.path.join(root, "AGENTS.md"), encoding="utf-8") as handle:
             text = handle.read()
         self.assertIn(
-            'dir=$(uv run --locked corral paths cache --mkdir) && body=$(mktemp "$dir/pr-', text
+            'dir=$(uv run --locked korapy paths cache --mkdir) && body=$(mktemp "$dir/pr-', text
         )
         self.assertNotIn("XDG_CACHE_HOME", text)
 

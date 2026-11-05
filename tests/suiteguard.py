@@ -15,7 +15,7 @@ protection. Three layers:
   the fleet API) in-process.
 
 Each record names the running test: ``TestCase.run`` exports its id in
-``CORRAL_GUARD_TEST``. The run fails when the log holds records. The check
+``KORAPY_GUARD_TEST``. The run fails when the log holds records. The check
 runs from the ``load_tests`` wrapper in ``tests/__init__.py``; an atexit
 fallback covers runners that never call ``load_tests`` (for example
 ``python -m unittest tests.test_x``).
@@ -37,7 +37,7 @@ import sys
 import tempfile
 import unittest
 
-CALLER_ENV = "CORRAL_GUARD_TEST"
+CALLER_ENV = "KORAPY_GUARD_TEST"
 SHIM_TOOLS = (
     "gh",
     "systemctl",
@@ -54,12 +54,12 @@ GIT_NETWORK_VERBS = frozenset(
     ("push", "fetch", "pull", "ls-remote", "clone", "archive", "submodule")
 )
 _SUBMODULE_NETWORK_SUBCOMMANDS = frozenset(("add", "update", "sync", "set-url", "foreach"))
-_ROOT_PREFIX = "corral-guard-"
+_ROOT_PREFIX = "korapy-guard-"
 _SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*)://")
 _SCP = re.compile(r"^[^/:@]+@[^/:]+:")
 _HOST_PATH = re.compile(r"^[^/:]+:")
 _GIT_VALUE_OPTS = frozenset(("-C", "-c", "--git-dir", "--work-tree", "--namespace"))
-_REFUSED = "corral suite: external connection refused"
+_REFUSED = "korapy suite: external connection refused"
 
 _LOG = ""  # the run log; install() sets it
 _checked = False
@@ -167,7 +167,7 @@ def git_main(argv):
         if any(_is_external_url(t) for t in targets):
             call = "git " + " ".join(args)
             record(call, log)
-            sys.stderr.write(f"corral suite: blocked external git call: {call}\n")
+            sys.stderr.write(f"korapy suite: blocked external git call: {call}\n")
             return 1
     os.execv(real, [real, *args])
     return 1
@@ -261,7 +261,7 @@ def _tool_shim(tool, log):
     return (
         f'printf \'%s\\t%s %s\\n\' "${{{CALLER_ENV}:-<no-test>}}" {tool} "$*"'
         f" >> {shlex.quote(log)}\n"
-        f"printf 'corral suite: blocked external call: %s %s\\n' {tool} \"$*\" >&2\n"
+        f"printf 'korapy suite: blocked external call: %s %s\\n' {tool} \"$*\" >&2\n"
         "exit 1\n"
     )
 

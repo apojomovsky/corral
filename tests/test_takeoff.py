@@ -1,4 +1,4 @@
-"""`corral takeoff` on scratch repositories, with fakes at the seams.
+"""`korapy takeoff` on scratch repositories, with fakes at the seams.
 
 Every git operation here is local: a bare directory is the "remote",
 and the remote read (`ls_remote`) and the check commands (`run_cmd`)
@@ -17,8 +17,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import leakcli, reviewrecord, settings, takeoff
-from corral.gitenv import clean_env
+from korapy import leakcli, reviewrecord, settings, takeoff
+from korapy.gitenv import clean_env
 
 REPO = "myrepo"
 NUMBER = 79
@@ -77,11 +77,11 @@ class TakeoffCase(unittest.TestCase):
         os.environ.pop("BASE_REF", None)
         for name in list(settings.REGISTRY.values()):
             os.environ.pop(name.env, None)
-        tmp = tempfile.TemporaryDirectory(prefix="corral-takeoff-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-takeoff-")
         self.addCleanup(tmp.cleanup)
         self.tmp = os.path.realpath(tmp.name)
-        for var in ("CORRAL_CONFIG", "CORRAL_STATE", "CORRAL_CACHE", "CORRAL_SESSIONS"):
-            os.environ[var] = os.path.join(self.tmp, var.lower().replace("corral_", ""))
+        for var in ("KORAPY_CONFIG", "KORAPY_STATE", "KORAPY_CACHE", "KORAPY_SESSIONS"):
+            os.environ[var] = os.path.join(self.tmp, var.lower().replace("korapy_", ""))
         os.environ["HOME"] = os.path.join(self.tmp, "home")
         host = mock.patch.object(leakcli, "_hostname", return_value="host-1.example.com")
         host.start()
@@ -160,7 +160,7 @@ class TakeoffCase(unittest.TestCase):
             handle.write(text)
 
     def write_ops(self, text):
-        with open(os.path.join(self.ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
 
     def write_body(self, text):
@@ -471,7 +471,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
 
     def test_blocking_record_fails(self):
-        shutil.rmtree(os.environ["CORRAL_SESSIONS"], ignore_errors=True)
+        shutil.rmtree(os.environ["KORAPY_SESSIONS"], ignore_errors=True)
         self.write_record(self.head, verdict="block")
         result = self.gate()
         self.assertEqual(result.exit_code, 1)
@@ -480,7 +480,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertIn(reviewrecord.commit_id(self.head), found.detail)
 
     def test_missing_record_fails_and_names_the_commit(self):
-        shutil.rmtree(os.environ["CORRAL_SESSIONS"], ignore_errors=True)
+        shutil.rmtree(os.environ["KORAPY_SESSIONS"], ignore_errors=True)
         result = self.gate()
         self.assertEqual(result.exit_code, 1)
         found = [c for c in result.checks if c.name == "review"][0]
@@ -720,7 +720,7 @@ class TakeoffCase(unittest.TestCase):
     def test_suite_lock_path_is_under_the_state_dir(self):
         self.assertEqual(
             takeoff.suite_lock_path(),
-            os.path.join(os.path.normpath(os.environ["CORRAL_STATE"]), takeoff.SUITE_LOCK_NAME),
+            os.path.join(os.path.normpath(os.environ["KORAPY_STATE"]), takeoff.SUITE_LOCK_NAME),
         )
 
     def test_second_takeoff_waits_for_the_lock_then_runs(self):
@@ -936,7 +936,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["review.required"].default, True)
         self.assertEqual(settings.REGISTRY["checks.timeout_s"].default, 1800)
         self.assertEqual(settings.REGISTRY["checks.suite_lock_timeout_s"].default, 3600)
-        self.assertIn("corral.takeoff", settings.PROVIDERS)
+        self.assertIn("korapy.takeoff", settings.PROVIDERS)
 
     def test_each_policy_check_names_its_flag_skip(self):
         for name in takeoff.SKIPPABLE_CHECKS:
@@ -969,7 +969,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
 
     def test_skipped_review_passes_without_a_record(self):
-        shutil.rmtree(os.environ["CORRAL_SESSIONS"], ignore_errors=True)
+        shutil.rmtree(os.environ["KORAPY_SESSIONS"], ignore_errors=True)
         result = self.gate(skips=["review"])
         found = [c for c in result.checks if c.name == "review"][0]
         self.assertEqual(found.status, "skipped")
@@ -1186,10 +1186,10 @@ class TakeoffCliCase(unittest.TestCase):
         self.case.doCleanups()
 
     def test_cli_human_output_names_every_check(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1204,10 +1204,10 @@ class TakeoffCliCase(unittest.TestCase):
             self.assertIn(f"takeoff {name}: ok", text)
 
     def test_cli_json_flag_prints_the_pinned_document(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1226,11 +1226,11 @@ class TakeoffCliCase(unittest.TestCase):
         )
 
     def test_cli_failure_prints_the_fix(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
         self.case.remote_sha = "f" * 40
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
@@ -1242,11 +1242,11 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertIn(f"git fetch origin {MAIN}", out.getvalue())
 
     def test_cli_unreachable_remote_exits_3(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
         self.case.ls_error = takeoff.LsRemoteError("connection refused")
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
@@ -1256,12 +1256,12 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertEqual(code, 3)
 
     def test_cli_suite_busy_exits_75(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
         clock = _FakeClock()
         self.case.patch_lock_seams(_contended(None), clock)
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
@@ -1273,7 +1273,7 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertEqual(self.case.cmd_calls, [])
 
     def test_cli_lock_setup_failure_exits_4(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
         blocker = os.path.join(self.case.tmp, "blocker")
@@ -1281,7 +1281,7 @@ class TakeoffCliCase(unittest.TestCase):
             handle.write("not a directory\n")
         bad = os.path.join(blocker, takeoff.SUITE_LOCK_NAME)
         with mock.patch.object(takeoff, "suite_lock_path", return_value=bad):
-            parser = argparse.ArgumentParser(prog="corral")
+            parser = argparse.ArgumentParser(prog="korapy")
             sub = parser.add_subparsers(dest="command", required=True)
             takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
             args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
@@ -1292,19 +1292,19 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertIn("cannot set up the suite lock", err.getvalue())
         self.assertEqual(self.case.cmd_calls, [])
 
-    def test_verb_is_on_the_corral_parser(self):
-        from corral import cli
+    def test_verb_is_on_the_korapy_parser(self):
+        from korapy import cli
 
         parser = cli.build_parser()
         args = parser.parse_args(["takeoff"])
         self.assertEqual(args.command, "takeoff")
 
     def test_cli_skip_flag_skips_a_check(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        shutil.rmtree(os.environ["CORRAL_SESSIONS"], ignore_errors=True)
-        parser = argparse.ArgumentParser(prog="corral")
+        shutil.rmtree(os.environ["KORAPY_SESSIONS"], ignore_errors=True)
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1326,10 +1326,10 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertIn("takeoff review: skipped - skipped by --skip review", out.getvalue())
 
     def test_cli_json_reports_skip_provenance(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1359,10 +1359,10 @@ class TakeoffCliCase(unittest.TestCase):
             self.assertIn("skipped_by", row, name)
 
     def test_cli_unknown_skip_exits_4(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1375,10 +1375,10 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertIn("bogus", err.getvalue())
 
     def test_cli_identity_skip_exits_4(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1391,10 +1391,10 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertIn("base", err.getvalue())
 
     def test_skip_help_names_every_skippable_check(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         takeoff_parser = sub.choices["takeoff"]
@@ -1408,10 +1408,10 @@ class TakeoffCliCase(unittest.TestCase):
                 self.assertIn(name, skip_help)
 
     def test_cli_plan_json_lists_planned_commands_without_running(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1439,10 +1439,10 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertEqual(self.case.cmd_calls, [])
 
     def test_cli_plan_text_names_the_planned_commands(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(
@@ -1456,11 +1456,11 @@ class TakeoffCliCase(unittest.TestCase):
         self.assertEqual(self.case.cmd_calls, [])
 
     def test_cli_plan_mirrors_a_resolved_failure(self):
-        from corral import takeoffcli
+        from korapy import takeoffcli
         import argparse
 
         self.case.remote_sha = "f" * 40
-        parser = argparse.ArgumentParser(prog="corral")
+        parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
         takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
         args = parser.parse_args(["takeoff", "--ops", self.case.ops, "--plan", self.case.work])
@@ -1475,7 +1475,7 @@ class TakeoffCliCase(unittest.TestCase):
 class NoEmDashInCodeCase(unittest.TestCase):
     def test_no_literal_em_dash_in_takeoff_sources(self):
         literal = chr(0x2014)
-        for name in ("src/corral/takeoff.py", "src/corral/takeoffcli.py", "tests/test_takeoff.py"):
+        for name in ("src/korapy/takeoff.py", "src/korapy/takeoffcli.py", "tests/test_takeoff.py"):
             path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), name)
             with open(path, encoding="utf-8") as handle:
                 for lineno, line in enumerate(handle, 1):
@@ -1491,7 +1491,7 @@ class TicketRepoRelativePath(unittest.TestCase):
     """`_ticket_repo` with a relative `clone.path`: the ops root wins from any cwd."""
 
     def test_relative_clone_path_matches_from_a_foreign_working_directory(self):
-        tmp = tempfile.TemporaryDirectory(prefix="corral-ticket-repo-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-ticket-repo-")
         self.addCleanup(tmp.cleanup)
         root = os.path.realpath(tmp.name)
         ops = os.path.join(root, "ops")
@@ -1502,7 +1502,7 @@ class TicketRepoRelativePath(unittest.TestCase):
         os.makedirs(ops)
         os.makedirs(clone)
         os.makedirs(foreign)
-        with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[[repo]]\nname = "app"\nclone.path = "../clone"\n')
         previous = os.getcwd()
         os.chdir(foreign)

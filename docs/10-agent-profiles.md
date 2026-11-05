@@ -4,9 +4,9 @@ Status: design, awaiting maintainer approval. No code ships with this doc.
 
 Decided by the maintainer (do not reopen):
 
-1. corral lets the operator change not only the model backend (provider
+1. korapy lets the operator change not only the model backend (provider
    and model) but also the program that runs the agent: muse or omp.
-   corral knows how to set each program up (per-launch
+   korapy knows how to set each program up (per-launch
    overlay; it never edits a home config, per AGENTS.md).
 2. There is a default profile, the most used setup, and it can change
    over time.
@@ -42,7 +42,7 @@ means (AGENTS.md fixes them).
 No `models use` verb exists today (verified: `quotacli.py` ships only
 `refresh`, `mark` and `unmark`; `agentcli.py` and `cli.py` carry no
 model-selection verb), so profiles replace an idea, and nothing is
-removed. `corral launch --model` and `--runtime` stay as one-shot
+removed. `korapy launch --model` and `--runtime` stay as one-shot
 refinements (section 5).
 
 ## 1. The profile object
@@ -107,7 +107,7 @@ Relation to the existing pieces:
   keep their shapes. The adapter gains one read-only declaration,
   `options_schema()`, and lays validated `options` over the per-launch
   config the way it already lays chains.
-- `corral launch --model`: kept, narrowed in meaning. It overrides the
+- `korapy launch --model`: kept, narrowed in meaning. It overrides the
   head of the launched role's chain for that launch only (today it
   overrides the model the same way), and provenance records it as a
   flag refinement (section 2). `--runtime` likewise overrides the
@@ -142,7 +142,7 @@ layer, and provenance always names both the layer and the source.
 
 Concretely:
 
-- Named profiles are declared in `corral.toml` as `[profiles.<name>]`
+- Named profiles are declared in `korapy.toml` as `[profiles.<name>]`
   tables (committed). The host config directory may also declare
   `[profiles.<name>]` tables for operator-only setups; a local table
   with the same name shadows the committed one, and `profile show`
@@ -150,7 +150,7 @@ Concretely:
 - Selections live outside `settings.resolve`, in one new local file,
   `profiles.toml` in the host config dir (`paths.config_dir()`), plus
   the tracker for the shared ticket assignment. This placement is
-  load-bearing: normal settings precedence lets `corral.toml` beat the
+  load-bearing: normal settings precedence lets `korapy.toml` beat the
   host config (`01-onboarding.md` section 2), which is backwards for an
   operator switch, so selections get their own resolver where local
   always wins. One fact, one place: `profiles.py` is the only module
@@ -193,10 +193,10 @@ when only this host should know. Both feed layer 2; they never stack.
 - Board mode: a `profile` concept in `extra`, alongside the section 1
   concepts of `07-board-fields.md`. Carriage is a people-owned text
   field holding the exact profile name (no option-id map: profile names
-  are already corral-owned strings in a label-safe charset, so there is
+  are already korapy-owned strings in a label-safe charset, so there is
   nothing to map). An unparseable or unknown name is carried verbatim
   and fails closed at resolve time (exit 4), never treated as empty.
-- Local-only alternative: `corral profile set --ticket REPO N NAME`
+- Local-only alternative: `korapy profile set --ticket REPO N NAME`
   writes a pin into `profiles.toml`. The pin is never mirrored, never
   touches the tracker, and never leaves the host.
 - Both present: when the tracker assignment and the pin name different
@@ -229,17 +229,17 @@ until = 1730000000          # epoch seconds; set with --temp 2h or --until
 reason = "trying the new setup for the afternoon"
 ```
 
-- Setting: `corral profile set (--global | --project R | --role O)
+- Setting: `korapy profile set (--global | --project R | --role O)
   NAME --temp 2h` (or `--until <instant>`). `--temp` with `--ticket`
   is rejected (section 5). Durations reuse `accounts.parse_duration`:
   `<n>[s|m|h|d]`, bare seconds, floats (`2h`, `90`, `1.5d`).
 - Expiry: past `until`, the resolver ignores the override as if it
   were absent. `profile show` keeps listing it marked `expired`, and
-  the doctor reports it (section 5), until `corral profile reset
+  the doctor reports it (section 5), until `korapy profile reset
   --temp` removes it. Expiry never edits anything else: no other layer
   moves, and no config is rewritten.
 - A long-running agent started under an override is unaffected by its
-  expiry. At launch corral records the resolved profile (name, runtime,
+  expiry. At launch korapy records the resolved profile (name, runtime,
   model head, provenance) in the session dir next to the existing
   `runtime` record (`runtimes.record` precedent). Resume reads the
   record back, exactly like `runtimes.recorded`. The snapshot shows the
@@ -248,20 +248,20 @@ reason = "trying the new setup for the afternoon"
 
 ## 5. Operator surface
 
-Decision: four verbs under `corral profile`, one launch flag, one
+Decision: four verbs under `korapy profile`, one launch flag, one
 snapshot field, and doctor rows. Nothing else changes.
 
 | Verb | What it does |
 | --- | --- |
-| `corral profile list [--json]` | every named profile (committed and local) with its runtime and role chains; a shadowed name is marked with its winning source |
-| `corral profile show [--repo R] [--role O] [--ticket N] [--json]` | the resolved profile for that ticket and role, with the full layer chain and provenance (which layer decided, from which source, and any expiry) |
-| `corral profile set (--global \| --project R \| --role O \| --ticket R N) NAME [--temp 2h \| --until T] [--reason R]` | write a local selection (layer 6, 4, 5, or the ticket pin in layer 2) or a temporary override (layer 3 with `--temp` / `--until`); `--temp` / `--until` with `--ticket` is rejected with exit 4 naming layer 2 as the shadow, with the fix (clear the ticket assignment or pin first) |
-| `corral profile reset (--global \| --project R \| --role O \| --ticket R N \| --temp)` | remove that local selection, pin, or override; exit 1 when there was nothing to remove |
+| `korapy profile list [--json]` | every named profile (committed and local) with its runtime and role chains; a shadowed name is marked with its winning source |
+| `korapy profile show [--repo R] [--role O] [--ticket N] [--json]` | the resolved profile for that ticket and role, with the full layer chain and provenance (which layer decided, from which source, and any expiry) |
+| `korapy profile set (--global \| --project R \| --role O \| --ticket R N) NAME [--temp 2h \| --until T] [--reason R]` | write a local selection (layer 6, 4, 5, or the ticket pin in layer 2) or a temporary override (layer 3 with `--temp` / `--until`); `--temp` / `--until` with `--ticket` is rejected with exit 4 naming layer 2 as the shadow, with the fix (clear the ticket assignment or pin first) |
+| `korapy profile reset (--global \| --project R \| --role O \| --ticket R N \| --temp)` | remove that local selection, pin, or override; exit 1 when there was nothing to remove |
 
-`corral launch` gains `--profile NAME` (layer 1). `--model` and
+`korapy launch` gains `--profile NAME` (layer 1). `--model` and
 `--runtime` stay as one-shot refinements that beat the profile's values
 for that launch only; `profile show` cannot predict them, and the
-launch line in the session record notes them. `corral resume` accepts
+launch line in the session record notes them. `korapy resume` accepts
 the same three flags with the section 2 semantics.
 
 Exit codes follow AGENTS.md (meanings unchanged):
@@ -299,7 +299,7 @@ rollout ticket bumps `schema_version` there). No other snapshot shape
 changes; drift between recorded and current resolution is a `profile
 show` question, not a snapshot field (section 4).
 
-`corral config show` does not render selections: they live outside
+`korapy config show` does not render selections: they live outside
 `settings.resolve` by design (section 2). `profile show` is the
 provenance view, and it prints the same origin style (`value  # from
 <source>`) so the two verbs read alike.
@@ -319,7 +319,7 @@ one-major-version rule is untouched.
    suite until the design is revisited (the `03-muse-runtime.md` flag
    allow-list precedent).
 3. A `system_deps.toml` entry with a version probe and a `below` bound,
-   so the doctor and `corral deps` see the runtime exactly like the
+   so the doctor and `korapy deps` see the runtime exactly like the
    existing three.
 4. Overlay behavior that never writes a home config: per-launch config
    travels by argv or a session-dir file, and a test pins that argv and
@@ -333,7 +333,7 @@ read-only mode are selected by role, and the session records the role,
 so resume keeps the same mode (launch.py documents this today).
 
 Adding a new runtime is therefore: a module under
-`src/corral/runtimes/`, a `NAMES` entry, the `system_deps.toml` entry,
+`src/korapy/runtimes/`, a `NAMES` entry, the `system_deps.toml` entry,
 the options schema, and the section-10 tests. A new major version of an
 existing runtime is a cutover, not a dialect: one PR ports the adapter
 and deletes the old support, and the `below` bound starts failing
@@ -386,7 +386,7 @@ settings they replace, in a single PR:
 1. `[models.<role>]` tables and `agents.runtime` move under
    `[profiles.default]` (runtime plus per-role chains); `profile.default
    = "default"` reproduces today's behavior byte for byte.
-2. From that PR on, a `corral.toml` still carrying top-level
+2. From that PR on, a `korapy.toml` still carrying top-level
    `[models]` or `agents.runtime` fails fast with `SettingsError`
    (exit 4) naming the new keys. No shim, no deprecation window: two
    readers for one fact is a bug even when they agree (AGENTS.md).

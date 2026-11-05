@@ -13,9 +13,9 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, mirror, mirrorcli, sync, syncli, tracker
-from corral import trackers
-from corral.github.board import BoardSchema
+from korapy import board, drive, mirror, mirrorcli, sync, syncli, tracker
+from korapy import trackers
+from korapy.github.board import BoardSchema
 from tests.test_board_reader import (
     BoardFakeRun,
     config,
@@ -98,10 +98,10 @@ class FakeGit:
 
 class WiringCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-wiring-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-wiring-")
         self.addCleanup(self.tmp.cleanup)
         self.root = self.tmp.name
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TWO_REPO_TOML)
         self.store = board.open_store(os.path.join(self.root, "board.sqlite"))
         self.addCleanup(self.store.close)
@@ -288,7 +288,7 @@ class PushReposTest(unittest.TestCase):
 
         from tests.test_mirror import MirrorTracker
 
-        tmp = tempfile.TemporaryDirectory(prefix="corral-push-repos-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-push-repos-")
         self.addCleanup(tmp.cleanup)
         store = board.open_store(os.path.join(tmp.name, "board.sqlite"))
         self.addCleanup(store.close)
@@ -317,7 +317,7 @@ class PushReposTest(unittest.TestCase):
 
         from tests.test_mirror import MirrorTracker
 
-        tmp = tempfile.TemporaryDirectory(prefix="corral-push-repos-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-push-repos-")
         self.addCleanup(tmp.cleanup)
         store = board.open_store(os.path.join(tmp.name, "board.sqlite"))
         self.addCleanup(store.close)
@@ -422,8 +422,8 @@ class DriveFanOutTest(WiringCase):
 
 class ProductionTrackersTest(WiringCase):
     def test_builds_one_tracker_per_variant(self):
-        from corral.github.tracker import GithubTracker
-        from corral.trackers import BoardBackedTracker as Backed
+        from korapy.github.tracker import GithubTracker
+        from korapy.trackers import BoardBackedTracker as Backed
 
         mapping, problem = trackers.production_trackers(self.root, ["app", "demo"], git=self.git)
         self.assertIsNone(problem)
@@ -435,7 +435,7 @@ class ProductionTrackersTest(WiringCase):
         self.assertEqual(mapping["demo"].tracker_repo, DEMO)
 
     def test_bad_variant_is_a_problem_naming_the_repo(self):
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 TWO_REPO_TOML.replace('tracker.variant = "board"', 'tracker.variant = "bord"')
             )
@@ -448,8 +448,8 @@ class ProductionTrackersTest(WiringCase):
 
 class DoctorFetchTest(unittest.TestCase):
     def test_production_fetch_uses_the_factory(self):
-        from corral import doctor
-        from corral.github import gh
+        from korapy import doctor
+        from korapy.github import gh
 
         cfg = config()
         with mock.patch.object(trackers, "board_snapshot_for", return_value="SNAPSHOT") as fetch:
@@ -460,8 +460,8 @@ class DoctorFetchTest(unittest.TestCase):
         self.assertIs(kwargs["run"], gh.run)
 
     def test_production_membership_uses_the_factory(self):
-        from corral import doctor
-        from corral.github import gh
+        from korapy import doctor
+        from korapy.github import gh
 
         cfg = config()
         with mock.patch.object(

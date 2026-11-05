@@ -1,6 +1,6 @@
-"""`corral init --ops` and `corral uninit --ops`: the split layout.
+"""`korapy init --ops` and `korapy uninit --ops`: the split layout.
 
-The ops root holds the agent side (`corral.toml`, the overlay, the hooks,
+The ops root holds the agent side (`korapy.toml`, the overlay, the hooks,
 the host registration); the project clone is touched only through local,
 untracked git state (`core.hooksPath`, `.git/info/exclude`).
 """
@@ -15,15 +15,15 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, init, projects
-from corral.gitenv import clean_env
+from korapy import cli, init, projects
+from korapy.gitenv import clean_env
 from tests.test_init import OVERLAY_GOLDEN, TAIL, registration_golden
 
 
 def ops_golden(name, clone_root, test_cmd="make check", branch="main"):
-    """The fresh-ops `corral.toml` text, as an independent copy."""
+    """The fresh-ops `korapy.toml` text, as an independent copy."""
     return (
-        "# corral.toml, written by `corral init`. Settings that differ\n"
+        "# korapy.toml, written by `korapy init`. Settings that differ\n"
         "# from the defaults live in [[repo]]; everything else is\n"
         "# commented out below with its default.\n"
         "[[repo]]\n"
@@ -51,9 +51,9 @@ class OpsFixture(unittest.TestCase):
         self.work = tmp.name
         self.clone = os.path.join(self.work, self.clone_name)
         os.makedirs(self.clone)
-        cfg = tempfile.mkdtemp(prefix="corral-config-")
+        cfg = tempfile.mkdtemp(prefix="korapy-config-")
         self.addCleanup(shutil.rmtree, cfg, True)
-        patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+        patcher = mock.patch.dict(os.environ, {"KORAPY_CONFIG": cfg})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.config_dir = cfg
@@ -128,12 +128,12 @@ class OpsFixture(unittest.TestCase):
         return found
 
     def ops_toml(self):
-        with open(os.path.join(self.ops, "corral.toml"), encoding="utf-8") as handle:
+        with open(os.path.join(self.ops, "korapy.toml"), encoding="utf-8") as handle:
             return handle.read()
 
     def make_clone_path_relative(self):
-        """Rewrite the ops corral.toml's clone.path as ops-relative."""
-        target = os.path.join(self.ops, "corral.toml")
+        """Rewrite the ops korapy.toml's clone.path as ops-relative."""
+        target = os.path.join(self.ops, "korapy.toml")
         with open(target, encoding="utf-8") as handle:
             text = handle.read()
         absolute = os.path.realpath(self.clone)
@@ -165,7 +165,7 @@ class FreshOpsCase(OpsFixture):
             self.assertEqual(
                 handle.read(), registration_golden("proj_ops", os.path.realpath(self.ops))
             )
-        self.assertIn("next: corral github setup", out)
+        self.assertIn("next: korapy github setup", out)
         found = projects.load_all()
         self.assertEqual(
             [(p.name, p.unit_prefix, p.root, p.floor, p.ceiling) for p in found],
@@ -204,7 +204,7 @@ class FreshOpsCase(OpsFixture):
     def test_bare_ops_uses_the_sibling(self):
         code, _, _ = self.run_cli("init", "--ops", "--test-cmd", "make check", self.clone)
         self.assertEqual(code, 0)
-        self.assertTrue(os.path.isfile(os.path.join(self.ops, "corral.toml")))
+        self.assertTrue(os.path.isfile(os.path.join(self.ops, "korapy.toml")))
 
     def test_ops_name_is_a_sibling(self):
         custom = os.path.join(self.work, "custom")
@@ -212,7 +212,7 @@ class FreshOpsCase(OpsFixture):
             "init", "--ops-name", "custom", "--test-cmd", "make check", self.clone
         )
         self.assertEqual(code, 0)
-        self.assertTrue(os.path.isfile(os.path.join(custom, "corral.toml")))
+        self.assertTrue(os.path.isfile(os.path.join(custom, "korapy.toml")))
         reg = os.path.join(self.config_dir, "projects.d", "custom.toml")
         with open(reg, encoding="utf-8") as handle:
             self.assertIn(f'root = "{os.path.realpath(custom)}"\n', handle.read())
@@ -230,7 +230,7 @@ class FreshOpsCase(OpsFixture):
             self.clone,
         )
         self.assertEqual(code, 0)
-        self.assertTrue(os.path.isfile(os.path.join(other, "corral.toml")))
+        self.assertTrue(os.path.isfile(os.path.join(other, "korapy.toml")))
         self.assertFalse(os.path.exists(os.path.join(self.work, "custom")))
 
     def test_plan_writes_nothing(self):
@@ -248,7 +248,7 @@ class FreshOpsCase(OpsFixture):
             "would set core.hooksPath",
             "would add .worktrees/",
             "projects.d/proj_ops.toml",
-            "next: corral github setup",
+            "next: korapy github setup",
         ):
             self.assertIn(want, out, want)
         self.assertFalse(os.path.exists(self.ops))
@@ -290,7 +290,7 @@ class FreshOpsCase(OpsFixture):
     def test_comments_only_ops_toml_gets_entry_appended(self):
         os.makedirs(self.ops)
         self.git("init", "-q", "-b", "main", cwd=self.ops)
-        with open(os.path.join(self.ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write("# hand-kept header\n")
         code, out, _ = self.run_cli(
             "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
@@ -374,7 +374,7 @@ class OpsErrorsCase(OpsFixture):
         self.assertEqual(self.hooks_path(), ".git/hooks")
         for want in ("exec", "commit-msg", "pre-push"):
             self.assertIn(want, out)
-        self.assertTrue(os.path.isfile(os.path.join(self.ops, "corral.toml")))
+        self.assertTrue(os.path.isfile(os.path.join(self.ops, "korapy.toml")))
         self.assertTrue(os.path.isfile(os.path.join(self.ops, "agents.overlay.md")))
         code, out, _ = self.run_cli(
             "init", "--ops", self.ops, "--test-cmd", "make check", self.clone
@@ -391,7 +391,7 @@ class OpsErrorsCase(OpsFixture):
             "init", "--ops", self.ops, "--test-cmd", "other", "--force", self.clone
         )
         self.assertEqual(code, 4)
-        self.assertIn("corral.toml", err)
+        self.assertIn("korapy.toml", err)
         self.assertIn("-test = ", out)
         self.assertIn("+test = ", out)
         self.assertEqual(self.ops_toml(), before)
@@ -424,7 +424,7 @@ class OpsErrorsCase(OpsFixture):
                 self.clone,
             )
             self.assertEqual(code, 4)
-            self.assertIn("corral.toml", err)
+            self.assertIn("korapy.toml", err)
         self.assertEqual(self.ops_toml(), before)
 
     def test_dropping_set_value_is_4(self):
@@ -446,7 +446,7 @@ class OpsErrorsCase(OpsFixture):
             "init", "--ops", self.ops, "--test-cmd", "make check", "--no-register", self.clone
         )
         self.assertEqual(code, 4)
-        self.assertIn("corral.toml", err)
+        self.assertIn("korapy.toml", err)
 
     def test_changing_runtime_is_4(self):
         self.assertEqual(
@@ -475,7 +475,7 @@ class OpsErrorsCase(OpsFixture):
             self.clone,
         )
         self.assertEqual(code, 4)
-        self.assertIn("corral.toml", err)
+        self.assertIn("korapy.toml", err)
 
     def test_dropping_runtime_converges(self):
         self.assertEqual(
@@ -546,9 +546,9 @@ class SecondCloneCase(OpsFixture):
             "init", "--ops", self.ops, "--test-cmd", "make check", *extra, self.clone
         )
         self.assertEqual(code, 0)
-        with open(os.path.join(self.ops, "corral.toml"), "a", encoding="utf-8") as handle:
+        with open(os.path.join(self.ops, "korapy.toml"), "a", encoding="utf-8") as handle:
             handle.write("# hand-kept comment\n")
-        with open(os.path.join(self.ops, "corral.toml"), encoding="utf-8") as handle:
+        with open(os.path.join(self.ops, "korapy.toml"), encoding="utf-8") as handle:
             first = handle.read()
         code, out, _ = self.run_cli("init", "--ops", self.ops, "--test-cmd", "npm test", self.other)
         self.assertEqual(code, 0, out)
@@ -592,17 +592,17 @@ class SecondCloneCase(OpsFixture):
         self.git("remote", "add", "origin", "https://github.com/owner/proj.git", cwd=sibling)
         code, _, err = self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", sibling)
         self.assertEqual(code, 4)
-        self.assertIn("corral.toml", err)
+        self.assertIn("korapy.toml", err)
 
 
 class ResolverErrorsCase(OpsFixture):
-    """A broken ops `corral.toml` fails `init` and `uninit` closed (exit 4), changing nothing."""
+    """A broken ops `korapy.toml` fails `init` and `uninit` closed (exit 4), changing nothing."""
 
     def setUp(self):
         super().setUp()
         code, _, _ = self.run_cli("init", "--ops", self.ops, "--test-cmd", "make check", self.clone)
         self.assertEqual(code, 0)
-        self.toml_path = os.path.join(self.ops, "corral.toml")
+        self.toml_path = os.path.join(self.ops, "korapy.toml")
 
     def append(self, text):
         with open(self.toml_path, "a", encoding="utf-8") as handle:
@@ -699,7 +699,7 @@ class UninitOpsCase(OpsFixture):
             handle.write(b"# edited\n")
         code, out, _ = self.uninit("--ops", self.ops, self.clone)
         self.assertEqual(code, 0, out)
-        self.assertIn("modified since `corral init` wrote it", out)
+        self.assertIn("modified since `korapy init` wrote it", out)
         self.assertTrue(os.path.isfile(target))
         self.assertFalse(os.path.exists(os.path.join(self.ops, "hooks", "proj", "pre-push")))
         self.assertEqual(self.hooks_path(), os.path.join(self.ops, "hooks", "proj"))

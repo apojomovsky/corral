@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from typing import Any
 
-from corral import board, sync, tracker
-from corral.github.board import BoardSchema
+from korapy import board, sync, tracker
+from korapy.github.board import BoardSchema
 from tests.test_tracker import FakeTracker, reading
 
 REPO = "acme/app"
@@ -53,7 +53,7 @@ class FakeBoardReader:
 
 class BoardCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-sync-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-sync-")
         self.addCleanup(self.tmp.cleanup)
         self.store = board.open_store(os.path.join(self.tmp.name, "board.sqlite"))
         self.addCleanup(self.store.close)

@@ -16,10 +16,10 @@ import tempfile
 import unittest
 from dataclasses import replace
 
-from corral import board, drive, registry
-from corral import tracker as iface
-from corral import projects as projects_mod
-from corral.tracker import NEEDS_DECISION
+from korapy import board, drive, registry
+from korapy import tracker as iface
+from korapy import projects as projects_mod
+from korapy.tracker import NEEDS_DECISION
 from tests.test_drive import policy_source, stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_tracker import FakeTracker, reading
@@ -163,14 +163,14 @@ class BudgetTest(unittest.TestCase):
         self.assertEqual(drive.load_restarts("/nonexistent/dir/budget.json"), {})
 
     def test_a_corrupt_budget_file_reads_empty(self):
-        with tempfile.TemporaryDirectory(prefix="corral-stuck-budget-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-stuck-budget-") as tmp:
             path = os.path.join(tmp, "budget.json")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("{not json")
             self.assertEqual(drive.load_restarts(path), {})
 
     def test_a_budget_round_trips_through_its_file(self):
-        with tempfile.TemporaryDirectory(prefix="corral-stuck-budget-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-stuck-budget-") as tmp:
             path = os.path.join(tmp, "budget.json")
             drive.save_restarts(path, {"app#7": [NOW - 10.0]})
             with open(path, encoding="utf-8") as handle:
@@ -240,7 +240,7 @@ class ReviewedClaimsTest(unittest.TestCase):
 
 class ReleaseReviewedTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-reviewed-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-reviewed-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -430,7 +430,7 @@ class LiveUnitAgreementTest(unittest.TestCase):
     """Plan and give-up agree with the real pass on live units. Fakes only."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-live-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-live-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -498,7 +498,7 @@ class LiveUnitAgreementTest(unittest.TestCase):
 
 class RestartPassTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-restart-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-restart-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -605,7 +605,7 @@ class RestartPassTest(unittest.TestCase):
         self.assertNotIn("restart", out.getvalue())
 
     def test_a_failed_stop_keeps_the_claim_and_records_no_restart(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -632,7 +632,7 @@ class RestartPassTest(unittest.TestCase):
         self.assertEqual(row.agent, AGENT)
 
     def test_a_failed_launch_keeps_the_claim_and_records_no_restart(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -728,7 +728,7 @@ class RestartPassTest(unittest.TestCase):
 
 class GiveUpPassTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-giveup-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-giveup-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -846,7 +846,7 @@ class GiveUpPassTest(unittest.TestCase):
 
 class FinishedPassTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-pass-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-pass-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1088,7 +1088,7 @@ class EntryForClaimTest(unittest.TestCase):
     """The one claim-to-entry resolver: a holder maps by ticket, never by id."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-entry-for-claim-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-entry-for-claim-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -1154,7 +1154,7 @@ class FinishedLookupPassTest(unittest.TestCase):
     """Real-shaped stuck passes: a drive-id holder, unit-name entries, no live unit."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-finished-lookup-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-finished-lookup-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1259,15 +1259,15 @@ class FinishedLookupPassTest(unittest.TestCase):
 
 class ProductionStuckProjectTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-project-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-project-")
         self.addCleanup(self.tmp.cleanup)
         self.root = os.path.join(self.tmp.name, "ops")
         os.makedirs(self.root)
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n')
 
     def test_the_first_project_mapping_the_repo_wins(self):
-        from corral import projects as projects_mod
+        from korapy import projects as projects_mod
 
         blue = projects_mod.Project(
             name="blue", unit_prefix="blue-agent-", root=self.root, eligibility=None
@@ -1275,7 +1275,7 @@ class ProductionStuckProjectTest(unittest.TestCase):
         self.assertEqual(drive.production_stuck_project([blue], "acme/app"), "blue")
 
     def test_an_unmapped_repo_has_no_project(self):
-        from corral import projects as projects_mod
+        from korapy import projects as projects_mod
 
         blue = projects_mod.Project(
             name="blue", unit_prefix="blue-agent-", root=self.root, eligibility=None
@@ -1287,7 +1287,7 @@ class ProductionStuckInputsTest(unittest.TestCase):
     def test_live_stale_and_finished_entries_report_with_heartbeats(self):
         from unittest import mock
 
-        from corral import projects as projects_mod
+        from korapy import projects as projects_mod
 
         registered = [
             projects_mod.Project(name="blue", unit_prefix="blue-agent-", root="/tmp/x"),
@@ -1318,7 +1318,7 @@ class ProductionStuckInputsTest(unittest.TestCase):
     def test_entries_naming_a_ticket_are_indexed_by_ticket(self):
         from unittest import mock
 
-        from corral import projects as projects_mod
+        from korapy import projects as projects_mod
 
         registered = [
             projects_mod.Project(name="blue", unit_prefix="blue-agent-", root="/tmp/x"),
@@ -1369,7 +1369,7 @@ def external_row(store, repo, number):
 
 class RefreshClaimTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-refresh-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-refresh-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -1443,7 +1443,7 @@ class RefreshClaimTest(unittest.TestCase):
 
 class RefreshRegressionTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-refresh-pass-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-refresh-pass-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1490,7 +1490,7 @@ class RefreshRegressionTest(unittest.TestCase):
         self.assertIn(("add_label", "app", 7, NEEDS_DECISION), fake.calls)
 
     def test_failing_launches_keep_the_claim_without_orphaning_or_spending(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -1522,7 +1522,7 @@ class RefreshRegressionTest(unittest.TestCase):
         self.assertEqual(drive.load_restarts(self.budget), {})
 
     def test_past_the_budget_give_up_needs_no_working_launcher(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -1554,7 +1554,7 @@ class RefreshRegressionTest(unittest.TestCase):
 
 class BudgetSaveTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-budget-save-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-budget-save-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1592,7 +1592,7 @@ class BudgetSaveTest(unittest.TestCase):
         self.assertEqual(drive.load_restarts(self.budget), {})
 
     def test_a_failed_launch_rolls_the_stamp_back(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -1633,7 +1633,7 @@ class BudgetSaveTest(unittest.TestCase):
         self.assertEqual(len(stamps), 1)
 
     def test_a_failed_stop_rolls_the_stamp_back(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -1659,7 +1659,7 @@ class BudgetSaveTest(unittest.TestCase):
     def test_a_failed_rollback_save_restores_the_prior_file(self):
         from unittest import mock
 
-        from corral import units
+        from korapy import units
 
         prior = {"other#9": [NOW - 500.0]}
         drive.save_restarts(self.budget, prior)
@@ -1700,7 +1700,7 @@ class BudgetSaveTest(unittest.TestCase):
     def test_a_failed_rollback_restore_fails_the_restart_closed(self):
         from unittest import mock
 
-        from corral import units
+        from korapy import units
 
         prior = {"other#9": [NOW - 500.0]}
         drive.save_restarts(self.budget, prior)
@@ -1755,7 +1755,7 @@ class BudgetSaveTest(unittest.TestCase):
 
 class GiveUpOrderTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-giveup-order-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-giveup-order-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1872,7 +1872,7 @@ class GiveUpOrderTest(unittest.TestCase):
 
 class StuckErrorBranchTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-branches-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-branches-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -2100,7 +2100,7 @@ class StuckErrorBranchTest(unittest.TestCase):
 
 class StuckJournalTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-journal-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-journal-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -2179,7 +2179,7 @@ class CapLabelTest(unittest.TestCase):
 
 class StuckDayCapTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-daycap-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-daycap-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -2348,7 +2348,7 @@ class StuckDayCapTest(unittest.TestCase):
 
 class HubEpochStuckTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-stuck-hub-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stuck-hub-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -2474,7 +2474,7 @@ class HubEpochStuckTest(unittest.TestCase):
 
 class DropStaleTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-drop-stale-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drop-stale-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -2504,7 +2504,7 @@ class DropStaleTest(unittest.TestCase):
         self.assertIn("nothing to drop", out.getvalue())
 
     def test_a_failed_stop_keeps_the_claim(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -2586,7 +2586,7 @@ class RestartEligibilityTest(unittest.TestCase):
     """The stuck sweep consults row eligibility before restarting. Fakes only."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-restart-eligibility-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-restart-eligibility-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.budget = os.path.join(self.tmp.name, "restarts.json")
@@ -2802,7 +2802,7 @@ class RestartEligibilityTest(unittest.TestCase):
         (_, _), text, _, _, _ = self.sweep(store)
         self.assertIn("app#7", text)
         self.assertIn("restarted", text)
-        self.assertIn("corral stop", text)
+        self.assertIn("korapy stop", text)
 
     def test_unreadable_labels_keep_the_claim_without_a_restart(self):
         store = stored(self.db, [("app", 7, "open")])
@@ -2969,7 +2969,7 @@ class FinishedWorkerReviewTest(unittest.TestCase):
     """A finished worker without a PR is reviewed, never restarted. Fakes only."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-finished-review-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-finished-review-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -3018,7 +3018,7 @@ class BasicInFlightTest(unittest.TestCase):
     """The ready-made basic policy keeps requesting in-flight tickets. Fakes only."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-basic-in-flight-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-basic-in-flight-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -3029,7 +3029,7 @@ class BasicInFlightTest(unittest.TestCase):
             name="blue",
             unit_prefix="blue-agent-",
             root=os.path.join(self.tmp.name, "ops", "blue"),
-            eligibility="corral.policies:basic",
+            eligibility="korapy.policies:basic",
         )
 
     def test_basic_keeps_a_stuck_in_flight_ticket_restart_eligible(self):

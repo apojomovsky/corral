@@ -1,7 +1,7 @@
 """Ownership settlement for board readings, ticket 6: echo, overridden,
 empty and stale cases through ``upsert`` for board-sourced values.
 
-Board-sourced corral values ride the tracker's ``agent`` and ``status``
+Board-sourced korapy values ride the tracker's ``agent`` and ``status``
 attributes (the board reader reports them there, never in ``extra``),
 so settlement must reach identical verdicts to label mode: a fresher
 reading echoing a queued value marks it sent, a fresher different value
@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from typing import Any
 
-from corral import board, sync
+from korapy import board, sync
 from tests.test_tracker import FakeTracker, reading
 
 REPO = "acme/app"
@@ -25,7 +25,7 @@ T0 = 1_800_000_100.0
 
 
 def board_reading(number=1, updated_at=T0, extra=None, **over: Any):
-    """One tracker reading shaped like board output: corral values as
+    """One tracker reading shaped like board output: korapy values as
     attributes, board concepts in ``extra``."""
     concepts = {"pool": "dispatch", "priority": "high"}
     concepts.update(extra or {})
@@ -48,7 +48,7 @@ def label_reading(number=1, updated_at=T0, **over: Any):
 
 class SettlementCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-settlement-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-settlement-")
         self.addCleanup(self.tmp.cleanup)
         self.store = board.open_store(os.path.join(self.tmp.name, "board.sqlite"))
         self.addCleanup(self.store.close)
@@ -202,7 +202,7 @@ def run_scenario(make_reading, field="agent", queued="agent-1"):
     directly with no shared state. Only the settlement verdict compares:
     board rows keep their stored concepts by design.
     """
-    tmp = tempfile.TemporaryDirectory(prefix="corral-board-settlement-parity-")
+    tmp = tempfile.TemporaryDirectory(prefix="korapy-board-settlement-parity-")
     try:
         store = board.open_store(os.path.join(tmp.name, "board.sqlite"))
         try:
@@ -317,7 +317,7 @@ class ResyncParityTest(SettlementCase):
             lambda: label_reading(agent="agent-1", updated_at=T0),
         ):
             with self.subTest(mode="board" if "pool" in (make_reading().extra or {}) else "label"):
-                tmp = tempfile.TemporaryDirectory(prefix="corral-board-settlement-race-")
+                tmp = tempfile.TemporaryDirectory(prefix="korapy-board-settlement-race-")
                 self.addCleanup(tmp.cleanup)
                 store = board.open_store(os.path.join(tmp.name, "board.sqlite"))
                 self.addCleanup(store.close)

@@ -1,4 +1,4 @@
-"""`corral new` (ticket 1): scaffold templates, writes, exits, idempotency.
+"""`korapy new` (ticket 1): scaffold templates, writes, exits, idempotency.
 
 Local only, no `init` wiring yet. Every git call goes through the
 `FakeGit` harness from `tests.test_init` (reused, not redefined); every
@@ -18,8 +18,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, forge as iface, gc, init, new, settings
-from corral import tracker as tracker_iface
+from korapy import cli, forge as iface, gc, init, new, settings
+from korapy import tracker as tracker_iface
 from tests.test_forge import FakeForge
 from tests.test_init import FakeGit
 from tests.test_tracker import FakeTracker
@@ -260,10 +260,10 @@ def run_new(
 
 
 def isolated_config(test):
-    """A throwaway `CORRAL_CONFIG` dir for the test (init registers the host)."""
-    cfg = tempfile.mkdtemp(prefix="corral-config-")
+    """A throwaway `KORAPY_CONFIG` dir for the test (init registers the host)."""
+    cfg = tempfile.mkdtemp(prefix="korapy-config-")
     test.addCleanup(shutil.rmtree, cfg, True)
-    patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+    patcher = mock.patch.dict(os.environ, {"KORAPY_CONFIG": cfg})
     patcher.start()
     test.addCleanup(patcher.stop)
     return cfg
@@ -271,11 +271,11 @@ def isolated_config(test):
 
 def isolated_git_identity(test):
     """A throwaway XDG config giving real git a commit identity."""
-    xdg = tempfile.mkdtemp(prefix="corral-xdg-")
+    xdg = tempfile.mkdtemp(prefix="korapy-xdg-")
     test.addCleanup(shutil.rmtree, xdg, True)
     os.makedirs(os.path.join(xdg, "git"))
     with open(os.path.join(xdg, "git", "config"), "w", encoding="utf-8") as handle:
-        handle.write("[user]\n\tname = Suite\n\temail = suite@corral.invalid\n")
+        handle.write("[user]\n\tname = Suite\n\temail = suite@korapy.invalid\n")
     patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg})
     patcher.start()
     test.addCleanup(patcher.stop)
@@ -451,7 +451,7 @@ class ScaffoldRun(unittest.TestCase):
         got = self.snapshot(target)
         for rel, blob in rendered.items():
             self.assertEqual(got[rel], blob, rel)
-        self.assertIn("corral.toml", got)
+        self.assertIn("korapy.toml", got)
 
     def test_force_leaves_a_differing_scaffold_file_alone(self):
         target = self.target()
@@ -469,7 +469,7 @@ class ScaffoldRun(unittest.TestCase):
                 continue
             self.assertEqual(got[rel], blob, rel)
         self.assertEqual(got["README.md"], edited)
-        self.assertIn("corral.toml", got)
+        self.assertIn("korapy.toml", got)
         self.assertIn("README.md", out)
 
     def test_force_rerun_with_only_a_differ_is_nothing_to_do(self):
@@ -630,9 +630,9 @@ class OnboardRun(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.parent = tmp.name
-        cfg = tempfile.mkdtemp(prefix="corral-config-")
+        cfg = tempfile.mkdtemp(prefix="korapy-config-")
         self.addCleanup(shutil.rmtree, cfg, True)
-        patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+        patcher = mock.patch.dict(os.environ, {"KORAPY_CONFIG": cfg})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.config_dir = cfg
@@ -645,7 +645,7 @@ class OnboardRun(unittest.TestCase):
             return handle.read()
 
     def toml(self, root=None):
-        return self.read(root or self.target(), "corral.toml")
+        return self.read(root or self.target(), "korapy.toml")
 
     def test_fresh_run_onboards_through_init_and_commits(self):
         fake = FakeGit(root=self.parent, status="?? README.md\n")
@@ -661,10 +661,10 @@ class OnboardRun(unittest.TestCase):
             (["commit", "-m", f"chore: scaffold the {FIXTURE} project"], self.target()),
             fake.commits,
         )
-        self.assertIn("corral github setup", out)
-        self.assertIn("next: corral doctor", out)
+        self.assertIn("korapy github setup", out)
+        self.assertIn("next: korapy doctor", out)
 
-    def test_set_branch_reaches_both_git_init_and_corral_toml(self):
+    def test_set_branch_reaches_both_git_init_and_korapy_toml(self):
         fake = FakeGit(root=self.parent, current="trunk", status="?? README.md\n")
         code, _, err = run_new(path=self.parent, git=fake, sets=("clone.default_branch=trunk",))
         self.assertEqual((code, err), (0, ""))
@@ -682,7 +682,7 @@ class OnboardRun(unittest.TestCase):
         self.assertIn((["init", "-b", "trunk"], self.target()), fake.calls)
         self.assertIn('default_branch = "trunk"', self.toml())
 
-    def test_collect_flags_land_in_corral_toml(self):
+    def test_collect_flags_land_in_korapy_toml(self):
         fake = FakeGit(root=self.parent, status="?? README.md\n")
         code, _, err = run_new(
             path=self.parent,
@@ -712,7 +712,7 @@ class OnboardRun(unittest.TestCase):
         self.assertEqual(len(first.commits), 1)
         before = {
             rel: self.read(self.target(), rel)
-            for rel in ("corral.toml", "agents.overlay.md", "README.md")
+            for rel in ("korapy.toml", "agents.overlay.md", "README.md")
         }
         rerun = FakeGit(root=self.target(), hooks=".githooks", status="")
         code, out, _ = run_new(path=self.parent, git=rerun)
@@ -736,8 +736,8 @@ class OnboardRun(unittest.TestCase):
         code, out, err = run_new(path=self.parent, git=fake, ops="")
         self.assertEqual((code, err), (0, ""), out)
         ops_root = os.path.join(ops_parent, f"{FIXTURE}_ops")
-        self.assertFalse(os.path.exists(os.path.join(self.target(), "corral.toml")))
-        ops_toml = self.read(ops_root, "corral.toml")
+        self.assertFalse(os.path.exists(os.path.join(self.target(), "korapy.toml")))
+        ops_toml = self.read(ops_root, "korapy.toml")
         self.assertIn("[[repo]]", ops_toml)
         self.assertIn(f'name = "{FIXTURE}"', ops_toml)
         self.assertEqual(fake.hooks, os.path.join(os.path.realpath(ops_root), "hooks", FIXTURE))
@@ -755,9 +755,9 @@ class OnboardRun(unittest.TestCase):
         self.assertFalse(os.path.exists(self.target()))
         self.assertIn("would run git init", out)
         self.assertIn("a/README.md", out)
-        self.assertIn("corral init", out)
+        self.assertIn("korapy init", out)
         self.assertIn("would commit", out)
-        self.assertIn("next: corral doctor", out)
+        self.assertIn("next: korapy doctor", out)
 
 
 class GenericTemplates(unittest.TestCase):
@@ -792,7 +792,7 @@ class ProviderLoading(unittest.TestCase):
         isolated_config(self)
 
     def _evict_launch(self):
-        saved_module = sys.modules.pop("corral.launch", None)
+        saved_module = sys.modules.pop("korapy.launch", None)
         saved = {}
         for key in ("clone.path", "clone.default_branch"):
             if key in settings.REGISTRY:
@@ -800,9 +800,9 @@ class ProviderLoading(unittest.TestCase):
         self.addCleanup(self._restore_launch, saved_module, saved)
 
     def _restore_launch(self, saved_module, saved):
-        sys.modules.pop("corral.launch", None)
+        sys.modules.pop("korapy.launch", None)
         if saved_module is not None:
-            sys.modules["corral.launch"] = saved_module
+            sys.modules["korapy.launch"] = saved_module
         settings.REGISTRY.update(saved)
 
     def test_new_run_registers_the_branch_setting_without_launch(self):
@@ -887,7 +887,7 @@ class SplitCommitScope(unittest.TestCase):
         code, _, err = run_new(path=self.parent, git=fake, ops="")
         self.assertEqual((code, err), (0, ""))
         ops_root = os.path.join(self.parent, f"{FIXTURE}_ops")
-        self.assertTrue(os.path.isfile(os.path.join(ops_root, "corral.toml")))
+        self.assertTrue(os.path.isfile(os.path.join(ops_root, "korapy.toml")))
         self.assertTrue(fake.commits)
         self.assertTrue(all(cwd == self.target() for _, cwd in fake.commits))
 
@@ -956,7 +956,7 @@ class CreateRemote(unittest.TestCase):
         self.assertEqual(git.origin_url, f"https://example.com/operator/{FIXTURE}.git")
         self.assertIn(f"created remote operator/{FIXTURE}", out)
         self.assertIn("set origin to", out)
-        self.assertIn("next: corral doctor", out)
+        self.assertIn("next: korapy doctor", out)
         self.assertLess(out.index("committed"), out.index("created remote"))
 
     def test_public_flag_creates_a_public_repo(self):
@@ -1200,7 +1200,7 @@ class LabelBootstrap(unittest.TestCase):
         self.assertIn(f"created label priority:backlog on operator/{FIXTURE}\n", out)
         self.assertLess(out.index("created remote"), out.index("created label ready"))
         self.assertLess(out.index("set origin to"), out.index("created label ready"))
-        self.assertIn("next: corral doctor", out)
+        self.assertIn("next: korapy doctor", out)
 
     def test_refused_labels_are_exit_1_with_fix_lines(self):
         git = FakeGit(root=self.parent, status="?? README.md\n")
@@ -1216,8 +1216,8 @@ class LabelBootstrap(unittest.TestCase):
             f"refused label hold on operator/{FIXTURE}: ask an owner to create it",
             out,
         )
-        self.assertIn("next: corral github setup", out)
-        self.assertNotIn("next: corral doctor", out)
+        self.assertIn("next: korapy github setup", out)
+        self.assertNotIn("next: korapy doctor", out)
 
     def test_unreachable_labels_are_exit_3_with_the_manual_command(self):
         git = FakeGit(root=self.parent, status="?? README.md\n")
@@ -1229,8 +1229,8 @@ class LabelBootstrap(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(len(forge.created), 1)
         self.assertIn(f"labels on operator/{FIXTURE} not bootstrapped", out)
-        self.assertIn("next: corral github setup", out)
-        self.assertNotIn("next: corral doctor", out)
+        self.assertIn("next: korapy github setup", out)
+        self.assertNotIn("next: korapy doctor", out)
 
     def test_rejected_labels_are_exit_1_with_only_the_reason_line(self):
         git = FakeGit(root=self.parent, status="?? README.md\n")
@@ -1248,8 +1248,8 @@ class LabelBootstrap(unittest.TestCase):
         self.assertIn(f"labels on operator/{FIXTURE} not bootstrapped", out)
         self.assertIn("tracker rejected", out)
         self.assertEqual(out.count("not bootstrapped"), 1)
-        self.assertIn("next: corral github setup", out)
-        self.assertNotIn("next: corral doctor", out)
+        self.assertIn("next: korapy github setup", out)
+        self.assertNotIn("next: korapy doctor", out)
 
     def test_adopted_remotes_bootstrap_too(self):
         git = FakeGit(root=self.parent)
@@ -1305,7 +1305,7 @@ class BoardEnsure(unittest.TestCase):
         return os.path.join(self.parent, FIXTURE)
 
     def toml_text(self):
-        with open(os.path.join(self.target(), "corral.toml"), encoding="utf-8") as handle:
+        with open(os.path.join(self.target(), "korapy.toml"), encoding="utf-8") as handle:
             return handle.read()
 
     def test_create_remote_provisions_the_board_once_and_writes_the_inert_table(self):
@@ -1344,7 +1344,7 @@ class BoardEnsure(unittest.TestCase):
         self.assertIn('agent_field = "Agent"', text)
         self.assertNotIn("area_column", text)
         self.assertNotIn('tracker.variant = "board"', text)
-        self.assertIn("next: corral doctor", out)
+        self.assertIn("next: korapy doctor", out)
 
     def test_refused_board_is_exit_1_with_the_setup_next_step(self):
         git = FakeGit(root=self.parent, status="?? README.md\n")
@@ -1363,8 +1363,8 @@ class BoardEnsure(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(err, "")
         self.assertEqual(len(provisioner.calls), 1)
-        self.assertIn("next: corral github setup", out)
-        self.assertNotIn("next: corral doctor", out)
+        self.assertIn("next: korapy github setup", out)
+        self.assertNotIn("next: korapy doctor", out)
 
     def test_unreachable_board_is_exit_3_with_the_setup_next_step(self):
         git = FakeGit(root=self.parent, status="?? README.md\n")
@@ -1384,8 +1384,8 @@ class BoardEnsure(unittest.TestCase):
         self.assertEqual(code, 3)
         self.assertEqual(len(provisioner.calls), 1)
         self.assertIn(f"board on operator/{FIXTURE} not bootstrapped", out)
-        self.assertIn("next: corral github setup", out)
-        self.assertNotIn("next: corral doctor", out)
+        self.assertIn("next: korapy github setup", out)
+        self.assertNotIn("next: korapy doctor", out)
 
     def test_board_value_error_is_exit_4(self):
         git = FakeGit(root=self.parent, status="?? README.md\n")
@@ -1430,11 +1430,11 @@ class BoardEnsure(unittest.TestCase):
 
         for bad in (object(), NotCallable()):
             with self.subTest(bad=type(bad).__name__):
-                parent = tempfile.mkdtemp(prefix="corral-new-")
+                parent = tempfile.mkdtemp(prefix="korapy-new-")
                 self.addCleanup(shutil.rmtree, parent, True)
-                cfg = tempfile.mkdtemp(prefix="corral-config-")
+                cfg = tempfile.mkdtemp(prefix="korapy-config-")
                 self.addCleanup(shutil.rmtree, cfg, True)
-                patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg})
+                patcher = mock.patch.dict(os.environ, {"KORAPY_CONFIG": cfg})
                 patcher.start()
                 self.addCleanup(patcher.stop)
                 code, _, err = run_new(
@@ -1468,14 +1468,14 @@ class BoardEnsure(unittest.TestCase):
         )
         self.assertEqual(status.stdout.strip(), "")
         show = subprocess.run(
-            ["git", "show", "HEAD:corral.toml"],
+            ["git", "show", "HEAD:korapy.toml"],
             cwd=self.target(),
             capture_output=True,
             text=True,
         )
         self.assertEqual(show.returncode, 0, show.stderr)
         self.assertIn("[repo.board]", show.stdout)
-        self.assertIn("next: corral doctor", out)
+        self.assertIn("next: korapy doctor", out)
 
     def test_refused_board_leaves_a_clean_tree_with_no_mapping(self):
         forge = FakeForge(user="operator")
@@ -1492,8 +1492,8 @@ class BoardEnsure(unittest.TestCase):
         )
         self.assertEqual(code, 1)
         self.assertEqual(err, "")
-        self.assertIn("next: corral github setup", out)
-        self.assertNotIn("next: corral doctor", out)
+        self.assertIn("next: korapy github setup", out)
+        self.assertNotIn("next: korapy doctor", out)
         self.assertNotIn("[repo.board]", self.toml_text())
         status = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -1503,7 +1503,7 @@ class BoardEnsure(unittest.TestCase):
         )
         self.assertEqual(status.stdout.strip(), "")
         show = subprocess.run(
-            ["git", "show", "HEAD:corral.toml"],
+            ["git", "show", "HEAD:korapy.toml"],
             cwd=self.target(),
             capture_output=True,
             text=True,
@@ -1603,14 +1603,14 @@ class CliWiring(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.parent = tmp.name
-        cfg = tempfile.mkdtemp(prefix="corral-config-")
+        cfg = tempfile.mkdtemp(prefix="korapy-config-")
         self.addCleanup(shutil.rmtree, cfg, True)
-        xdg = tempfile.mkdtemp(prefix="corral-xdg-")
+        xdg = tempfile.mkdtemp(prefix="korapy-xdg-")
         self.addCleanup(shutil.rmtree, xdg, True)
         os.makedirs(os.path.join(xdg, "git"))
         with open(os.path.join(xdg, "git", "config"), "w", encoding="utf-8") as handle:
-            handle.write("[user]\n\tname = Suite\n\temail = suite@corral.invalid\n")
-        patcher = mock.patch.dict(os.environ, {"CORRAL_CONFIG": cfg, "XDG_CONFIG_HOME": xdg})
+            handle.write("[user]\n\tname = Suite\n\temail = suite@korapy.invalid\n")
+        patcher = mock.patch.dict(os.environ, {"KORAPY_CONFIG": cfg, "XDG_CONFIG_HOME": xdg})
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -1655,7 +1655,7 @@ class CliWiring(unittest.TestCase):
             self.assertEqual(cli.main(["init", self.target()]), 1)
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["uninit", self.target()]), 0)
-        for rel in ("README.md", "Makefile", "AGENTS.md", "corral.toml", "agents.overlay.md"):
+        for rel in ("README.md", "Makefile", "AGENTS.md", "korapy.toml", "agents.overlay.md"):
             self.assertTrue(os.path.isfile(os.path.join(self.target(), rel)), rel)
         self.assertFalse(os.path.exists(os.path.join(self.target(), ".githooks")))
 
@@ -1817,11 +1817,11 @@ class TemplateDir(unittest.TestCase):
         self.assertFalse(os.path.exists(self.target()))
 
     def test_cli_accepts_template_dir(self):
-        xdg = tempfile.mkdtemp(prefix="corral-xdg-")
+        xdg = tempfile.mkdtemp(prefix="korapy-xdg-")
         self.addCleanup(shutil.rmtree, xdg, True)
         os.makedirs(os.path.join(xdg, "git"))
         with open(os.path.join(xdg, "git", "config"), "w", encoding="utf-8") as handle:
-            handle.write("[user]\n\tname = Suite\n\temail = suite@corral.invalid\n")
+            handle.write("[user]\n\tname = Suite\n\temail = suite@korapy.invalid\n")
         patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": xdg})
         patcher.start()
         self.addCleanup(patcher.stop)

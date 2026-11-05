@@ -1,11 +1,11 @@
-# 12: the web dashboard (browser UI over `corral serve` and the hub)
+# 12: the web dashboard (browser UI over `korapy serve` and the hub)
 
 Status: design, awaiting maintainer approval. No code ships with this
 doc. It designs a read-only browser UI served by the two processes
-that already serve JSON: `corral serve` for one host
-(`05-dashboard-api.md`, built as `src/corral/serve.py`) and
-`corral hub serve` for the merged multi-host view
-(`08-hub-multihost.md`, built as `src/corral/hub.py`). One screen to
+that already serve JSON: `korapy serve` for one host
+(`05-dashboard-api.md`, built as `src/korapy/serve.py`) and
+`korapy hub serve` for the merged multi-host view
+(`08-hub-multihost.md`, built as `src/korapy/hub.py`). One screen to
 see every project and every agent, filterable by project with an
 "all" view, on arbitrary devices that can reach the network,
 tablets included.
@@ -24,8 +24,8 @@ Conventions: shapes, constants and behaviors quoted from
 `quotacli.py` were read from the tree at design time. Browser and
 library facts that could not be verified from the tree are marked
 UNVERIFIED with a safe way to learn them. "Host mode" means the UI
-is served by `corral serve` on one host; "hub mode" means it is
-served by `corral hub serve` and reads the hub's merged routes.
+is served by `korapy serve` on one host; "hub mode" means it is
+served by `korapy hub serve` and reads the hub's merged routes.
 Line and byte counts for the UI itself are estimates and are
 labelled as such; they are budgets the test plan enforces
 (section 8), not measurements.
@@ -46,7 +46,7 @@ Three findings from the code shape everything below:
    navigation or to a native `EventSource`** (platform behavior,
    UNVERIFIED here; the smoke checklist in section 8 confirms it
    on the maintainer's browsers). On a non-loopback
-   bind, `corral serve` requires the token on every request
+   bind, `korapy serve` requires the token on every request
    (`_authorized` runs before routing in `do_GET`), so a
    token-entry page can never load unless the static shell is
    exempt from auth (section 4). And `EventSource` accepts no
@@ -99,7 +99,7 @@ depend on the exact figures; the gaps are an order of magnitude.
 | Moving parts a contributor must learn | HTML, CSS, DOM APIs they likely know | components, hooks subset, htm tagged templates | web components, reactive properties, shadow DOM styling | the framework, JSX or SFCs, the bundler, npm |
 | Build step or package manager | none: files are served as written | none at runtime; a human copies two pinned files and reviews them | none at runtime; several pinned module files | node, npm, a lockfile with hundreds of transitive deps, a bundler config |
 | Cost to the standard-library-only rule | none: Python stays stdlib, repo gains no toolchain | none for Python; the repo gains vendored third-party JS that must be reviewed, licensed and updated by hand | same as B, more files | breaks the spirit: a second ecosystem in the repo, `system_deps.toml` gains node, `make check` would need it, and `uv_build` cannot run npm, so the built bundle must be committed as generated code or the package build breaks |
-| How an update reaches devices | edit file, upgrade corral, restart the server, reload (section 7) | same, plus re-vendoring on library updates (security fixes are manual forever) | same as B | rebuild, commit the bundle (unreviewable diffs), upgrade, reload |
+| How an update reaches devices | edit file, upgrade korapy, restart the server, reload (section 7) | same, plus re-vendoring on library updates (security fixes are manual forever) | same as B | rebuild, commit the bundle (unreviewable diffs), upgrade, reload |
 | Tested under our rules | Python tests cover serving, headers, contracts and source discipline (section 8); JS logic kept tiny and pure | same Python side; library behavior is trusted, not tested | same | same Python side, plus a JS test runner becomes tempting, which needs node (absent from `system_deps.toml` today) |
 | How long the choice stays easy to change | forever: DOM APIs are the platform, no version to chase | years; Preact majors are rare, but the vendored copy ages until someone re-vendors | years | shortest: framework and bundler churn is continuous |
 
@@ -309,7 +309,7 @@ Overview, narrow (wide screens put the cards in two columns):
 
 ```
 +---------------------------------------------------+
-| corral  host-1        live 12s ago      [token]  |
+| korapy  host-1        live 12s ago      [token]  |
 | [All] [project-a] [project-b]  >                  |
 +---------------------------------------------------+
 | Agents: 6 live, 1 stale, 23 finished              |
@@ -383,10 +383,10 @@ Board, log, hosts and the token screen, same skeleton, narrow:
 +---------------------------------------------------+
 
 +---------------------------------------------------+
-| corral dashboard, host mode (api 1)               |
+| korapy dashboard, host mode (api 1)               |
 | Paste the API token for this server.              |
 | It lives in the host's token file; mint one with  |
-|   corral serve --new-token                        |
+|   korapy serve --new-token                        |
 | [________________________]  [ save ]              |
 | Wrong token: this server answered 401.            |
 +---------------------------------------------------+
@@ -394,10 +394,10 @@ Board, log, hosts and the token screen, same skeleton, narrow:
 
 ## 3. Serving: package data, one asset table, two processes
 
-Static files live at `src/corral/web/` inside the Python package
+Static files live at `src/korapy/web/` inside the Python package
 and ship the way `prompts/`, `templates/`, `hooks/` and
 `system_deps.toml` already ship: read through
-`importlib.resources.files("corral")`, the pattern in `deps.py`,
+`importlib.resources.files("korapy")`, the pattern in `deps.py`,
 `prompts.py` and `init.py`. No packaging change is expected
 (`uv_build` includes package data it finds in the package tree);
 the first implementation ticket verifies a built wheel actually
@@ -414,7 +414,7 @@ and cheap to check. The file set is deliberately small and flat:
 | `views.js` | the view renderers; DOM building only through `textContent` |
 
 Asset resolution is one fact in one place: a new small module,
-`src/corral/webui.py`, owns the asset table (URL path to bytes,
+`src/korapy/webui.py`, owns the asset table (URL path to bytes,
 content type and a strong ETag computed once as a truncated
 SHA-256 of the bytes), the document route's content, and the
 security header values of section 5. It is a pure core: functions
@@ -493,7 +493,7 @@ existing honest-staleness rule.
 The two backends authenticate differently today, and the UI must
 fit both without inventing a third scheme.
 
-**Host mode.** `corral serve` requires the Bearer [REDACTED] only on
+**Host mode.** `korapy serve` requires the Bearer [REDACTED] only on
 a non-loopback bind: `cmd_serve` sets `token_required=remote`,
 `check_bind` refuses a remote bind without `--allow-remote` and a
 readable token file (exit 4), the token lives at
@@ -511,7 +511,7 @@ and wrong methods 405 without one, and `GET /v1/version` is
 open. There is no loopback exemption and no read-only class.
 This design adds one, because the alternative is a fleet
 credential in a browser: a "reader" token minted by
-`corral hub add-reader --id <name>` (printed once, same
+`korapy hub add-reader --id <name>` (printed once, same
 `secrets.token_hex(32)` mint and salted-hash storage as
 `add_host`), accepted by `_reader` for the GET data routes, and
 rejected by every POST route, which keeps requiring a host
@@ -557,7 +557,7 @@ a hash, or a log.
 first data call shows the token screen: one password-type field
 (no autocomplete), a save button, and one line of help naming
 where the token comes from (the host's token file, minted by
-`corral serve --new-token`, which deliberately never prints it,
+`korapy serve --new-token`, which deliberately never prints it,
 so the operator reads the file on the host; or the hub reader
 token printed once at mint). Paste from a password manager is
 the expected path for a 64-hex-char token, UNVERIFIED per
@@ -571,7 +571,7 @@ hub mode calls `/v1/hosts` (`/v1/version` is open on the hub and
 would prove nothing). A wrong token says so and keeps the field.
 
 **Storage.** `localStorage`, one key per origin
-(`corral.token`), written only after a successful validation,
+(`korapy.token`), written only after a successful validation,
 with a visible "forget this token" action that removes it and
 reloads. The alternatives lose on a tablet: memory-only means
 retyping 64 hex characters on every reload, and `sessionStorage`
@@ -624,7 +624,7 @@ temporarily.
 **TLS and secure contexts.** Both servers speak plain HTTP and
 rely on a private network, the decided transport for the hub
 (`08-hub-multihost.md` section 6) and the only sane one here
-without a certificate lifecycle corral should not own. The UI
+without a certificate lifecycle korapy should not own. The UI
 is designed to need no secure-context-only feature: no service
 worker, no `crypto.subtle`, no camera, no clipboard API
 (selectable text instead), no notifications. `localStorage`,
@@ -842,8 +842,8 @@ from quietly stale storage.
 
 The UI ships inside the package and is versioned by the package
 release; there is no separate UI versioning. Updating every
-device is: upgrade corral on the host (or hub host), restart
-`corral serve` (or `corral hub serve`) as today, reload the
+device is: upgrade korapy on the host (or hub host), restart
+`korapy serve` (or `korapy hub serve`) as today, reload the
 tab. Content-hash ETags with `no-cache` (section 3) make the
 reload fetch only what changed and make a half-updated shell
 impossible to keep serving: `index.html` revalidates on every
@@ -964,7 +964,7 @@ the existing serve and hub suites):
   quietly stops being lightweight. Adding a dependency later
   means arguing with these tests in a PR, which is the point.
 - Packaging: the wheel built by the first ticket contains
-  `corral/web/*` (checked by listing the built artifact in
+  `korapy/web/*` (checked by listing the built artifact in
   that ticket, not necessarily as a permanent suite test, to
   keep the suite fast; the ticket records the listing).
 
@@ -1057,7 +1057,7 @@ ticket changes a public interface beyond the additive routes,
 flags and verbs it names.
 
 - **W1: static serving and the shell (host mode).** `webui.py`,
-  the `src/corral/web/` files with a shell that shows mode,
+  the `src/korapy/web/` files with a shell that shows mode,
   version and connection state, `/` and `/ui/*` and
   `/ui/config.json` in `serve.py`, the shell auth exemption,
   section 5 headers (including `nosniff` on all `serve`
@@ -1066,7 +1066,7 @@ flags and verbs it names.
   minimum cannot wait for the polish ticket), and the
   `test_webui.py` asset, serving, exemption and source-
   discipline tests. Acceptance: wheel listing shows
-  `corral/web/*`; a browser on loopback loads the shell with a
+  `korapy/web/*`; a browser on loopback loads the shell with a
   clean CSP console; with a token required, assets load and
   data calls 401 until the token is pasted; `README.md` gains
   one sentence on the `serve` row saying the same address in a
@@ -1259,7 +1259,7 @@ or board bodies. History, trends and sparklines. Push
 notifications. Multi-user anything: no accounts, no per-user
 views, no audit log of reads. Internationalization. A
 component framework (section 1's trigger names when). TLS in
-corral. Subpath or reverse-proxy deployments.
+korapy. Subpath or reverse-proxy deployments.
 
 ## 13. Open decisions
 

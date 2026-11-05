@@ -1,4 +1,4 @@
-"""The user timer for `corral drive`: unit text, state reads and the install step.
+"""The user timer for `korapy drive`: unit text, state reads and the install step.
 
 Everything runs against fakes at the single seams: a fake `run` for the
 `systemctl` calls and a temporary `XDG_CONFIG_HOME` for the unit files,
@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import cli, drive, drivehub, paths, units
+from korapy import cli, drive, drivehub, paths, units
 
 
 def proc(stdout="", stderr="", returncode=0):
@@ -21,7 +21,7 @@ def proc(stdout="", stderr="", returncode=0):
 
 def home_env():
     """An env mapping whose systemd user dir is a fresh temp dir."""
-    tmp = tempfile.mkdtemp(prefix="corral-timer-home-")
+    tmp = tempfile.mkdtemp(prefix="korapy-timer-home-")
     return {"XDG_CONFIG_HOME": os.path.join(tmp, "config")}
 
 
@@ -29,17 +29,17 @@ class UnitText(unittest.TestCase):
     def test_service_runs_a_oneshot_pass(self):
         text = drive.service_text()
         self.assertIn("Type=oneshot", text)
-        self.assertIn("corral drive", text)
+        self.assertIn("korapy drive", text)
         self.assertNotIn("--plan", text)
 
     def test_service_exec_uses_the_shipped_binary_by_default(self):
         text = drive.service_text()
-        self.assertIn(drive.TIMER_CORRAL_BIN, text)
+        self.assertIn(drive.TIMER_KORAPY_BIN, text)
         self.assertIn("%h", text)
 
     def test_service_names_an_explicit_binary_when_given(self):
-        text = drive.service_text("/opt/fleet/bin/corral")
-        self.assertIn("ExecStart=/opt/fleet/bin/corral drive", text)
+        text = drive.service_text("/opt/fleet/bin/korapy")
+        self.assertIn("ExecStart=/opt/fleet/bin/korapy drive", text)
 
     def test_timer_wakes_a_pass_every_five_minutes_and_catches_up(self):
         text = drive.timer_text()
@@ -124,8 +124,8 @@ class TimerState(unittest.TestCase):
 
     def test_missing_variants_read_as_missing(self):
         for err in (
-            "Failed to get unit file state for corral-drive.timer.",
-            "Unit corral-drive.timer could not be found.",
+            "Failed to get unit file state for korapy-drive.timer.",
+            "Unit korapy-drive.timer could not be found.",
             "No such file or directory",
         ):
             with self.subTest(err=err):
@@ -144,7 +144,7 @@ class TimerState(unittest.TestCase):
 
     def test_a_missing_unit_file_reads_as_missing(self):
         def run(argv, timeout):
-            return proc("", "Failed to get unit file state for corral-drive.timer.", 1)
+            return proc("", "Failed to get unit file state for korapy-drive.timer.", 1)
 
         self.assertEqual(drive.timer_state(run=run), "missing")
 
@@ -164,7 +164,7 @@ class TimerState(unittest.TestCase):
             drive.timer_state(run=run)
 
     def test_an_absent_systemctl_is_unreachable_through_the_real_seam(self):
-        empty = tempfile.mkdtemp(prefix="corral-no-systemctl-")
+        empty = tempfile.mkdtemp(prefix="korapy-no-systemctl-")
         with mock.patch.dict(os.environ, {"PATH": empty}):
             with self.assertRaises(units.Unreachable) as ctx:
                 drive.timer_state()
@@ -290,7 +290,7 @@ class InstallTimer(unittest.TestCase):
         self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_an_absent_systemctl_is_unreachable_through_the_real_seam(self):
-        empty = tempfile.mkdtemp(prefix="corral-no-systemctl-")
+        empty = tempfile.mkdtemp(prefix="korapy-no-systemctl-")
         with mock.patch.dict(os.environ, {"PATH": empty}):
             with self.assertRaises(units.Unreachable) as ctx:
                 drive.install_timer(env=home_env(), run=units.default_run)
@@ -328,7 +328,7 @@ class InstallTimer(unittest.TestCase):
     def test_an_unwritable_home_is_exit_4(self):
         # A file where the unit dir belongs pins the exit code without
         # depending on who runs the suite.
-        blocked = os.path.join(tempfile.mkdtemp(prefix="corral-timer-blocked-"), "file")
+        blocked = os.path.join(tempfile.mkdtemp(prefix="korapy-timer-blocked-"), "file")
         with open(blocked, "w", encoding="utf-8") as handle:
             handle.write("in the way")
         with self.assertRaises(drive.TimerError) as ctx2:

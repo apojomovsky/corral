@@ -12,20 +12,20 @@ Run one agent fleet on a host and the tooling is simple. Run two projects' fleet
 - two cleanup passes with different rules prune the same docker daemon and the same disk;
 - one project paces its GitHub calls and the other does not, against one rate limit.
 
-corral is the part every such project needs unchanged. Projects keep what makes them different.
+korapy is the part every such project needs unchanged. Projects keep what makes them different.
 
 ## 2. Where the line falls
 
-The test: **if a second project would need it unchanged, it belongs in corral.**
+The test: **if a second project would need it unchanged, it belongs in korapy.**
 
-### corral owns
+### korapy owns
 
 1. **Runtimes.** One adapter per headless agent runtime (omp, muse). The adapter builds the argv, writes the per-launch config overlay, finds the session file, resumes, tails, and classifies provider errors. A reviewer launch asks the runtime for its read-only mode (muse adds `--disable-write`); adapters with no read-only flag accept the request and rely on the reviewer prompt's read-only rule.
 2. **Units.** Transient `systemd --user` units: spawn lock, liveness, stop, naming. The unit prefix is set per project.
 3. **Sessions.** One session root per host, one directory per `<project>/<ticket>`, with one leaf per role generation (`<role>-<n>`) below it, so a reviewer launch never overwrites the worker's record. Resume and tail read the newest leaf of a role; a legacy single-directory session reads as generation 0.
 4. **Accounts and models.** One accounts file per host lists providers, accounts and their quota readers. Each project declares its own agent profiles (runtime, roles, fallback chains, sub-agent overrides), naming only providers from that pool. The user's home runtime config is never edited.
 5. **Quota.** Readers, reactive rate-limit marks, cooldowns, the gate, pacing, outage probes. The gate is evaluated per project's model chains against **one shared ledger**: a project whose chains avoid an exhausted provider keeps running.
-6. **Admission.** A total cap for the host, a floor and ceiling per project, and a disk ceiling, all under one lock. Each project decides what it wants to start; corral decides whether it may start now.
+6. **Admission.** A total cap for the host, a floor and ceiling per project, and a disk ceiling, all under one lock. Each project decides what it wants to start; korapy decides whether it may start now.
 7. **Host hygiene.** One cleanup pass and one disk keeper per host, over every project's worktrees, caches, docker and sessions. Each project supplies a keep-check.
 8. **GitHub pacing.** One token bucket per account, with a `gh` shim on every agent's PATH.
 9. **Review gate building blocks** (optional for a project). Review records keyed by commit, the "reviewer is not the author" check, a diff-derived review budget, and a takeoff skeleton that projects extend with their own gates.
@@ -35,7 +35,7 @@ The test: **if a second project would need it unchanged, it belongs in corral.**
 
 ### Two provider interfaces
 
-corral talks to code hosting through two interfaces, so a provider can be swapped later without touching the rest:
+korapy talks to code hosting through two interfaces, so a provider can be swapped later without touching the rest:
 
 - **Tracker:** tickets, labels, claims, comments, and the board, if any.
 - **Forge:** branches on the remote, pull requests, their checks and review state, merges.
@@ -57,7 +57,7 @@ Everything that reads tickets reads a local store instead of the tracker: agents
 - **PRs and merges always act live.** Creating a PR and merging it go to the forge directly.
 - **Field ownership resolves conflicts.**
   - People win the fields they own on the tracker: title, body, labels, priority, closing, comments, their own assignments.
-  - corral wins the agent fields: the claim, in-flight status, the agent.
+  - korapy wins the agent fields: the claim, in-flight status, the agent.
   - A queued write that a person has meanwhile overridden is dropped and logged.
 - **External items are read-only.** An item is external when its author is not an operator, or when it comes from a fork. External items are labelled for a human, and every write to them is refused, mirror included.
 - **The tracker can be down.** Claims, status and dashboards keep working, and only PR creation and merges wait.
@@ -70,7 +70,7 @@ The board and its schema, which ticket is eligible, triage, prompts, the decisio
 
 ### The contract
 
-A project registers with a small file, `~/.config/corral/projects.d/<name>.toml`: its name, unit prefix, clones, model declaration, cap settings, and an entry module implementing a narrow protocol:
+A project registers with a small file, `~/.config/korapy/projects.d/<name>.toml`: its name, unit prefix, clones, model declaration, cap settings, and an entry module implementing a narrow protocol:
 
 ```python
 class Project(Protocol):
@@ -80,21 +80,21 @@ class Project(Protocol):
     def wants(self) -> list[StartRequest]: ...                    # optional: shared start pass
 ```
 
-Projects call corral as a library (`corral.launch(...)`, `corral.admit(...)`, `corral.quota.gate(...)`). corral calls back into projects only through this protocol.
+Projects call korapy as a library (`korapy.launch(...)`, `korapy.admit(...)`, `korapy.quota.gate(...)`). korapy calls back into projects only through this protocol.
 
 ### Packaging
 
-corral is a uv project. On a host, `uv tool install` puts the CLI in its own environment, and most projects need nothing more: a `corral.toml` is the whole contract ([`01-onboarding.md`](01-onboarding.md)). Only a project with code hooks depends on corral as a library. It pins the source in `[tool.uv.sources]` (a git tag, or an editable path while developing both), so the name never resolves from PyPI by accident. The doctor warns when a project expects a newer API than the one installed.
+korapy is a uv project. On a host, `uv tool install` puts the CLI in its own environment, and most projects need nothing more: a `korapy.toml` is the whole contract ([`01-onboarding.md`](01-onboarding.md)). Only a project with code hooks depends on korapy as a library. It pins the source in `[tool.uv.sources]` (a git tag, or an editable path while developing both), so the name never resolves from PyPI by accident. The doctor warns when a project expects a newer API than the one installed.
 
 ## 3. Milestone 1: one host
 
-1. Ground rules: skeleton, hooks, `make bootstrap`, `corral deps`, the API versioning rule.
+1. Ground rules: skeleton, hooks, `make bootstrap`, `korapy deps`, the API versioning rule.
 2. Runtimes, units, sessions. Exit: a fake project launches, resumes, tails and stops an omp and a muse agent in tests, through fake seams.
-3. Accounts, models, quota. Exit: `corral quota` shows one view, and a launch whose chain is exhausted is refused or re-routed.
+3. Accounts, models, quota. Exit: `korapy quota` shows one view, and a launch whose chain is exhausted is refused or re-routed.
 4. Admission. Exit: with the total cap reached by one project, another gets only its floor.
 5. Host hygiene, run first in plan-only mode next to whatever it replaces.
 6. GitHub pacing.
-7. Snapshot. Exit: `corral snapshot --json` lists every project's agents.
+7. Snapshot. Exit: `korapy snapshot --json` lists every project's agents.
 
 ## 4. Milestone 2: several hosts, a hub
 
@@ -110,7 +110,7 @@ Decided: a hub, hosted on one host the maintainer owns, reachable
 over a private network. A small service in front of SQLite, standard
 library only, authenticated per host with bearer tokens.
 
-**Assumption:** every host can reach the hub directly at a configured address (a LAN, or a tailnet such as Tailscale or Netbird), so hosts are always "local-ish". corral sees `host:port` and a per-host bearer token kept in the host config dir, and never relies on the network layer for authentication.
+**Assumption:** every host can reach the hub directly at a configured address (a LAN, or a tailnet such as Tailscale or Netbird), so hosts are always "local-ish". korapy sees `host:port` and a per-host bearer token kept in the host config dir, and never relies on the network layer for authentication.
 
 **Principle: certainty over availability.** A host acts alone only where it is certain nothing can collide. A hub outage blocks new claims everywhere; a single host outage blocks nothing.
 
@@ -128,7 +128,7 @@ library only, authenticated per host with bearer tokens.
 - **If the hub is unreachable, no new claim is made.** Work on
   claims already held continues (work, commit, push, open PRs,
   resume). Removing a host is an operator action
-  (`corral hub remove-host --id <host>`): it bumps the membership epoch
+  (`korapy hub remove-host --id <host>`): it bumps the membership epoch
   and releases the removed host's claims. A removed host that comes
   back sees the newer epoch, stops its agents, drops their claims,
   and does nothing until it is added again. Worktrees stay under

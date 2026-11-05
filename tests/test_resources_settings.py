@@ -14,7 +14,7 @@ import os
 import tempfile
 import unittest
 
-from corral import projects, resources as R, settings as S
+from korapy import projects, resources as R, settings as S
 
 
 def resolve(**kw):
@@ -47,7 +47,7 @@ REVIEWER = {"role": {"reviewer": {"cpu_m": 500, "memory_mb": 1024}}}
 
 class Providers(unittest.TestCase):
     def test_resources_registers_its_settings(self):
-        self.assertIn("corral.resources", S.PROVIDERS)
+        self.assertIn("korapy.resources", S.PROVIDERS)
 
     def test_gone_s_defaults_to_ten_minutes(self):
         self.assertEqual(resolve()["resources.gone_s"], 600)
@@ -93,7 +93,7 @@ class HostBudget(unittest.TestCase):
             resolve(host={"resources": {}})
 
     def test_resources_tables_do_not_belong_in_the_project_file(self):
-        with self.assertRaisesRegex(S.SettingsError, r"corral.toml.*resources\.host"):
+        with self.assertRaisesRegex(S.SettingsError, r"korapy.toml.*resources\.host"):
             resolve(project={"resources": {"host": {"cpu_m": 1}}})
 
     def test_resources_tables_do_not_belong_in_a_repo_entry(self):
@@ -155,13 +155,13 @@ class GoneS(unittest.TestCase):
     def test_gone_s_is_settable_in_any_layer(self):
         self.assertEqual(resolve(host={"resources.gone_s": 60})["resources.gone_s"], 60)
         self.assertEqual(resolve(project={"resources.gone_s": 30})["resources.gone_s"], 30)
-        self.assertEqual(resolve(env={"CORRAL_RESOURCES_GONE_S": "45"})["resources.gone_s"], 45)
+        self.assertEqual(resolve(env={"KORAPY_RESOURCES_GONE_S": "45"})["resources.gone_s"], 45)
 
     def test_config_carries_gone_s_with_the_limits(self):
         limits = R.config(resolve())
         self.assertEqual((limits.gone_s, limits.projects, limits.foreign), (600.0, {}, []))
         self.assertIsNone(limits.host)
-        tuned = R.config(resolve(env={"CORRAL_RESOURCES_GONE_S": "60"}))
+        tuned = R.config(resolve(env={"KORAPY_RESOURCES_GONE_S": "60"}))
         self.assertEqual(tuned.gone_s, 60)
 
     def test_a_negative_gone_s_is_a_settings_error(self):
@@ -220,11 +220,11 @@ class DefaultsLeaveBehaviorUnchanged(unittest.TestCase):
         self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
 
     def test_count_floors_still_load_without_a_resources_table(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(
                 config_dir,
                 "web",
-                'name = "web"\nunit_prefix = "corral-web-"\nroot = "/srv/web"\n'
+                'name = "web"\nunit_prefix = "korapy-web-"\nroot = "/srv/web"\n'
                 "floor = 2\nceiling = 4\n",
             )
             (found,) = projects.load_all(config_dir)
@@ -241,7 +241,7 @@ def write_registration(config_dir, name, text):
 
 SHARE = """\
 name = "web"
-unit_prefix = "corral-web-"
+unit_prefix = "korapy-web-"
 root = "/srv/web"
 
 [resources]
@@ -253,7 +253,7 @@ memory_floor_mb = 1024
 
 class ProjectShares(unittest.TestCase):
     def test_the_documented_project_table_loads(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(config_dir, "web", SHARE)
             (found,) = projects.load_all(config_dir)
         self.assertEqual(
@@ -273,7 +273,7 @@ class ProjectShares(unittest.TestCase):
         text = SHARE.replace("weight = 1", "weight = 2") + (
             "pids_floor = 50\ncpu_ceiling_m = 2000\nmemory_ceiling_mb = 4096\npids_ceiling = 200\n"
         )
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(config_dir, "web", text)
             (found,) = projects.load_all(config_dir)
         self.assertEqual(
@@ -290,17 +290,17 @@ class ProjectShares(unittest.TestCase):
         )
 
     def test_no_resources_table_reads_as_unset(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(
                 config_dir,
                 "web",
-                'name = "web"\nunit_prefix = "corral-web-"\nroot = "/srv/web"\n',
+                'name = "web"\nunit_prefix = "korapy-web-"\nroot = "/srv/web"\n',
             )
             (found,) = projects.load_all(config_dir)
         self.assertIsNone(found.resources)
 
     def test_an_unknown_share_key_names_the_file_and_key(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(config_dir, "web", SHARE + "cpu_cap_m = 5\n")
             with self.assertRaisesRegex(projects.ProjectsError, r"web\.toml.*cpu_cap_m"):
                 projects.load_all(config_dir)
@@ -308,17 +308,17 @@ class ProjectShares(unittest.TestCase):
     def test_a_prefixed_weight_is_not_a_key(self):
         # The doc's example spells this `cpu_weight`; the merged core and
         # O2 call the single remainder weight `weight`, so only that loads.
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(config_dir, "web", SHARE.replace("weight = 1", "cpu_weight = 1"))
             with self.assertRaisesRegex(projects.ProjectsError, "cpu_weight"):
                 projects.load_all(config_dir)
 
     def test_a_share_table_must_be_a_table(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(
                 config_dir,
                 "web",
-                'name = "web"\nunit_prefix = "corral-web-"\nroot = "/srv/web"\nresources = 5\n',
+                'name = "web"\nunit_prefix = "korapy-web-"\nroot = "/srv/web"\nresources = 5\n',
             )
             with self.assertRaisesRegex(projects.ProjectsError, r"web\.toml.*\[resources\]"):
                 projects.load_all(config_dir)
@@ -333,19 +333,19 @@ class ProjectShares(unittest.TestCase):
         ]
         for old, new, key in cases:
             with self.subTest(new=new):
-                with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+                with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
                     write_registration(config_dir, "web", SHARE.replace(old, new))
                     with self.assertRaisesRegex(projects.ProjectsError, key):
                         projects.load_all(config_dir)
 
     def test_a_floor_above_its_ceiling_names_the_numbers(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(config_dir, "web", SHARE + "cpu_ceiling_m = 100\n")
             with self.assertRaisesRegex(projects.ProjectsError, r"500.*100"):
                 projects.load_all(config_dir)
 
     def test_a_weight_of_zero_with_a_floor_is_allowed(self):
-        with tempfile.TemporaryDirectory(prefix="corral-resources-") as config_dir:
+        with tempfile.TemporaryDirectory(prefix="korapy-resources-") as config_dir:
             write_registration(config_dir, "web", SHARE.replace("weight = 1", "weight = 0"))
             (found,) = projects.load_all(config_dir)
         assert found.resources is not None

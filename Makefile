@@ -15,7 +15,7 @@ bootstrap: ## First run: needs only uv; sets up Python, the venv, the hooks, the
 	@$(MAKE) --no-print-directory deps
 
 deps: ## Check the host programs in system-deps.toml; print how to install what is missing
-	@uv run --locked corral deps
+	@uv run --locked korapy deps
 
 sync: ## Install the locked environment into .venv
 	uv sync --locked
@@ -48,5 +48,5 @@ check: lint typecheck test-matrix ## Everything CI runs
 pre-pr-check: ## Takeoff ritual: PR_BODY=<file> required, TEST=1 also runs the suite
 	@uv run --script scripts/pre_pr_check.py --body "$(PR_BODY)" $(if $(filter 1,$(TEST)),--test,)
 
-install: ## Install the corral CLI for your user from this checkout (uv tool)
+install: ## Install the korapy CLI for your user from this checkout (uv tool)
 	uv tool install --reinstall .

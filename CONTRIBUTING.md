@@ -1,6 +1,6 @@
 # Contributing
 
-corral is opinionated: one fact in one place, pure cores with thin seams, and no test that touches the outside world. `AGENTS.md` has the full rules, and they apply to human contributors too. If a change could go several ways, ask in an issue first: a scope question is cheaper there than in a PR.
+korapy is opinionated: one fact in one place, pure cores with thin seams, and no test that touches the outside world. `AGENTS.md` has the full rules, and they apply to human contributors too. If a change could go several ways, ask in an issue first: a scope question is cheaper there than in a PR.
 
 ## Setup
 

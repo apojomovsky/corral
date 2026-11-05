@@ -1,13 +1,13 @@
-# 04: the dispatch loop (`corral drive`)
+# 04: the dispatch loop (`korapy drive`)
 
 Status: design, awaiting maintainer approval. No code ships with this doc.
 
-The loop is the part of corral that keeps a fleet busy with no human
-typing `corral launch`. Each tick it syncs the board from the tracker,
+The loop is the part of korapy that keeps a fleet busy with no human
+typing `korapy launch`. Each tick it syncs the board from the tracker,
 asks every registered project which tickets are eligible, consults
 admission and the quota gate, claims, and starts workers and reviewers
 through the existing launch path. Projects keep their own eligibility
-rules; corral owns the loop, ordering across projects, caps, backoff
+rules; korapy owns the loop, ordering across projects, caps, backoff
 and idempotence.
 
 This doc decides the ten points the ticket lists, with reasoning. Where
@@ -16,7 +16,7 @@ says so; implementation waits for approval.
 
 ## 0. Scope and non-goals
 
-`corral drive` runs one pass over all registered projects on this host:
+`korapy drive` runs one pass over all registered projects on this host:
 sync, mirror backlog, eligibility, gating, claims, starts, stuck-agent
 handling, bookkeeping. One pass, then exit. A timer repeats it.
 
@@ -27,9 +27,9 @@ loop deletes (section 7: the loop deletes nothing).
 
 ## 1. Process model: a timer running a one-shot pass
 
-Decision: no daemon. `corral drive` runs one pass and exits. A
+Decision: no daemon. `korapy drive` runs one pass and exits. A
 `systemd --user` timer wakes it every `drive.period` (default 5
-minutes). The timer unit ships with corral and is enabled by the
+minutes). The timer unit ships with korapy and is enabled by the
 operator; installing or enabling host units needs a maintainer's
 go-ahead per AGENTS.md, so the implementation ticket files that as a
 separate step.
@@ -69,7 +69,7 @@ root = "/srv/ops/blue_ops"
 eligibility = "blue_policy:eligible"
 ```
 
-On each pass corral imports the entry point once per project and calls:
+On each pass korapy imports the entry point once per project and calls:
 
 ```python
 def eligible(rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]: ...
@@ -83,9 +83,9 @@ review state as data. `StartRequest` names `repo`, `number` and `kind`
 weight used only to order within that project.
 
 The function is pure by contract: no tracker, forge, `gh`, network,
-clock or settings access inside. Corral supplies everything as
+clock or settings access inside. Korapy supplies everything as
 arguments, including `now`. That keeps project policy testable with
-plain rows and keeps every side effect behind corral's seams.
+plain rows and keeps every side effect behind korapy's seams.
 
 Keep requesting the in-flight tickets the project still wants,
 claimed or not. The stuck sweep restarts only tickets some project
@@ -98,13 +98,13 @@ start verdict; it only keeps the restart path open for them.
 
 Why not the alternatives:
 
-- A subprocess command adds serialization, version skew between corral
+- A subprocess command adds serialization, version skew between korapy
   and the policy, and slow failure modes, for no isolation benefit:
-  policy code already runs in-process as a corral library per the
+  policy code already runs in-process as a korapy library per the
   design doc's contract section.
-- Declarative rules in `corral.toml` cannot express real triage
+- Declarative rules in `korapy.toml` cannot express real triage
   (labels plus priority plus linked PR state plus history), and every
-  new predicate would become a project-specific setting inside corral,
+  new predicate would become a project-specific setting inside korapy,
   exactly what the line in section 2 of `00-design.md` forbids.
 
 Open question settled here: the design doc's `Project.wants()` sketch
@@ -115,8 +115,8 @@ errors (exit 4) naming the project and entry point, reported once per
 pass, and they block only that project.
 
 Ready-made policy: most projects need no policy code. The
-`corral.policies` module ships `basic(rows, *, now)`, which a
-registration names as `eligibility = "corral.policies:basic"`. It
+`korapy.policies` module ships `basic(rows, *, now)`, which a
+registration names as `eligibility = "korapy.policies:basic"`. It
 returns one `start` request per ticket that is open, not external,
 unheld (no `hold`, `needs-decision`, or `needs-triage` label, and no
 standalone `HOLD` word in the title), unblocked (empty
@@ -323,7 +323,7 @@ carrying that label are never started (section 3).
 
 This is an explicit protocol change: neither write can go through
 the outbox. `Store.enqueue` refuses anything outside `AGENT_FIELDS`
-(`board.py`), and `Tracker.write` covers only the corral-owned
+(`board.py`), and `Tracker.write` covers only the korapy-owned
 `agent` and `status` fields, while `00-design.md` reserves labels and
 comments as people-owned tracker fields. So the loop gains a narrow
 decision-write seam on `Tracker`: `comment(repo, number, body)` and
@@ -332,7 +332,7 @@ adapter behind the single `gh` seam. The people-owned rule stands:
 the loop writes only the one `needs-decision` label and its own
 comment (marked as the loop's), and never edits title, body, other
 labels or assignments; the mirror treats those two writes as
-corral-originated, never as conflicts to drop. The writes go direct,
+korapy-originated, never as conflicts to drop. The writes go direct,
 not through the outbox, and on `TrackerError` the loop keeps the
 claim, logs, and retries on a later pass: it never releases a ticket
 it failed to flag for a human.
@@ -408,15 +408,15 @@ re-check below.
   correctly) and logs why, except when the ticket has a live unit:
   a live unit is logged and left to finish, and its claim is never
   released, whatever the eligibility says (it is stopped only through
-  `corral stop`). No budget stamp is written and no give-up
+  `korapy stop`). No budget stamp is written and no give-up
   is posted. Unreadable hold labels fail closed instead: the claim
   is kept for a later pass.
-- Operator stops: `corral stop` marks the unit's registry entry done,
+- Operator stops: `korapy stop` marks the unit's registry entry done,
   so the ticket takes the completion path above and is never
   restarted. Stopping the unit directly (for example with
   `systemctl stop`) leaves the registry entry as it was, which the
   loop reads as a crash and restarts within budget. The restart
-  logbook line names `corral stop`, so an operator who stopped the
+  logbook line names `korapy stop`, so an operator who stopped the
   unit learns the lasting way to keep it stopped.
 - Restart budget: at most 3 automatic restarts per ticket in any
   sliding 24 hour window, counted as timestamps in a small state
@@ -445,13 +445,13 @@ with ticket and verdict counts, each skip with its reason, each
 release, each give-up. Per-ticket comments go to the tracker only on
 give-up and on the decision protocol; routine skips stay local.
 
-`corral snapshot` gains a `drive` section, all reads, no new state:
+`korapy snapshot` gains a `drive` section, all reads, no new state:
 `last_pass_at`, `last_exit`, `lock_held`, `paused` (with reason),
 `starts_today`, `starts_remaining`, and the last pass verdict counts
 (started, skipped by reason, released, gave up). Snapshot stays exit 0
 with section errors on failure, per its contract.
 
-`corral drive --plan` is the dry run. It reads the store and runs
+`korapy drive --plan` is the dry run. It reads the store and runs
 the whole gate order but never syncs and writes nothing: no tracker
 calls, no claims, no outbox rows, no starts, no mirror, no journal. It prints one row per candidate with the
 verdict and the reason in the same words the logbook would use, plus a

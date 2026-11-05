@@ -17,8 +17,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, registry
-from corral.tracker import NEEDS_DECISION
+from korapy import board, drive, registry
+from korapy.tracker import NEEDS_DECISION
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_stuck import AGENT, HOST, NOW, OLD, UNIT, UNIT_R1, claimed
@@ -58,7 +58,7 @@ def review_pass(
 
 class FinishedHoldersTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-review-holders-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-review-holders-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -318,7 +318,7 @@ class FixModeTest(unittest.TestCase):
 
 class ProductionFinishedForTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-review-registry-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-review-registry-")
         self.addCleanup(self.tmp.cleanup)
         self.dir = os.path.join(self.tmp.name, "agents")
         os.makedirs(self.dir)
@@ -403,7 +403,7 @@ class ReviewerPromptTest(unittest.TestCase):
 
 class ReviewPassTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-review-pass-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-review-pass-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -647,7 +647,7 @@ class ReviewPassTest(unittest.TestCase):
 
 class FixPassTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-pass-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-fix-pass-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -758,7 +758,7 @@ class FixPassTest(unittest.TestCase):
         self.assertIn("fix already landed", out)
 
     def test_a_refused_fix_launch_releases_the_fresh_claim(self):
-        from corral import launch
+        from korapy import launch
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -782,7 +782,7 @@ class FixPassTest(unittest.TestCase):
         self.assertIsNone(store.claim_of("app", 7))
 
     def test_a_live_unit_race_on_a_fix_launch_keeps_the_fresh_claim(self):
-        from corral import units
+        from korapy import units
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -806,7 +806,7 @@ class FixPassTest(unittest.TestCase):
         self.assertTrue(held.agent.startswith(drive.MANAGED_PREFIX))
 
     def test_a_released_fix_claim_fences_the_next_claim(self):
-        from corral import launch
+        from korapy import launch
 
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
@@ -847,7 +847,7 @@ class FixPassTest(unittest.TestCase):
 
 class FixBudgetTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-budget-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-fix-budget-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1000,7 +1000,7 @@ class FixBudgetTest(unittest.TestCase):
 
 class FreshFixSaveTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-save-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-fix-save-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1071,7 +1071,7 @@ class FreshFixSaveTest(unittest.TestCase):
 
 class FixBehindReviewerTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-fix-reviewer-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-fix-reviewer-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1212,7 +1212,7 @@ class FixBehindReviewerTest(unittest.TestCase):
 
 class ReviewFixDayCapTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-review-day-cap-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-review-day-cap-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")
@@ -1360,7 +1360,7 @@ class ReviewerReleaseTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-reviewer-release-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-reviewer-release-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -1450,7 +1450,7 @@ class ClaimRaceTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-claim-races-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-claim-races-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.budget = os.path.join(self.tmp.name, "restarts.json")

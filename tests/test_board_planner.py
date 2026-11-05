@@ -1,7 +1,7 @@
 """Ticket 1: board types, the standard spec and the pure planner.
 
 Tests for the provider-neutral board provisioning types in
-``corral.tracker``: ``FieldSpec``, ``BoardSpec``, ``BoardProvision``,
+``korapy.tracker``: ``FieldSpec``, ``BoardSpec``, ``BoardProvision``,
 ``BoardPopulate``, the ``BoardProvisioner`` protocol, ``STANDARD_BOARD``,
 ``effective_spec`` and the pure ``plan_board`` planner. No seams, no
 provider: every input is plain data, so nothing here can reach the
@@ -10,8 +10,8 @@ outside world.
 
 import unittest
 
-from corral import settings, tracker as iface
-from corral.tracker import (
+from korapy import settings, tracker as iface
+from korapy.tracker import (
     BoardPlan,
     BoardPopulate,
     BoardProvision,

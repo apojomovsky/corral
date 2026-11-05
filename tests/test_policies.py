@@ -13,9 +13,9 @@ import unittest
 from typing import Any
 from unittest import mock
 
-from corral import eligibility
-from corral import policies
-from corral import tracker
+from korapy import eligibility
+from korapy import policies
+from korapy import tracker
 
 
 def row(number, repo="app", **fields):
@@ -179,7 +179,7 @@ class WeightsTest(unittest.TestCase):
         self.assertEqual(selected(rows), [("app", 9), ("app", 7)])
 
     def test_resolve_orders_by_weight_then_repo_number(self):
-        policy = eligibility.load_policy("corral.policies:basic", project="blue")
+        policy = eligibility.load_policy("korapy.policies:basic", project="blue")
         rows = [
             row(9, priority="normal"),
             row(7, priority="urgent"),
@@ -214,13 +214,13 @@ class PurityTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {}, clear=True):
             third = policies.basic(rows, now=1000.0)
         self.assertEqual(first, third)
-        module = sys.modules["corral.policies"]
+        module = sys.modules["korapy.policies"]
         namespace = vars(module)
         for name in ("time", "environ", "settings"):
             self.assertNotIn(name, namespace)
         for value in namespace.values():
             self.assertIsNot(value, sys.modules.get("time"))
-            self.assertIsNot(value, sys.modules.get("corral.settings"))
+            self.assertIsNot(value, sys.modules.get("korapy.settings"))
             self.assertIsNot(value, os.environ)
         source = inspect.getsource(module)
         for token in (
@@ -286,10 +286,10 @@ class ConstantsTest(unittest.TestCase):
 
 
 class ResolveTest(unittest.TestCase):
-    def test_entry_resolves_as_corral_policies_basic(self):
-        self.assertIsNone(eligibility.check_entry("corral.policies:basic", project="blue"))
-        policy = eligibility.load_policy("corral.policies:basic", project="blue")
-        self.assertEqual(policy.entry, "corral.policies:basic")
+    def test_entry_resolves_as_korapy_policies_basic(self):
+        self.assertIsNone(eligibility.check_entry("korapy.policies:basic", project="blue"))
+        policy = eligibility.load_policy("korapy.policies:basic", project="blue")
+        self.assertEqual(policy.entry, "korapy.policies:basic")
         requests = policy.eligible([row(7)], now=1000.0)
         self.assertEqual(
             [(request.repo, request.number) for request in requests],

@@ -1,4 +1,4 @@
-"""The agent registry and `corral agent`: temp dirs and fake pid probes only."""
+"""The agent registry and `korapy agent`: temp dirs and fake pid probes only."""
 
 import io
 import json
@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, registry as reg, runtimes, settings
+from korapy import cli, registry as reg, runtimes, settings
 
 T0 = 1_800_000_000.0
 HOST = "host-1"
@@ -216,7 +216,7 @@ class LivenessTest(RegistryCase):
 
 class ConfigTest(unittest.TestCase):
     def resolved(self, **values):
-        env = {f"CORRAL_REGISTRY_{k.upper()}": str(v) for k, v in values.items()}
+        env = {f"KORAPY_REGISTRY_{k.upper()}": str(v) for k, v in values.items()}
         return settings.resolve(env=env)
 
     def test_defaults(self):
@@ -237,7 +237,7 @@ class ConfigTest(unittest.TestCase):
     def test_every_settings_provider_is_listed(self):
         src = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
         found = set()
-        for here, _, names in os.walk(os.path.join(src, "corral")):
+        for here, _, names in os.walk(os.path.join(src, "korapy")):
             for name in names:
                 if not name.endswith(".py"):
                     continue
@@ -394,11 +394,11 @@ class CliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        env = {"CORRAL_STATE": tmp.name, "CORRAL_CONFIG": os.path.join(tmp.name, "none")}
+        env = {"KORAPY_STATE": tmp.name, "KORAPY_CONFIG": os.path.join(tmp.name, "none")}
         patch = mock.patch.dict(os.environ, env)
         patch.start()
         self.addCleanup(patch.stop)
-        for key in [k for k in os.environ if k.startswith("CORRAL_REGISTRY_")]:
+        for key in [k for k in os.environ if k.startswith("KORAPY_REGISTRY_")]:
             os.environ.pop(key)
         self.dir = os.path.join(tmp.name, "agents")
 
@@ -431,7 +431,7 @@ class CliTest(unittest.TestCase):
         self.assertEqual(self.run_cli("heartbeat", "nobody")[0], 4)
         self.assertEqual(self.run_cli("register", "w1", "--runtime", "omp", "--repo", "lib")[0], 4)
         self.assertEqual(self.run_cli("register", "w1", "--runtime", "bogus")[0], 4)
-        with mock.patch.dict(os.environ, {"CORRAL_REGISTRY_GONE_S": "1"}):
+        with mock.patch.dict(os.environ, {"KORAPY_REGISTRY_GONE_S": "1"}):
             code, _, err = self.run_cli("list")
         self.assertEqual(code, 4)
         self.assertIn("gone_s", err)

@@ -1,4 +1,4 @@
-"""Tests for corral.disk: pressure, the reclaim plan, `--apply`, and the gate.
+"""Tests for korapy.disk: pressure, the reclaim plan, `--apply`, and the gate.
 
 All seams are fakes. The real removal seam is parked behind
 `_REAL_PRODUCTION_REMOVE` and replaced at module level with
@@ -20,7 +20,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from unittest import mock
 
-from corral import disk, diskcli, doctor, gc, launch, settings
+from korapy import disk, diskcli, doctor, gc, launch, settings
 from tests.test_doctor import env as doctor_env
 
 GB = 1024**3
@@ -72,7 +72,7 @@ def live_entry(repo, number):
 
 class DiskCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-disk-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-disk-")
         self.addCleanup(self.tmp.cleanup)
         self.state = os.path.join(self.tmp.name, "state")
         self.cache = os.path.join(self.tmp.name, "cache")
@@ -561,7 +561,7 @@ class LaunchGateTest(DiskCase):
     def target(self):
         return SimpleNamespace(
             repo="demo",
-            prefix="corral-agent-",
+            prefix="korapy-agent-",
             root="",
             cap=1,
             resolved=settings.resolve(env={}),
@@ -571,9 +571,9 @@ class LaunchGateTest(DiskCase):
         return mock.patch.dict(
             os.environ,
             {
-                "CORRAL_STATE": self.state,
-                "CORRAL_CACHE": self.cache,
-                "CORRAL_SESSIONS": self.sessions,
+                "KORAPY_STATE": self.state,
+                "KORAPY_CACHE": self.cache,
+                "KORAPY_SESSIONS": self.sessions,
             },
         )
 
@@ -631,10 +631,10 @@ class CliTest(DiskCase):
         with mock.patch.dict(
             os.environ,
             {
-                "CORRAL_STATE": self.state,
-                "CORRAL_CACHE": self.cache,
-                "CORRAL_SESSIONS": self.sessions,
-                "CORRAL_CONFIG": os.path.join(self.tmp.name, "config"),
+                "KORAPY_STATE": self.state,
+                "KORAPY_CACHE": self.cache,
+                "KORAPY_SESSIONS": self.sessions,
+                "KORAPY_CONFIG": os.path.join(self.tmp.name, "config"),
             },
         ):
             with mock.patch.object(diskcli.settings, "find_root", return_value=None):
@@ -671,12 +671,12 @@ class CliTest(DiskCase):
         self.assertIn("pressure: critical", out)
 
     def test_settings_register_disk_keys(self):
-        from corral import settings
+        from korapy import settings
 
         self.assertEqual(settings.REGISTRY["disk.min_free_pct"].default, 10)
         self.assertEqual(settings.REGISTRY["disk.min_free_gb"].default, 5)
         self.assertEqual(settings.REGISTRY["disk.session_retention_days"].default, 14)
-        self.assertIn("corral.disk", settings.PROVIDERS)
+        self.assertIn("korapy.disk", settings.PROVIDERS)
 
 
 if __name__ == "__main__":

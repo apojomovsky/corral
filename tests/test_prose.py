@@ -1,6 +1,6 @@
 import unittest
 
-from corral import prose
+from korapy import prose
 
 
 class NormalizeTest(unittest.TestCase):
@@ -451,7 +451,7 @@ class VerifyTest(unittest.TestCase):
 import io
 from contextlib import redirect_stdout, redirect_stderr
 
-from corral import cli
+from korapy import cli
 
 
 class RenderTest(unittest.TestCase):

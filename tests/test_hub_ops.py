@@ -14,11 +14,11 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from corral import hub, paths
+from korapy import hub, paths
 
 
 def temp_db():
-    tmp = tempfile.TemporaryDirectory(prefix="corral-hub-ops-")
+    tmp = tempfile.TemporaryDirectory(prefix="korapy-hub-ops-")
     return tmp, os.path.join(tmp.name, "hub.sqlite")
 
 
@@ -100,7 +100,7 @@ class RemoveHostTest(StoreCase):
 
     def test_remove_is_logged_without_the_token(self):
         token = self.add_host("host-1")
-        with self.assertLogs("corral.hub", level="INFO") as logs:
+        with self.assertLogs("korapy.hub", level="INFO") as logs:
             hub.remove_host(self.store, "host-1", now=2000.0)
         self.assertTrue(any("host-1" in line for line in logs.output))
         self.assertFalse(any(token in line for line in logs.output))
@@ -158,7 +158,7 @@ class ReleaseClaimTest(StoreCase):
     def test_release_logs_the_reason(self):
         self.add_host("host-1")
         hub.grant(self.store, "app", 7, "drive-aaa", "host-1", now=1000.0, lease_ttl_s=90)
-        with self.assertLogs("corral.hub", level="INFO") as logs:
+        with self.assertLogs("korapy.hub", level="INFO") as logs:
             hub.release_claim(self.store, "app", 7, now=2000.0, reason="stuck unit")
         self.assertTrue(any("stuck unit" in line for line in logs.output))
 
@@ -186,7 +186,7 @@ class RotateTokenTest(StoreCase):
 
     def test_rotated_token_never_touches_the_logs(self):
         self.add_host("host-1")
-        with self.assertLogs("corral.hub", level="INFO") as logs:
+        with self.assertLogs("korapy.hub", level="INFO") as logs:
             new = hub.rotate_token(self.store, "host-1")
         self.assertTrue(any("host-1" in line for line in logs.output))
         self.assertFalse(any(new in line for line in logs.output))
@@ -194,7 +194,7 @@ class RotateTokenTest(StoreCase):
 
 class OperatorCommandTest(unittest.TestCase):
     def parse(self, *argv):
-        from corral import cli
+        from korapy import cli
 
         return cli.build_parser().parse_args(["hub", *argv])
 
@@ -202,12 +202,12 @@ class OperatorCommandTest(unittest.TestCase):
         from unittest import mock
 
         args = self.parse(*argv)
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 return args.func(args), state
 
     def seed(self, state, host_id="host-1"):
-        store = hub.open_db(paths.hub_db_path({"CORRAL_HUB_STATE": state}))
+        store = hub.open_db(paths.hub_db_path({"KORAPY_HUB_STATE": state}))
         try:
             token = hub.add_host(store, host_id)
             receipt = hub.grant(store, "app", 7, "drive-aaa", host_id, now=1000.0, lease_ttl_s=90)
@@ -218,8 +218,8 @@ class OperatorCommandTest(unittest.TestCase):
     def test_remove_host_verb_bumps_and_second_remove_is_usage(self):
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 self.seed(state)
                 args = self.parse("remove-host", "--id", "host-1")
                 self.assertEqual(args.func(args), 0)
@@ -229,8 +229,8 @@ class OperatorCommandTest(unittest.TestCase):
     def test_release_verb_frees_the_ticket(self):
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 self.seed(state)
                 args = self.parse("release", "app", "7", "--reason", "stuck unit")
                 self.assertEqual(args.func(args), 0)
@@ -255,8 +255,8 @@ class OperatorCommandTest(unittest.TestCase):
     def test_rotate_token_verb_prints_a_working_token_once(self):
         from unittest import mock
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 old, _ = self.seed(state)
                 args = self.parse("rotate-token", "--id", "host-1")
                 out = io.StringIO()
@@ -281,7 +281,7 @@ class OperatorCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr
         from unittest import mock
 
-        from corral import paths
+        from korapy import paths
 
         for argv in (
             ("remove-host", "--id", "host-1"),
@@ -305,12 +305,12 @@ class OperatorCommandTest(unittest.TestCase):
         from contextlib import redirect_stderr
         from unittest import mock
 
-        from corral import hub as hub_module
-        from corral import paths
-        from corral import settings
+        from korapy import hub as hub_module
+        from korapy import paths
+        from korapy import settings
 
-        with tempfile.TemporaryDirectory(prefix="corral-hub-ops-cli-") as state:
-            with mock.patch.dict(os.environ, {"CORRAL_HUB_STATE": state}):
+        with tempfile.TemporaryDirectory(prefix="korapy-hub-ops-cli-") as state:
+            with mock.patch.dict(os.environ, {"KORAPY_HUB_STATE": state}):
                 export_file = os.path.join(state, "hub-export.json")
                 with open(export_file, "w", encoding="utf-8") as handle:
                     json.dump(

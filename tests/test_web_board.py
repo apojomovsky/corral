@@ -7,7 +7,7 @@ with the right types. Source-discipline tests pin the view's own
 rules: named constants, the `body=0` request shape, scheme-checked
 tracker links, and no ticket body in the rendered output. Offline: a
 real HTTP server on a loopback ephemeral port, a scratch board store,
-source reads over the packaged `corral/web/` files. No `gh`, no
+source reads over the packaged `korapy/web/` files. No `gh`, no
 network beyond loopback, no real state dirs.
 """
 
@@ -18,13 +18,13 @@ import tempfile
 import unittest
 from importlib import resources
 
-from corral import board, serve
+from korapy import board, serve
 from tests.test_serve import FakeBuilder, ServeCase, healthy_doc
 from tests.test_snapshot import T0
 
 
 def web_bytes(name):
-    return resources.files("corral").joinpath(f"web/{name}").read_bytes()
+    return resources.files("korapy").joinpath(f"web/{name}").read_bytes()
 
 
 def stored_board_with_text(path, *itemspec, claims=()):
@@ -64,7 +64,7 @@ class BoardSlimParam(ServeCase):
         return json.loads(body)
 
     def test_body_zero_drops_exactly_body_and_extra(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-slim-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-slim-") as tmp:
             opener = self.open_store(
                 tmp,
                 {"number": 3, "extra": {"sprint": "12"}},
@@ -85,7 +85,7 @@ class BoardSlimParam(ServeCase):
                     self.assertEqual(thin[key], fat[key], key)
 
     def test_default_reply_still_carries_body_and_extra(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-slim-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-slim-") as tmp:
             opener = self.open_store(tmp, {"number": 3, "extra": {"sprint": "12"}})
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             payload = self.get_json(server, "/v1/board")
@@ -94,7 +94,7 @@ class BoardSlimParam(ServeCase):
             self.assertEqual(row["extra"], {"sprint": "12"})
 
     def test_body_one_reads_like_the_default(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-slim-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-slim-") as tmp:
             opener = self.open_store(tmp, {"number": 3, "extra": {"sprint": "12"}})
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             default = self.get_json(server, "/v1/board")
@@ -102,7 +102,7 @@ class BoardSlimParam(ServeCase):
             self.assertEqual(explicit, default)
 
     def test_body_zero_paging_honors_total(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-slim-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-slim-") as tmp:
             specs = [{"number": n, "fetched_at": T0 + n} for n in range(1, 4)]
             opener = self.open_store(tmp, *specs)
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
@@ -116,7 +116,7 @@ class BoardSlimParam(ServeCase):
                 self.assertNotIn("extra", row)
 
     def test_body_bad_value_is_a_400(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-slim-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-slim-") as tmp:
             opener = self.open_store(tmp, {"number": 3})
             server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
             for target in ("/v1/board?body=many", "/v1/board?body=2", "/v1/board?body="):
@@ -128,7 +128,7 @@ class BoardSlimParam(ServeCase):
 
 class BoardContract(ServeCase):
     def test_board_rows_carry_the_fields_the_view_reads(self):
-        with tempfile.TemporaryDirectory(prefix="corral-serve-board-view-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-view-") as tmp:
             stored_board_with_text(
                 os.path.join(tmp, "board.sqlite"),
                 {

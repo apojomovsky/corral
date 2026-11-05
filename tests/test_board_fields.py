@@ -27,9 +27,9 @@ import unittest
 from typing import NoReturn
 from unittest import mock
 
-from corral import board, sync, tracker
-from corral.github import gh
-from corral.github import tracker as ghtracker
+from korapy import board, sync, tracker
+from korapy.github import gh
+from korapy.github import tracker as ghtracker
 from tests import suiteguard
 from tests.test_tracker import FakeRun, FakeTracker, reading
 
@@ -52,7 +52,7 @@ def _guarded_pacer_factory() -> NoReturn:
     raise AssertionError("test reached the default GraphQL pacer: inject a fake pacer")
 
 
-_guarded_pacer_factory._corral_pacer_guard = True  # ty: ignore[unresolved-attribute]
+_guarded_pacer_factory._korapy_pacer_guard = True  # ty: ignore[unresolved-attribute]
 gh._pacer = _guarded_pacer_factory  # ty: ignore[invalid-assignment]
 
 
@@ -66,7 +66,7 @@ class _GuardedPacerClass(_REAL_PACER_CLASS):
     builds a real pacer, so file-backed pacer tests keep working.
     """
 
-    _corral_pacer_guard = True
+    _korapy_pacer_guard = True
 
     def __init__(self, path, *args, **kwargs):
         default = os.path.abspath(gh.pacing_path())
@@ -207,7 +207,7 @@ class EffectivePriorityTest(unittest.TestCase):
 
 class StoreExtraMergeTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-fields-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-fields-")
         self.addCleanup(self.tmp.cleanup)
         self.store = store_in(self.tmp.name)
         self.addCleanup(self.store.close)
@@ -501,7 +501,7 @@ class SyncExtraTest(unittest.TestCase):
     T0 = 1_800_000_100.0
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-fields-sync-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-fields-sync-")
         self.addCleanup(self.tmp.cleanup)
         self.store = store_in(self.tmp.name)
         self.addCleanup(self.store.close)
@@ -856,7 +856,7 @@ class RowPriorityTest(unittest.TestCase):
     def test_board_priority_wins_in_the_policy_row(self):
         from tests.test_eligibility import item as board_item
 
-        from corral import eligibility
+        from korapy import eligibility
 
         row = eligibility.row_from_item(board_item(priority="low", extra={"priority": "high"}))
         self.assertEqual(row.priority, "high")
@@ -864,7 +864,7 @@ class RowPriorityTest(unittest.TestCase):
     def test_label_priority_stands_without_a_board_key(self):
         from tests.test_eligibility import item as board_item
 
-        from corral import eligibility
+        from korapy import eligibility
 
         row = eligibility.row_from_item(board_item(priority="low", extra={}))
         self.assertEqual(row.priority, "low")
@@ -872,7 +872,7 @@ class RowPriorityTest(unittest.TestCase):
     def test_a_list_board_priority_never_reaches_the_policy_row(self):
         from tests.test_eligibility import item as board_item
 
-        from corral import eligibility
+        from korapy import eligibility
 
         row = eligibility.row_from_item(board_item(priority="low", extra={"priority": ["high"]}))
         self.assertEqual(row.priority, "low")
@@ -997,10 +997,10 @@ class PacerGuardTest(unittest.TestCase):
     """No test reaches the default pacer file or a real subprocess."""
 
     def test_tripwire_watches_the_real_pacer_factory(self):
-        self.assertTrue(getattr(gh._pacer, "_corral_pacer_guard", False))
+        self.assertTrue(getattr(gh._pacer, "_korapy_pacer_guard", False))
 
     def test_tripwire_watches_direct_pacer_construction(self):
-        self.assertTrue(getattr(gh.GraphqlPacer, "_corral_pacer_guard", False))
+        self.assertTrue(getattr(gh.GraphqlPacer, "_korapy_pacer_guard", False))
         self.assertIsNot(gh.GraphqlPacer, _REAL_PACER_CLASS)
 
     def test_guarded_factory_records_and_raises_without_delegating(self):
@@ -1037,7 +1037,7 @@ class PacerGuardTest(unittest.TestCase):
         record.assert_called_once_with("constructed the default GraphQL pacer (no injected pacer)")
 
     def test_construction_off_the_default_path_builds_a_real_pacer(self):
-        with tempfile.TemporaryDirectory(prefix="corral-pacer-guard-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-pacer-guard-") as tmp:
             pacer = gh.GraphqlPacer(os.path.join(tmp, "pacing.json"))
         self.assertIsInstance(pacer, _REAL_PACER_CLASS)
 

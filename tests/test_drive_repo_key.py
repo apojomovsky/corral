@@ -1,7 +1,7 @@
 """A registry short name is never a claim's tracker repo. Fakes only.
 
 The registry entry for a worker records its ticket with the short
-``[[repo]]`` name from the project's ``corral.toml`` (``app``), while
+``[[repo]]`` name from the project's ``korapy.toml`` (``app``), while
 the board store claims the same ticket under the tracker repo
 (``acme/app``). Every join between the two goes through the one
 short-to-tracker resolver; a raw ``ticket != (claim.repo,
@@ -12,7 +12,7 @@ The lock is a real ``flock`` over temporary files only; the store is a
 temporary board store; the registry and the project config are real
 files in temporary directories, written through the production
 writers (``registry.register``/``done``, ``store.claim``,
-``corral.toml`` plus ``tracker.repo``). Unit listings are a recording
+``korapy.toml`` plus ``tracker.repo``). Unit listings are a recording
 fake at the seam. No ``gh``, no systemd, no network, no real state
 dir.
 """
@@ -23,8 +23,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, registry
-from corral import projects as projects_mod
+from korapy import board, drive, registry
+from korapy import projects as projects_mod
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_drive_review import review_pass
@@ -60,11 +60,11 @@ class RepoKeyCase(unittest.TestCase):
     """A project whose short name and tracker repo differ, on disk."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-repo-key-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-repo-key-")
         self.addCleanup(self.tmp.cleanup)
         self.root = os.path.join(self.tmp.name, "ops")
         os.makedirs(self.root)
-        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(TOML)
         self.regdir = os.path.join(self.tmp.name, "agents")
         os.makedirs(self.regdir)

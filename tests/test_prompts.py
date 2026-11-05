@@ -1,4 +1,4 @@
-"""Built-in role prompts, their overrides, and `corral launch --role`.
+"""Built-in role prompts, their overrides, and `korapy launch --role`.
 
 Core tests use temp ops roots with the environment pointed at temp dirs;
 no test touches the real state, config or session dirs, the network, or a
@@ -14,7 +14,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from corral import board, doctor, launchcli, paths, prompts, promptscli, settings
+from korapy import board, doctor, launchcli, paths, prompts, promptscli, settings
 from tests.test_board import reading
 from tests.test_doctor import env as doctor_env
 from tests.test_launch import OpsCase
@@ -31,13 +31,13 @@ FULL = {
 
 
 def temp_env(tmp):
-    """The environment with every corral dir pointed at temp dirs."""
-    env = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+    """The environment with every korapy dir pointed at temp dirs."""
+    env = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
     env.update(
-        CORRAL_STATE=os.path.join(tmp, "state"),
-        CORRAL_SESSIONS=os.path.join(tmp, "sessions"),
-        CORRAL_CONFIG=os.path.join(tmp, "config"),
-        CORRAL_CACHE=os.path.join(tmp, "cache"),
+        KORAPY_STATE=os.path.join(tmp, "state"),
+        KORAPY_SESSIONS=os.path.join(tmp, "sessions"),
+        KORAPY_CONFIG=os.path.join(tmp, "config"),
+        KORAPY_CACHE=os.path.join(tmp, "cache"),
     )
     return env
 
@@ -46,7 +46,7 @@ class PromptsCase(unittest.TestCase):
     """A temp ops root with the environment pointed at temp dirs."""
 
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-prompts-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-prompts-"))
         self.root = os.path.join(self.tmp, "ops")
         os.makedirs(self.root)
         self.enterContext(mock.patch.dict(os.environ, temp_env(self.tmp), clear=True))
@@ -81,13 +81,13 @@ class RolesTest(PromptsCase):
     def test_the_settings_and_the_provider_are_registered(self):
         for role in prompts.ROLES:
             self.assertEqual(settings.REGISTRY[f"prompts.{role}"].default, "")
-        self.assertIn("corral.prompts", settings.PROVIDERS)
+        self.assertIn("korapy.prompts", settings.PROVIDERS)
 
 
 class PlaceholdersTest(PromptsCase):
     def setUp(self):
         super().setUp()
-        self.write("corral.toml", '[prompts]\nworker = "custom.md"\n')
+        self.write("korapy.toml", '[prompts]\nworker = "custom.md"\n')
         self.write("custom.md", "ticket {issue}: {title}\n")
 
     def test_an_unknown_placeholder_names_the_placeholder_and_the_role(self):
@@ -119,27 +119,27 @@ class PrecedenceTest(PromptsCase):
         self.assertEqual(text, prompts._builtin_text("worker"))
 
     def test_file_beats_builtin_and_setting_beats_file(self):
-        self.write(os.path.join(".corral", "prompts", "worker.md"), "file text {title}\n")
+        self.write(os.path.join(".korapy", "prompts", "worker.md"), "file text {title}\n")
         text, source = prompts.effective("worker", self.root)
         self.assertEqual((text, source), ("file text {title}\n", "file"))
-        self.write("corral.toml", '[prompts]\nworker = "custom.md"\n')
+        self.write("korapy.toml", '[prompts]\nworker = "custom.md"\n')
         self.write("custom.md", "setting text {title}\n")
         text, source = prompts.effective("worker", self.root)
         self.assertEqual((text, source), ("setting text {title}\n", "setting"))
 
     def test_a_setting_path_is_relative_to_the_ops_root(self):
-        self.write("corral.toml", '[prompts]\nworker = "sub/custom.md"\n')
+        self.write("korapy.toml", '[prompts]\nworker = "sub/custom.md"\n')
         self.write(os.path.join("sub", "custom.md"), "nested {title}\n")
         text, source = prompts.effective("worker", self.root)
         self.assertEqual((text, source), ("nested {title}\n", "setting"))
 
     def test_a_setting_naming_a_missing_file_is_a_configuration_error(self):
-        self.write("corral.toml", '[prompts]\nworker = "missing.md"\n')
+        self.write("korapy.toml", '[prompts]\nworker = "missing.md"\n')
         with self.assertRaises(prompts.PromptsError):
             prompts.effective("worker", self.root)
 
     def test_a_directory_at_the_ejected_path_is_a_configuration_error(self):
-        os.makedirs(os.path.join(self.root, ".corral", "prompts", "worker.md"))
+        os.makedirs(os.path.join(self.root, ".korapy", "prompts", "worker.md"))
         with self.assertRaises(prompts.PromptsError):
             prompts.effective("worker", self.root)
 
@@ -147,13 +147,13 @@ class PrecedenceTest(PromptsCase):
 class EjectTest(PromptsCase):
     def test_eject_writes_the_hash_line_then_the_builtin(self):
         path = prompts.eject("worker", self.root)
-        self.assertEqual(path, os.path.join(self.root, ".corral", "prompts", "worker.md"))
+        self.assertEqual(path, os.path.join(self.root, ".korapy", "prompts", "worker.md"))
         with open(path, encoding="utf-8") as handle:
             first, rest = handle.readline().rstrip("\n"), handle.read()
         import hashlib
 
         digest = hashlib.sha256(prompts._builtin_text("worker").encode("utf-8")).hexdigest()
-        self.assertEqual(first, f"<!-- corral-prompt sha256:{digest} -->")
+        self.assertEqual(first, f"<!-- korapy-prompt sha256:{digest} -->")
         self.assertEqual(rest, prompts._builtin_text("worker"))
         self.assertFalse(prompts.stale("worker", self.root))
 
@@ -166,7 +166,7 @@ class EjectTest(PromptsCase):
     def test_stale_is_none_when_not_ejected_or_unmarked(self):
         self.assertIsNone(prompts.stale("worker", self.root))
         self.assertIsNone(prompts.stale("worker", None))
-        self.write(os.path.join(".corral", "prompts", "worker.md"), "no marker {title}\n")
+        self.write(os.path.join(".korapy", "prompts", "worker.md"), "no marker {title}\n")
         self.assertIsNone(prompts.stale("worker", self.root))
 
     def test_stale_flips_when_the_builtin_hash_changes(self):
@@ -185,7 +185,7 @@ class CheckTest(PromptsCase):
         self.assertIn("prompts ok", out)
 
     def test_an_unknown_placeholder_in_an_override_is_invalid(self):
-        self.write(os.path.join(".corral", "prompts", "worker.md"), "bad {bogus}\n")
+        self.write(os.path.join(".korapy", "prompts", "worker.md"), "bad {bogus}\n")
         result = prompts.check(self.root)
         self.assertFalse(result.clean)
         self.assertIn("worker", result.invalid)
@@ -205,12 +205,12 @@ class CheckTest(PromptsCase):
             self.assertIn("stale", out)
 
     def test_a_missing_setting_file_is_a_configuration_error(self):
-        self.write("corral.toml", '[prompts]\nworker = "missing.md"\n')
+        self.write("korapy.toml", '[prompts]\nworker = "missing.md"\n')
         with self.assertRaises(prompts.PromptsError):
             prompts.check(self.root)
         code, _, err = self.run_prompts(["check"])
         self.assertEqual(code, 4)
-        self.assertIn("corral:", err)
+        self.assertIn("korapy:", err)
 
     def test_show_prints_the_effective_template_unrendered(self):
         code, out, _ = self.run_prompts(["show", "worker"])
@@ -221,10 +221,10 @@ class CheckTest(PromptsCase):
     def test_eject_prints_the_path_and_needs_force_the_second_time(self):
         code, out, _ = self.run_prompts(["eject", "triage"])
         self.assertEqual(code, 0)
-        self.assertEqual(out.strip(), os.path.join(self.root, ".corral", "prompts", "triage.md"))
+        self.assertEqual(out.strip(), os.path.join(self.root, ".korapy", "prompts", "triage.md"))
         code, _, err = self.run_prompts(["eject", "triage"])
         self.assertEqual(code, 4)
-        self.assertIn("corral:", err)
+        self.assertIn("korapy:", err)
         code, _, _ = self.run_prompts(["eject", "triage", "--force"])
         self.assertEqual(code, 0)
 
@@ -332,7 +332,7 @@ class DoctorGatheringTest(unittest.TestCase):
         for error in (
             prompts.PromptsError("bad override"),
             settings.SettingsError("bad settings"),
-            doctor.paths.PathError("CORRAL_CONFIG must be an absolute path"),
+            doctor.paths.PathError("KORAPY_CONFIG must be an absolute path"),
             OSError("no cwd"),
         ):
             with self.subTest(error=type(error).__name__):
@@ -370,7 +370,7 @@ class LaunchRoleTest(OpsCase):
         self.plant("lib", 5, "Board title")
         code, out, err = self.run_launch(["launch", "lib", "5", "--role", "worker"])
         self.assertEqual((code, err), (0, ""))
-        self.assertIn("launched corral-agent-lib-5", out)
+        self.assertIn("launched korapy-agent-lib-5", out)
         prompt = self.prompt_of("lib", 5)
         workdir = os.path.realpath(
             os.path.join(self.root, "clones", "lib", ".worktrees", "5-board-title")
@@ -383,7 +383,7 @@ class LaunchRoleTest(OpsCase):
         self.assertNotIn("}", prompt)
 
     def test_a_bad_override_fails_before_any_worktree_exists(self):
-        override = os.path.join(self.root, ".corral", "prompts", "worker.md")
+        override = os.path.join(self.root, ".korapy", "prompts", "worker.md")
         os.makedirs(os.path.dirname(override))
         with open(override, "w", encoding="utf-8") as handle:
             handle.write("{bogus}\n")
@@ -429,8 +429,8 @@ class LaunchRoleTest(OpsCase):
         code, _, err = self.run_launch(["launch", "lib", "9", "--title", "feat: x"])
         self.assertEqual(code, 4)
 
-    def test_the_launch_verb_is_registered_on_the_corral_command(self):
-        from corral import cli
+    def test_the_launch_verb_is_registered_on_the_korapy_command(self):
+        from korapy import cli
 
         with redirect_stdout(io.StringIO()):
             self.assertEqual(cli.main(["launch", "--help"]), 0)

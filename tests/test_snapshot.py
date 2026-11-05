@@ -1,4 +1,4 @@
-"""`corral snapshot`: one read-only view of the host.
+"""`korapy snapshot`: one read-only view of the host.
 
 Offline: every reader is faked. No `gh`, no systemd, no network, no
 real state dirs.
@@ -13,7 +13,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, registry, resources as R, settings, snapshot
+from korapy import cli, registry, resources as R, settings, snapshot
 
 T0 = 1_800_000_000.0
 HOST = "host-1"
@@ -119,7 +119,7 @@ def resolved_settings(**extra):
     values = {
         "admission.total_cap": 4,
         "admission.repo_cap": 1,
-        "agents.unit_prefix": "corral-agent-",
+        "agents.unit_prefix": "korapy-agent-",
         "registry.count_toward_cap": True,
         "registry.stale_s": 600,
         "registry.gone_s": 3600,
@@ -195,7 +195,7 @@ def doc_of(**overrides):
 
 class FullDocument(unittest.TestCase):
     def test_full_document_pins_schema(self):
-        from corral import paths
+        from korapy import paths
 
         doc = doc_of()
         state, cache = paths.state_dir(), paths.cache_dir()
@@ -720,9 +720,9 @@ class ChargedMatchesGate(unittest.TestCase):
         ]
 
     def gate_charged(self, rows):
-        from corral import launch
+        from korapy import launch
 
-        with mock.patch("corral.registry.visible", return_value=list(rows)):
+        with mock.patch("korapy.registry.visible", return_value=list(rows)):
             return launch._charged_usage(
                 "proj-a",
                 self.PREFIX_A,
@@ -781,7 +781,7 @@ class ChargedMatchesGate(unittest.TestCase):
         report the gate's totals and by_project keys, with no phantom
         prefix key and no double charge.
         """
-        from corral import launch
+        from korapy import launch
 
         rows = [
             (
@@ -807,7 +807,7 @@ class ChargedMatchesGate(unittest.TestCase):
         def list_fn(prefix):
             return list(table.get(prefix, []))
 
-        with mock.patch("corral.registry.visible", return_value=list(rows)):
+        with mock.patch("korapy.registry.visible", return_value=list(rows)):
             charged = launch._charged_usage(
                 "proj-a",
                 self.PREFIX_A,
@@ -850,19 +850,19 @@ class ChargedMatchesGate(unittest.TestCase):
 
     def test_no_projects_ticketless_unit_keys_match(self):
         """Gate and snapshot key an unregistered ticketless unit the same way."""
-        from corral import launch
+        from korapy import launch
 
-        unit = "corral-agent-lib-5"
+        unit = "korapy-agent-lib-5"
         rows = [({"id": unit, "role": None, "ticket": None, "host": HOST}, "live")]
 
         def list_fn(prefix):
-            self.assertEqual(prefix, "corral-agent-")
+            self.assertEqual(prefix, "korapy-agent-")
             return [(unit, "active", "running")]
 
-        with mock.patch("corral.registry.visible", return_value=list(rows)):
+        with mock.patch("korapy.registry.visible", return_value=list(rows)):
             charged = launch._charged_usage(
-                "corral-agent-",
-                "corral-agent-",
+                "korapy-agent-",
+                "korapy-agent-",
                 [],
                 list_fn,
                 dict(self.ROLES),
@@ -876,11 +876,11 @@ class ChargedMatchesGate(unittest.TestCase):
             doc_pressure(),
             [],
             None,
-            live_by_owner={"corral-agent-": [unit]},
+            live_by_owner={"korapy-agent-": [unit]},
             project_names=[],
         )
         self.assertEqual(set(charged.by_project), set(section["by_project"]))
-        self.assertEqual(set(section["by_project"]), {"corral-agent-"})
+        self.assertEqual(set(section["by_project"]), {"korapy-agent-"})
         self.assertNotIn("", section["by_project"])
 
 
@@ -973,20 +973,20 @@ class MappingLimitsBranch(unittest.TestCase):
 
 class DefaultMeasured(unittest.TestCase):
     def test_agent_scope_reads_the_leaf(self):
-        from corral import units
+        from korapy import units
 
         measured = R.Measured(cpu_usage_usec=5000, memory_mb=12.5, pids=8)
-        with mock.patch("corral.resources.read_slice_use", return_value=(measured, [])) as reader:
-            got = snapshot.default_measured("agent", "corral-agent-lib-5", "proj-a")
+        with mock.patch("korapy.resources.read_slice_use", return_value=(measured, [])) as reader:
+            got = snapshot.default_measured("agent", "korapy-agent-lib-5", "proj-a")
         self.assertEqual(got, measured)
         (directory,), _ = reader.call_args
-        self.assertEqual(directory, units.agent_cgroup("proj-a", "corral-agent-lib-5"))
+        self.assertEqual(directory, units.agent_cgroup("proj-a", "korapy-agent-lib-5"))
 
     def test_project_scope_reads_the_slice(self):
-        from corral import units
+        from korapy import units
 
         measured = R.Measured(cpu_usage_usec=6000, memory_mb=20.0, pids=12)
-        with mock.patch("corral.resources.read_slice_use", return_value=(measured, [])) as reader:
+        with mock.patch("korapy.resources.read_slice_use", return_value=(measured, [])) as reader:
             got = snapshot.default_measured("project", "proj-a")
         self.assertEqual(got, measured)
         (directory,), _ = reader.call_args
@@ -994,20 +994,20 @@ class DefaultMeasured(unittest.TestCase):
 
     def test_scopes_without_a_subject_read_null_without_reading(self):
         with mock.patch(
-            "corral.resources.read_slice_use",
+            "korapy.resources.read_slice_use",
             side_effect=AssertionError("must not read"),
         ):
-            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", None))
-            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", ""))
+            self.assertIsNone(snapshot.default_measured("agent", "korapy-agent-lib-5", None))
+            self.assertIsNone(snapshot.default_measured("agent", "korapy-agent-lib-5", ""))
             self.assertIsNone(snapshot.default_measured("project", None))
             self.assertIsNone(snapshot.default_measured("project", ""))
             self.assertIsNone(snapshot.default_measured("bogus", "x", "proj-a"))
 
     def test_an_unreadable_leaf_and_a_bad_unit_read_null(self):
-        with mock.patch("corral.resources.read_slice_use", side_effect=OSError("slice gone")):
-            self.assertIsNone(snapshot.default_measured("agent", "corral-agent-lib-5", "proj-a"))
+        with mock.patch("korapy.resources.read_slice_use", side_effect=OSError("slice gone")):
+            self.assertIsNone(snapshot.default_measured("agent", "korapy-agent-lib-5", "proj-a"))
         with mock.patch(
-            "corral.resources.read_slice_use",
+            "korapy.resources.read_slice_use",
             side_effect=AssertionError("must not read"),
         ):
             self.assertIsNone(snapshot.default_measured("agent", "not a unit!", "proj-a"))
@@ -1015,7 +1015,7 @@ class DefaultMeasured(unittest.TestCase):
 
 class HubPathNeverWritesTheLedger(unittest.TestCase):
     def test_report_and_snapshot_build_with_writes_rigged_to_fail(self):
-        from corral import host_ledger
+        from korapy import host_ledger
 
         with (
             mock.patch.object(host_ledger, "update", side_effect=AssertionError("must not write")),
@@ -1035,7 +1035,7 @@ class HubPathNeverWritesTheLedger(unittest.TestCase):
     def test_report_and_snapshot_modules_never_name_the_ledger(self):
         import ast
 
-        for dotted in ("corral.snapshot", "corral.resources"):
+        for dotted in ("korapy.snapshot", "korapy.resources"):
             path = os.path.join("src", *dotted.split(".")) + ".py"
             with open(path, encoding="utf-8") as handle:
                 tree = ast.parse(handle.read())
@@ -1056,7 +1056,7 @@ class HubPathNeverWritesTheLedger(unittest.TestCase):
 
 class CliExits(unittest.TestCase):
     def run_main(self, argv, registry_view=None, quota=None, resolved=None, usage_fn=None):
-        from corral import settings
+        from korapy import settings
 
         if registry_view is None:
             registry_view = view((entry("a1"), "live"))
@@ -1066,25 +1066,25 @@ class CliExits(unittest.TestCase):
             resolved = resolved_settings()
         out, err = io.StringIO(), io.StringIO()
         with (
-            mock.patch("corral.registry.visible", return_value=registry_view),
-            mock.patch("corral.accounts.providers", return_value=[]),
-            mock.patch("corral.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
-            mock.patch("corral.settings.load", return_value=resolved),
-            mock.patch("corral.projects.load_all", return_value=[]),
-            mock.patch("corral.units.list_units", return_value=[]),
-            mock.patch("corral.drive.drive_status", return_value={"last_exit": 0}),
+            mock.patch("korapy.registry.visible", return_value=registry_view),
+            mock.patch("korapy.accounts.providers", return_value=[]),
+            mock.patch("korapy.quota_ledger.load", return_value={"readings": {}, "marks": {}}),
+            mock.patch("korapy.settings.load", return_value=resolved),
+            mock.patch("korapy.projects.load_all", return_value=[]),
+            mock.patch("korapy.units.list_units", return_value=[]),
+            mock.patch("korapy.drive.drive_status", return_value={"last_exit": 0}),
             mock.patch(
-                "corral.resources.read_pressure",
+                "korapy.resources.read_pressure",
                 return_value=(R.Pressure(load_per_cpu=0.4), []),
             ),
-            mock.patch("corral.snapshot.default_measured", return_value=None),
+            mock.patch("korapy.snapshot.default_measured", return_value=None),
             mock.patch("socket.gethostname", return_value=HOST),
             mock.patch("shutil.disk_usage", side_effect=lambda path: (1000, 400, 600)),
             redirect_stdout(out),
             redirect_stderr(err),
         ):
             if isinstance(quota, Exception):
-                with mock.patch("corral.quotacli.snapshot", side_effect=quota):
+                with mock.patch("korapy.quotacli.snapshot", side_effect=quota):
                     code = cli.main(argv)
             else:
                 code = cli.main(argv)
@@ -1139,10 +1139,10 @@ class CliExits(unittest.TestCase):
         self.assertEqual(json.loads(out)["quota"], {"error": "pool gone"})
 
     def test_settings_error_exits_four(self):
-        from corral import settings
+        from korapy import settings
 
         with (
-            mock.patch("corral.settings.load", side_effect=settings.SettingsError("bad cap")),
+            mock.patch("korapy.settings.load", side_effect=settings.SettingsError("bad cap")),
             redirect_stdout(io.StringIO()),
             redirect_stderr(io.StringIO()),
         ):
@@ -1151,14 +1151,14 @@ class CliExits(unittest.TestCase):
     def test_nothing_readable_exits_three(self):
         out, err = io.StringIO(), io.StringIO()
         with (
-            mock.patch("corral.registry.visible", side_effect=OSError("gone")),
-            mock.patch("corral.accounts.providers", side_effect=OSError("gone")),
-            mock.patch("corral.settings.load", return_value=resolved_settings()),
-            mock.patch("corral.projects.load_all", return_value=[]),
-            mock.patch("corral.units.list_units", return_value=[]),
-            mock.patch("corral.paths.state_dir", side_effect=OSError("gone")),
+            mock.patch("korapy.registry.visible", side_effect=OSError("gone")),
+            mock.patch("korapy.accounts.providers", side_effect=OSError("gone")),
+            mock.patch("korapy.settings.load", return_value=resolved_settings()),
+            mock.patch("korapy.projects.load_all", return_value=[]),
+            mock.patch("korapy.units.list_units", return_value=[]),
+            mock.patch("korapy.paths.state_dir", side_effect=OSError("gone")),
             mock.patch(
-                "corral.resources.read_pressure",
+                "korapy.resources.read_pressure",
                 return_value=(R.Pressure(), ["note: gone"]),
             ),
             mock.patch("socket.gethostname", return_value=HOST),
@@ -1171,15 +1171,15 @@ class CliExits(unittest.TestCase):
     def test_only_drive_healthy_exits_zero(self):
         out, err = io.StringIO(), io.StringIO()
         with (
-            mock.patch("corral.registry.visible", side_effect=OSError("gone")),
-            mock.patch("corral.accounts.providers", side_effect=OSError("gone")),
-            mock.patch("corral.settings.load", return_value=resolved_settings()),
-            mock.patch("corral.projects.load_all", return_value=[]),
-            mock.patch("corral.units.list_units", return_value=[]),
-            mock.patch("corral.drive.drive_status", return_value={"last_exit": 0}),
-            mock.patch("corral.paths.cache_dir", side_effect=OSError("gone")),
+            mock.patch("korapy.registry.visible", side_effect=OSError("gone")),
+            mock.patch("korapy.accounts.providers", side_effect=OSError("gone")),
+            mock.patch("korapy.settings.load", return_value=resolved_settings()),
+            mock.patch("korapy.projects.load_all", return_value=[]),
+            mock.patch("korapy.units.list_units", return_value=[]),
+            mock.patch("korapy.drive.drive_status", return_value={"last_exit": 0}),
+            mock.patch("korapy.paths.cache_dir", side_effect=OSError("gone")),
             mock.patch(
-                "corral.resources.read_pressure",
+                "korapy.resources.read_pressure",
                 return_value=(R.Pressure(), ["note: gone"]),
             ),
             mock.patch("socket.gethostname", return_value=HOST),

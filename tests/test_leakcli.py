@@ -1,4 +1,4 @@
-"""`corral leakcheck` on real temporary repositories."""
+"""`korapy leakcheck` on real temporary repositories."""
 
 import io
 import json
@@ -9,8 +9,8 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import cli, leakcli, settings
-from corral.gitenv import clean_env
+from korapy import cli, leakcli, settings
+from korapy.gitenv import clean_env
 
 TERM = "Acme Client"
 
@@ -23,12 +23,12 @@ class RepoCase(unittest.TestCase):
         for name in [n for n in os.environ if n.startswith("GIT_")]:
             del os.environ[name]
         os.environ.pop("BASE_REF", None)
-        tmp = tempfile.TemporaryDirectory(prefix="corral-leakcheck-")
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-leakcheck-")
         self.addCleanup(tmp.cleanup)
         self.tmp = tmp.name
         self.config = os.path.join(self.tmp, "config")
         os.makedirs(self.config)
-        os.environ["CORRAL_CONFIG"] = self.config
+        os.environ["KORAPY_CONFIG"] = self.config
         for setting in settings.REGISTRY.values():
             os.environ.pop(setting.env, None)
         host = mock.patch.object(leakcli, "_hostname", return_value="host-1.example.com")
@@ -76,13 +76,13 @@ class RepoCase(unittest.TestCase):
     def make_ops(self, text):
         ops = os.path.join(self.tmp, "ops")
         os.makedirs(ops, exist_ok=True)
-        with open(os.path.join(ops, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(text)
         return ops
 
     def make_registered(self, private_text):
         """An ops root registered for the clone, holding `private_text`."""
-        from corral import projects
+        from korapy import projects
 
         ops = self.make_ops(f'[[repo]]\nname = "app"\nclone.path = "{self.repo}"\n\n{private_text}')
         directory = projects.projects_dir()
@@ -113,7 +113,7 @@ class VerbTest(RepoCase):
         self.assertEqual(code, 1)
         self.assertIn(TERM, out)
         self.assertIn("commit ", out)
-        self.assertIn("corral.toml", out)
+        self.assertIn("korapy.toml", out)
 
     def test_a_clean_repo_exits_0(self):
         ops = self.make_ops('[private]\nterms = ["Acme Client"]\n')
@@ -129,7 +129,7 @@ class VerbTest(RepoCase):
         self.git("checkout", "-q", "-b", "feat/acme-client-x")
         code, out, _ = self.run_cli("--ops", ops, "--base", self.base)
         self.assertEqual(code, 1)
-        self.assertIn("branch: acme-client (corral.toml)", out)
+        self.assertIn("branch: acme-client (korapy.toml)", out)
 
     def test_a_term_in_the_body_file_is_reported(self):
         ops = self.make_ops('[private]\nterms = ["Acme Client"]\n')
@@ -138,7 +138,7 @@ class VerbTest(RepoCase):
             handle.write("this ships Acme Client work\n")
         code, out, _ = self.run_cli("--ops", ops, "--base", self.base, "--body", body)
         self.assertEqual(code, 1)
-        self.assertIn("body: Acme Client (corral.toml)", out)
+        self.assertIn("body: Acme Client (korapy.toml)", out)
 
     def test_added_diff_lines_carry_their_path_and_line(self):
         ops = self.make_ops('[private]\npatterns = ["acme-[0-9]+"]\n')
@@ -148,7 +148,7 @@ class VerbTest(RepoCase):
         code, out, _ = self.run_cli("--ops", ops, "--base", self.base)
         self.assertEqual(code, 1)
         self.assertIn("diff work.txt:2", out)
-        self.assertIn("acme-[0-9]+ (corral.toml)", out)
+        self.assertIn("acme-[0-9]+ (korapy.toml)", out)
 
     def test_json_pins_the_schema(self):
         ops = self.make_ops('[private]\nterms = ["Acme Client"]\n')
@@ -188,7 +188,7 @@ class VerbTest(RepoCase):
         self.make_registered("[private\n")
         code, _, err = self.run_cli("--base", self.base)
         self.assertEqual(code, 4)
-        self.assertIn("corral.toml", err)
+        self.assertIn("korapy.toml", err)
 
     def test_a_registered_ops_root_guards_without_ops(self):
         self.make_registered('[private]\nterms = ["Acme Client"]\n')
@@ -214,19 +214,19 @@ class VerbTest(RepoCase):
         code, _, err = self.run_cli("--ops", ops, "--base", "no-such-ref")
         self.assertEqual(code, 4, err)
 
-    def test_an_ops_dir_without_corral_toml_is_exit_4(self):
+    def test_an_ops_dir_without_korapy_toml_is_exit_4(self):
         empty = os.path.join(self.tmp, "empty-ops")
         os.makedirs(empty)
         code, _, err = self.run_cli("--ops", empty, "--base", self.base)
         self.assertEqual(code, 4, err)
 
     def test_two_registrations_for_one_clone_are_ambiguous(self):
-        from corral import projects
+        from korapy import projects
 
         self.make_registered('[private]\nterms = ["Acme Client"]\n')
         other = os.path.join(self.tmp, "ops2")
         os.makedirs(other)
-        with open(os.path.join(other, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(other, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(f'[[repo]]\nname = "app"\nclone.path = "{self.repo}"\n')
         with open(
             os.path.join(projects.projects_dir(), "other.toml"), "w", encoding="utf-8"
@@ -250,7 +250,7 @@ class VerbTest(RepoCase):
         self.assertIn("diff work.txt:2", out)
 
     def test_relative_clone_path_in_registration_resolves_from_foreign_cwd(self):
-        from corral import projects
+        from korapy import projects
 
         ops = self.make_ops(
             '[[repo]]\nname = "app"\nclone.path = "../clone"\n\n[private]\nterms = ["Acme Client"]\n'

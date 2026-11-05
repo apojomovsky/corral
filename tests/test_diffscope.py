@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import diffscope, prose
+from korapy import diffscope, prose
 
 LONG_BLOCK = "\n".join(f"// reason line {n}" for n in range(12))
 C_SOURCE = LONG_BLOCK + "\nint value(void)\n{\n    return 1;\n}\n"
@@ -104,7 +104,7 @@ class RealRepoTest(unittest.TestCase):
     def git(self, *args):
         # Belt and braces with the setUp scrub below: per-call, so this
         # helper stays safe even when hook-like GIT_* vars are set.
-        from corral.gitenv import clean_env
+        from korapy.gitenv import clean_env
 
         subprocess.run(
             ["git", *args],
@@ -222,7 +222,7 @@ class RealRepoTest(unittest.TestCase):
     def test_prose_cli_exits_4_on_an_unknown_base(self):
         import argparse
 
-        from corral import cli
+        from korapy import cli
 
         before = os.getcwd()
         os.chdir(self.repo)
@@ -266,7 +266,7 @@ class UnderAHookTest(RealRepoTest):
 
     def setUp(self):
         super().setUp()
-        from corral.gitenv import clean_env
+        from korapy.gitenv import clean_env
 
         # Beside the fixture, never inside it: the fixture diffs its own
         # tree, so anything under it would show up as content.
@@ -334,7 +334,7 @@ class DefaultBaseTest(unittest.TestCase):
                     with open(path, encoding="utf-8") as handle:
                         if "BASE_REF" in handle.read():
                             readers.append(os.path.relpath(path, src))
-        self.assertEqual(readers, [os.path.join("corral", "diffscope.py")])
+        self.assertEqual(readers, [os.path.join("korapy", "diffscope.py")])
 
 
 class CallersUseTheResolverTest(unittest.TestCase):
@@ -353,14 +353,14 @@ class CallersUseTheResolverTest(unittest.TestCase):
             return fn(*args)
 
     def test_prose(self):
-        from corral import cli
+        from korapy import cli
 
         with mock.patch.object(prose, "extract", return_value=[]) as extract:
             self.quiet(cli.main, ["prose"])
         self.assertEqual(extract.call_args.args[0], "origin/elsewhere")
 
     def test_budget_verb_and_module(self):
-        from corral import budget, cli
+        from korapy import budget, cli
 
         with mock.patch.object(budget, "dispatch_block", return_value="") as block:
             self.quiet(cli.main, ["budget"])
@@ -371,7 +371,7 @@ class CallersUseTheResolverTest(unittest.TestCase):
         )
 
     def test_review_show(self):
-        from corral import cli, mergeup
+        from korapy import cli, mergeup
 
         with mock.patch.object(mergeup, "find_record", return_value=(None, "")) as find:
             code = self.quiet(cli.main, ["review", "show", "lib", "1"])

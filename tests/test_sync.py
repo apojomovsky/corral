@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from typing import Any
-from corral import board, drive, eligibility, policies, sync, tracker
+from korapy import board, drive, eligibility, policies, sync, tracker
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -15,7 +15,7 @@ T0 = 1_800_000_100.0
 
 class StoreCase(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-sync-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-sync-")
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "board.sqlite")
         self.store = board.open_store(self.path)

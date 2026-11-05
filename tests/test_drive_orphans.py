@@ -13,8 +13,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import board, drive, registry, settings, units
-from corral import projects as projects_mod
+from korapy import board, drive, registry, settings, units
+from korapy import projects as projects_mod
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
 from tests.test_tracker import FakeTracker, reading
@@ -45,7 +45,7 @@ def orphan_kwargs(**over):
 
 class ClaimOfTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-orphan-claimof-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-orphan-claimof-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -138,7 +138,7 @@ class IsOrphanTest(unittest.TestCase):
 
 class ReleaseOrphansTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-orphans-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-orphans-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -336,7 +336,7 @@ class ProductionOrphanInputsTest(unittest.TestCase):
 
 class OrphanPassTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-orphan-pass-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-orphan-pass-")
         self.addCleanup(self.tmp.cleanup)
         self.db = os.path.join(self.tmp.name, "board.sqlite")
         self.lock = os.path.join(self.tmp.name, "drive.lock")

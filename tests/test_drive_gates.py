@@ -12,8 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral import accounts, admission, board, drive, projects, registry
-from corral.eligibility import LinkedPull, StartRequest, TicketRow
+from korapy import accounts, admission, board, drive, projects, registry
+from korapy.eligibility import LinkedPull, StartRequest, TicketRow
 from tests.test_drive import policy_source, stored
 
 
@@ -555,10 +555,10 @@ class QuotaGateTest(unittest.TestCase):
 
 class ProjectQuotaTest(unittest.TestCase):
     def test_project_quota_uses_the_chained_provider_bound(self):
-        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-quota-pool-"))
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-quota-pool-"))
         root = os.path.join(tmp, "ops", "blue")
         os.makedirs(root)
-        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[profiles.default]\nruntime = "omp"\n'
                 '[profiles.default.models.default]\nchain = ["tired/model"]\n'
@@ -570,10 +570,10 @@ class ProjectQuotaTest(unittest.TestCase):
         self.assertEqual(source.stale_after, 60.0)
 
     def test_project_quota_ignores_unchained_pool_providers(self):
-        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-quota-pool-"))
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-quota-pool-"))
         root = os.path.join(tmp, "ops", "blue")
         os.makedirs(root)
-        with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
             handle.write(
                 '[profiles.default]\nruntime = "omp"\n'
                 '[profiles.default.models.default]\nchain = ["fresh/model"]\n'
@@ -588,7 +588,7 @@ class ProjectQuotaTest(unittest.TestCase):
 
 class StoreLabelsTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-labels-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-labels-"))
         self.db = os.path.join(self.tmp, "board.sqlite")
 
     def test_a_pull_read_fails_closed(self):
@@ -608,7 +608,7 @@ class StoreLabelsTest(unittest.TestCase):
 
 class PassWiringTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="corral-gates-"))
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-gates-"))
         self.db = os.path.join(self.tmp, "board.sqlite")
         self.lock = os.path.join(self.tmp, "drive.lock")
         self.policies = os.path.join(self.tmp, "policies")
@@ -685,7 +685,7 @@ class PassWiringTest(unittest.TestCase):
         ):
             code, _, err = self.run_pass(store, [self.project("blue", entry)], quotas={}, pool=None)
         self.assertEqual(code, 4)
-        self.assertIn("corral drive:", err)
+        self.assertIn("korapy drive:", err)
         self.assertIn("accounts.toml", err)
 
     def test_a_bad_entry_is_exit_four_naming_project_and_entry(self):
@@ -836,11 +836,11 @@ class PassWiringTest(unittest.TestCase):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         entry = self.write_policy("blue_policy", [("app", 7, "start")])
-        kept = {k: v for k, v in os.environ.items() if not k.startswith("CORRAL_")}
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
         env = dict(
             kept,
-            CORRAL_CONFIG=os.path.join(self.tmp, "config"),
-            CORRAL_STATE=os.path.join(self.tmp, "state"),
+            KORAPY_CONFIG=os.path.join(self.tmp, "config"),
+            KORAPY_STATE=os.path.join(self.tmp, "state"),
         )
         with mock.patch.dict(os.environ, env, clear=True):
             out, err = io.StringIO(), io.StringIO()

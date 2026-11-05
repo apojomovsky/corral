@@ -1,0 +1,714 @@
+"""`korapy snapshot`: one read-only view of the host.
+
+Composes what already exists and adds no new state: the agent registry,
+the quota pool and ledger, the admission caps, the resource charges, the
+host disks and the drive status. Every
+section is read independently, so one unreadable section errors while the
+rest still print. Exits 0 when the document printed (even with section
+errors), 3 when nothing at all could be read, 4 on a usage or settings
+error. No GitHub, no network, no service control in this module.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import socket
+import sys
+import time
+from collections.abc import Mapping
+
+OK, UNREACHABLE, USAGE = 0, 3, 4
+
+#: The document schema version, printed as `schema_version`. Version 2 adds
+#: the agent `profile` row field: the profile name recorded at launch.
+#: Rows from before profile records display `default`: the cutover
+#: resolves them as the default profile for display only.
+SCHEMA_VERSION = 2
+
+#: Sections whose `{"error"}` body marks the server degraded.
+#: The one owner of the section names; `serve` reads through this.
+ERROR_SECTIONS = ("agents", "quota", "capacity", "resources", "disk", "drive")
+
+
+def _err(text):
+    print(f"korapy snapshot: {text}", file=sys.stderr)
+
+
+def error_text(exc):
+    """`str(exc)`, or `repr(exc)` when the message is empty."""
+    text = str(exc)
+    return text if text else repr(exc)
+
+
+def is_error_section(value):
+    """Whether a built section is a `{"error": ...}` failure body."""
+    return isinstance(value, dict) and set(value) == {"error"}
+
+
+def _section_error(exc):
+    """A failed section: `{"error": text}`, never an empty message."""
+    return {"error": error_text(exc)}
+
+
+def _agent_row(entry, state):
+    """One agent row from a registry entry and its status (pure).
+
+    Fields missing on the entry read as null, never absent, except the
+    profile: entries from before profile records display `default`.
+    """
+    from korapy import profiles, registry
+
+    ticket = entry.get("ticket")
+    if not isinstance(ticket, dict):
+        ticket = {}
+    held = registry.ticket_of(entry)
+    return {
+        "id": entry.get("id"),
+        "project": ticket.get("project") or None,
+        "repo": held[0] if held else None,
+        "number": held[1] if held else None,
+        "runtime": entry.get("runtime"),
+        "role": entry.get("role"),
+        "profile": entry.get("profile") or profiles.DEFAULT_PROFILE_NAME,
+        "model": entry.get("model"),
+        "state": state,
+        "started_at": entry.get("started_at"),
+        "last_seen": entry.get("last_seen"),
+        "note": entry.get("note"),
+    }
+
+
+def _sort_key(row):
+    """Sort rows by `(project, repo, number, id)`; tickets without a number sort last."""
+    return (
+        row["project"] or "",
+        row["repo"] or "",
+        row["number"] is None,
+        row["number"] or 0,
+        row["id"] or "",
+    )
+
+
+def _agents_and_header(registry_view):
+    """`(fleet_header, agents)`: both error when the registry cannot be read."""
+    rows = [_agent_row(entry, state) for entry, state in registry_view]
+    rows.sort(key=_sort_key)
+    header = {
+        "host": None,  # filled in by build, which owns `host`
+        "now": None,  # filled in by build, which owns `now`
+        "agents_live": sum(1 for row in rows if row["state"] == "live"),
+        "agents_stale": sum(1 for row in rows if row["state"] == "stale"),
+        "agents_finished": sum(1 for row in rows if row["state"] == "finished"),
+    }
+    return header, rows
+
+
+def _capacity(registry_view, settings, host):
+    """`{total_cap, repo_cap, live, by_project, pending}` (pure).
+
+    `live` counts counted tickets, not entries: one ticket holds one slot
+    no matter how many entries name it, exactly like
+    `registry.counted_tickets`; like it, only this host's entries count.
+    `pending` is not tracked yet and always reads `[]`.
+    """
+    from korapy import registry
+
+    total_cap = settings["admission.total_cap"]
+    repo_cap = settings["admission.repo_cap"]
+    tickets = {}
+    if settings.get("registry.count_toward_cap", True):
+        for entry, state in registry_view:
+            if state != registry.LIVE or entry.get("host") != host:
+                continue
+            held = registry.ticket_of(entry)
+            if held is None or held in tickets:
+                continue
+            ticket = entry.get("ticket")
+            project = ticket.get("project") if isinstance(ticket, dict) else None
+            tickets[held] = project or ""
+    by_project = {}
+    for held in sorted(tickets, key=lambda held: (tickets[held], held[0], held[1])):
+        by_project.setdefault(tickets[held], 0)
+        by_project[tickets[held]] += 1
+    return {
+        "total_cap": total_cap,
+        "repo_cap": repo_cap,
+        "live": len(tickets),
+        "by_project": by_project,
+        "pending": [],
+    }
+
+
+def _disk(usage_fn):
+    """`{paths: [...]}` for the state dir and the cache dir.
+
+    A path that cannot be read gives `{path, error}`; an unresolvable
+    directory gives a section `{"error": ...}`.
+    """
+    from korapy import paths
+
+    try:
+        names = (paths.state_dir(), paths.cache_dir())
+    except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
+        return _section_error(exc)
+    out = []
+    for name in names:
+        try:
+            total, used, free = usage_fn(name)
+        except Exception as exc:  # noqa: BLE001 - per-path failure, not a section failure
+            out.append({"path": name, "error": error_text(exc)})
+        else:
+            out.append({"path": name, "total": total, "used": used, "free": free})
+    return {"paths": out}
+
+
+def default_measured(scope, name, project=None):
+    """Measured slice use through the real cgroup files, or None.
+
+    `scope` is `"agent"` (name is the unit id) or `"project"` (name is
+    the project). Anything unreadable or unresolvable reads None: a
+    missing leaf is routine (a foreign agent, a drifted layout), so it
+    stays silent, while host-level misses surface through the pressure
+    notes instead. Never raises.
+    """
+    from korapy import resources, units
+
+    try:
+        if scope == "agent":
+            if not project:
+                return None
+            directory = units.agent_cgroup(project, name)
+        elif scope == "project":
+            if not name:
+                return None
+            directory = units.project_cgroup(name)
+        else:
+            return None
+        measured, _notes = resources.read_slice_use(directory)
+        return measured
+    except Exception:  # noqa: BLE001 - a missing leaf reads null, never an error
+        return None
+
+
+def resources_section(
+    registry_view,
+    host,
+    limits,
+    pressure,
+    pressure_notes=(),
+    measured_fn=None,
+    *,
+    live_by_owner,
+    project_names,
+):
+    """The `resources` snapshot section from plain data.
+
+    Charged usage is `resources.charge_live_units` over the registry
+    view and `live_by_owner`, the same sum the launch gate admits
+    from, so totals and per-project attribution are identical: a unit
+    counts for the project its ticket names when registered, else the
+    project whose listing owns it, never an empty name. A registry
+    entry whose unit is gone holds no share and reads zero, as does
+    every entry of another state; only listed units charge. A missing
+    role reads as the default role, and an unpriced role reads as
+    zero. `live_by_owner` maps an owning project to its live unit
+    names as `resources.live_units_by_owner` builds it; `project_names`
+    holds the registered project names, passed explicitly rather than
+    derived from the listing keys. `host` scopes nothing in the sum,
+    the listing already does, and stays for the callers that pass the
+    host they listed on.
+
+    Measured use comes from `measured_fn(scope, name, project)`: one
+    call per charged agent under its owning project, one per charged
+    project; a failing call reads null. `pressure_notes` names the
+    unreadable pressure files and any unreadable units listing. Raises
+    the registry exception when the registry could not be read, so the
+    section errors with it.
+    """
+    from korapy import resources
+
+    if isinstance(registry_view, Exception):
+        raise registry_view
+    if limits is None:
+        roles = {}
+        host_budget = None
+    elif isinstance(limits, resources.Limits):
+        roles = limits.roles
+        host_budget = limits.host
+    elif isinstance(limits, Mapping):
+        raw_roles = limits.get("roles")
+        if raw_roles is None:
+            roles = {}
+        elif isinstance(raw_roles, Mapping):
+            roles = raw_roles
+        else:
+            raise resources.LimitsError(
+                f"roles must be a mapping of role names to charges, not {raw_roles!r}"
+            )
+        host_budget = limits.get("host")
+    else:
+        raise resources.LimitsError(f"limits must be a Limits table, not {limits!r}")
+    if not isinstance(live_by_owner, Mapping):
+        raise resources.LimitsError(
+            f"live units must be a mapping of owner to unit names, not {live_by_owner!r}"
+        )
+    names = set(project_names)
+    charged, per_unit = resources.charge_live_units(registry_view, live_by_owner, names, roles)
+    zeros = resources.Usage()
+    rows = []
+    for entry, state in registry_view:
+        row = _agent_row(entry, state)
+        if row["id"] in per_unit:
+            owner, cost = per_unit[row["id"]]
+            measured = None
+            if measured_fn is not None:
+                try:
+                    measured = resources.measured_dict(measured_fn("agent", row["id"], owner))
+                except Exception:  # noqa: BLE001 - a missing leaf reads null
+                    measured = None
+            rows.append(
+                {
+                    "id": row["id"],
+                    "project": row["project"],
+                    "role": row["role"],
+                    "state": state,
+                    "charged": resources.usage_dict(cost),
+                    "measured": measured,
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "id": row["id"],
+                    "project": row["project"],
+                    "role": row["role"],
+                    "state": state,
+                    "charged": resources.usage_dict(zeros),
+                    "measured": None,
+                }
+            )
+    measured_by_project = {}
+    for name in charged.by_project:
+        if measured_fn is None:
+            measured_by_project[name] = None
+            continue
+        try:
+            measured_by_project[name] = resources.measured_dict(measured_fn("project", name))
+        except Exception:  # noqa: BLE001 - a missing slice reads null
+            measured_by_project[name] = None
+    report = resources.capacity_report(
+        host_budget=host_budget,
+        charged=charged,
+        pressure=pressure,
+    )
+    return {
+        "schema_version": report["schema_version"],
+        "host_budget": report["host_budget"],
+        "charged": report["charged"],
+        "by_project": report["by_project"],
+        "measured_by_project": measured_by_project,
+        "agents": rows,
+        "pressure": report["pressure"],
+        "notes": list(pressure_notes or []),
+    }
+
+
+def build(
+    now,
+    host,
+    registry_view,
+    quota_view,
+    settings,
+    usage_fn=None,
+    drive_view=None,
+    resources_view=None,
+):
+    """The snapshot document from plain data (pure, except disk paths).
+
+    `registry_view` is `[(entry, status)]` as `registry.visible` returns,
+    or the exception reading it raised. `quota_view` is the dict
+    `quotacli.snapshot` returns, or the exception reading it raised.
+    `settings` is a plain dict of the `admission.*` and
+    `registry.count_toward_cap` values, or the exception reading it
+    raised. `usage_fn(path)` reports `(total, used, free)` and defaults
+    to `shutil.disk_usage`. `drive_view` is the dict `drive.drive_status`
+    returns, or the exception reading it raised; None reads as a section
+    error, since nothing collected it. `resources_view` is the dict
+    `resources_section` returns, or the exception reading it raised;
+    None reads as a section error too, and a broken registry errors it
+    like the capacity section. Sections fail independently: a broken
+    one reads `{"error": ...}` while the rest still print.
+    """
+    if usage_fn is None:
+        usage_fn = shutil.disk_usage
+    if isinstance(registry_view, Exception):
+        header = agents = _section_error(registry_view)
+    else:
+        try:
+            header, agents = _agents_and_header(registry_view)
+        except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
+            header = agents = _section_error(exc)
+        else:
+            header["host"] = host
+            header["now"] = now
+    if isinstance(quota_view, Exception):
+        quota = _section_error(quota_view)
+    else:
+        quota = quota_view
+    if isinstance(settings, Exception) or isinstance(registry_view, Exception):
+        capacity = _section_error(settings if isinstance(settings, Exception) else registry_view)
+    else:
+        try:
+            capacity = _capacity(registry_view, settings, host)
+        except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
+            capacity = _section_error(exc)
+    if isinstance(registry_view, Exception):
+        resources = _section_error(registry_view)
+    elif isinstance(resources_view, Exception):
+        resources = _section_error(resources_view)
+    elif resources_view is None:
+        resources = _section_error(ValueError("resources section not collected"))
+    else:
+        resources = resources_view
+    try:
+        disk = _disk(usage_fn)
+    except Exception as exc:  # noqa: BLE001 - one broken section must not break the rest
+        disk = _section_error(exc)
+    if drive_view is None:
+        drive = _section_error(ValueError("drive section not collected"))
+    elif isinstance(drive_view, Exception):
+        drive = _section_error(drive_view)
+    elif isinstance(drive_view, dict):
+        drive = drive_view
+    else:
+        drive = _section_error(ValueError(f"drive section is {type(drive_view).__name__}"))
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "fleet_header": header,
+        "agents": agents,
+        "quota": quota,
+        "capacity": capacity,
+        "resources": resources,
+        "disk": disk,
+        "drive": drive,
+    }
+
+
+def _all_failed(doc):
+    """Whether every readable section failed: nothing at all could be read."""
+    return all(is_error_section(doc.get(section)) for section in ERROR_SECTIONS)
+
+
+def _show(doc):
+    """The human view: one short table per section, agents first."""
+    agents = doc.get("agents")
+    if isinstance(agents, list):
+        header = doc.get("fleet_header") or {}
+        print(
+            f"agents: {header.get('agents_live', 0)} live,"
+            f" {header.get('agents_stale', 0)} stale,"
+            f" {header.get('agents_finished', 0)} finished"
+        )
+        for row in agents:
+            if row["repo"] is None:
+                ticket = "-"
+            else:
+                project = f"{row['project']}/" if row["project"] else ""
+                ticket = f"{project}{row['repo']} #{row['number']}"
+            note = f"  {row['note']}" if row.get("note") else ""
+            role = row.get("role") or "-"
+            print(f"  {row['id']}  {row['runtime']}  {role}  {row['state']}  {ticket}{note}")
+    else:
+        _err(
+            f"agents: {agents.get('error', 'unreadable') if isinstance(agents, dict) else 'unreadable'}"
+        )
+    header = doc.get("fleet_header")
+    if isinstance(header, dict) and "host" in header:
+        print(f"host: {header['host']}  now: {header['now']}")
+    quota = doc.get("quota")
+    if isinstance(quota, dict) and "providers" in quota:
+        states = [
+            f"{name}={info.get('state')}" for name, info in sorted(quota["providers"].items())
+        ]
+        print(f"quota: {', '.join(states) if states else 'no providers'}")
+    else:
+        _err(
+            f"quota: {quota.get('error', 'unreadable') if isinstance(quota, dict) else 'unreadable'}"
+        )
+    capacity = doc.get("capacity")
+    if isinstance(capacity, dict) and "live" in capacity:
+        projects = ", ".join(
+            f"{name or '-'}={count}" for name, count in sorted(capacity["by_project"].items())
+        )
+        print(
+            f"capacity: {capacity['live']}/{capacity['total_cap']} live"
+            f" (repo cap {capacity['repo_cap']})" + (f"  {projects}" if projects else "")
+        )
+    else:
+        _err(
+            f"capacity: {capacity.get('error', 'unreadable') if isinstance(capacity, dict) else 'unreadable'}"
+        )
+    resources = doc.get("resources")
+    if isinstance(resources, dict) and isinstance(resources.get("charged"), dict):
+        charged = resources["charged"]
+        budget = resources.get("host_budget") or {}
+        parts = []
+        for dim, short, unit in (
+            ("cpu_m", "cpu", "m"),
+            ("memory_mb", "mem", "MB"),
+            ("pids", "pids", ""),
+        ):
+            used = charged.get(dim)
+            whole = budget.get(dim)
+            parts.append(
+                f"{short} {used}/{whole}{unit}" if whole is not None else f"{short} {used}{unit}"
+            )
+        print(f"resources: charged {', '.join(parts)}")
+        pressure = resources.get("pressure") or {}
+        load = pressure.get("load_per_cpu")
+        mem = pressure.get("mem_available_pct")
+        if load is None and mem is None:
+            print("pressure: unknown")
+        else:
+            bits = []
+            if load is not None:
+                bits.append(f"load {load:.2f}/cpu")
+            if mem is not None:
+                bits.append(f"mem {mem:.1f}% avail")
+            bits.append("saturated" if pressure.get("saturated") else "ok")
+            print(f"pressure: {', '.join(bits)}")
+        for note in resources.get("notes") or []:
+            print(f"  note: {note}")
+    else:
+        _err(
+            f"resources: {resources.get('error', 'unreadable') if isinstance(resources, dict) else 'unreadable'}"
+        )
+    disk = doc.get("disk")
+    if isinstance(disk, dict) and "paths" in disk:
+        for item in disk["paths"]:
+            if "error" in item:
+                print(f"  {item['path']}: {item['error']}")
+            else:
+                print(
+                    f"  {item['path']}: total {item['total']} used {item['used']} free {item['free']}"
+                )
+    else:
+        _err(f"disk: {disk.get('error', 'unreadable') if isinstance(disk, dict) else 'unreadable'}")
+    drive = doc.get("drive")
+    if isinstance(drive, dict) and "error" not in drive:
+        skipped = drive.get("skipped_by_reason") or {}
+        skipped_total = sum(skipped.values())
+        print(
+            f"drive: last pass {drive.get('last_pass_at')} exit {drive.get('last_exit')},"
+            f" started {drive.get('started', 0)} skipped {skipped_total}"
+            f" released {drive.get('released', 0)} gave up {drive.get('gave_up', 0)}"
+        )
+        print(
+            f"  {drive.get('starts_today', 0)}/{drive.get('max_starts_per_day', 0)} starts today"
+            f" ({drive.get('starts_remaining', 0)} remaining)"
+            + ("  paused: " + str(drive.get("pause_reason")) if drive.get("paused") else "")
+            + ("  lock held" if drive.get("lock_held") else "")
+        )
+        for code in sorted(skipped):
+            print(f"  skip {code}: {skipped[code]}")
+    else:
+        _err(
+            f"drive: {drive.get('error', 'unreadable') if isinstance(drive, dict) else 'unreadable'}"
+        )
+
+
+def _settings_root(start):
+    """The ops root owning `start`, or None when no project claims it.
+
+    The nearest directory above `start` holding `korapy.toml` wins; else
+    the registered project whose root or clone holds `start`. A broken
+    registration or project file is skipped, never fatal: the caller
+    falls back to the host defaults.
+    """
+    from korapy import projects, settings
+
+    root = settings.find_root(start)
+    if root is not None:
+        return root
+    want = os.path.realpath(start)
+    try:
+        registered = projects.load_all()
+    except projects.ProjectsError:
+        return None
+    for project in registered:
+        if _covers(project.root, want):
+            return project.root
+    return None
+
+
+def _covers(root, want):
+    """Whether the project at `root` holds the path `want`.
+
+    A project holds its root, and any path under a clone its
+    `[[repo]]` entries cover. Clone matching goes through
+    `settings.covering_repo`, the one place that maps a clone to its
+    entry; a file that reads broken holds nothing.
+    """
+    from korapy import settings
+
+    real_root = os.path.realpath(root)
+    if want == real_root or _below(want, real_root):
+        return True
+    here = want
+    while True:
+        try:
+            if settings.covering_repo(root, here) is not None:
+                return True
+        except settings.SettingsError:
+            return False
+        parent = os.path.dirname(here)
+        if parent == here:
+            return False
+        here = parent
+
+
+def _below(path, parent):
+    """Whether real path `path` lies strictly below real path `parent`."""
+    if path == parent:
+        return False
+    try:
+        return os.path.commonpath([path, parent]) == parent
+    except ValueError:
+        return False
+
+
+def collect_kwargs() -> dict:
+    """Keyword arguments for `build` from the host's local readers.
+
+    One shared helper so the `snapshot` verb and `serve.collect`
+    cannot diverge: settings load, registry config, validated limits,
+    the host budget, and the registry, quota, drive and pressure
+    readers in that order. Settings and limit errors propagate;
+    section readers fail into the returned values, never raise. The
+    budget, pressure and slice readers never touch the ledger: the
+    hub path built from this report cannot write it.
+    """
+    from korapy import (
+        accounts,
+        admission,
+        drive,
+        projects,
+        quota_ledger,
+        quotacli,
+        registry,
+        resources,
+        settings,
+        units,
+    )
+
+    resolved = settings.load(root=_settings_root(os.getcwd()))
+    cfg = registry.config(resolved)
+    plain = {
+        "admission.total_cap": resolved["admission.total_cap"],
+        "admission.repo_cap": resolved["admission.repo_cap"],
+        "registry.count_toward_cap": cfg["count_toward_cap"],
+    }
+    admission.validate_limits(
+        admission.Limits(total=plain["admission.total_cap"], repo_cap=plain["admission.repo_cap"])
+    )
+    limits = resources.config(resolved)
+    low_pct = resolved["quota.low_pct"]
+    now = time.time()
+    host = socket.gethostname()
+    try:
+        registry_view = registry.visible(now, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+        registry_view = exc
+    try:
+        quota_view = quotacli.snapshot(
+            accounts.providers(), quota_ledger.load(), now, low_pct=low_pct
+        )
+    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+        quota_view = exc
+    try:
+        drive_view = drive.drive_status(
+            now=now,
+            max_starts=resolved["drive.max_starts_per_day"],
+            journal_path=drive.journal_path(),
+            pause_path=drive.pause_path(),
+            day_path=drive.day_path(),
+            lock_path=drive.lock_path(),
+        )
+    except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+        drive_view = exc
+    pressure, pressure_notes = resources.read_pressure()
+    notes = list(pressure_notes)
+    try:
+        registered = projects.load_all()
+    except Exception as exc:  # noqa: BLE001 - without names nothing is attributable
+        resources_view = exc
+    else:
+        own_prefix = resolved["agents.unit_prefix"]
+        local = next(
+            (entry.name for entry in registered if entry.unit_prefix == own_prefix),
+            own_prefix,
+        )
+        try:
+            listing = resources.live_units_by_owner(
+                [(entry.name, entry.unit_prefix) for entry in registered],
+                local,
+                own_prefix,
+                units.list_units,
+            )
+        except Exception as exc:  # noqa: BLE001 - an unread listing charges nothing, noted
+            notes.append(f"units listing unreadable: {error_text(exc)}")
+            listing = {}
+        try:
+            resources_view = resources_section(
+                registry_view,
+                host,
+                limits,
+                pressure,
+                notes,
+                default_measured,
+                live_by_owner=listing,
+                project_names=[entry.name for entry in registered],
+            )
+        except Exception as exc:  # noqa: BLE001 - one broken reader must not break the rest
+            resources_view = exc
+    return {
+        "now": now,
+        "host": host,
+        "registry_view": registry_view,
+        "quota_view": quota_view,
+        "settings": plain,
+        "usage_fn": shutil.disk_usage,
+        "drive_view": drive_view,
+        "resources_view": resources_view,
+    }
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    """Run the `snapshot` verb."""
+    from korapy import admission, paths, settings
+
+    try:
+        kwargs = collect_kwargs()
+    except (settings.SettingsError, paths.PathError, admission.LimitsError) as err:
+        _err(str(err))
+        return USAGE
+    doc = build(**kwargs)
+    if _all_failed(doc):
+        _err("nothing to report: every section failed")
+        return UNREACHABLE
+    if args.json:
+        print(json.dumps(doc))
+    else:
+        _show(doc)
+    return OK
+
+
+def add_parser(sub) -> None:
+    """Register `snapshot` on the top-level subparsers."""
+    p = sub.add_parser(
+        "snapshot",
+        help="one read-only view of the host: agents, quota, capacity, resources, disks and drive",
+    )
+    p.add_argument("--json", action="store_true", help="print the stable machine-readable document")
+    p.set_defaults(func=cmd_snapshot)

@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 
-from corral import board, paths, profiles, settings, tracker as iface
+from korapy import board, paths, profiles, settings, tracker as iface
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -50,7 +50,7 @@ def resolve(parsed_profiles, selections=None, **kw):
 class SelectionsPath(unittest.TestCase):
     def test_the_selections_file_lives_in_the_host_config_dir(self):
         self.assertEqual(profiles.SELECTIONS_FILE, "profiles.toml")
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             self.assertEqual(
                 profiles.selections_path(config_dir=directory),
                 os.path.join(directory, "profiles.toml"),
@@ -67,7 +67,7 @@ class SelectionsPath(unittest.TestCase):
 
 class LoadSave(unittest.TestCase):
     def test_a_missing_file_reads_as_empty_selections(self):
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             found = profiles.load_selections(os.path.join(directory, "profiles.toml"))
         self.assertEqual(found, profiles.empty_selections())
 
@@ -79,26 +79,26 @@ class LoadSave(unittest.TestCase):
             pins={profiles.pin_key("owner/name", NUMBER): "fast"},
             override=over("project:example", "fast", T0 + 3600, "trying it out"),
         )
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             profiles.save_selections(selections, path)
             self.assertEqual(profiles.load_selections(path), selections)
 
     def test_save_creates_the_config_dir_first(self):
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "nested", "profiles.toml")
             profiles.save_selections(sel(default="fast"), path)
             self.assertEqual(profiles.load_selections(path).default, "fast")
 
     def test_a_dangling_reference_loads_cleanly_for_the_doctor_to_report(self):
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write('[default]\nprofile = "ghost"\n')
             self.assertEqual(profiles.load_selections(path).default, "ghost")
 
     def test_a_corrupt_file_is_exit_4(self):
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("not = [valid toml\n")
@@ -106,7 +106,7 @@ class LoadSave(unittest.TestCase):
                 profiles.load_selections(path)
 
     def test_an_unknown_top_level_table_is_exit_4(self):
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write('[selections]\nprofile = "fast"\n')
@@ -115,7 +115,7 @@ class LoadSave(unittest.TestCase):
             self.assertIn("selections", str(ctx.exception))
 
     def test_a_second_override_table_is_exit_4(self):
-        with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
             path = os.path.join(directory, "profiles.toml")
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write(
@@ -139,7 +139,7 @@ class LoadSave(unittest.TestCase):
         ]
         for text in bad:
             with self.subTest(text=text):
-                with tempfile.TemporaryDirectory(prefix="corral-config-") as directory:
+                with tempfile.TemporaryDirectory(prefix="korapy-config-") as directory:
                     path = os.path.join(directory, "profiles.toml")
                     with open(path, "w", encoding="utf-8") as handle:
                         handle.write(text)
@@ -613,7 +613,7 @@ def load(store, tracker, **kw):
 
 class StoreAssignment(unittest.TestCase):
     def test_a_fresh_labels_row_resolves_end_to_end(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(directory, labels=["ready", "profile:fast"], fetched_at=T0)
             fake = FakeTracker([])
             name, source, skip = load(store, fake)
@@ -625,7 +625,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual((found.name, provenance.layer), ("fast", 2))
 
     def test_a_fresh_board_field_row_resolves_end_to_end(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(
                 directory, labels=["ready"], extra={"profile": "fast"}, fetched_at=T0
             )
@@ -637,7 +637,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual((found.name, provenance.layer), ("fast", 2))
 
     def test_a_row_without_assignment_reads_absent(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(directory, labels=["ready"], fetched_at=T0)
             fake = FakeTracker([])
             name, source, skip = load(store, fake)
@@ -651,7 +651,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual((found.name, provenance.layer), ("other", 6))
 
     def test_a_missing_row_skips_as_withdrawn(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = board.open_store(os.path.join(directory, "board.db"))
             fake = FakeTracker([])
             name, source, skip = load(store, fake)
@@ -661,7 +661,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_a_stale_row_is_reread_live_not_trusted(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(directory, labels=["ready"], fetched_at=T0 - 2 * STALE_AFTER)
             fake = FakeTracker([reading(repo=REPO, number=NUMBER, labels=("profile:live",))])
             name, source, skip = load(store, fake)
@@ -671,7 +671,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertIn(("item", REPO, NUMBER), fake.calls)
 
     def test_a_fresh_row_never_touches_a_failing_tracker(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(directory, labels=["profile:fast"], fetched_at=T0)
             fake = FakeTracker([])
             fake.item_errors[(REPO, NUMBER)] = "down"
@@ -681,7 +681,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual(fake.calls, [])
 
     def test_a_stale_row_with_an_unreachable_tracker_raises_exit_3(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(directory, labels=["ready"], fetched_at=T0 - 2 * STALE_AFTER)
             fake = FakeTracker([])
             fake.item_errors[(REPO, NUMBER)] = "down"
@@ -690,7 +690,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual(ctx.exception.exit_code, 3)
 
     def test_a_stale_row_without_a_tracker_uses_the_cached_row(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(
                 directory,
                 labels=["profile:cached"],
@@ -701,7 +701,7 @@ class StoreAssignment(unittest.TestCase):
         self.assertEqual(name, "cached")
 
     def test_a_corrupt_shared_value_fails_closed_instead_of_skipping(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(
                 directory,
                 labels=["profile:a", "profile:b"],
@@ -711,7 +711,7 @@ class StoreAssignment(unittest.TestCase):
                 load(store, FakeTracker([]))
 
     def test_a_store_pin_disagreement_names_both_sources(self):
-        with tempfile.TemporaryDirectory(prefix="corral-board-") as directory:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as directory:
             store = stored_row(directory, labels=["profile:fast"], fetched_at=T0)
             name, source, _ = load(store, FakeTracker([]))
             selections = sel(pins={profiles.pin_key(REPO, NUMBER): "other"})

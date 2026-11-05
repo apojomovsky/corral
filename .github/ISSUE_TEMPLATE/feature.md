@@ -1,11 +1,11 @@
 ---
 name: Feature
-about: Something corral should do that it does not
+about: Something korapy should do that it does not
 ---
 
 ## Problem
 
-What is hard or impossible today, without working around corral.
+What is hard or impossible today, without working around korapy.
 
 ## Proposal
 

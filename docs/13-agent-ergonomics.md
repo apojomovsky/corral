@@ -1,7 +1,7 @@
 # 13: agent ergonomics (wait, events, report, merge, gate)
 
 Status: design, awaiting maintainer approval. No code ships with
-this doc. It decides which coordinator verbs belong in corral,
+this doc. It decides which coordinator verbs belong in korapy,
 specifies each one's arguments, output shape and exit codes, and
 leaves the build to the tickets in section 11.
 
@@ -28,7 +28,7 @@ coordinator re-invents this, and each invention drifts.
 The candidates for core verbs are: `wait`, an event list with
 follow, a review-report reader, a merge verb, and a configurable
 gate. This doc covers each candidate, decides what belongs in
-corral and what stays project policy, and shows that every
+korapy and what stays project policy, and shows that every
 coordinator script in use today rebuilds from the verbs in about
 ten lines of shell.
 
@@ -36,13 +36,13 @@ ten lines of shell.
 
 | Verb today | What it does | Gap this doc closes |
 | --- | --- | --- |
-| `corral coord wait [--timeout] [--json]` | Blocks until an unresolved coordinator event exists; prints the batch or `[]`. Exits 0 on events, 1 on timeout, 4 on usage. | None. `wait` stays as is. |
-| `corral coord ack <id>` | Resolves one unresolved event. Exits 0, 1 on unknown id, 4 on usage. | None. Unchanged. |
-| `corral review show --pr N --json` | Prints the record a commit has, or inherits across a clean merge-up, plus `inherited_from`. Exits 0 when the record approves, 1 when none exists or the verdict blocks, 3 when the forge is unreachable, 4 on usage. | None. This already is the review-report reader; section 5.3 blesses it instead of adding a verb. |
-| `corral takeoff [--body FILE] [--test] [--json] [path]` | Runs the project-level gate and reports one row per check. Exits 0 when every check is ok or skipped, 1 on failure, 3 when the remote cannot be read, 4 on usage or configuration error, 75 when another takeoff holds the full-suite lock past the wait. | Named skips: today a check is skipped only by a config flag, silently. Section 6 adds `--skip NAME` with recorded skips. |
-| `corral drive [--plan]` | Runs one dispatch pass, or reports the verdict without changing anything under `--plan`. Exits 0, 1, 2 (a pass holds the lock), 3, 4, 75 (no free slot, try later). | None. Section 5.6 documents the retry loop over these codes. |
-| `corral push` | Pushes, verifies the remote ref, retries once on a dead connection. Exits 0, 1, 3, 4. | None. `push` stays the worktree-side half; `merge` (section 7) is the forge-side half. |
-| `corral agent list --json`, `corral snapshot --json`, `corral serve /v1/stream` | Read-only views of live agents and host state; the stream is Server-Sent Events over the snapshot. | None. Watchers compose these with `wait` (section 10). |
+| `korapy coord wait [--timeout] [--json]` | Blocks until an unresolved coordinator event exists; prints the batch or `[]`. Exits 0 on events, 1 on timeout, 4 on usage. | None. `wait` stays as is. |
+| `korapy coord ack <id>` | Resolves one unresolved event. Exits 0, 1 on unknown id, 4 on usage. | None. Unchanged. |
+| `korapy review show --pr N --json` | Prints the record a commit has, or inherits across a clean merge-up, plus `inherited_from`. Exits 0 when the record approves, 1 when none exists or the verdict blocks, 3 when the forge is unreachable, 4 on usage. | None. This already is the review-report reader; section 5.3 blesses it instead of adding a verb. |
+| `korapy takeoff [--body FILE] [--test] [--json] [path]` | Runs the project-level gate and reports one row per check. Exits 0 when every check is ok or skipped, 1 on failure, 3 when the remote cannot be read, 4 on usage or configuration error, 75 when another takeoff holds the full-suite lock past the wait. | Named skips: today a check is skipped only by a config flag, silently. Section 6 adds `--skip NAME` with recorded skips. |
+| `korapy drive [--plan]` | Runs one dispatch pass, or reports the verdict without changing anything under `--plan`. Exits 0, 1, 2 (a pass holds the lock), 3, 4, 75 (no free slot, try later). | None. Section 5.6 documents the retry loop over these codes. |
+| `korapy push` | Pushes, verifies the remote ref, retries once on a dead connection. Exits 0, 1, 3, 4. | None. `push` stays the worktree-side half; `merge` (section 7) is the forge-side half. |
+| `korapy agent list --json`, `korapy snapshot --json`, `korapy serve /v1/stream` | Read-only views of live agents and host state; the stream is Server-Sent Events over the snapshot. | None. Watchers compose these with `wait` (section 10). |
 
 What does not exist yet: a read-only event list (`events`), a
 follow mode for it, named gate skips, any merge verb, and a merge
@@ -51,7 +51,7 @@ method on the forge interface (`forge.py` has PR reads only:
 
 ## 3. Principles applied
 
-The ticket fixes six principles; each maps to an existing corral
+The ticket fixes six principles; each maps to an existing korapy
 rule:
 
 1. **Views over open state.** Events and agent state stay plain
@@ -68,7 +68,7 @@ rule:
    Silent config-off skips stay, but they report as config skips,
    never as passes.
 4. **Policy in the project.** The gate runs a configured list of
-   commands from the project's `corral.toml`. Privacy checks, model
+   commands from the project's `korapy.toml`. Privacy checks, model
    policy and review wording never enter core.
 5. **No daemon decisions.** No MCP server and no skill holds state
    or rules the CLI lacks. Section 9 states the MCP verdict.
@@ -133,7 +133,7 @@ would let two coordinators disagree about what is open.
 
 ## 5. The verbs
 
-### 5.1 `corral coord wait` (exists, unchanged)
+### 5.1 `korapy coord wait` (exists, unchanged)
 
 Purpose: block until an unresolved coordinator event exists, with
 no GitHub calls. The wakeup primitive; filtering and dispatch stay
@@ -158,7 +158,7 @@ needs no `--plan`. Deliberately no `--kind` filter: the caller
 loops `wait` with `jq` (section 10). One flag per new predicate
 would turn `wait` into a query language.
 
-### 5.2 `corral coord events` (PROPOSED)
+### 5.2 `korapy coord events` (PROPOSED)
 
 Purpose: the read-only twin the queue is missing. List what is
 open (or everything, with `--all`), and follow new arrivals for
@@ -205,7 +205,7 @@ only. Never the tracker, never the forge.
 
 Read-only twin: the verb itself; it writes nothing.
 
-### 5.3 The review-report reader: `corral review show --json` (exists, blessed)
+### 5.3 The review-report reader: `korapy review show --json` (exists, blessed)
 
 Purpose: return the machine fact a review established: the
 verdict, the commit it covers, whose review it was, every finding,
@@ -249,7 +249,7 @@ No new verb, no report sidecar file: a second artifact beside the
 record would split the one fact (the review's verdict) into two
 places that can disagree.
 
-### 5.4 `corral merge` (PROPOSED)
+### 5.4 `korapy merge` (PROPOSED)
 
 Purpose: merge one pull request after proving it is mergeable,
 serially, with every precondition reported as data. The forge-side
@@ -304,7 +304,7 @@ fail exits 1 with the failing rows.
 Checks, refusal and never-dos are specified in section 7; the
 forge seam it needs in section 8.
 
-### 5.5 The gate: `corral takeoff --skip NAME` (exists, extended)
+### 5.5 The gate: `korapy takeoff --skip NAME` (exists, extended)
 
 Purpose: run the project-level gate before a PR and report each
 check. `takeoff` already runs the configured command list and
@@ -338,7 +338,7 @@ full-suite lock). A `--skip` of an unknown check name is exit 4.
 
 State read: the worktree (status, commits, added lines), the
 `--body` file, the leak rules, the review record, the forge base,
-and `corral.toml` (`checks.takeoff`, `checks.test`,
+and `korapy.toml` (`checks.takeoff`, `checks.test`,
 `review.required`, `git.commits.conventional`,
 `checks.no_em_dash`). The configured commands run in the
 worktree with the standard timeout and seam injection.
@@ -353,12 +353,12 @@ running it. Exit codes mirror the verdict: 0 when every resolved
 check passes and the plan lists the commands, 1 when a resolved
 check fails.
 
-### 5.6 Retrying dispatch: `corral drive` (exists, documented)
+### 5.6 Retrying dispatch: `korapy drive` (exists, documented)
 
 Purpose: run one dispatch pass. No new verb: the retry loop
 branches on exit codes the pass already returns.
 
-Arguments: `corral drive [--plan]` (plus the existing hub and
+Arguments: `korapy drive [--plan]` (plus the existing hub and
 timer flags). `--plan` is the read-only twin: it holds no lock
 and writes nothing, and prints what the pass would do.
 
@@ -378,7 +378,7 @@ and 1 stop, anything else aborts loudly.
 
 ### 6.1 Config shape
 
-The gate runs what the project's `corral.toml` configures; core
+The gate runs what the project's `korapy.toml` configures; core
 only runs the list and reports each result. Two keys, both
 registered today:
 
@@ -525,7 +525,7 @@ Only the GitHub adapter implements it (a `gh api` merge call
 against the pinned head, verified as in section 7.2). Everything
 else takes a `Forge`, per the rule that nothing outside the two
 adapters calls `gh`. Coordinators calling `gh pr merge` directly
-today migrate to `corral merge`; the direct call keeps working,
+today migrate to `korapy merge`; the direct call keeps working,
 since the state stays open, but it loses serialization and the
 recorded verdict.
 
@@ -544,7 +544,7 @@ recorded verdict.
 
 ## 10. Surfaces: CLI, skill, MCP
 
-The CLI is the API. Every verb above is a `corral` subcommand
+The CLI is the API. Every verb above is a `korapy` subcommand
 with `--json` output and public exit codes, so any shell, any
 harness, and any future surface builds on the same behavior.
 
@@ -558,7 +558,7 @@ the CLI parsers, so the two cannot drift silently.
 
 The MCP server is optional, last, and only a mirror: if one ever
 exists, it exposes the same verbs with the same behavior and
-holds no state or rules of its own. Verdict: corral should NOT
+holds no state or rules of its own. Verdict: korapy should NOT
 ship an MCP server in this round. Reasons: the CLI is already
 scriptable from any agent over stdio with no extra process to
 supervise; a second surface doubles the conformance burden
@@ -575,16 +575,16 @@ about ten lines of shell. Names below are stand-ins.
 Live-agent watcher (exit 0 when nothing is live on the ticket):
 
 ```sh
-while corral agent list --json \
+while korapy agent list --json \
   | jq -e 'any(.[]; .ticket.repo == "atlas" and .ticket.number == 12)' > /dev/null; do
-  corral coord wait --timeout 120 > /dev/null || true
+  korapy coord wait --timeout 120 > /dev/null || true
 done
 ```
 
 Gate (run the project gate, report each check, refuse on failure):
 
 ```sh
-corral takeoff --json --body "$body" "$worktree" > gate.json || exit 1
+korapy takeoff --json --body "$body" "$worktree" > gate.json || exit 1
 jq -r '.checks[] | "\(.status) \(.name) \(.detail)"' gate.json
 jq -e 'all(.checks[]; .status != "fail")' gate.json > /dev/null
 ```
@@ -592,7 +592,7 @@ jq -e 'all(.checks[]; .status != "fail")' gate.json > /dev/null
 Review-report reader (the machine verdict plus every finding):
 
 ```sh
-corral review show atlas 12 --pr 34 --head "$sha" --json > report.json
+korapy review show atlas 12 --pr 34 --head "$sha" --json > report.json
 jq -e '.verdict == "approve" or .verdict == "approve-with-findings"' report.json
 jq -r '.findings[] | "- \(.severity): \(.text)"' report.json
 ```
@@ -601,7 +601,7 @@ Serialized merge (one merger at a time per repo; exit 2 retries):
 
 ```sh
 while true; do
-  corral merge example/atlas 34 --head "$sha" --json > merge.json; code=$?
+  korapy merge example/atlas 34 --head "$sha" --json > merge.json; code=$?
   [ $code -eq 0 ] && break
   [ $code -eq 2 ] && sleep 30 && continue
   jq -r '.checks[] | "\(.status) \(.name): \(.detail)"' merge.json; exit 1
@@ -611,9 +611,9 @@ done
 Retrying dispatch (plan first, then run; 75 and 2 retry later):
 
 ```sh
-corral drive --plan || exit 1
+korapy drive --plan || exit 1
 while true; do
-  corral drive; code=$?
+  korapy drive; code=$?
   [ $code -eq 0 ] && break
   { [ $code -eq 75 ] || [ $code -eq 2 ]; } && sleep 60 && continue
   exit $code
@@ -658,7 +658,7 @@ state dirs, per AGENTS.md).
    against a fake runner (both fields parsed, missing PR raises
    `ForgeError`), fake-forge coverage of each `checks_state`
    value, seam refusal shapes.
-6. `corral merge` verb: per-repo lock via the single resolver
+6. `korapy merge` verb: per-repo lock via the single resolver
    `merge.lock_path(repo)`, ordered preconditions (section 7.2),
    `--plan`, `--json`, exit codes 0/1/2/3/4, `--skip` of
    anything but `checks` exits 4. Tests: lock race is exit 2,

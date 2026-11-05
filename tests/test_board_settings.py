@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 
-from corral import settings
+from korapy import settings
 
 
 def resolve(**kw):
@@ -63,14 +63,14 @@ class ScalarDefaults(unittest.TestCase):
         self.assertIsNone(resolve(project=project(board=None, variant="labels")).board)
 
     def test_board_settings_come_from_the_sync_module(self):
-        self.assertIn("corral.sync", settings.PROVIDERS)
+        self.assertIn("korapy.sync", settings.PROVIDERS)
 
     def test_scalars_layer_like_every_other_setting(self):
         resolved = resolve(
             host={"board": {"poll_pages": 2}},
             project=project(board=None, variant="labels"),
             repo="app",
-            env={"CORRAL_TRACKER_VARIANT": "board", "CORRAL_BOARD_POLL_PAGES": "9"},
+            env={"KORAPY_TRACKER_VARIANT": "board", "KORAPY_BOARD_POLL_PAGES": "9"},
             flags={"board.poll_pages": 7},
         )
         self.assertEqual(resolved["tracker.variant"], "board")
@@ -187,7 +187,7 @@ class VariantValidation(unittest.TestCase):
             resolve(
                 project=project(board=None, variant="labels"),
                 repo="app",
-                env={"CORRAL_TRACKER_VARIANT": "bord"},
+                env={"KORAPY_TRACKER_VARIANT": "bord"},
             )
 
     def test_both_variants_resolve(self):
@@ -302,14 +302,14 @@ class TomlText(unittest.TestCase):
             '"opt-p0-id" = "urgent"\n'
             '"opt-p1-id" = "high"\n'
         )
-        with tempfile.TemporaryDirectory(prefix="corral-board-settings-") as tmp:
+        with tempfile.TemporaryDirectory(prefix="korapy-board-settings-") as tmp:
             config = os.path.join(tmp, "config")
             os.makedirs(config)
             root = os.path.join(tmp, "ops")
             os.makedirs(root)
-            with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
+            with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
                 handle.write(text)
-            resolved = settings.load(root=root, repo="app", env={"CORRAL_CONFIG": config})
+            resolved = settings.load(root=root, repo="app", env={"KORAPY_CONFIG": config})
         self.assertEqual(resolved["tracker.variant"], "board")
         self.assertEqual(resolved["tracker.repo"], "example/demo")
         board = resolved.board

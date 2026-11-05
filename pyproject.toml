@@ -1,5 +1,5 @@
 [project]
-name = "corral"
+name = "korapy"
 version = "0.1.0"
 description = "An opinionated core for running fleets of headless coding agents on Linux hosts"
 readme = "README.md"
@@ -20,7 +20,7 @@ classifiers = [
 dependencies = []
 
 [project.scripts]
-corral = "corral.cli:main"
+korapy = "korapy.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.5,<0.14.0"]

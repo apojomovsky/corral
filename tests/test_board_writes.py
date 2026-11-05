@@ -10,9 +10,9 @@ import tempfile
 import unittest
 from typing import Any
 
-from corral import board, mirror, tracker
-from corral.github import board as boardmod
-from corral.github import gh
+from korapy import board, mirror, tracker
+from korapy.github import board as boardmod
+from korapy.github import gh
 from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
     BoardFakeRun,
@@ -360,7 +360,7 @@ def stored(path, number=7, **over: Any):
 
 class BoardMirrorTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-writes-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-writes-")
         self.addCleanup(self.tmp.cleanup)
         self.path = os.path.join(self.tmp.name, "board.sqlite")
 
@@ -479,7 +479,7 @@ class BoardMirrorTest(unittest.TestCase):
 
 class BoardSettlementTest(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="corral-board-settle-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-settle-")
         self.addCleanup(self.tmp.cleanup)
         self.store = board.open_store(os.path.join(self.tmp.name, "board.sqlite"))
         self.addCleanup(self.store.close)

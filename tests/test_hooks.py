@@ -15,7 +15,7 @@ def git(repo, *args, env=None):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, env=env)
 
 
-def clean_env(email="suite@corral.invalid"):
+def clean_env(email="suite@korapy.invalid"):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(
         GIT_AUTHOR_NAME="suite",
@@ -129,7 +129,7 @@ class PrePush(Repo):
 
     def test_an_approved_force_push_passes(self):
         git(self.repo, "reset", "-q", "--hard", "HEAD~1", env=self.env)
-        env = dict(self.env, CORRAL_FORCE_PUSH_APPROVED="1")
+        env = dict(self.env, KORAPY_FORCE_PUSH_APPROVED="1")
         r = git(self.repo, "push", "-q", "--force", "origin", "master", env=env)
         self.assertEqual(r.returncode, 0, r.stderr)
 
@@ -144,8 +144,8 @@ class PrePush(Repo):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("suite already passed", r.stdout + r.stderr)
 
-    def test_the_hook_and_corral_push_share_the_stamp_name(self):
-        from corral import push
+    def test_the_hook_and_korapy_push_share_the_stamp_name(self):
+        from korapy import push
 
         lines = [
             l for l in (HOOKS / "pre-push").read_text().splitlines() if l.startswith("stamp_file=")
@@ -160,17 +160,17 @@ class PrePush(Repo):
 
 
 class PackagedHooks(unittest.TestCase):
-    """`corral init` ships copies of the repo hooks: drift must fail loudly."""
+    """`korapy init` ships copies of the repo hooks: drift must fail loudly."""
 
     def test_commit_msg_matches_the_repo_hook_byte_for_byte(self):
-        packaged = resources.files("corral").joinpath("hooks/commit-msg").read_bytes()
+        packaged = resources.files("korapy").joinpath("hooks/commit-msg").read_bytes()
         self.assertEqual(packaged, (HOOKS / "commit-msg").read_bytes())
 
     def test_pre_push_ships_the_guard_block_verbatim(self):
         repo_lines = (HOOKS / "pre-push").read_text().splitlines()
         end = next(i for i, line in enumerate(repo_lines) if line == "done")
         packaged = (
-            resources.files("corral").joinpath("hooks/pre-push").read_text("utf-8").splitlines()
+            resources.files("korapy").joinpath("hooks/pre-push").read_text("utf-8").splitlines()
         )
         self.assertEqual(packaged[-1], "done")
         self.assertEqual(_code(packaged), _code(repo_lines[: end + 1]))
@@ -198,14 +198,14 @@ class PackagedHookRuns(unittest.TestCase):
             ["git", "init", "-q", "-b", "main", str(self.repo)], check=True, env=self.env
         )
         git(self.repo, "config", "user.name", "suite", env=self.env)
-        git(self.repo, "config", "user.email", "suite@corral.invalid", env=self.env)
+        git(self.repo, "config", "user.email", "suite@korapy.invalid", env=self.env)
         (self.repo / "f").write_text("one")
         git(self.repo, "add", "f", env=self.env)
         git(self.repo, "commit", "-qm", "chore: one", env=self.env)
         (self.repo / "g").write_text("two")
         git(self.repo, "add", "g", env=self.env)
         git(self.repo, "commit", "-qm", "chore: two", env=self.env)
-        base = resources.files("corral").joinpath("hooks")
+        base = resources.files("korapy").joinpath("hooks")
         self.pre_push = str(base.joinpath("pre-push"))
         self.commit_msg = str(base.joinpath("commit-msg"))
 
@@ -242,7 +242,7 @@ class PackagedHookRuns(unittest.TestCase):
         refused = self.run_pre_push(line)
         self.assertEqual(refused.returncode, 1)
         self.assertIn("refusing", refused.stderr)
-        approved = self.run_pre_push(line, {"CORRAL_FORCE_PUSH_APPROVED": "1"})
+        approved = self.run_pre_push(line, {"KORAPY_FORCE_PUSH_APPROVED": "1"})
         self.assertEqual(approved.returncode, 0, approved.stderr)
 
     def test_packaged_commit_msg_rejects_an_em_dash(self):

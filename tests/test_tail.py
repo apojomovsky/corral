@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from corral.runtimes import tail
+from korapy.runtimes import tail
 
 
 def entry(role, *content):

@@ -1,9 +1,9 @@
-"""Tests for `corral review show`: the gate takes the base from the forge.
+"""Tests for `korapy review show`: the gate takes the base from the forge.
 
 Real git repositories in temp dirs (local only, no network); `origin`
 remotes name a forge repo but are never contacted. The forge is always
 the in-memory `FakeForge`; no test calls a real `gh`. Records live
-under `CORRAL_SESSIONS` pointed at a temp dir, never the host's.
+under `KORAPY_SESSIONS` pointed at a temp dir, never the host's.
 """
 
 import argparse
@@ -14,7 +14,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from corral import forge, mergeup, reviewcli, reviewrecord
+from korapy import forge, mergeup, reviewcli, reviewrecord
 from tests.test_forge import FakeForge, make_pr
 from tests.test_reviewrecord import git_in
 
@@ -40,7 +40,7 @@ class ShowTest(unittest.TestCase):
         self.reviewed = self.rev("HEAD")
         self.approve(self.reviewed)
         self.master_base = self.rev("master")
-        env = mock.patch.dict(os.environ, {"CORRAL_SESSIONS": self.sessions})
+        env = mock.patch.dict(os.environ, {"KORAPY_SESSIONS": self.sessions})
         env.start()
         self.addCleanup(env.stop)
         here = os.getcwd()

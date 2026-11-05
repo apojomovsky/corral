@@ -1,7 +1,7 @@
 """Coordinator logbook and brief.
 
 Offline: API tests use a temp state root and a fake clock; CLI tests
-redirect the state dir through CORRAL_STATE; snapshot and PR
+redirect the state dir through KORAPY_STATE; snapshot and PR
 reads use injected fakes (never the real state dir, the network or the
 board).
 """
@@ -15,8 +15,8 @@ import unittest
 from unittest import mock
 from contextlib import redirect_stderr, redirect_stdout
 
-from corral import cli, coordcli
-from corral import coord
+from korapy import cli, coordcli
+from korapy import coord
 
 T0 = datetime.datetime(2026, 10, 14, tzinfo=datetime.timezone.utc)
 
@@ -221,7 +221,7 @@ class JournalCliTest(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        env = mock.patch.dict(os.environ, {"CORRAL_STATE": tmp.name, "CORRAL_PROJECT": "demo"})
+        env = mock.patch.dict(os.environ, {"KORAPY_STATE": tmp.name, "KORAPY_PROJECT": "demo"})
         env.start()
         self.addCleanup(env.stop)
         for name, fake in (("_coord_snapshot", fake_snapshot), ("_coord_human_prs", fake_prs)):

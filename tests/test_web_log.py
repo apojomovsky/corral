@@ -4,7 +4,7 @@ Contract tests: every events and journal field the log view reads,
 served at the production seam with fakes, asserted present with the
 right types and nullability. A failing test here means an API change
 that would silently blank or garble the view. Source-discipline tests
-read the packaged `corral/web/` files: the log entry points, caps and
+read the packaged `korapy/web/` files: the log entry points, caps and
 routing exist, since no JS runner exists. Offline: a real HTTP server
 on a loopback ephemeral port with fake readers. No `gh`, no network
 beyond loopback, no real state dirs.
@@ -15,13 +15,13 @@ import re
 import unittest
 from importlib import resources
 
-from corral import coord
+from korapy import coord
 from tests.test_serve import EVENT_ROWS, ServeCase, healthy_doc, journal_entry
 from tests.test_serve import FakeBuilder
 
 
 def web_text(name):
-    return resources.files("corral").joinpath(f"web/{name}").read_text(encoding="utf-8")
+    return resources.files("korapy").joinpath(f"web/{name}").read_text(encoding="utf-8")
 
 
 class EventsContract(ServeCase):
@@ -168,7 +168,7 @@ class LogSourceDiscipline(unittest.TestCase):
         self.assertIn("export const LOG_EVENTS_CAP = 100;", api)
 
     def test_kind_list_matches_the_route(self):
-        from corral import coord as coord_module
+        from korapy import coord as coord_module
 
         api = web_text("api.js")
         found = re.search(r"export const LOG_KINDS = \[([^\]]*)\];", api)

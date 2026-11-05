@@ -19,7 +19,7 @@ Decisions already made (do not reopen):
    `05-dashboard-api.md`.
 3. Hub unreachable: hosts keep running work they already hold (commit,
    push, open PRs, resume). No new claims until it is back.
-4. One corral per machine: one state directory and one host-wide
+4. One korapy per machine: one state directory and one host-wide
    ledger; projects register to it. Resource admission (CPU, memory)
    is decided by the host, never by the hub; the hub only learns each
    host's capacity and load.
@@ -27,7 +27,7 @@ Decisions already made (do not reopen):
    it.
 
 Conventions: "dashboard" means any UI owned by a project or a user,
-never by corral, per `05-dashboard-api.md`. Shapes quoted from
+never by korapy, per `05-dashboard-api.md`. Shapes quoted from
 existing modules were read from the tree; anything needing a live run
 is marked UNVERIFIED with a safe way to learn it.
 
@@ -60,7 +60,7 @@ transaction. Four tables plus one meta row:
   disk ceilings the host reports), `constraints` (docker, attached
   hardware, clones it serves), `last_seen` (hub clock, epoch
   seconds), `reachable` (derived, section 5). The id is minted once
-  by `corral hub add-host` and stored on the host; a host that loses
+  by `korapy hub add-host` and stored on the host; a host that loses
   its id re-registers as a new host, never by guessing.
 - **projects**: one row per registered project: `name`, the repos it
   serves, and which hosts serve it. Registration stays per host (a
@@ -77,7 +77,7 @@ transaction. Four tables plus one meta row:
   are `(host, repo, number)` for agents and claims and
   `(host, provider)` for quota, per `05-dashboard-api.md` section 5.
 - **snapshots**: one row per host: the last pushed host document in
-  the `corral snapshot --json` shape (unchanged schema, built by the
+  the `korapy snapshot --json` shape (unchanged schema, built by the
   same `snapshot.build`), plus `host_now` (the serving host's clock
   at build time) and `received_at` (hub clock). Snapshots are data,
   never decisions: the hub never admits, gates, or claims from them.
@@ -198,9 +198,9 @@ propose only tickets the hub shows as unclaimed.
 
 Operator verbs (all client commands against the hub, all logged):
 
-- `corral hub add-host --id host-1`: mints the host id and its
+- `korapy hub add-host --id host-1`: mints the host id and its
   bearer token (section 6), prints the token once.
-- `corral hub remove-host --id host-1`: bumps `membership_epoch`
+- `korapy hub remove-host --id host-1`: bumps `membership_epoch`
   in the meta row and releases that host's claims (epochs kept for
   the next mint). The bump is visible to a rejoining host through
   the register and heartbeat replies, which both carry the current
@@ -208,9 +208,9 @@ Operator verbs (all client commands against the hub, all logged):
   than the reply's stops its agents, drops their claims, and does
   nothing until added again. Same rule as the peer plan's removal,
   minus the ack roundtrip.
-- `corral hub release <repo> <number>`: force-releases one claim
+- `korapy hub release <repo> <number>`: force-releases one claim
   (operator override, logged with reason).
-- `corral hub rotate-token --id host-1`: revokes and re-mints one
+- `korapy hub rotate-token --id host-1`: revokes and re-mints one
   host's token (section 6).
 
 ## 3. Hub-down behavior
@@ -266,7 +266,7 @@ injection test with a scriptable clock, no real network (section 9).
 
 ## 4. Single-host mode
 
-With no hub configured, corral behaves as today. The config key is
+With no hub configured, korapy behaves as today. The config key is
 `hub.url`; absent means single-host: the drive skips the hub step
 entirely (no exit 3 from a hub that was never configured), claims go
 through the local store transaction only, and the dashboard is the
@@ -319,7 +319,7 @@ replaces per-host reads.
 ## 6. Security
 
 - Token model: the bearer model from `05-dashboard-api.md`
-  section 3, extended to one token per host. `corral hub add-host`
+  section 3, extended to one token per host. `korapy hub add-host`
   mints a random token (stdlib `secrets`), prints it once, and
   stores only a salted hash hub-side (stdlib `hashlib`, salt beside
   the hash). The host keeps its token in `<config_dir>/hub-token`
@@ -338,7 +338,7 @@ replaces per-host reads.
   continues. There is no `--allow-remote` flag and no bind
   refusal: the operator knows best.
 - Leaked token: the operator runs
-  `corral hub rotate-token --id <host>`; the old hash is replaced
+  `korapy hub rotate-token --id <host>`; the old hash is replaced
   immediately, so the leaked token dies on the next request. The
   affected host's requests get `401` until its operator installs
   the new token; a `401` is a configuration error (exit 4 naming
@@ -362,15 +362,15 @@ replaces per-host reads.
   mode), resolved by exactly one helper in `paths.py`, following
   the one-fact-one-place rule. The hub runs on the maintainer's
   host under its own state dir; it never shares a state dir with a
-  worker host's corral.
+  worker host's korapy.
 - Backup: a file copy of the SQLite database (WAL checkpointed
   first) is a complete backup; the stdlib `sqlite3` backup API
   gives an online variant. Either is operator-run, on a schedule
   the operator owns. Restore is a file replacement while the hub
   is stopped.
 - Export and import, so the hub can move to another host:
-  `corral hub export` writes JSON with hosts, projects, and claims
-  including epochs; `corral hub import` loads it into a fresh hub.
+  `korapy hub export` writes JSON with hosts, projects, and claims
+  including epochs; `korapy hub import` loads it into a fresh hub.
   Epochs are preserved across the move, so fencing continuity
   survives it. Snapshots are excluded by design: hosts re-push on
   their next heartbeat. Token hashes are excluded: after an import
@@ -442,10 +442,10 @@ the previous ticket's tests. Order matters: hub with claims and a
 registry first, the aggregated dashboard last.
 
 - H1: hub skeleton, host registry, claims table. New hub service
-  (stdlib HTTP plus SQLite), `hub.url` setting, `corral hub
+  (stdlib HTTP plus SQLite), `hub.url` setting, `korapy hub
   add-host`, atomic grant with epochs, `409` conflicts.
   Acceptance: the grant-atomicity and conflict tests pass; `make
-  check` green. H1 updates `README.md` for the new `corral hub`
+  check` green. H1 updates `README.md` for the new `korapy hub`
   verbs and `hub.url` (the only README change this design needs).
 - H2: leases, renewal, release, crash recovery. Renew and release
   routes, `lease_ttl_s` and `heartbeat_s` settings, expiry
@@ -480,7 +480,7 @@ registry first, the aggregated dashboard last.
 - H7: takeoff. Full suite with `TEST=1`, `make check`, and the
   takeoff ritual on a branch, then review. Acceptance: green
   gates and a review record. No further README change is expected
-  (H1 already covered the `corral hub` verbs and `hub.url`);
+  (H1 already covered the `korapy hub` verbs and `hub.url`);
   record that reason in the H7 PR body.
 
 ## 11. What the hub owns versus resource governance (issue 195)
