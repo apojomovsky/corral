@@ -1,10 +1,11 @@
 # 03: the muse runtime adapter
 
-Status: design, not built. This doc fixes the second adapter, `muse`
-(the Muse Code CLI), next to `omp` in
+Status: built (T1 to T5, T7 and T9; T6 is the host-side quota reader,
+outside korapy, and the gaps T8 closes stay UNVERIFIED). This doc fixes
+the second adapter, `muse` (the Muse Code CLI), next to `omp` in
 `src/korapy/runtimes/`. Nothing here changes the launch, resume, tail or
 stop flow in `src/korapy/launch.py`, the unit model, the registry,
-admission, exit codes, or any CLI verb. T9 names the muse runtime in
+admission, exit codes, or any CLI verb. T9 named the muse runtime in
 `README.md` and in the design docs.
 The only index change is the row for this doc in `docs/README.md`.
 
