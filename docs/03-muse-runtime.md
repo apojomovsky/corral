@@ -413,7 +413,7 @@ raising the no-activity `LaunchError`).
 ## 10. Implementation tickets
 
 Each is one agent of work with its own tests; none needs a new
-public interface beyond `agents.runtime: muse`.
+public interface beyond a profile `runtime` of `muse`.
 
 - T1: argv and registration. Build `muse.binary`, `muse.argv`
   (worker, reviewer, resume), wire `NAMES`/`get`, keep
