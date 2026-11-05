@@ -21,20 +21,19 @@ here, only shapes. Home paths below are generic stand-ins:
 ## 0. Where it fits
 
 One new module, `src/korapy/runtimes/muse.py`, exposing the same
-`Runtime` protocol as the other two (`argv`, `env`, `write_config`,
-`with_models`, `resume_handle`, `activity_file`), plus two small
-helpers this runtime needs: `resolve(session_id)` (session id to
-session file) and `classify(returncode, stderr_text, stream_text)`
-(provider error classification, section 5). `activity_file(session)`
-returns the unit's `out.log` path when present and `None` otherwise,
-because `launch.py` tail calls it unconditionally; without it a muse
-session would crash `korapy tail`.
+`Runtime` protocol as `omp` (`argv`, `env`, `write_config`,
+`with_models`, `resume_handle`, `activity_file`, `options_schema`),
+plus two small helpers this runtime needs: `resolve(session_id)`
+(session id to session file) and `classify(returncode, stderr_text,
+stream_text)` (provider error classification, section 5).
+`activity_file(session)` returns the unit's `out.log` path when present
+and `None` otherwise, because `launch.py` tail calls it unconditionally;
+without it a muse session would crash `korapy tail`.
 `runtimes/__init__.py` gains the name:
 `NAMES` becomes `("omp", "muse")`, `get("muse")` returns the
 adapter, and profiles accept `muse` as a runtime. `DEFAULT_RUNTIME` stays
-`omp`; `record`/`recorded` are unchanged. `settings.PROVIDERS` already
-lists `korapy.runtimes`, and this design adds no new setting (section
-1), so settings need no change.
+`omp`; `record`/`recorded` are unchanged, and this design adds no new
+setting (section 1), so settings need no change.
 
 Model ids: `quota.chain_provider` takes the part before the first `/`,
 so a chain entry `muse/muse-spark-1.3` names provider `muse` and the
