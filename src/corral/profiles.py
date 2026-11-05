@@ -59,8 +59,10 @@ class Profile:
 
 
 #: The shipped default setup. Lower layers fall back to it, so resolution
-#: always succeeds; it carries no chains or options of its own.
-BUILTIN_DEFAULT = Profile(name=DEFAULT_PROFILE_NAME, runtime="muse")
+#: always succeeds; it carries no chains or options of its own. The runtime
+#: comes from `runtimes.DEFAULT_RUNTIME`: one fact, one place, so the
+#: cutover changes no default.
+BUILTIN_DEFAULT = Profile(name=DEFAULT_PROFILE_NAME, runtime=runtimes.DEFAULT_RUNTIME)
 
 
 def _want_type(entry):

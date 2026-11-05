@@ -389,7 +389,7 @@ GOLDEN_FLAGS = """# corral.toml, written by `corral init`. Settings that differ
 default = "default"
 
 [profiles.default]
-runtime = "omp"
+runtime = "muse"
 
 [[repo]]
 name = "empty"
@@ -721,7 +721,7 @@ class FlagsCase(Fixture):
             "--cap",
             "3",
             "--runtime",
-            "omp",
+            "muse",
             "--set",
             "board.ready=triage",
             "--set",
@@ -734,13 +734,13 @@ class FlagsCase(Fixture):
         env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["agents.cap"], 3)
-        self.assertEqual(resolved.profiles["default"]["runtime"], "omp")
+        self.assertEqual(resolved.profiles["default"]["runtime"], "muse")
         self.assertEqual(resolved.profile_committed["default"], "default")
         self.assertEqual(resolved["board.ready"], "triage")
         self.assertIs(resolved["git.commits.conventional"], False)
 
     def test_a_builtin_runtime_writes_no_profiles_table(self):
-        code, _, _ = self.run_cli("--test-cmd", "make check", "--runtime", "muse", self.root)
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--runtime", "omp", self.root)
         self.assertEqual(code, 0)
         with open(self.target(), encoding="utf-8") as handle:
             text = handle.read()

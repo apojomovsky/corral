@@ -1038,6 +1038,26 @@ class LaunchTest(OpsCase):
         self.assertEqual(unit, "corral-agent-lib-5")
         self.assertTrue(os.path.isdir(workdir))
 
+    def test_no_profiles_launches_on_the_shipped_default_runtime(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            '[profile]\ndefault = "default"\n\n[profiles.default]\nruntime = "omp"\n\n', ""
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        unit, workdir = self.start("omp")
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertTrue(os.path.isdir(workdir))
+        session = self.leaf("lib", 5)
+        self.assertEqual(runtimes.recorded(session), runtimes.DEFAULT_RUNTIME)
+        recorded = profiles.recorded_profile(session)
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, profiles.DEFAULT_PROFILE_NAME)
+        self.assertEqual(recorded.runtime, runtimes.DEFAULT_RUNTIME)
+
     def test_an_unreachable_service_manager_is_exit_3(self):
         def down(prefix):
             raise units.Unreachable("no bus")
