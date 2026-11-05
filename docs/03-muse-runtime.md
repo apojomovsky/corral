@@ -31,7 +31,7 @@ because `launch.py` tail calls it unconditionally; without it a muse
 session would crash `corral tail`.
 `runtimes/__init__.py` gains the name:
 `NAMES` becomes `("omp", "muse")`, `get("muse")` returns the
-adapter, and `agents.runtime` accepts `muse`. `DEFAULT_RUNTIME` stays
+adapter, and profiles accept `muse` as a runtime. `DEFAULT_RUNTIME` stays
 `omp`; `record`/`recorded` are unchanged. `settings.PROVIDERS` already
 lists `corral.runtimes`, and this design adds no new setting (section
 1), so settings need no change.

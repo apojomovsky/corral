@@ -448,7 +448,7 @@ class OpsErrorsCase(OpsFixture):
         self.assertEqual(code, 4)
         self.assertIn("corral.toml", err)
 
-    def test_dropping_runtime_is_4(self):
+    def test_changing_runtime_is_4(self):
         self.assertEqual(
             self.run_cli(
                 "init",
@@ -457,17 +457,46 @@ class OpsErrorsCase(OpsFixture):
                 "--test-cmd",
                 "make check",
                 "--runtime",
-                "muse",
+                "omp",
                 "--no-register",
                 self.clone,
             )[0],
             0,
         )
         code, _, err = self.run_cli(
-            "init", "--ops", self.ops, "--test-cmd", "make check", "--no-register", self.clone
+            "init",
+            "--ops",
+            self.ops,
+            "--test-cmd",
+            "make check",
+            "--runtime",
+            "muse",
+            "--no-register",
+            self.clone,
         )
         self.assertEqual(code, 4)
         self.assertIn("corral.toml", err)
+
+    def test_dropping_runtime_converges(self):
+        self.assertEqual(
+            self.run_cli(
+                "init",
+                "--ops",
+                self.ops,
+                "--test-cmd",
+                "make check",
+                "--runtime",
+                "omp",
+                "--no-register",
+                self.clone,
+            )[0],
+            0,
+        )
+        code, out, err = self.run_cli(
+            "init", "--ops", self.ops, "--test-cmd", "make check", "--no-register", self.clone
+        )
+        self.assertEqual((code, err), (1, ""))
+        self.assertIn("is up to date", out)
 
     def test_init_refuses_second_name_for_same_clone(self):
         self.assertEqual(

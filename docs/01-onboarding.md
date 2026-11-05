@@ -29,7 +29,7 @@ Decided on 2026-10-26, meeting R1 to R7:
 - **One code path.** `corral.toml` always lives in an *ops root* and lists the repositories it drives as `[[repo]]` entries. The inline layout is the case where the ops root is the project, and the list holds that one repository. Commands, settings and the doctor behave the same in both layouts. The split layout adds only two things:
   - the rule that nothing tracked is written into the project (R1);
   - the leak guard (below).
-- **Several repositories per ops root.** Each `[[repo]]` entry has its own clone, default branch, test command and caps. Shared settings (models, prompts, private terms) are declared once. When several repositories share one tracker, a `repo:<name>` label set at triage says which repository a ticket targets.
+- **Several repositories per ops root.** Each `[[repo]]` entry has its own clone, default branch, test command and caps. Shared settings (profiles, prompts, private terms) are declared once. When several repositories share one tracker, a `repo:<name>` label set at triage says which repository a ticket targets.
 - **Where tickets live follows visibility.** For each repository, `init` proposes:
   - a **public** project: its tickets live in the project repository, so contributors can read how it evolved;
   - a **private** project: its tickets live in the ops repository, so the project's owner sees the PRs, not the work behind them.
@@ -109,8 +109,7 @@ Everything a project might reasonably do differently is a named setting with a d
 | `review.budget.limit_multiple` | `3` | hard limit as a multiple of the expected duration |
 | `review.budget.floor_minutes` | `30` | hard limit floor, however small the diff |
 | `review.budget.ceiling_minutes` | `120` | agent runtime ceiling for one dispatched reviewer |
-| `agents.runtime` | `omp` | or `muse` |
-| `models.*` | roles and fallback chains | must name providers from the host's accounts |
+| `profiles.*` | runtime, role chains and options | declared per profile; selected per ticket (see `10-agent-profiles.md`) |
 | `prompts.<role>` | built-in templates | override with a file (see 4) |
 
 Settings resolve in one place, in this order (later wins):

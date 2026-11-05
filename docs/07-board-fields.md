@@ -243,8 +243,8 @@ Two board-specific cases:
 Decision: one per-repo setting picks the variant, and one project-owned
 table per repo maps names to concepts. Scalars go in the settings
 registry; the `[repo.board]` tables are popped and validated inside
-`settings.py` in `resolve()`, exactly like the `[models]` and
-`[private]` precedent: strict concept keys (an unknown concept key is
+`settings.py` in `resolve()`, exactly like the `[private]`
+precedent: strict concept keys (an unknown concept key is
 `SettingsError`, exit 4) with opaque option-id keys in `priority_map`
 that are never resolved against the registry, and the checked tables
 are exposed as data on the resolved settings for the repo. The board
@@ -372,7 +372,7 @@ Each is sized for one agent, with acceptance criteria.
    any test reaches the real pacer state file or a real subprocess.
 2. Board settings and validation. Registry scalars, plus `settings.py`
    popping and validating the per-repo `board` tables in `resolve()`
-   on the `[models]` and `[private]` precedent (strict concept keys,
+   on the `[private]` precedent (strict concept keys,
    opaque option-id keys in `priority_map`), exposed as data for the
    board slice, which never re-reads the file. Criteria: the documented
    `[repo.board]` table loads through `resolve()`; an unknown concept

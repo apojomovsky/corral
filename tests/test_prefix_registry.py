@@ -38,10 +38,11 @@ class PrefixOps(OpsCase):
 
     def start(self, number=5, runtime="omp", repo="lib"):
         return launch.launch(
-            launch.target(self.root, repo, flags={"agents.runtime": runtime} if runtime else None),
+            launch.target(self.root, repo),
             number,
             "do the thing",
             title="feat: add the thing",
+            runtime=None if runtime == "omp" else runtime,
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,

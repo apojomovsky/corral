@@ -1,12 +1,12 @@
 """Model declarations and the per-launch overlay: chains, re-route, refusal.
 
-A project declares its roles in ``corral.toml``::
+A profile declares its roles in ``corral.toml``::
 
-    [models.default]
+    [profiles.default.models.default]
     chain = ["provider-a/model-x", "provider-b/model-y"]
 
-``settings.resolve`` is the one place that reads these tables (as
-``Resolved.models``). This module checks them against the account pool,
+``profiles.validate`` is the one place that reads these tables (as
+``Profile.models``). This module checks them against the account pool,
 removes exhausted providers from each chain (re-route), and refuses a
 launch whose required role has no live provider left. The runtime
 adapters lay the filtered chains over the per-launch config; the user's

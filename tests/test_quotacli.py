@@ -428,7 +428,7 @@ class LaunchGate(OpsCase):
     def setUp(self):
         super().setUp()
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
-            handle.write(TOML + '[models.default]\nchain = ["a/x", "b/y"]\n')
+            handle.write(TOML + '[profiles.default.models.default]\nchain = ["a/x", "b/y"]\n')
 
     def pool(self):
         return [accounts.Provider(name=name, reader="fake:Reader") for name in ("a", "b")]
@@ -440,7 +440,7 @@ class LaunchGate(OpsCase):
         )
         with self.assertRaises(models.Exhausted) as ctx:
             launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",

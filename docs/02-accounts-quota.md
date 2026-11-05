@@ -64,10 +64,11 @@ A provider is `ok`, `low` (a window at or above the `quota.low_pct` setting), `e
 
 ## Models
 
-A project declares its roles in `corral.toml`:
+A profile declares its roles in `corral.toml` (see
+`10-agent-profiles.md` for declaration, selection and overrides):
 
 ```toml
-[models.default]
+[profiles.default.models.default]
 chain = ["provider-a/model-x", "provider-b/model-y"]
 ```
 

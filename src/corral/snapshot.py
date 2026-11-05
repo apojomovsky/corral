@@ -22,6 +22,8 @@ OK, UNREACHABLE, USAGE = 0, 3, 4
 
 #: The document schema version, printed as `schema_version`. Version 2 adds
 #: the agent `profile` row field: the profile name recorded at launch.
+#: Rows from before profile records display `default`: the cutover
+#: resolves them as the default profile for display only.
 SCHEMA_VERSION = 2
 
 #: Sections whose `{"error"}` body marks the server degraded.
@@ -52,9 +54,10 @@ def _section_error(exc):
 def _agent_row(entry, state):
     """One agent row from a registry entry and its status (pure).
 
-    Fields missing on the entry read as null, never absent.
+    Fields missing on the entry read as null, never absent, except the
+    profile: entries from before profile records display `default`.
     """
-    from corral import registry
+    from corral import profiles, registry
 
     ticket = entry.get("ticket")
     if not isinstance(ticket, dict):
@@ -67,7 +70,7 @@ def _agent_row(entry, state):
         "number": held[1] if held else None,
         "runtime": entry.get("runtime"),
         "role": entry.get("role"),
-        "profile": entry.get("profile"),
+        "profile": entry.get("profile") or profiles.DEFAULT_PROFILE_NAME,
         "model": entry.get("model"),
         "state": state,
         "started_at": entry.get("started_at"),

@@ -848,7 +848,7 @@ def _checked_pressure(raw, where):
 def check_tables(raw, where):
     """The host config's ``[resources]`` value as Tables, None when absent.
 
-    Strict on the ``[models]`` precedent: unknown tables (there is no
+    Strict on the ``[private]`` precedent: unknown tables (there is no
     project or instance layer at host level), unknown keys, unknown role
     names, and partial host triples are SettingsError naming the file
     and the key. A missing role table prices that role at zero later,

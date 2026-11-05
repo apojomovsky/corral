@@ -48,6 +48,7 @@ from corral import (
     launch,
     mirror,
     paths,
+    profiles,
     projects,
     prompts,
     quota,
@@ -1023,13 +1024,26 @@ def _default_host_inputs(registered):
 
 
 def _project_quota(project, pool):
-    """One project's quota input from its own settings file and the pool.
+    """One project's quota input from its declared profiles and the pool.
 
+    The declarations validate here (exit 4 naming the value), then the
+    gate reads the union of every declared profile's chains per role:
+    the pre-launch check cannot resolve per-ticket layers, so it covers
+    every chain any ticket could resolve to, and the launch re-resolves
+    exactly (exit 75 when the ticket's own profile is exhausted). With
+    no profiles declared the chains are empty, so the gate passes them.
     The freshness bound comes from the shared helper over the pool
-    providers the project's chains name, never a second resolver.
+    providers those chains name, never a second resolver.
     """
     resolved = settings.load(root=project.root)
-    chains = dict(resolved.models)
+    parsed = profiles.validate(resolved.profiles, pool)
+    chains: dict[str, list[str]] = {}
+    for profile in parsed.values():
+        for role, chain in profile.models.items():
+            known = chains.setdefault(role, [])
+            for entry in chain:
+                if entry not in known:
+                    known.append(entry)
     return QuotaSource(
         chains=chains,
         stale_after=quota.stale_after_for(chains, pool),

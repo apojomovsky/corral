@@ -218,7 +218,7 @@ class FullDocument(unittest.TestCase):
                         "number": None,
                         "runtime": "omp",
                         "role": None,
-                        "profile": None,
+                        "profile": "default",
                         "model": "m1",
                         "state": "finished",
                         "started_at": T0 - 100,
@@ -232,7 +232,7 @@ class FullDocument(unittest.TestCase):
                         "number": 1,
                         "runtime": "omp",
                         "role": None,
-                        "profile": None,
+                        "profile": "default",
                         "model": "m1",
                         "state": "live",
                         "started_at": T0 - 100,
@@ -246,7 +246,7 @@ class FullDocument(unittest.TestCase):
                         "number": 2,
                         "runtime": "omp",
                         "role": None,
-                        "profile": None,
+                        "profile": "default",
                         "model": "m1",
                         "state": "stale",
                         "started_at": T0 - 100,
@@ -340,7 +340,7 @@ class FullDocument(unittest.TestCase):
                     "number": None,
                     "runtime": "omp",
                     "role": None,
-                    "profile": None,
+                    "profile": "default",
                     "model": "m1",
                     "state": "live",
                     "started_at": T0 - 100,
@@ -388,7 +388,7 @@ class FullDocument(unittest.TestCase):
                 "number": None,
                 "runtime": None,
                 "role": None,
-                "profile": None,
+                "profile": "default",
                 "model": None,
                 "state": "live",
                 "started_at": None,
@@ -415,13 +415,13 @@ class FullDocument(unittest.TestCase):
             )
         )
         by_id = {row["id"]: row["profile"] for row in doc["agents"]}
-        self.assertEqual(by_id, {"p1": "fast", "p2": None})
+        self.assertEqual(by_id, {"p1": "fast", "p2": "default"})
 
-    def test_entry_without_a_profile_key_reads_null(self):
+    def test_entry_without_a_profile_key_reads_default(self):
         naked = entry("p3")
         del naked["profile"]
         doc = doc_of(registry_view=view((naked, "live")))
-        self.assertIsNone(doc["agents"][0]["profile"])
+        self.assertEqual(doc["agents"][0]["profile"], "default")
 
 
 class SectionErrors(unittest.TestCase):

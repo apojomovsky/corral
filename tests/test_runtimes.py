@@ -415,12 +415,12 @@ class OmpSessionFiles(SessionCase):
 
 
 class RuntimeSetting(unittest.TestCase):
-    def test_the_agents_runtime_setting_is_registered_by_the_runtimes_package(self):
-        setting = settings.REGISTRY["agents.runtime"]
-        self.assertEqual(setting.default, rt.DEFAULT_RUNTIME)
-        for name in rt.NAMES:
-            self.assertIn(name, setting.help)
-        self.assertIn("corral.runtimes", settings.PROVIDERS)
+    def test_the_agents_runtime_setting_is_gone_after_the_cutover(self):
+        self.assertNotIn("agents.runtime", settings.REGISTRY)
+        self.assertNotIn("corral.runtimes", settings.PROVIDERS)
+
+    def test_the_recorded_runtime_fallback_survives(self):
+        self.assertEqual(rt.DEFAULT_RUNTIME, "omp")
 
 
 if __name__ == "__main__":

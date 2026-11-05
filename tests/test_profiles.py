@@ -222,10 +222,10 @@ class NoSilentFallback(unittest.TestCase):
 
 
 class BuiltinDefault(unittest.TestCase):
-    def test_the_builtin_default_is_the_shipped_muse_setup(self):
+    def test_the_builtin_default_keeps_the_shipped_default_runtime(self):
         self.assertEqual(profiles.DEFAULT_PROFILE_NAME, "default")
         self.assertEqual(profiles.BUILTIN_DEFAULT.name, "default")
-        self.assertEqual(profiles.BUILTIN_DEFAULT.runtime, "muse")
+        self.assertEqual(profiles.BUILTIN_DEFAULT.runtime, runtimes.DEFAULT_RUNTIME)
         self.assertIn(profiles.BUILTIN_DEFAULT.runtime, runtimes.NAMES)
 
     def test_the_builtin_default_validates_cleanly(self):

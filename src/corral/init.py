@@ -70,7 +70,7 @@ from collections.abc import Callable
 from importlib import resources
 from typing import NamedTuple
 
-from corral import detect, gc, paths, projects, runtimes, settings, tracker, worktrees
+from corral import detect, gc, paths, profiles, projects, runtimes, settings, tracker, worktrees
 
 OK, NOTHING, USAGE = 0, 1, 4
 
@@ -111,6 +111,7 @@ class PlanInputs(NamedTuple):
     default_branch: str
     test_command: str
     extra: tuple  # ((key, value), ...) active settings beyond the entry trio, sorted
+    runtime: str | None = None  # the --runtime flag: the [profiles.default] runtime, if any
 
 
 def _coerce(key, raw):
@@ -245,7 +246,6 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
                 raise InitError(f"internal: {key} is not a str setting")
             trio[key] = value
     rest = {
-        "agents.runtime": runtime,
         "agents.cap": cap,
     }
     rest.update(overrides)
@@ -262,6 +262,7 @@ def collect(path, *, git, test_cmd=None, runtime=None, cap=None, sets=(), clone_
         default_branch=trio["clone.default_branch"],
         test_command=trio["checks.test"],
         extra=extra,
+        runtime=runtime,
     )
 
 
@@ -481,11 +482,36 @@ def _entry_values_equal(entry, name, active):
     return flat == active
 
 
+def _profiles_block(inputs):
+    """The top-level profile tables for `inputs.runtime`, or "".
+
+    A `--runtime` naming the built-in default's runtime writes nothing:
+    the built-in default already runs it. Any other runtime writes a
+    `[profiles.default]` table carrying it plus the `[profile]`
+    default selection naming `default`, so the declared table wins the
+    layer-6 resolution instead of the built-in one. Model chains are
+    never written: detection does not know them.
+    """
+    runtime = inputs.runtime
+    if runtime is None or runtime == profiles.BUILTIN_DEFAULT.runtime:
+        return ""
+    return (
+        "[profile]\n"
+        f"default = {json.dumps(profiles.DEFAULT_PROFILE_NAME)}\n"
+        "\n"
+        "[profiles.default]\n"
+        f"runtime = {json.dumps(runtime)}\n"
+        "\n"
+    )
+
+
 def render(inputs):
     """The `corral.toml` text for `inputs`: the settings that differ
-    from the defaults live in the single `[[repo]]` entry; every other
-    registered setting is commented out with its default and one-line
-    help, grouped by prefix, so the template never goes stale."""
+    from the defaults live in the single `[[repo]]` entry; a `--runtime`
+    writes the top-level `[profiles.default]` table (plus the `[profile]`
+    default selection) above it; every other registered setting is
+    commented out with its default and one-line help, grouped by prefix,
+    so the template never goes stale."""
     settings._load_providers()
     active = _active(inputs)
     lines = [
@@ -493,6 +519,10 @@ def render(inputs):
         "# from the defaults live in [[repo]]; everything else is",
         "# commented out below with its default.",
     ]
+    block = _profiles_block(inputs)
+    if block:
+        lines.extend(block.strip("\n").splitlines())
+        lines.append("")
     lines.extend(_entry_lines(inputs.name, active))
     commented = [key for key in settings.REGISTRY if key not in active]
     lines.append("# Defaults: uncomment to override.")
@@ -751,13 +781,39 @@ def _flatten_entry(entry):
     return flat
 
 
+def _split_profiles_converged(data, inputs):
+    """Whether the parsed ops file already carries `inputs.runtime`.
+
+    The split layout is append-only: `init` adds `[[repo]]` entries but
+    never rewrites the shared profile tables, which other entries may
+    already rely on. No `--runtime` flag never touches them, so it always
+    reads as converged. An explicit flag must match the file's
+    `[profiles.default]` runtime plus the `[profile]` default selection;
+    a missing table matches only the built-in default's runtime, which
+    needs no table at all. Anything else is refused for a hand edit.
+    """
+    runtime = inputs.runtime
+    if runtime is None:
+        return True
+    tables = data.get("profiles")
+    default = tables.get("default") if isinstance(tables, dict) else None
+    if not isinstance(default, dict):
+        return runtime == profiles.BUILTIN_DEFAULT.runtime
+    if default.get("runtime") != runtime:
+        return False
+    profile = data.get("profile")
+    return isinstance(profile, dict) and profile.get("default") == profiles.DEFAULT_PROFILE_NAME
+
+
 def _split_toml_change(toml_target, inputs):
     """`(new_text, is_noop)` for the split layout's append-only `corral.toml`.
 
     A missing file is created from `render(inputs)`; otherwise the new
     `[[repo]]` entry is appended and every existing byte is preserved. An
     entry with the same name but different values prints its diff and is
-    exit 4, even with `--force`: edit it by hand.
+    exit 4, even with `--force`: edit it by hand. A `--runtime` the
+    existing file's `[profiles.default]` table does not already carry is
+    exit 4 the same way: the shared tables are never rewritten here.
     """
     active = _active(inputs)
     current = _read_text(toml_target)
@@ -767,6 +823,15 @@ def _split_toml_change(toml_target, inputs):
         data = tomllib.loads(current)
     except tomllib.TOMLDecodeError as err:
         raise InitError(f"{toml_target}: cannot parse the ops corral.toml: {err}") from None
+    if not _split_profiles_converged(data, inputs):
+        block = _profiles_block(inputs)
+        if block:
+            sys.stdout.write(block)
+        raise InitError(
+            f"{toml_target} carries a different [profiles.default] runtime "
+            f"than --runtime {inputs.runtime!r}: change it by hand, init "
+            "never rewrites the shared profile tables"
+        )
     entries = data.get("repo")
     if entries is None:
         entries = []

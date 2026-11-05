@@ -25,7 +25,7 @@ from unittest import mock
 
 from contextlib import redirect_stdout
 
-from corral import accounts, cli, hold, host_ledger, launch, launchcli, models, paths
+from corral import accounts, board, cli, hold, host_ledger, launch, launchcli, models, paths
 from corral import pressure, profiles, registry, resources, runtimes
 from corral import settings, units
 from corral.runtimes import muse, omp
@@ -38,6 +38,12 @@ REPOS = ("lib", "my-repo")
 TOML = """\
 [agents]
 cap = 2
+
+[profile]
+default = "default"
+
+[profiles.default]
+runtime = "omp"
 
 [[repo]]
 name = "lib"
@@ -116,6 +122,7 @@ class FakeSystem:
             labels_fn=lambda kind, repo, number: [],
             usage=roomy,
             controllers_read=lambda path: "cpu memory pids",
+            tracker=FakeTracker([]),
         )
 
 
@@ -153,9 +160,8 @@ class OpsCase(unittest.TestCase):
         git_in(seed, "push", "-q", "origin", "main")
         git_in(self.tmp, "clone", "-q", origin, os.path.join(self.root, "clones", name))
 
-    def target(self, repo="lib", runtime=None):
-        flags = {"agents.runtime": runtime} if runtime else None
-        return launch.target(self.root, repo, flags=flags)
+    def target(self, repo="lib"):
+        return launch.target(self.root, repo)
 
     def prompt_file(self, text="do the thing"):
         path = os.path.join(self.tmp, "prompt.md")
@@ -185,13 +191,9 @@ class TargetTest(OpsCase):
         self.assertEqual(tgt.clone, os.path.join(self.root, "clones", "lib"))
         self.assertEqual(tgt.default_branch, "main")
         self.assertEqual(tgt.prefix, "corral-agent-")
-        self.assertEqual(tgt.runtime, "omp")
         self.assertEqual(tgt.cap, 2)
         self.assertEqual(tgt.branch_template, "{type}/{issue}-{slug}")
         self.assertEqual(tgt.worktrees_root, ".worktrees/")
-
-    def test_the_runtime_flag_overrides_the_setting(self):
-        self.assertEqual(self.target("lib", runtime="muse").runtime, "muse")
 
     def test_a_repo_without_a_clone_path_is_a_configuration_error(self):
         with self.assertRaises(launch.LaunchError) as ctx:
@@ -337,7 +339,7 @@ class BudgetWiringTest(OpsCase):
     def test_no_host_budget_passes_and_creates_no_slices(self):
         self.admit()
         unit, _ = launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
@@ -397,7 +399,7 @@ class BudgetWiringTest(OpsCase):
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
         )
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
-            handle.write(TOML + "[models.worker]\nchain = ['fresh/model']\n")
+            handle.write(TOML + "[profiles.default.models.worker]\nchain = ['fresh/model']\n")
         self.system.units["corral-agent-lib-6"] = "active"
         pool = [accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0)]
         quota_ledger = {
@@ -411,7 +413,7 @@ class BudgetWiringTest(OpsCase):
         }
         with self.assertRaises(launch.CapFull):
             launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
@@ -429,7 +431,7 @@ class BudgetWiringTest(OpsCase):
     def test_an_exhausted_quota_still_refuses_when_the_budget_is_roomy(self):
         self.host_config(HOST_BUDGET + WORKER_PRICE)
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
-            handle.write(TOML + "[models.worker]\nchain = ['fresh/model']\n")
+            handle.write(TOML + "[profiles.default.models.worker]\nchain = ['fresh/model']\n")
         pool = [accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0)]
         quota_ledger = {
             "readings": {
@@ -442,7 +444,7 @@ class BudgetWiringTest(OpsCase):
         }
         with self.assertRaises(models.Exhausted) as caught:
             launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
@@ -485,7 +487,7 @@ class BudgetWiringTest(OpsCase):
         self.host_config(HOST_BUDGET + WORKER_PRICE)
         with self.assertRaises(launch.LaunchError):
             launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
@@ -504,7 +506,7 @@ class BudgetWiringTest(OpsCase):
         self.host_config(HOST_BUDGET + WORKER_PRICE + REVIEWER_PRICE)
         self.register_web()
         unit, _ = launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
@@ -522,7 +524,7 @@ class BudgetWiringTest(OpsCase):
 
     def test_no_host_budget_leaves_an_unpriced_role_untouched(self):
         unit, _ = launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
@@ -596,7 +598,7 @@ class BudgetWiringTest(OpsCase):
         self.host_config(HOST_BUDGET + WORKER_PRICE)
         self.register_web()
         unit, _ = launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
@@ -645,7 +647,7 @@ class BudgetWiringTest(OpsCase):
         self.register_web()
         with self.assertRaisesRegex(units.UnitsError, "memory") as caught:
             launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
@@ -672,7 +674,7 @@ class BudgetWiringTest(OpsCase):
             "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
         )
         unit, _ = launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
@@ -693,7 +695,7 @@ class BudgetWiringTest(OpsCase):
         started = len(self.system.started)
         with self.assertRaises(launch.CapFull) as caught:
             launch.resume(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "keep going",
                 hold_reason_fn=_free_hold,
@@ -810,10 +812,11 @@ class PressureWiringTest(OpsCase):
 class LaunchTest(OpsCase):
     def start(self, runtime, number=5, title="feat: add the thing", **kwargs):
         return launch.launch(
-            self.target("lib", runtime),
+            self.target("lib"),
             number,
             kwargs.pop("prompt", "do the thing"),
             title=title,
+            runtime=None if runtime == "omp" else runtime,
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=kwargs.pop("usage", roomy),
@@ -998,6 +1001,63 @@ class LaunchTest(OpsCase):
             self.start("omp")
         self.assertEqual(self.worktrees_of("lib"), [])
 
+    def test_a_bad_profile_beats_a_full_host(self):
+        self.system.units["corral-agent-my-repo-6"] = "active"
+        self.system.units["corral-agent-my-repo-7"] = "active"
+        with self.assertRaises(settings.SettingsError) as caught:
+            self.start("omp", profile="nope")
+        self.assertIn("nope", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+        self.assertEqual(self.system.started, [])
+        self.assertFalse(os.path.exists(self.session("lib", 5)))
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_bad_profile_beats_a_live_ticket(self):
+        self.system.units["corral-agent-lib-5"] = "active"
+        with self.assertRaises(settings.SettingsError) as caught:
+            self.start("omp", profile="nope")
+        self.assertIn("nope", str(caught.exception))
+        self.assertEqual(launchcli._exit_code(caught.exception), 4)
+        self.assertEqual(self.system.started, [])
+        self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_corrupt_store_with_no_profiles_still_launches(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            '[profile]\ndefault = "default"\n\n[profiles.default]\nruntime = "omp"\n\n', ""
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        path = board.db_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as handle:
+            handle.write(b"not a database")
+        unit, workdir = self.start("omp")
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertTrue(os.path.isdir(workdir))
+
+    def test_no_profiles_launches_on_the_shipped_default_runtime(self):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            text = handle.read()
+        text = text.replace(
+            '[profile]\ndefault = "default"\n\n[profiles.default]\nruntime = "omp"\n\n', ""
+        )
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        unit, workdir = self.start("omp")
+        self.assertEqual(unit, "corral-agent-lib-5")
+        self.assertTrue(os.path.isdir(workdir))
+        session = self.leaf("lib", 5)
+        self.assertEqual(runtimes.recorded(session), runtimes.DEFAULT_RUNTIME)
+        recorded = profiles.recorded_profile(session)
+        self.assertIsNotNone(recorded)
+        assert recorded is not None
+        self.assertEqual(recorded.name, profiles.DEFAULT_PROFILE_NAME)
+        self.assertEqual(recorded.runtime, runtimes.DEFAULT_RUNTIME)
+
     def test_an_unreachable_service_manager_is_exit_3(self):
         def down(prefix):
             raise units.Unreachable("no bus")
@@ -1034,12 +1094,12 @@ class LaunchTest(OpsCase):
         self.assertEqual(self.system.started, [])
 
     def test_an_unknown_runtime_is_a_configuration_error(self):
-        tgt = dataclasses.replace(self.target("lib"), runtime="claude-code")
         with self.assertRaises(launch.LaunchError):
             launch.launch(
-                tgt,
+                self.target("lib"),
                 5,
                 "x",
+                runtime="claude-code",
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
@@ -1080,10 +1140,11 @@ class MuseSessionTest(OpsCase):
 
     def test_launch_then_resume_uses_one_uuid(self):
         unit, _ = launch.launch(
-            self.target("lib", "muse"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
+            runtime="muse",
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
@@ -1119,10 +1180,11 @@ class MuseSessionTest(OpsCase):
 
     def test_resume_without_a_recorded_id_is_refused(self):
         unit, _ = launch.launch(
-            self.target("lib", "muse"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
+            runtime="muse",
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
@@ -1147,10 +1209,11 @@ class MuseSessionTest(OpsCase):
         self.system.fail = "Failed to connect to bus: no medium found"
         with self.assertRaises(units.Unreachable) as ctx:
             launch.launch(
-                self.target("lib", "muse"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
+                runtime="muse",
                 list_fn=self.system.list_fn,
                 run=self.system.run,
                 usage=roomy,
@@ -1182,11 +1245,12 @@ class MuseSessionTest(OpsCase):
         ):
             with self.assertRaisesRegex(launch.LaunchError, "profile record"):
                 launch.launch(
-                    self.target("lib", "muse"),
+                    self.target("lib"),
                     5,
                     "do the thing",
                     title="feat: add the thing",
                     profile="fast",
+                    runtime="muse",
                     list_fn=self.system.list_fn,
                     run=self.system.run,
                     usage=roomy,
@@ -1215,10 +1279,11 @@ class MuseSessionTest(OpsCase):
 
     def test_tail_without_an_out_log_is_refused(self):
         launch.launch(
-            self.target("lib", "muse"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
+            runtime="muse",
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
@@ -1273,15 +1338,18 @@ class FakeAdapter:
     def activity_file(self, session_dir):
         return None
 
+    def options_schema(self):
+        return {}
+
 
 class ReviewerWiringTest(OpsCase):
     """`--role reviewer` reaches the runtime argv as `reviewer=True`. Fakes only."""
 
-    def start(self, role, number=5, runtime="omp", prompt="do the thing"):
+    def start(self, role, number=5, prompt="do the thing"):
         fake = FakeAdapter()
         with mock.patch.object(runtimes, "get", return_value=fake):
             unit, _ = launch.launch(
-                self.target("lib", runtime),
+                self.target("lib"),
                 number,
                 prompt,
                 title="feat: add the thing",
@@ -1413,7 +1481,7 @@ class ReviewerWiringTest(OpsCase):
 
         with mock.patch.object(runtimes, "get", return_value=fake):
             unit, _ = launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
@@ -1470,7 +1538,7 @@ class ReviewerWiringTest(OpsCase):
 
         with mock.patch.object(runtimes, "get", return_value=fake):
             unit, _ = launch.launch(
-                self.target("lib", "omp"),
+                self.target("lib"),
                 5,
                 "do the thing",
                 title="feat: add the thing",
@@ -1510,7 +1578,7 @@ class EnvRefusalTest(OpsCase):
         with mock.patch.object(runtimes, "get", return_value=RefusingAdapter()):
             with self.assertRaises(launch.LaunchError) as ctx:
                 launch.launch(
-                    self.target("lib", "omp"),
+                    self.target("lib"),
                     5,
                     "do the thing",
                     title="feat: add the thing",
@@ -1532,11 +1600,12 @@ class MuseReviewerLaunchTest(OpsCase):
 
     def start(self, role, number=5):
         return launch.launch(
-            self.target("lib", "muse"),
+            self.target("lib"),
             number,
             "do the thing",
             title="feat: add the thing",
             role=role,
+            runtime="muse",
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,
@@ -1624,7 +1693,7 @@ class ResumeTailTest(OpsCase):
 
     def test_a_resume_whose_argv_fails_is_a_configuration_error(self):
         launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "do the thing",
             title="feat: add the thing",
@@ -1950,7 +2019,7 @@ class RaceTest(OpsCase):
 
     def test_a_launch_that_loses_the_second_admit_leaves_the_live_session_alone(self):
         launch.launch(
-            self.target("lib", "omp"),
+            self.target("lib"),
             5,
             "first prompt",
             title="feat: add the thing",
@@ -1978,9 +2047,10 @@ class RaceTest(OpsCase):
 
         with self.assertRaises(units.UnitExists):
             launch.launch(
-                self.target("lib", "muse"),
+                self.target("lib"),
                 5,
                 "second prompt",
+                runtime="muse",
                 title="feat: add the thing",
                 list_fn=flipping,
                 usage=roomy,
@@ -2246,9 +2316,7 @@ class StopUnprovenTest(OpsCase):
 class ModelChainsFreshnessTest(unittest.TestCase):
     def test_chains_use_the_minimum_bound_of_their_own_providers(self):
         now = 1_800_000_000.0
-        resolved = settings.resolve(
-            project={"models": {"worker": {"chain": ["fresh/model"]}}}, env={}
-        )
+        resolved = settings.resolve(project={}, env={})
         tgt = SimpleNamespace(resolved=resolved)
         pool = [
             accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0),
@@ -2264,7 +2332,7 @@ class ModelChainsFreshnessTest(unittest.TestCase):
             "marks": {},
         }
         with self.assertRaises(models.Exhausted):
-            launch._model_chains(tgt, pool, ledger, now)
+            launch._model_chains(tgt, pool, ledger, now, {"worker": ["fresh/model"]})
 
 
 class RoleSessionIsolationTest(OpsCase):

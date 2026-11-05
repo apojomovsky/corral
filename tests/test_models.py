@@ -40,16 +40,15 @@ def resolve(project, **kw):
 
 
 class ChainsSetting(unittest.TestCase):
-    def test_models_chains_resolve_from_the_project_file(self):
-        resolved = resolve({"models": {"default": {"chain": ["a/x", "b/y"]}}})
-        self.assertEqual(resolved.models, {"default": ["a/x", "b/y"]})
+    """The cutover: a top-level `[models]` table is refused, wherever it sits."""
 
-    def test_no_models_table_resolves_to_no_chains(self):
-        self.assertEqual(resolve({}).models, {})
-        self.assertEqual(resolve({"models": {}}).models, {})
+    def test_a_project_models_table_names_the_profiles_home(self):
+        with self.assertRaisesRegex(settings.SettingsError, "profiles"):
+            resolve({"models": {"default": {"chain": ["a/x", "b/y"]}}})
 
-    def test_a_models_table_must_hold_roles_with_chains(self):
+    def test_an_empty_models_table_is_still_refused(self):
         for project in (
+            {"models": {}},
             {"models": ["default"]},
             {"models": {"default": ["a/x"]}},
             {"models": {"default": {}}},
@@ -60,13 +59,14 @@ class ChainsSetting(unittest.TestCase):
             {"models": {"default": {"chain": ["a/x"], "other": 1}}},
             {"models": {"": {"chain": ["a/x"]}}},
         ):
-            with self.subTest(project=project), self.assertRaises(settings.SettingsError):
-                resolve(project)
+            with self.subTest(project=project):
+                with self.assertRaisesRegex(settings.SettingsError, "profiles"):
+                    resolve(project)
 
-    def test_models_are_project_level_not_host_or_repo(self):
-        with self.assertRaisesRegex(settings.SettingsError, "unknown setting"):
+    def test_models_are_refused_at_host_and_repo_level_too(self):
+        with self.assertRaisesRegex(settings.SettingsError, "profiles"):
             resolve({}, host={"models": {"default": {"chain": ["a/x"]}}})
-        with self.assertRaisesRegex(settings.SettingsError, "unknown setting"):
+        with self.assertRaisesRegex(settings.SettingsError, "profiles"):
             resolve(
                 {"repo": [{"name": "app", "models": {"default": {"chain": ["a/x"]}}}]}, repo="app"
             )
@@ -247,14 +247,15 @@ class LaunchModels(OpsCase):
     def setUp(self):
         super().setUp()
         with open(os.path.join(self.root, settings.PROJECT_FILE), "w", encoding="utf-8") as handle:
-            handle.write(TOML + '[models.default]\nchain = ["a/x", "b/y"]\n')
+            handle.write(TOML + '[profiles.default.models.default]\nchain = ["a/x", "b/y"]\n')
 
     def start(self, seen, number=5, pool_names=("a", "b"), runtime="omp"):
         return launch.launch(
-            self.target("lib", runtime),
+            self.target("lib"),
             number,
             "do the thing",
             title="feat: add the thing",
+            runtime=None if runtime == "omp" else runtime,
             list_fn=self.system.list_fn,
             run=self.system.run,
             usage=roomy,

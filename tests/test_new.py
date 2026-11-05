@@ -696,6 +696,7 @@ class OnboardRun(unittest.TestCase):
         text = self.toml()
         self.assertIn('test = "make check"', text)
         self.assertIn("cap = 3", text)
+        self.assertIn("[profiles.default]", text)
         self.assertIn('runtime = "muse"', text)
         self.assertIn('ready = "triage"', text)
 

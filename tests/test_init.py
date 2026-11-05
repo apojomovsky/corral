@@ -283,7 +283,6 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [agents]
 # agents.cap = 1  # this project's ceiling of live agents on the host
-# agents.runtime = "omp"  # agent runtime: omp or muse
 # agents.unit_prefix = "corral-agent-"  # prefix of transient agent unit names
 #
 # [board]
@@ -386,12 +385,17 @@ GOLDEN_DOCSY = HEAD % ("docsy", "make test") + TAIL
 GOLDEN_FLAGS = """# corral.toml, written by `corral init`. Settings that differ
 # from the defaults live in [[repo]]; everything else is
 # commented out below with its default.
+[profile]
+default = "default"
+
+[profiles.default]
+runtime = "muse"
+
 [[repo]]
 name = "empty"
 
 [repo.agents]
 cap = 3
-runtime = "muse"
 
 [repo.board]
 ready = "triage"
@@ -710,7 +714,7 @@ class DocsyCase(GoldenCase):
 class FlagsCase(Fixture):
     name = "empty"
 
-    def test_flags_land_in_the_repo_entry(self):
+    def test_flags_land_in_the_file(self):
         code, _, _ = self.run_cli(
             "--test-cmd",
             "make check",
@@ -730,9 +734,21 @@ class FlagsCase(Fixture):
         env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
         resolved = settings.load(root=self.root, repo=self.name, env=env)
         self.assertEqual(resolved["agents.cap"], 3)
-        self.assertEqual(resolved["agents.runtime"], "muse")
+        self.assertEqual(resolved.profiles["default"]["runtime"], "muse")
+        self.assertEqual(resolved.profile_committed["default"], "default")
         self.assertEqual(resolved["board.ready"], "triage")
         self.assertIs(resolved["git.commits.conventional"], False)
+
+    def test_a_builtin_runtime_writes_no_profiles_table(self):
+        code, _, _ = self.run_cli("--test-cmd", "make check", "--runtime", "omp", self.root)
+        self.assertEqual(code, 0)
+        with open(self.target(), encoding="utf-8") as handle:
+            text = handle.read()
+        self.assertNotIn("[profiles", text)
+        self.assertNotIn("[profile]", text)
+        env = {"CORRAL_CONFIG": os.path.join(self.root, "none")}
+        resolved = settings.load(root=self.root, repo=self.name, env=env)
+        self.assertEqual(resolved.profiles, {})
 
     def test_yes_is_a_no_op(self):
         code, _, _ = self.run_cli("--yes", "--test-cmd", "make check", self.root)
