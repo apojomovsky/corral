@@ -1,12 +1,14 @@
 """`korapy takeoff`: the project-level gate before a PR.
 
 Exit codes: 0 every check ok, skipped or planned, 1 a check failed,
-3 the remote could not be read, 4 usage or configuration error
-(including an unknown or identity `--skip` name), 75 another takeoff
-held the full-suite lock past the wait (`--plan` never takes the lock).
+3 the remote could not be read or a lane scope could not be created,
+4 usage or configuration error (including an unknown or identity
+`--skip` name), 75 a heavy command found no free lane slot in time
+(`--plan` never runs anything).
 """
 
 import argparse
+import functools
 import json
 import os
 import sys
@@ -14,14 +16,21 @@ import sys
 OK, NO, UNREACHABLE, USAGE = 0, 1, 3, 4
 
 
-def cmd_takeoff(args, *, ls_remote=None, run_cmd=None):
+def cmd_takeoff(args, *, ls_remote=None, run_cmd=None, heavy_run=None):
     """Run the verb. The seams default to the live ones; tests pass fakes."""
-    from korapy import takeoff
+    from korapy import heavy, takeoff
 
     if ls_remote is None:
         ls_remote = takeoff.production_ls_remote
     if run_cmd is None:
         run_cmd = takeoff.production_run_cmd
+    if heavy_run is None:
+        heavy_run = functools.partial(
+            heavy.run_heavy,
+            run=heavy.default_run,
+            teardown=heavy.stop_scope,
+            scope_cgroup=heavy.show_cgroup,
+        )
     try:
         result = takeoff.run_takeoff(
             args.path or os.getcwd(),
@@ -32,6 +41,7 @@ def cmd_takeoff(args, *, ls_remote=None, run_cmd=None):
             plan=args.plan,
             ls_remote=ls_remote,
             run_cmd=run_cmd,
+            heavy_run=heavy_run,
         )
     except takeoff.TakeoffError as err:
         print(f"korapy takeoff: {err}", file=sys.stderr)
@@ -69,7 +79,7 @@ def cmd_takeoff(args, *, ls_remote=None, run_cmd=None):
     return result.exit_code
 
 
-def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
+def add_parser(sub, *, ls_remote=None, run_cmd=None, heavy_run=None) -> None:
     """Register `takeoff` on the top-level subparsers."""
     p = sub.add_parser(
         "takeoff",
@@ -78,8 +88,9 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
         "the ticket branch, the commit rules, the PR body, the leak guard, "
         "the review record and the configured takeoff commands. Exit 0 when "
         "every check is ok, skipped or planned, 1 when one failed, 3 when "
-        "the remote could not be read, 4 on usage or configuration error, "
-        "75 when another takeoff holds the full-suite lock past the wait. "
+        "the remote could not be read or a lane scope could not be created, "
+        "4 on usage or configuration error, "
+        "75 when a heavy command finds no free lane slot in time. "
         "A repeatable --skip NAME waives one policy check and records it; "
         "an unknown name or an identity check is exit 4.",
     )
@@ -87,7 +98,7 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
         "--plan",
         action="store_true",
         help="resolve the checks without running anything: each configured "
-        "command is reported as planned, the suite lock is never taken",
+        "command is reported as planned",
     )
     p.add_argument("--body", default=None, metavar="FILE", help="the PR body file")
     p.add_argument(
@@ -117,4 +128,8 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None) -> None:
         default=None,
         help="the worktree to gate (default: the current directory)",
     )
-    p.set_defaults(func=lambda args: cmd_takeoff(args, ls_remote=ls_remote, run_cmd=run_cmd))
+    p.set_defaults(
+        func=lambda args: cmd_takeoff(
+            args, ls_remote=ls_remote, run_cmd=run_cmd, heavy_run=heavy_run
+        )
+    )
