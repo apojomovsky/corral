@@ -163,6 +163,21 @@ class BoardPollTest(BoardCase):
         after = self.stored(1)
         self.assertEqual((after.title, after.extra), (before.title, before.extra))
 
+    def test_rejected_poll_is_refused_not_an_error(self):
+        self.seed(1, T0 - 100, {"pool": "a"})
+        self.store.set_cursor(REPO, sync.BOARD_CURSOR_NAME, tracker.format_cursor(T0 - 100))
+        result = self.poll(
+            FakeBoardReader(
+                error=tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+            )
+        )
+        self.assertEqual(result.items_seen, 0)
+        self.assertEqual(result.cursor, tracker.format_cursor(T0 - 100))
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.refused), 1)
+        self.assertIn(REPO, result.refused[0])
+        self.assertEqual(self.board_cursor(), tracker.format_cursor(T0 - 100))
+
     def test_corrupt_board_cursor_returns_an_error_line(self):
         self.seed(1, T0 - 100, {"pool": "a"})
         before = self.stored(1)

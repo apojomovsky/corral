@@ -7,7 +7,9 @@ progress is kept, the error is reported, and the cursor never advances
 past what was applied. A corrupt stored row (or an unusable reading)
 never aborts the pass either: it is reported in ``store_errors`` and
 the pass moves on, so callers can bucket store corruption toward exit
-4 while tracker failures stay exit 3.
+4 while tracker failures stay exit 3. A read the tracker answers with
+a validation rejection is refused, not unreachable: it is reported in
+``refused`` toward exit 1, and the repo keeps its cursor.
 """
 
 from typing import Iterator, NamedTuple
@@ -70,6 +72,9 @@ class SyncResult(NamedTuple):
     errors: tuple[str, ...]  # tracker/outage lines; "" never appears
     conflicts: tuple[str, ...] = ()  # resync-only: "repo#N: store=A tracker=B" where corral wins
     store_errors: tuple[str, ...] = ()  # corrupt/unusable-row lines (exit 4, not 3)
+    refused: tuple[
+        str, ...
+    ] = ()  # validation-rejection lines: the tracker answered (exit 1, not 3)
 
 
 def _reading(item: iface.TrackerItem) -> board.Item:
@@ -126,6 +131,8 @@ def sync_repo(
     """
     try:
         found, nxt = tracker.changes(repo, cursor)
+    except iface.TrackerRejected as err:
+        return SyncResult(0, cursor, (), refused=(f"{repo}: {err}",))
     except iface.TrackerError as err:
         return SyncResult(0, cursor, (f"{repo}: {err}",))
     seen = 0
@@ -178,6 +185,8 @@ def sync_board_repo(
         found, resume = reader.poll(
             schema, after=store.get_cursor(repo, BOARD_PAGE_NAME), max_pages=max_pages
         )
+    except iface.TrackerRejected as err:
+        return SyncResult(0, old, (), refused=(f"{repo}: {err}",))
     except iface.TrackerError as err:
         return SyncResult(0, old, (f"{repo}: {err}",))
     seen = 0
@@ -235,6 +244,7 @@ def resync_repo(
     listed: set[int] = set()
     stamps: list[float] = []
     errors: list[str] = []
+    refused: list[str] = []
     store_errors: list[str] = []
     conflicts: list[str] = []
     shown: list[tuple[str, int, str]] = []  # tracker-reported claims, decided below
@@ -251,6 +261,8 @@ def resync_repo(
             stamps.append(item.updated_at)
             if item.agent:
                 shown.append((item.repo, item.number, item.agent))
+    except iface.TrackerRejected as err:
+        refused.append(f"{repo}: {err}")
     except iface.TrackerError as err:
         errors.append(f"{repo}: {err}")
     # Adoptions are decided after the walk: each upsert settles queued
@@ -287,7 +299,7 @@ def resync_repo(
             store.adopt_claim(shown_repo, shown_number, shown_agent, epoch=int(now), now=now)
         elif holder != shown_agent:
             conflicts.append(f"{shown_repo}#{shown_number}: store={holder} tracker={shown_agent}")
-    if not errors and not store_errors:
+    if not errors and not refused and not store_errors:
         absent = 0
         try:
             rows = store.items(repo=repo)
@@ -304,7 +316,9 @@ def resync_repo(
         seen += absent
     cursor = iface.format_cursor(max(stamps)) if stamps else store.get_cursor(repo, CURSOR_NAME)
     _store_cursor(store, repo, cursor)
-    return SyncResult(seen, cursor, tuple(errors), tuple(conflicts), tuple(store_errors))
+    return SyncResult(
+        seen, cursor, tuple(errors), tuple(conflicts), tuple(store_errors), tuple(refused)
+    )
 
 
 def audit_repo(
@@ -319,7 +333,8 @@ def audit_repo(
     """Re-read the ``limit`` rows verified least recently, one by one.
 
     One failing item does not stop the others: each failure is reported
-    and the audit moves on, whether the live re-read (a tracker line) or
+    and the audit moves on, whether the live re-read (a tracker line, a
+    refused line when the tracker answered with a rejection) or
     the upsert failed (a store line: a corrupt stored row, an unusable
     reading), and only applied items count as seen. A corrupt row that
     breaks the stored enumeration itself is reported as one store line
@@ -328,6 +343,7 @@ def audit_repo(
     """
     seen = 0
     errors: list[str] = []
+    refused: list[str] = []
     store_errors: list[str] = []
     try:
         rows = store.items(repo=repo)[: max(limit, 0)]
@@ -336,6 +352,9 @@ def audit_repo(
     for row in rows:
         try:
             item = tracker.item(row.repo, row.number)
+        except iface.TrackerRejected as err:
+            refused.append(f"{row.repo}#{row.number}: {err}")
+            continue
         except iface.TrackerError as err:
             errors.append(f"{row.repo}#{row.number}: {err}")
             continue
@@ -346,5 +365,9 @@ def audit_repo(
             continue
         seen += 1
     return SyncResult(
-        seen, store.get_cursor(repo, CURSOR_NAME), tuple(errors), store_errors=tuple(store_errors)
+        seen,
+        store.get_cursor(repo, CURSOR_NAME),
+        tuple(errors),
+        store_errors=tuple(store_errors),
+        refused=tuple(refused),
     )

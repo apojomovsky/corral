@@ -409,7 +409,8 @@ def _read_assignment(seams: Seams, root, repo: str, number: int, stale_after, no
     Reads the store row with a live re-read past the freshness bound,
     exactly like the launch path. A withdrawn ticket (no row) reads as
     no assignment. Corrupt store content refuses (exit 4); an
-    unreachable tracker raises `TrackerError` (exit 3) unchanged.
+    unreachable tracker raises `TrackerError` (exit 3) unchanged, while
+    a validation rejection raises `TrackerRejected` (exit 1, refused).
     """
     tracker = seams.tracker
     if tracker is None:
@@ -553,6 +554,9 @@ def _verb(fn, seams: Seams):
         try:
             return fn(args, seams)
         except EmptyReset as err:
+            print(f"corral: {err}", file=sys.stderr)
+            return NOTHING
+        except iface.TrackerRejected as err:
             print(f"corral: {err}", file=sys.stderr)
             return NOTHING
         except iface.TrackerError as err:

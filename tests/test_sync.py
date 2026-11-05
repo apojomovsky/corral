@@ -98,6 +98,21 @@ class SyncRepoTest(StoreCase):
         self.assertEqual((after.title, after.confidence), (before.title, before.confidence))
         self.assertIsNone(self.store.item(REPO, 2, now=T0)[0])
 
+    def test_rejected_feed_is_refused_not_an_error(self):
+        class RejectingTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        cursor = tracker.format_cursor(T0 - 100)
+        result = sync.sync_repo(
+            self.store, RejectingTracker(), REPO, operators=["alice"], now=T0, cursor=cursor
+        )
+        self.assertEqual(result.items_seen, 0)
+        self.assertEqual(result.cursor, cursor)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.refused), 1)
+        self.assertIn(REPO, result.refused[0])
+
     def test_priority_flows_from_tracker_reading(self):
         fake = FakeTracker([reading(number=1, priority="urgent", updated_at=T0)])
         sync.sync_repo(self.store, fake, REPO, operators=["alice"], now=T0, cursor=None)
@@ -282,6 +297,19 @@ class ResyncTest(StoreCase):
         row, _ = self.store.item(REPO, 1, now=T0)
         self.assertEqual(row.confidence, board.DIRTY)
 
+    def test_rejected_listing_is_refused(self):
+        class RejectingTracker(FakeTracker):
+            def items(self, repo):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        self.stored(1)
+        result = sync.resync_repo(self.store, RejectingTracker(), REPO, operators=["alice"], now=T0)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.refused), 1)
+        self.assertIn(REPO, result.refused[0])
+        row, _ = self.store.item(REPO, 1, now=T0)
+        self.assertEqual(row.confidence, board.CONFIRMED)
+
 
 class AuditTest(StoreCase):
     def test_audit_rereads_oldest_first(self):
@@ -326,6 +354,30 @@ class AuditTest(StoreCase):
         fake = FakeTracker([reading(number=1, updated_at=T0)])
         result = sync.audit_repo(self.store, fake, REPO, operators=["alice"], now=T0, limit=0)
         self.assertEqual(result, sync.SyncResult(0, None, (), (), ()))
+
+    def test_audit_reports_a_rejected_item_as_refused(self):
+        self.stored(1)
+        self.stored(2)
+
+        class RejectingTracker(FakeTracker):
+            def item(self, repo, number):
+                if number == 1:
+                    raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+                return super().item(repo, number)
+
+        fake = RejectingTracker(
+            [
+                reading(number=1, title="One", updated_at=T0),
+                reading(number=2, title="Two", updated_at=T0),
+            ]
+        )
+        result = sync.audit_repo(self.store, fake, REPO, operators=["alice"], now=T0, limit=10)
+        self.assertEqual(result.items_seen, 1)
+        self.assertEqual(result.errors, ())
+        self.assertEqual(len(result.refused), 1)
+        self.assertIn(f"{REPO}#1", result.refused[0])
+        row, _ = self.store.item(REPO, 2, now=T0)
+        self.assertEqual(row.title, "Two")
 
 
 class ResyncAdoptionTest(StoreCase):
@@ -465,7 +517,7 @@ class SyncAllTest(StoreCase):
     def test_healthy_repos_sync_with_no_lines(self):
         self.stored(1, tracker_updated_at=T0 - 100)
         self.stored(2, repo=self.OTHER, tracker_updated_at=T0 - 100)
-        seen, errors, store_errors = drive.sync_all(
+        seen, errors, store_errors, refused = drive.sync_all(
             self.store,
             self.factory(
                 {
@@ -476,7 +528,7 @@ class SyncAllTest(StoreCase):
             operators=["alice"],
             now=T0,
         )
-        self.assertEqual((seen, errors, store_errors), (2, [], []))
+        self.assertEqual((seen, errors, store_errors, refused), (2, [], [], []))
         self.assertEqual(self.store.get_cursor(REPO, sync.CURSOR_NAME), tracker.format_cursor(T0))
         self.assertEqual(
             self.store.get_cursor(self.OTHER, sync.CURSOR_NAME), tracker.format_cursor(T0)
@@ -486,7 +538,7 @@ class SyncAllTest(StoreCase):
         self.stored(1, tracker_updated_at=T0 - 100)
         self.stored(2, repo=self.OTHER, tracker_updated_at=T0 - 100)
         self.corrupt(REPO, 1)
-        seen, errors, store_errors = drive.sync_all(
+        seen, errors, store_errors, refused = drive.sync_all(
             self.store,
             self.factory(
                 {
@@ -499,6 +551,7 @@ class SyncAllTest(StoreCase):
         )
         self.assertEqual(seen, 1)
         self.assertEqual(errors, [])
+        self.assertEqual(refused, [])
         self.assertEqual(len(store_errors), 1)
         self.assertIn(f"{REPO}#1", store_errors[0])
         self.assertEqual(
@@ -508,16 +561,54 @@ class SyncAllTest(StoreCase):
 
     def test_unknown_repo_is_a_tracker_line_not_a_store_line(self):
         self.stored(1, tracker_updated_at=T0 - 100)
-        seen, errors, store_errors = drive.sync_all(
+        seen, errors, store_errors, refused = drive.sync_all(
             self.store, self.factory({}), operators=["alice"], now=T0
         )
         self.assertEqual(seen, 0)
         self.assertEqual(len(errors), 1)
         self.assertIn(REPO, errors[0])
         self.assertEqual(store_errors, [])
+        self.assertEqual(refused, [])
 
     def test_no_factory_syncs_nothing(self):
-        self.assertEqual(drive.sync_all(self.store, None, operators=["alice"], now=T0), (0, [], []))
+        self.assertEqual(
+            drive.sync_all(self.store, None, operators=["alice"], now=T0), (0, [], [], [])
+        )
+
+    def test_rejected_feed_is_refused_not_an_error(self):
+        class RejectingTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        self.stored(1, tracker_updated_at=T0 - 100)
+        seen, errors, store_errors, refused = drive.sync_all(
+            self.store, lambda repo: RejectingTracker(), operators=["alice"], now=T0
+        )
+        self.assertEqual(seen, 0)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(refused), 1)
+        self.assertIn("tracker rejected", refused[0])
+        self.assertEqual(store_errors, [])
+
+    def test_rejected_board_schema_is_refused_not_an_error(self):
+        class RejectingBoardTracker(FakeTracker):
+            board_poll_pages = 5
+
+            def board_schema(self):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+            def poll(self, schema, *, after=None, max_pages=5):
+                return [], None
+
+        self.stored(1, tracker_updated_at=T0 - 100)
+        seen, errors, store_errors, refused = drive.sync_all(
+            self.store, lambda repo: RejectingBoardTracker(), operators=["alice"], now=T0
+        )
+        self.assertEqual(seen, 0)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(refused), 1)
+        self.assertIn("tracker rejected", refused[0])
+        self.assertEqual(store_errors, [])
 
 
 class StoreErrorKindTest(StoreCase):

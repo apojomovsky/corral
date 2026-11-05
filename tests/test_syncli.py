@@ -100,6 +100,64 @@ class ExitCodeTest(SyncRootCase):
         fake.changes_error = "connection refused"
         self.assertEqual(self.run_sync(fake), 3)
 
+    def test_rejected_read_exits_1(self):
+        class RejectingTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        code = self.run_sync(RejectingTracker())
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+
+    def test_rejected_resync_exits_1(self):
+        class RejectingTracker(FakeTracker):
+            def items(self, repo):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+        code = self.run_sync(RejectingTracker(), resync=True)
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+
+    def test_refused_plus_unreachable_exits_3(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n'
+                '[[repo]]\nname = "lib"\ntracker.repo = "acme/lib"\n'
+            )
+
+        class MixedTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                if repo == "acme/app":
+                    raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+                raise tracker.TrackerError("connection refused")
+
+        code = self.run_sync(MixedTracker())
+        self.assertEqual(code, 3)
+        self.assertIn("tracker rejected", self.err.getvalue())
+        self.assertIn("connection refused", self.err.getvalue())
+
+    def test_rejected_board_schema_exits_1_and_keeps_cursor(self):
+        with open(os.path.join(self.root, "corral.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\ntracker.repo = "acme/app"\ntracker.variant = "board"\n'
+            )
+        old = tracker.format_cursor(T0 - 100)
+        self.store.set_cursor(REPO, sync.BOARD_CURSOR_NAME, old)
+
+        class RejectingBoardTracker(FakeTracker):
+            board_poll_pages = 5
+
+            def board_schema(self):
+                raise tracker.TrackerRejected("tracker rejected: Validation Failed (HTTP 422)")
+
+            def poll(self, schema, *, after=None, max_pages=5):
+                return [], None
+
+        code = self.run_sync(RejectingBoardTracker())
+        self.assertEqual(code, 1)
+        self.assertIn("tracker rejected", self.err.getvalue())
+        self.assertEqual(self.store.get_cursor(REPO, sync.BOARD_CURSOR_NAME), old)
+
     def test_partial_errors_still_exit_0(self):
         fake = FakeTracker(
             [
