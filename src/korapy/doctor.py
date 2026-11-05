@@ -1498,14 +1498,20 @@ def load_hub_probe(url: str | None, token: str | None) -> HubProbe | None:
             status = response.status
             raw = response.read(65536)
     except urllib.error.HTTPError as err:
-        if err.code == 401:
-            return HubProbe(
-                "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
-            )
-        refusal = _typed_version_refusal(err)
-        if refusal is not None:
-            return refusal
-        return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+        # HTTPError subclasses tempfile._TemporaryFileWrapper: an unclosed
+        # one warns at collection and leaks the response's file. The typed
+        # refusal reads the body first, then the handle closes either way.
+        try:
+            if err.code == 401:
+                return HubProbe(
+                    "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
+                )
+            refusal = _typed_version_refusal(err)
+            if refusal is not None:
+                return refusal
+            return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+        finally:
+            err.close()
     except Exception as err:  # noqa: BLE001 - a failed probe is report data, never a traceback
         return HubProbe("unreachable", f"the hub at {url} cannot be reached: {err}")
     if status != 200:
