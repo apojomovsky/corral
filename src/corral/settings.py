@@ -93,7 +93,6 @@ PROVIDERS = (
     "corral.quota",
     "corral.registry",
     "corral.resources",
-    "corral.runtimes",
     "corral.serve",
     "corral.sync",
     "corral.takeoff",
@@ -113,6 +112,15 @@ register("git.worktrees", str, ".worktrees/", "worktree root, relative to the cl
 register("git.commits.conventional", bool, True, "enforce Conventional Commits")
 register("board.ready", str, "ready", "label that makes an issue eligible")
 register("agents.cap", int, 1, "this project's ceiling of live agents on the host")
+
+
+#: Settings the profiles cutover replaced: the old key maps to the new
+#: ``[profiles.*]`` home the error names. One fact, one place: `_check`
+#: rejects these wherever they appear (host config, project file, repo
+#: entry, flags), and `resolve` rejects them in the environment too.
+REMOVED_KEYS = {
+    "agents.runtime": "[profiles.<name>] runtime",
+}
 
 
 class Private(NamedTuple):
@@ -157,14 +165,10 @@ class Value:
 @dataclass
 class Resolved:
     values: dict[str, Value] = field(default_factory=dict)
-    #: The project's model chains: role to ``["provider/model", ...]``.
-    #: From ``[models.<role>]`` tables in corral.toml; this is the one place
-    #: that reads them.
-    models: dict[str, list[str]] = field(default_factory=dict)
     #: The project's private terms and patterns, from ``[private]`` in
-    #: corral.toml. Like ``[models]``, this is PROJECT-level only: the host
-    #: config and ``[[repo]]`` entries cannot set it, and read as unknown
-    #: settings there.
+    #: corral.toml. Like the removed ``[models]`` tables, this is
+    #: PROJECT-level only: the host config and ``[[repo]]`` entries cannot
+    #: set it, and read as unknown settings there.
     private: Private = field(default_factory=lambda: Private(terms=[], patterns=[]))
     #: The selected repo's ``[board]`` table, or None when the entry has
     #: none. The board slice reads this; it never re-reads corral.toml.
@@ -234,6 +238,12 @@ def _apply_check(setting, value, where):
 
 
 def _check(key, value, where):
+    if key in REMOVED_KEYS:
+        raise SettingsError(
+            f"{where}: {key} was replaced by {REMOVED_KEYS[key]}: "
+            "declare [profiles.default] (or another profile) with a "
+            "runtime and select it, then remove this key"
+        )
     setting = REGISTRY.get(key)
     if setting is None:
         raise SettingsError(f"{where}: unknown setting {key!r}")
@@ -245,28 +255,19 @@ def _check(key, value, where):
     return _apply_check(setting, value, where)
 
 
-def _check_models(raw, where):
-    """``[models.<role>]`` tables as role to chain lists. Shape errors are exit 4."""
-    if not isinstance(raw, dict):
-        raise SettingsError(f"{where}: [models] must be a table of roles")
-    chains: dict[str, list[str]] = {}
-    for role, table in raw.items():
-        if not isinstance(role, str) or not role:
-            raise SettingsError(f"{where}: [models] role names must be non-empty strings")
-        if not isinstance(table, dict) or set(table) != {"chain"}:
-            raise SettingsError(f"{where}: [models.{role}] must hold exactly a chain list")
-        chain = table["chain"]
-        if not isinstance(chain, list) or not chain:
-            raise SettingsError(
-                f"{where}: [models.{role}] chain must be a non-empty list of model ids"
-            )
-        for entry in chain:
-            if not isinstance(entry, str) or not entry:
-                raise SettingsError(
-                    f"{where}: [models.{role}] chain entries must be non-empty strings"
-                )
-        chains[role] = list(chain)
-    return chains
+def _reject_models(where):
+    """Refuse a top-level ``[models]`` table: profiles own the chains now.
+
+    The profiles cutover moved every ``[models.<role>]`` table under
+    ``[profiles.default]`` (or another profile) as its ``models`` table.
+    There is no shim: two readers for one fact is a bug even when they
+    agree. The refusal is exit 4, like the old shape check.
+    """
+    raise SettingsError(
+        f"{where}: [models] was replaced by [profiles.<name>] models: "
+        "move each [models.<role>] table under [profiles.default] "
+        "(runtime plus per-role chains), then remove this table"
+    )
 
 
 def _check_profile_tables(raw, where):
@@ -351,8 +352,8 @@ _BOARD_COLUMNS = (
 )
 
 #: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
-#: the ``[models]`` and ``[private]`` precedent: strict keys, so a typo
-#: fails here instead of silently running label mode. Derived from the
+#: the ``[private]`` precedent: strict keys, so a typo fails here instead
+#: of silently running label mode. Derived from the
 #: address and column groups above (plus ``priority_map``), so a concept
 #: added to one group is never silently dropped by the other.
 _BOARD_KEYS = frozenset(_BOARD_ADDRESS + _BOARD_COLUMNS + ("priority_map",))
@@ -495,6 +496,8 @@ def _repo_entries(repos, project_name):
         if name in entries:
             raise SettingsError(f"{project_name}: [[repo]] {name!r} appears twice")
         where = f"{project_name} [[repo]] {name}"
+        if "models" in entry:
+            _reject_models(where)
         profile = entry.pop("profile", None)
         if profile is not None and (not isinstance(profile, str) or not profile):
             raise SettingsError(f"{where}: profile must be a non-empty string")
@@ -601,6 +604,8 @@ def resolve(
 
     limits = host.pop("limits", {})
     resource_tables = host.pop("resources", None)
+    if "models" in host:
+        _reject_models(host_name)
     host_profiles = _check_profile_tables(host.pop("profiles", {}), host_name)
     if not isinstance(limits, dict):
         raise SettingsError(f"{host_name}: [limits] must be a table")
@@ -621,7 +626,8 @@ def resolve(
         result["resources.gone_s"] = Value(_check("resources.gone_s", nested_gone, host_name), HOST)
 
     repos = project.pop("repo", [])
-    chains = _check_models(project.pop("models", {}), project_name)
+    if "models" in project:
+        _reject_models(project_name)
     private = _check_private(project.pop("private", {}), project_name)
     project_profiles = _check_profile_tables(project.pop("profiles", {}), project_name)
     profile_default = _check_profile_default(project.pop("profile", {}), project_name)
@@ -640,6 +646,15 @@ def resolve(
         if raw is not None and raw != "":
             parsed = _parse_env(setting, raw)
             result[key] = Value(_apply_check(setting, parsed, setting.env), ENV)
+    for key in REMOVED_KEYS:
+        env_key = "CORRAL_" + key.upper().replace(".", "_")
+        raw = env.get(env_key)
+        if raw is not None and raw != "":
+            raise SettingsError(
+                f"{env_key}={raw!r} was replaced by {REMOVED_KEYS[key]}: "
+                "declare [profiles.default] (or another profile) with a "
+                "runtime and select it, then unset this variable"
+            )
     for key, value in (flags or {}).items():
         if value is not None:
             result[key] = Value(_check(key, value, "flag"), FLAG)
@@ -668,7 +683,6 @@ def resolve(
     board = boards[repo] if repo is not None else None
     return Resolved(
         result,
-        chains,
         private,
         board,
         resources.check_tables(resource_tables, host_name),

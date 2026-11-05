@@ -9,6 +9,7 @@ clones from test_launch.
 import io
 import os
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -362,7 +363,7 @@ class LaunchRoleTest(OpsCase):
             store.upsert_item(
                 reading(repo=repo, number=number, title=title),
                 operators=["alice"],
-                now=1000.0,
+                now=time.time(),
             )
 
     def test_role_renders_the_board_title_into_prompt_md(self):

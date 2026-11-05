@@ -45,10 +45,10 @@ class Layers(unittest.TestCase):
                 self.assertEqual((item.value, item.origin), (value, origin))
 
     def test_a_repo_entry_applies_only_to_its_repo(self):
-        project = {"repo": [{"name": "app", "agents": {"runtime": "muse"}}, {"name": "lib"}]}
-        self.assertEqual(resolve(project=project, repo="app")["agents.runtime"], "muse")
-        self.assertEqual(resolve(project=project, repo="lib")["agents.runtime"], "omp")
-        self.assertEqual(resolve(project=project)["agents.runtime"], "omp")
+        project = {"repo": [{"name": "app", "agents": {"cap": 4}}, {"name": "lib"}]}
+        self.assertEqual(resolve(project=project, repo="app")["agents.cap"], 4)
+        self.assertEqual(resolve(project=project, repo="lib")["agents.cap"], 1)
+        self.assertEqual(resolve(project=project)["agents.cap"], 1)
 
     def test_env_values_are_parsed_by_type(self):
         r = resolve(env={"CORRAL_GIT_COMMITS_CONVENTIONAL": "no", "CORRAL_AGENTS_CAP": "3"})
@@ -269,7 +269,7 @@ class ConfigShow(unittest.TestCase):
         code, out, _ = self.run_cli("--origin", "--repo", "app")
         self.assertEqual(code, 0)
         self.assertIn("agents.cap = 2  # repo\n", out)
-        self.assertIn("agents.runtime = 'omp'  # default\n", out)
+        self.assertNotIn("agents.runtime", out)
 
     def test_a_settings_error_exits_4(self):
         code, _, err = self.run_cli("--repo", "nope")

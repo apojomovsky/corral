@@ -963,13 +963,20 @@ def _check_recorded(raw: object, where: str) -> RecordedProfile:
 
 
 def record_profile(
-    session_dir: str, profile: Profile, provenance: Provenance, model: str | None = None
+    session_dir: str,
+    profile: Profile,
+    provenance: Provenance,
+    model: str | None = None,
+    runtime: str | None = None,
 ) -> None:
     """Write the resolved profile into `session_dir`, next to the runtime record.
 
     Records the name, runtime, model head and provenance, so a resume reuses
-    the launch setup even after an override expires. Validates before writing:
-    a bad value raises and nothing is written.
+    the launch setup even after an override expires. `runtime` is the run's
+    effective runtime: the `--runtime` refinement when one was given, else
+    the profile's runtime. The resume reruns the recorded runtime, so
+    recording the unrefined one would silently switch the refined run back.
+    Validates before writing: a bad value raises and nothing is written.
     """
     if not isinstance(profile, Profile):
         raise ProfileError(f"profile record: want a Profile, not {type(profile).__name__}")
@@ -977,11 +984,13 @@ def record_profile(
         raise ProfileError(f"profile record: want a Provenance, not {type(provenance).__name__}")
     if model is not None and (not isinstance(model, str) or not model):
         raise ProfileError(f"profile record: model must be a model id or null, not {model!r}")
+    if runtime is not None and (not isinstance(runtime, str) or not runtime):
+        raise ProfileError(f"profile record: runtime must be a runtime name, not {runtime!r}")
     target = os.path.join(session_dir, PROFILE_FILE)
     stored = _check_recorded(
         {
             "profile": profile.name,
-            "runtime": profile.runtime,
+            "runtime": runtime if runtime is not None else profile.runtime,
             "model": model,
             "layer": provenance.layer,
             "layer_name": provenance.layer_name,

@@ -212,10 +212,14 @@ def _board_title(args, tgt, seams):
 def _profile_tracker(seams, args, tgt):
     """The tracker for the ticket's profile assignment, or None.
 
-    The injected fake wins; otherwise the production tracker builds only
-    when a profile may resolve (a declaration exists or `--profile` names
-    one), and a build failure is exit 4. With no profiles configured the
-    launch runs the pre-profiles path and never touches a tracker.
+    The injected fake wins; otherwise the production tracker builds when
+    a profile may resolve (a declaration exists or `--profile` names one),
+    and a build failure is exit 4. With neither, the ticket layer still
+    fails closed on the cached store row (an assignment naming an
+    undeclared profile refuses without any live re-read), so no tracker
+    is built and origin-less clones keep launching with `--title`.
+    The build itself is local (settings plus the tracker factory, no
+    network reads); the network only happens on a stale-row re-read.
     """
     if seams.tracker is not None:
         return seams.tracker
@@ -281,8 +285,7 @@ def cmd_launch(args, seams: Seams) -> int:
     if bool(args.prompt_file) == bool(args.role):
         raise launch.LaunchError("pass exactly one of --role and --prompt-file")
     config = _read_config(args.runtime_config)
-    flags = {"agents.runtime": args.runtime} if args.runtime else None
-    tgt = _target(args, flags)
+    tgt = _target(args)
     tracker = _profile_tracker(seams, args, tgt)
     if args.role:
         prompt, title = _role_prompt(args, tgt, seams)
@@ -413,7 +416,9 @@ def add_parser(sub, seams: Seams) -> None:
     )
     p.add_argument("--title", default=None, help="the ticket title, to name a new branch")
     p.add_argument("--model", default=None, help="the model the runtime should use")
-    p.add_argument("--runtime", default=None, help="the runtime (default: agents.runtime)")
+    p.add_argument(
+        "--runtime", default=None, help="the runtime for this launch only (default: the profile's)"
+    )
     p.add_argument("--profile", default=None, help="the agent profile for this launch only")
     p.add_argument("--runtime-config", default=None, help="a JSON object file, the runtime config")
     p.set_defaults(func=_verb(cmd_launch, seams))

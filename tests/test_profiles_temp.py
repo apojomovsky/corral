@@ -210,6 +210,14 @@ class SessionRecord(unittest.TestCase):
             profiles.record_profile(directory, bad, provenance)
         self.assertFalse(os.path.exists(directory))
 
+    def test_a_runtime_refinement_is_recorded_for_the_resume(self):
+        found, provenance = resolve(parsed("fast", "sixth"), sel(default="sixth"))
+        directory = session_dir()
+        profiles.record_profile(directory, found, provenance, runtime="muse")
+        recorded = profiles.recorded_profile(directory)
+        assert recorded is not None
+        self.assertEqual((recorded.name, recorded.runtime), ("sixth", "muse"))
+
     def test_a_session_launched_under_an_override_resumes_its_record_after_expiry(self):
         selections = sel(default="sixth", override=over("global", "fast", T0 + 3600))
         found, provenance = resolve(parsed("fast", "sixth"), selections)

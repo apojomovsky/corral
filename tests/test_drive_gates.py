@@ -559,7 +559,10 @@ class ProjectQuotaTest(unittest.TestCase):
         root = os.path.join(tmp, "ops", "blue")
         os.makedirs(root)
         with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
-            handle.write('[models.default]\nchain = ["tired/model"]\n')
+            handle.write(
+                '[profiles.default]\nruntime = "omp"\n'
+                '[profiles.default.models.default]\nchain = ["tired/model"]\n'
+            )
         project = projects.Project(name="blue", unit_prefix="blue-agent", root=root)
         pool = [accounts.Provider(name="tired", reader="pkg:Reader", stale_after_s=60.0)]
         source = drive._project_quota(project, pool)
@@ -571,7 +574,10 @@ class ProjectQuotaTest(unittest.TestCase):
         root = os.path.join(tmp, "ops", "blue")
         os.makedirs(root)
         with open(os.path.join(root, "corral.toml"), "w", encoding="utf-8") as handle:
-            handle.write('[models.default]\nchain = ["fresh/model"]\n')
+            handle.write(
+                '[profiles.default]\nruntime = "omp"\n'
+                '[profiles.default.models.default]\nchain = ["fresh/model"]\n'
+            )
         project = projects.Project(name="blue", unit_prefix="blue-agent", root=root)
         pool = [
             accounts.Provider(name="fresh", reader="pkg:Reader", stale_after_s=3600.0),

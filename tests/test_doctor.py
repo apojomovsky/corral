@@ -342,8 +342,25 @@ class SettingsResolution(unittest.TestCase):
     def test_a_clean_host_and_root_resolve(self):
         root = tempfile.mkdtemp(prefix="corral-doctor-")
         config = tempfile.mkdtemp(prefix="corral-doctor-")
-        self.write(root, "corral.toml", "[models.default]\nchain = ['pool/model']\n")
+        self.write(
+            root,
+            "corral.toml",
+            '[profiles.default]\nruntime = "omp"\n'
+            "[profiles.default.models.default]\nchain = ['pool/model']\n",
+        )
         self.assertIsNone(doctor.check_settings(root, {"CORRAL_CONFIG": config}))
+
+    def test_old_models_and_runtime_keys_are_errors_naming_profiles(self):
+        root = tempfile.mkdtemp(prefix="corral-doctor-")
+        config = tempfile.mkdtemp(prefix="corral-doctor-")
+        self.write(root, "corral.toml", "[models.default]\nchain = ['pool/model']\n")
+        error = doctor.check_settings(root, {"CORRAL_CONFIG": config})
+        self.assertIsNotNone(error)
+        self.assertIn("profiles", error or "")
+        self.write(root, "corral.toml", '[agents]\nruntime = "omp"\n')
+        error = doctor.check_settings(root, {"CORRAL_CONFIG": config})
+        self.assertIsNotNone(error)
+        self.assertIn("profiles", error or "")
 
 
 class ProductionGathering(unittest.TestCase):

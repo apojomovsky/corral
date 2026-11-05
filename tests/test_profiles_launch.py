@@ -167,11 +167,13 @@ class SettingsCarriage(unittest.TestCase):
 
 
 class SelectionGate(unittest.TestCase):
-    def test_no_declarations_and_no_flag_returns_none_without_touching_the_store(self):
+    def test_no_declarations_and_no_flag_resolves_the_builtin_default(self):
         tgt = target(resolve(project={}))
         store = FakeStore()
-        self.assertIsNone(select(tgt, store=store))
-        self.assertEqual(store.calls, [])
+        found = select(tgt, store=store)
+        self.assertEqual(found.profile, profiles.BUILTIN_DEFAULT)
+        self.assertEqual(found.runtime, profiles.BUILTIN_DEFAULT.runtime)
+        self.assertEqual(found.provenance.layer, 6)
 
     def test_a_flag_with_no_declarations_still_refuses_an_unknown_name(self):
         tgt = target(resolve(project={}))

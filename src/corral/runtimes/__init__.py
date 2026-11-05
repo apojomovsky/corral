@@ -18,7 +18,7 @@ has none.
 import os
 from typing import Protocol
 
-from corral import paths, settings
+from corral import paths
 
 #: The session file that names the runtime a session was launched on.
 RUNTIME_FILE = "runtime"
@@ -38,8 +38,10 @@ class UnknownRuntime(ValueError):
     """A runtime name corral does not support (exit 4, usage error)."""
 
 
-#: The runtime a project's agents use; `get` is where the name is checked.
-settings.register("agents.runtime", str, DEFAULT_RUNTIME, f"agent runtime: {' or '.join(NAMES)}")
+#: The runtime a session with no recorded runtime ran on: sessions record
+#: their runtime at launch, and only sessions from before recording read
+#: this. New launches resolve their runtime from the resolved profile.
+#: `get` is where a profile's runtime name is checked.
 
 
 def check_prompt(prompt):

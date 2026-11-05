@@ -256,7 +256,7 @@ the doctor row for a human to audit. The write channel is an open decision
 ## 5. Settings
 
 One `[resources]` surface, resolved by `settings.resolve` on the existing
-`[models]` and `[private]` precedent (strict keys, exit 4 naming the file
+`[private]` precedent (strict keys, exit 4 naming the file
 and the key):
 
 ```toml
