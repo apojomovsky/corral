@@ -526,9 +526,32 @@ reports the verdict without queueing or running. Everything after
 holders, waiters and learned costs. An empty lane is an empty list,
 not a failure.
 
-There is no rename verb. To rename a `[[repo]]` entry, rename it in
-`korapy.toml` and re-run `korapy init --force` so the host
-registration matches again.
+A renamed tracker repository keeps its issues, so plain reads keep
+working through the forge redirect; but the board store keys every
+row by the old `owner/name`. `korapy repo rename` moves those keys
+after you rename on the forge:
+
+```sh
+korapy repo rename OLD NEW --plan
+korapy repo rename OLD NEW
+```
+
+`--plan` prints what would move and changes nothing. The move itself
+migrates items, claims (agent and epoch kept), the outbox and the
+sync cursors in a single transaction. Session directories and review
+records are keyed by the short `[[repo]]` name and are not touched
+(see #479). The verb refuses with exit 2 while a live agent or a
+live-held claim names either name, or while a drive pass holds its
+lock. Every run leaves a timestamped backup beside the store; the
+newest five are kept and older ones are pruned. To restore one, stop
+the loop and copy it back over the store file.
+
+Run the move while the repo is quiet: pause the loop with the pause
+file (the loop section above), stop the repo's agents (`korapy stop
+REPO N` per ticket) until `korapy agent list` shows none live, run
+the verb, point the clone's origin remote at the new URL and set
+`tracker.repo` to the new name, then remove the pause file and
+re-run `korapy doctor`.
 
 Exit codes are a public interface; scripts branch on them:
 
