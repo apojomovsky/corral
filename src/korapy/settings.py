@@ -525,6 +525,41 @@ def _repo_entries(repos, project_name):
     return entries, boards, repo_profiles
 
 
+def read_project(root):
+    """The ops root's parsed ``korapy.toml`` table, from one file read.
+
+    ``{}`` when there is no root or no file. A broken file raises
+    SettingsError. The one reader for entry views: matching, the
+    tracker map and settings resolution all take this table instead of
+    reading the file again, so one pass never mixes tables from a
+    concurrent edit.
+    """
+    _load_providers()
+    if not root:
+        return {}
+    return _load(os.path.join(root, PROJECT_FILE))
+
+
+def read_host(env=None):
+    """The host config's parsed table, from one file read.
+
+    ``{}`` when there is no file. A broken file raises SettingsError.
+    """
+    env = os.environ if env is None else env
+    return _load(os.path.join(paths.config_dir(env), HOST_CONFIG_NAME))
+
+
+def entry_names(table, project_name):
+    """Names of the ``[[repo]]`` entries in one parsed project table.
+
+    `table` is the pre-read project file (see `read_project`): the one
+    validated derivation of entry names, shared by matching and the
+    tracker map instead of re-reading entry names from the raw table.
+    """
+    entries, _, _ = _repo_entries(table.get("repo", []), project_name)
+    return list(entries)
+
+
 def repo_names(root):
     """Names of the ``[[repo]]`` entries in the ops root's korapy.toml,
     in file order. Empty when there is no root or no file."""
@@ -532,9 +567,37 @@ def repo_names(root):
     if not root:
         return []
     project_path = os.path.join(root, PROJECT_FILE)
-    project = _load(project_path)
-    entries, _, _ = _repo_entries(project.get("repo", []), project_path)
-    return list(entries)
+    return entry_names(read_project(root), project_path)
+
+
+def match_covering(table, root, clone, project_name):
+    """The ``[[repo]]`` entry name whose ``clone.path`` covers ``clone``.
+
+    `table` is the pre-read project file (see `read_project`): the
+    match validates that single parse instead of reading the file
+    again. A relative `clone.path` resolves against the ops root, and
+    the match compares real paths, so the answer never depends on the
+    working directory. Several entries covering the same clone are a
+    SettingsError: the entry name keys hooks and ticket records, so it
+    must stay unambiguous. None when no entry covers the clone.
+    """
+    entries, _, _ = _repo_entries(table.get("repo", []), project_name)
+    want = os.path.realpath(clone)
+    matched = []
+    for name, values in entries.items():
+        path = values.get("clone.path")
+        if not path:
+            continue
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(root, path))
+        if os.path.realpath(path) == want:
+            matched.append(name)
+    if len(matched) > 1:
+        raise SettingsError(
+            f"{project_name}: several [[repo]] entries match this clone "
+            f"({', '.join(matched)}): give each entry a distinct clone.path"
+        )
+    return matched[0] if matched else None
 
 
 def covering_repo(root, clone):
@@ -550,23 +613,7 @@ def covering_repo(root, clone):
     if not root:
         return None
     project_path = os.path.join(root, PROJECT_FILE)
-    entries, _, _ = _repo_entries(_load(project_path).get("repo", []), project_path)
-    want = os.path.realpath(clone)
-    matched = []
-    for name, values in entries.items():
-        path = values.get("clone.path")
-        if not path:
-            continue
-        if not os.path.isabs(path):
-            path = os.path.normpath(os.path.join(root, path))
-        if os.path.realpath(path) == want:
-            matched.append(name)
-    if len(matched) > 1:
-        raise SettingsError(
-            f"{project_path}: several [[repo]] entries match this clone "
-            f"({', '.join(matched)}): give each entry a distinct clone.path"
-        )
-    return matched[0] if matched else None
+    return match_covering(read_project(root), root, clone, project_path)
 
 
 def private(root):
@@ -578,7 +625,7 @@ def private(root):
     if not root:
         return Private(terms=[], patterns=[])
     project_path = os.path.join(root, PROJECT_FILE)
-    return resolve(project=_load(project_path), env={}, project_name=project_path).private
+    return resolve(project=read_project(root), env={}, project_name=project_path).private
 
 
 def find_root(start):
@@ -717,8 +764,8 @@ def load(root=None, repo=None, env=None, flags=None):
     host_path = os.path.join(paths.config_dir(env), HOST_CONFIG_NAME)
     project_path = os.path.join(root, PROJECT_FILE) if root else None
     return resolve(
-        host=_load(host_path),
-        project=_load(project_path) if project_path else {},
+        host=read_host(env),
+        project=read_project(root),
         repo=repo,
         env=env,
         flags=flags,
