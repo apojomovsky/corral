@@ -889,6 +889,91 @@ class RenameRootCase(TempStoreTest):
         self.assertIn("#479", text)
 
 
+class _UnusedGit:
+    """A git seam that must never run: explicit `tracker.repo` needs no lookup."""
+
+    def __call__(self, *args, **kwargs):
+        raise AssertionError("no origin lookup: tracker.repo is set")
+
+
+class RenameHoldsSyncAndMirrorTest(unittest.TestCase):
+    """While the rename holds the drive lock, sync and mirror refuse.
+
+    The migration window the ticket closes: a standalone sync of the
+    old name must not land rows under the old key after the rename's
+    UPDATE commits. Both verbs take the same lock the rename holds,
+    so an attempt from inside that window exits 2 with its store
+    untouched. The real flock lock stands in for the rename's hold.
+    """
+
+    def setUp(self):
+        import tempfile
+
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-rename-window-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/old"\n')
+        self.store = board.open_store(os.path.join(self.root, "board.sqlite"))
+        self.addCleanup(self.store.close)
+        self.out = io.StringIO()
+        self.err = io.StringIO()
+        self.lock_path = os.path.join(self.root, "drive.lock")
+
+    def test_sync_attempted_inside_the_window_exits_2(self):
+        from korapy import drive, syncli
+        from tests.test_tracker import FakeTracker
+        from tests.test_tracker import reading as tracker_reading
+
+        fake = FakeTracker([tracker_reading("acme/old", 1, updated_at=NOW)])
+        with drive.drive_lock(self.lock_path):
+            code = syncli.sync_root(
+                self.root,
+                [],
+                resync=False,
+                audit=None,
+                as_json=False,
+                tracker=fake,
+                store=self.store,
+                git=_UnusedGit(),
+                now=NOW,
+                out=self.out,
+                err=self.err,
+                lock=drive.drive_lock,
+                lock_path=self.lock_path,
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("another drive pass", self.err.getvalue())
+        found, _ = self.store.item("acme/old", 1, now=NOW)
+        self.assertIsNone(found)
+
+    def test_mirror_attempted_inside_the_window_exits_2(self):
+        from korapy import drive, mirrorcli
+        from tests.test_tracker import FakeTracker
+
+        self.store.upsert_item(reading(OLD, 1), operators=["alice"], now=NOW - 100)
+        self.store.enqueue(OLD, 1, "agent", HOLDER, now=NOW - 50)
+        with drive.drive_lock(self.lock_path):
+            code = mirrorcli.mirror_root(
+                self.root,
+                (),
+                limit=None,
+                as_json=False,
+                tracker=FakeTracker(),
+                store=self.store,
+                git=_UnusedGit(),
+                now=NOW,
+                out=self.out,
+                err=self.err,
+                operators={OLD: ["alice"]},
+                lock=drive.drive_lock,
+                lock_path=self.lock_path,
+            )
+        self.assertEqual(code, 2)
+        self.assertIn("another drive pass", self.err.getvalue())
+        self.assertEqual(len(self.store.queued_writes()), 1)
+
+
 class TrackerRowTest(unittest.TestCase):
     def rows(self, **over):
         from korapy import doctor
