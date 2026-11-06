@@ -8,8 +8,9 @@ em-dashes. Reading the file touches nothing outside the tree.
 import re
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from korapy import runtimes
+from korapy import drive, eligibility, runtimes
 
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
@@ -88,14 +89,25 @@ class FrontDoor(unittest.TestCase):
         self.assertIn("docs/assets/korapy-logo.svg", self.text.split("## ", 1)[0])
         head = self.text.split("## ", 1)[0]
         for badge in (
-            "actions/workflow/status",
             "License-MIT",
             "3.11",
             "linux",
+            "dependencies-none",
             "alpha",
         ):
             with self.subTest(badge=badge):
                 self.assertIn(badge, head)
+
+    def test_the_badges_need_no_owner_path(self):
+        head = self.text.split("## ", 1)[0]
+        self.assertNotIn("actions/workflow/status", head)
+        self.assertNotIn("github.com/", head)
+        self.assertIn("CI badge goes here", head)
+
+    def test_the_readme_names_no_owner_or_old_name(self):
+        lowered = self.text.lower()
+        self.assertNotIn("github.com/", self.text)
+        self.assertNotIn("corral", lowered)
 
     def test_the_opinions_link_to_the_design(self):
         opinions = self.text.split("## Opinions", 1)[1].split("## ", 1)[0]
@@ -104,6 +116,21 @@ class FrontDoor(unittest.TestCase):
         self.assertLessEqual(len(bullets), 5, f"Opinions has {len(bullets)} bullets")
         for bullet in bullets:
             self.assertLessEqual(len(bullet.splitlines()), 1)
+
+
+class QuickstartOutputs(unittest.TestCase):
+    """The quickstart quotes the real pass outputs, not approximations."""
+
+    def test_the_drive_summaries_match_the_renderer(self):
+        text = readme_text()
+        self.assertIn(drive.render([], label="plan", plan=True).strip(), text)
+        self.assertIn(drive.render([], label="pass", plan=False).strip(), text)
+
+    def test_the_skipped_line_matches_the_eligibility_reason(self):
+        project = SimpleNamespace(name="NAME", eligibility=None, root=".")
+        outcome = eligibility.for_project(project, [], now=0.0)
+        assert outcome.skipped is not None
+        self.assertIn(outcome.skipped, readme_text())
 
 
 class RegisteredRuntimes(unittest.TestCase):

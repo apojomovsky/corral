@@ -8,7 +8,8 @@ korapy runs fleets of headless coding agents on Linux hosts. It claims
 tickets from a board, launches one agent per ticket under a shared
 budget, and lands the work through review and merge.
 
-[![CI](https://img.shields.io/github/actions/workflow/status/apojomovsky/corral/ci.yml?label=CI)](https://github.com/apojomovsky/corral/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml) [![Linux only](https://img.shields.io/badge/platform-linux-lightgrey.svg)](docs/00-design.md) [![No runtime dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](pyproject.toml) [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
+<!-- CI badge goes here once the owner path is approved, one line, same row as the badges below. -->
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml) [![Linux only](https://img.shields.io/badge/platform-linux-lightgrey.svg)](docs/00-design.md) [![No runtime dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](pyproject.toml) [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 ## What it does
 
@@ -71,8 +72,10 @@ korapy deps          # ok per program, or the install command for what is missin
 korapy init          # in a project clone: writes korapy.toml and registers the host
 korapy doctor        # one row per check; every failure names its fix
 korapy drive --plan  # what one pass would start
+                     # project NAME: project NAME has no eligibility entry: skipped
                      # plan: 0 candidate(s), would start 0
 korapy drive         # run the pass
+                     # project NAME: project NAME has no eligibility entry: skipped
                      # pass: 0 candidate(s), started 0
 korapy serve         # the dashboard, on loopback
                      # korapy serve: dashboard at http://127.0.0.1:8420/
