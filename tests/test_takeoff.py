@@ -16,7 +16,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from korapy import heavy, leakcli, reviewrecord, settings, takeoff
+from korapy import heavy, leakcli, reviewrecord, settings, syncli, takeoff
 from korapy.gitenv import clean_env
 
 REPO = "myrepo"
@@ -664,6 +664,82 @@ class TakeoffCase(unittest.TestCase):
             verdict="approve",
         )
         result = self.gate(ops_dir=None, body_file=None)
+        self.assertEqual(self.status(result, "review"), "ok")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_tracker_spelled_repo_translates_to_the_short_name(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'tracker.repo = "acme/myrepo"\n'
+            'checks.test = "make test"\n'
+        )
+        builds = []
+        real_map = syncli.short_to_tracker
+
+        def counting(root, git):
+            builds.append(root)
+            return real_map(root, git)
+
+        seen = []
+        real_local = reviewrecord.local_repo
+
+        def spying(repo, mapping):
+            seen.append(repo)
+            return real_local(repo, mapping)
+
+        with (
+            mock.patch.object(syncli, "short_to_tracker", side_effect=counting),
+            mock.patch.object(reviewrecord, "local_repo", side_effect=spying),
+        ):
+            result = self.gate()
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(seen, ["acme/myrepo"])
+        self.assertEqual(self.status(result, "review"), "ok")
+        self.assertEqual(result.exit_code, 0)
+
+    def test_untranslatable_repo_is_a_usage_error(self):
+        self.write_ops(
+            "[[repo]]\n"
+            'name = "acme/myrepo"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+        )
+        with self.assertRaisesRegex(takeoff.TakeoffError, "acme/myrepo"):
+            self.gate()
+
+    def test_covering_entry_supplies_settings_when_two_shorts_share_a_tracker(self):
+        other = os.path.join(self.tmp, "other")
+        os.makedirs(other)
+        self.write_ops(
+            "[[repo]]\n"
+            'name = "app"\n'
+            f'clone.path = "{other}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'tracker.repo = "acme/myrepo"\n'
+            'checks.test = "make first"\n'
+            "[[repo]]\n"
+            'name = "app-2"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'tracker.repo = "acme/myrepo"\n'
+            'checks.test = "make second"\n'
+        )
+        # The record lookup still resolves the shared tracker spelling to
+        # the first entry, so the approving record lives under "app".
+        reviewrecord.write_record(
+            "app",
+            NUMBER,
+            self.head,
+            reviewer="reviewer-1",
+            author="author-1",
+            verdict="approve",
+        )
+        result = self.gate()
+        self.assertEqual(self.cmd_calls, [("make second", self.work)])
         self.assertEqual(self.status(result, "review"), "ok")
         self.assertEqual(result.exit_code, 0)
 
@@ -1532,7 +1608,13 @@ class TakeoffDocstringCase(unittest.TestCase):
 
 
 class TicketRepoRelativePath(unittest.TestCase):
-    """`_ticket_repo` with a relative `clone.path`: the ops root wins from any cwd."""
+    """`_ticket_repo` with a relative `clone.path`: the ops root wins from any cwd.
+
+    The triple carries the covering short alongside the ticket
+    spelling, so settings load under the matched entry even when the
+    reverse lookup would prefer another entry feeding the same
+    tracker repo.
+    """
 
     def test_relative_clone_path_matches_from_a_foreign_working_directory(self):
         tmp = tempfile.TemporaryDirectory(prefix="korapy-ticket-repo-")
@@ -1551,8 +1633,17 @@ class TicketRepoRelativePath(unittest.TestCase):
         previous = os.getcwd()
         os.chdir(foreign)
         try:
-            self.assertEqual(takeoff._ticket_repo(ops, os.path.realpath(clone)), ("app", True))
-            self.assertEqual(takeoff._ticket_repo(None, os.path.realpath(clone)), ("clone", False))
+            self.assertEqual(
+                takeoff._ticket_repo(ops, os.path.realpath(clone), {"app": "acme/app"}),
+                ("acme/app", "app", True),
+            )
+            self.assertEqual(
+                takeoff._ticket_repo(ops, os.path.realpath(clone), {}), ("app", "app", True)
+            )
+            self.assertEqual(
+                takeoff._ticket_repo(None, os.path.realpath(clone), {}),
+                ("clone", None, False),
+            )
         finally:
             os.chdir(previous)
 
