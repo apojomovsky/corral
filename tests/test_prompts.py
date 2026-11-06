@@ -284,6 +284,19 @@ class BuiltinsTest(PromptsCase):
         ):
             self.assertIn(snippet, text)
 
+    def test_reviewer_states_the_record_rule(self):
+        text = prompts.render("reviewer", FULL, ops_root=self.root)
+        for snippet in (
+            "only when `korapy review record` succeeded",
+            f"korapy review record <repo> {FULL['issue']}",
+            "--commit",
+            "--verdict",
+            "--finding",
+            "--author",
+            "a prose verdict alone is not a review",
+        ):
+            self.assertIn(snippet, text)
+
     def test_triage_proposes_labels_and_never_closes(self):
         text = prompts._builtin_text("triage")
         for snippet in (

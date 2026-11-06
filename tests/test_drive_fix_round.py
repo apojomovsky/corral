@@ -13,6 +13,7 @@ real state dir.
 """
 
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -192,6 +193,148 @@ class OpenPullPassTest(unittest.TestCase):
         self.assertEqual(launcher.calls, [])
         self.assertIsNone(store.claim_of("app", 7))
         self.assertIn("released finished reviewer", out.getvalue())
+
+
+class MissingReviewRecordPassTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-missing-review-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+        self.journal = os.path.join(self.tmp.name, "journal.jsonl")
+
+    def run_missing(self, store, record, kinds=("start",), **fields):
+        out, err = io.StringIO(), io.StringIO()
+        launcher = FakeLauncher()
+        values = {
+            "found": [("blue", [("app", 7, kind) for kind in kinds])],
+            "policy_dir": self.policies,
+            "fake_tracker": FakeTracker([reading(repo="app", number=7, updated_at=1900.0)]),
+            "launcher": launcher,
+            "agent_states": {REVIEWER_UNIT: (FINISHED, NOW - 5.0)},
+            "agent_tickets": {REVIEWER_UNIT: ("app", 7)},
+            "finished_for": {("app", 7): (REVIEWER_UNIT, "reviewer", "ok")},
+            "review_reader": lambda repo, number: record,
+            "journal_path": self.journal,
+            "now": NOW,
+        }
+        values.update(fields)
+        code = drive_pass(store, self.lock, out, err, **values)
+        events = []
+        try:
+            with open(self.journal, encoding="utf-8") as handle:
+                for line in handle.read().splitlines():
+                    if line.strip():
+                        events.append(json.loads(line))
+        except FileNotFoundError:
+            pass
+        return code, out.getvalue(), err.getvalue(), launcher, events
+
+    def reviewed_store(self):
+        """An open row claimed by a finished reviewer, ready to release."""
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, REVIEWER, HOST, now=NOW - 10.0)
+        return store
+
+    def test_no_worker_starts_and_the_missing_record_is_logged_once(self):
+        store = self.reviewed_store()
+        code, out, err, launcher, events = self.run_missing(store, None)
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        logged = [
+            line
+            for line in out.splitlines()
+            if line.startswith("app#7: reviewer finished without a review record")
+        ]
+        self.assertEqual(len(logged), 1)
+        self.assertIn(REVIEWER, logged[0])
+        self.assertIn("review missing, skipped", out)
+        self.assertIsNone(store.claim_of("app", 7))
+        skips = [
+            event
+            for event in events
+            if event.get("event") == "skip" and event.get("ticket") == "app#7"
+        ]
+        self.assertEqual([event.get("code") for event in skips], ["review-missing"])
+
+    def test_two_projects_requesting_still_log_once(self):
+        store = self.reviewed_store()
+        out, err = io.StringIO(), io.StringIO()
+        launcher = FakeLauncher()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            found=[("blue", [("app", 7, "start")]), ("green", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            fake_tracker=FakeTracker([reading(repo="app", number=7, updated_at=1900.0)]),
+            launcher=launcher,
+            agent_states={REVIEWER_UNIT: (FINISHED, NOW - 5.0)},
+            agent_tickets={REVIEWER_UNIT: ("app", 7)},
+            finished_for={("app", 7): (REVIEWER_UNIT, "reviewer", "ok")},
+            review_reader=lambda repo, number: None,
+            now=NOW,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        logged = [
+            line
+            for line in out.getvalue().splitlines()
+            if line.startswith("app#7: reviewer finished without a review record")
+        ]
+        self.assertEqual(len(logged), 1)
+
+    def test_a_recorded_review_stays_on_the_normal_path(self):
+        store = self.reviewed_store()
+        code, out, err, launcher, _ = self.run_missing(store, lows_record())
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertEqual(launcher.calls, [])
+        self.assertNotIn("reviewer finished without a review record", out)
+        self.assertIn("merge-ready, skipped", out)
+
+    def test_a_failed_reviewer_without_a_record_keeps_todays_fix_round(self):
+        store = self.reviewed_store()
+        code, out, err, launcher, _ = self.run_missing(
+            store,
+            None,
+            kinds=("fix",),
+            finished_for={("app", 7): (REVIEWER_UNIT, "reviewer", "failed")},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(launcher.calls), 1)
+        self.assertEqual(launcher.calls[0][3], "start")
+        self.assertNotIn("reviewer finished without a review record", out)
+
+    def test_a_plan_shows_the_missing_record_skip(self):
+        store = self.reviewed_store()
+        out, err = io.StringIO(), io.StringIO()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=True,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            agent_states={REVIEWER_UNIT: (FINISHED, NOW - 5.0)},
+            agent_tickets={REVIEWER_UNIT: ("app", 7)},
+            finished_for={("app", 7): (REVIEWER_UNIT, "reviewer", "ok")},
+            review_reader=lambda repo, number: None,
+            now=NOW,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("review missing, skipped", out.getvalue())
+        logged = [
+            line
+            for line in out.getvalue().splitlines()
+            if line.startswith("app#7: reviewer finished without a review record")
+        ]
+        self.assertEqual(len(logged), 1)
 
 
 if __name__ == "__main__":
