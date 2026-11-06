@@ -1,14 +1,15 @@
 """The heavy lane: weighted slots, the queue file, scope runs, learned
-estimates and the rollup.
+estimates, the bypass, and the rollup.
 
-Tickets 1 to 4 of the heavy-lane design: the lane budget check, the
+Tickets 1 to 6 of the heavy-lane design: the lane budget check, the
 transient scope argv on the ``units`` precedent, per-command routing
 for takeoff with role ``takeoff``, one ledger row per run with the host
 descriptor, the queue file with its lock sidecar, fair order with
-bounded backfill plus reaping of dead holders and stale waiters, and
-the section 6 estimator (robust per-key statistics over the raw rows,
+bounded backfill plus reaping of dead holders and stale waiters, the
+section 6 estimator (robust per-key statistics over the raw rows,
 the wait-deadline and ETA feeds, flaky detection) with the portable
-rollup document. Weights start from config and learn from measurement;
+rollup document, and the explicit logged bypass with roles and the
+recent ring. Weights start from config and learn from measurement;
 the ``heavy`` verbs live in ``heavycli`` as thin parsers over this
 module.
 
@@ -63,6 +64,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Mapping
@@ -144,8 +146,10 @@ WAITER_GRACE_S = 60.0
 #: admit-to-start window would free weight for a live run.
 HOLDER_GRACE_S = 5.0
 
-#: The recent ring keeps this many outcomes; reaped rows are the only
-#: writers so far, and later tickets add the released and bypassed rows.
+#: The recent ring keeps this many outcomes: reaped rows from the admit
+#: passes, released rows from the normal path, and bypassed rows from
+#: runs that skipped the queue. The status view reads the ring, and the
+#: doctor counts bypasses from it; the lane never enforces on it.
 RECENT_LIMIT = 50
 
 #: The unit name prefix for lane scopes.
@@ -1961,20 +1965,144 @@ def wait_for_slot(
         rest(HEAVY_POLL_S)
 
 
-def release_lane(holder_id, budget, state_dir=None, *, lock_timeout=HEAVY_LOCK_TIMEOUT_S):
+def release_lane(holder_id, budget, state_dir=None, *, lock_timeout=HEAVY_LOCK_TIMEOUT_S, now=None):
     """Remove one holder row under the exclusive lock and refresh the cache.
 
+    The normal path also records a `released` row in the recent ring, so
+    the status view shows the run finished and freed its weight.
     Releasing an unknown holder is a no-op: the wait is already over
-    and there is nothing to free. The live budget is cached again, so
-    hand readers see what this writer saw.
+    and there is nothing to free, and no row is recorded. The live budget
+    is cached again, so hand readers see what this writer saw.
     """
+    moment = time.time() if now is None else _check_now(now)
     path = lane_path(state_dir)
     lock = lock_path(state_dir)
     with _locked_sidecar(lock, False, lock_timeout):
         lane = _read_locked(path)
+        held = [row for row in lane["holders"] if row["id"] == holder_id]
+        if not held:
+            lane["budget"] = _budget_copy(budget)
+            _store_locked(path, lane)
+            return
         lane["holders"] = [row for row in lane["holders"] if row["id"] != holder_id]
+        lane["recent"].append(
+            {
+                "at": _iso(moment),
+                "outcome": "released",
+                "unit": held[0].get("unit", ""),
+                "id": holder_id,
+                "command": list(held[0]["command"]),
+            }
+        )
+        lane["recent"] = lane["recent"][-RECENT_LIMIT:]
         lane["budget"] = _budget_copy(budget)
         _store_locked(path, lane)
+
+
+def record_bypass(command, reason, *, state_dir=None, now=None, lock_timeout=HEAVY_LOCK_TIMEOUT_S):
+    """Record one bypassed run in the recent ring, trimming to the limit.
+
+    A bypass skips the queue but stays visible: the status view names
+    the row and its reason, and the doctor counts bypasses from the
+    same ring. An empty reason is refused (a bare `--bypass` is exit 4
+    at the CLI); the lane budget cache is untouched, since a bypass is
+    never charged against the lane.
+    """
+    items = _check_command(command)
+    if not isinstance(reason, str) or not reason:
+        raise HeavyError("a bypass needs a reason: pass --bypass REASON")
+    moment = time.time() if now is None else _check_now(now)
+    path = lane_path(state_dir)
+    lock = lock_path(state_dir)
+    with _locked_sidecar(lock, False, lock_timeout):
+        lane = _read_locked(path)
+        lane["recent"].append(
+            {"at": _iso(moment), "outcome": "bypassed", "reason": reason, "command": items}
+        )
+        lane["recent"] = lane["recent"][-RECENT_LIMIT:]
+        _store_locked(path, lane)
+
+
+def _warn_stderr(text):
+    """The live bypass warning writer: one stderr line naming the failure."""
+    print(f"korapy heavy: {text}", file=sys.stderr)
+
+
+def run_bypass(
+    argv,
+    cwd,
+    env,
+    *,
+    role,
+    repo,
+    reason,
+    weight,
+    budget,
+    run,
+    teardown,
+    scope_cgroup,
+    read=None,
+    clock=None,
+    host=None,
+    pressure=None,
+    timeout,
+    starved_ratio=DEFAULT_STARVED_RATIO,
+    state_dir=None,
+    unit=None,
+    now=None,
+    warn=None,
+    lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+):
+    """Run one heavy command now, skipping the queue, and record the bypass.
+
+    The command runs at once in a transient scope with the same limits
+    the request would have carried (kernel safety is not policy), but
+    it is never charged against the lane budget and leaves no waiter
+    or holder row behind, so the head-of-queue order is untouched. The
+    run still appends its ledger row through `run_heavy` (with a zero
+    wait), then records a `bypassed` row naming the reason in the
+    recent ring. An empty reason is refused before anything runs.
+    `run`, `teardown` and `scope_cgroup` are required seams with no
+    default; `timeout` caps this run only and is required. `now` is an
+    epoch timestamp for the journal row (live when None); `clock` is
+    the run's injectable clock, on the `run_heavy` precedent.
+    `lock_timeout` caps the journal write's lock wait. A journal
+    failure (a lock busy past the timeout, a corrupt lane file) warns
+    through `warn` (stderr live, faked in tests) naming the failure
+    and still returns the run result: the bypass is visible, not
+    prevented, and the ledger row keeps it measurable.
+    """
+    if not isinstance(reason, str) or not reason:
+        raise HeavyError("a bypass needs a reason: pass --bypass REASON")
+    moment = time.time() if now is None else _check_now(now)
+    tell = warn or _warn_stderr
+    result = run_heavy(
+        argv,
+        cwd,
+        env,
+        role=role,
+        repo=repo,
+        weight=weight,
+        budget=budget,
+        run=run,
+        teardown=teardown,
+        scope_cgroup=scope_cgroup,
+        read=read,
+        clock=clock,
+        host=host,
+        pressure=pressure,
+        timeout=timeout,
+        starved_ratio=starved_ratio,
+        waited_s=0.0,
+        unit=unit,
+    )
+    try:
+        record_bypass(
+            list(argv), reason, state_dir=state_dir, now=moment, lock_timeout=lock_timeout
+        )
+    except HeavyError as err:
+        tell(f"bypass ran but the journal row was lost: {err}")
+    return result
 
 
 def hand_weight(cfg, name):
@@ -2124,7 +2252,9 @@ def run_through_lane(
             unit=scope_unit,
         )
     finally:
-        release_lane(waiter["id"], live, state_dir=state_dir, lock_timeout=lock_timeout)
+        release_lane(
+            waiter["id"], live, state_dir=state_dir, lock_timeout=lock_timeout, now=clock()
+        )
     return LaneRun(result=result, waited_s=waited)
 
 
