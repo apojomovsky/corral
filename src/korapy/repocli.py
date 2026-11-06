@@ -10,10 +10,11 @@ cursors, in a single transaction, with a backup left beside the store.
 
 Exit codes: 0 migrated (or a plan with changes), 1 nothing to do (an
 unknown old name, the same name twice, a second run, or a plan with no
-changes), 2 a live agent or a live-held claim blocks the move (named),
-or a drive pass holds its lock (named), 3 the live-unit scan cannot
-reach systemd, 4 a bad name, a target that already holds rows, an
-unreadable store or config, or a lock that cannot be set up.
+changes), 2 a live or stale agent entry or a live-held claim blocks
+the move (named), or a drive pass holds its lock (named), 3 the
+live-unit scan cannot reach systemd, 4 a bad name, a target that
+already holds rows, an unreadable store or config, or a lock that
+cannot be set up.
 """
 
 import argparse
@@ -404,6 +405,7 @@ def add_parser(sub) -> None:
     parser = sub.add_parser(
         "repo",
         help="the repositories behind the board store: migrate keys after a rename",
+        description=__doc__,
     )
     verbs = parser.add_subparsers(dest="repo_verb", required=True)
     p = verbs.add_parser("rename", help="migrate the store's keys to the renamed repo")
