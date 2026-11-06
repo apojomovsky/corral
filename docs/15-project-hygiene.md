@@ -246,8 +246,8 @@ Proof failures are plan rows, never silent. In human output,
 following the `diskcli.format_plan` shape:
 
 ```text
-  [keep] hygiene-dir /home/cache/acme/scratch/run-9 (4120 bytes): kept: touched 2d ago, rule keeps 7d
-  note: dropped /home/cache/acme/scratch/link: is a symlink
+  [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (4120 bytes): kept: touched 2d ago, rule keeps 7d
+  note: dropped /home/someone/cache/acme/scratch/link: is a symlink
 ```
 
 In `--json`, the same rows carry `"safe": false` with the
@@ -351,11 +351,11 @@ existing rows:
 
 ```text
 pressure: low
-  /home/state/korapy: 4.10 GB free (8%)
+  /home/someone/state/korapy: 4.10 GB free (8%)
   [safe] hygiene-image acme-dev:a94c199d (3.21 GB): rule acme-images; no container uses 16270d5; built 8d ago, floor 3d
   [keep] hygiene-image acme-dev:712ce40 (3.21 GB): kept: built 21h ago, floor is 3d
-  [safe] hygiene-dir /home/cache/acme/scratch/run-4 (2.01 GB): rule acme-scratch; untouched for 9d, a regular entry inside the cache dir
-  [keep] hygiene-dir /home/cache/acme/scratch/run-9 (4.10 MB): kept: touched 2d ago, rule keeps 7d
+  [safe] hygiene-dir /home/someone/cache/acme/scratch/run-4 (2.01 GB): rule acme-scratch; untouched for 9d, a regular entry inside the cache dir
+  [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (4.10 MB): kept: touched 2d ago, rule keeps 7d
 ```
 
 With `--apply`, each safe row is re-verified just before
