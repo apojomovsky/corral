@@ -30,6 +30,7 @@ from korapy import (
     promptscli,
     quotacli,
     registry,
+    repocli,
     reviewcli,
     serve,
     settings,
@@ -245,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     githubcli.add_parser(sub)
     heavycli.add_parser(sub)
     quotacli.add_parser(sub)
+    repocli.add_parser(sub)
     serve.add_parser(sub)
     snapshot.add_parser(sub)
     syncli.add_parser(sub)
