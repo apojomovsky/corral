@@ -121,7 +121,7 @@ class BuilderKeyTest(RepoKeyCase):
         store = self.claimed_tracker_store()
         states, _, tickets, finished_for = self.builders()
         self.assertEqual(tickets, {UNIT: (TRACKER, NUMBER), UNIT_R1: (TRACKER, NUMBER)})
-        self.assertEqual(finished_for, {(TRACKER, NUMBER): (UNIT_R1, "worker")})
+        self.assertEqual(finished_for, {(TRACKER, NUMBER): (UNIT_R1, "worker", "ok")})
         claim = store.claim_of(TRACKER, NUMBER)
         self.assertIsNotNone(claim)
         assert claim is not None
@@ -136,7 +136,7 @@ class BuilderKeyTest(RepoKeyCase):
         with mock.patch.object(drive, "production_repo_map", return_value={}):
             states, _, tickets, finished_for = self.builders()
         self.assertEqual(tickets, {UNIT: (SHORT, NUMBER)})
-        self.assertEqual(finished_for, {(SHORT, NUMBER): (UNIT, "worker")})
+        self.assertEqual(finished_for, {(SHORT, NUMBER): (UNIT, "worker", "ok")})
         self.assertIn(UNIT, states)
 
 
@@ -160,7 +160,7 @@ class OneMapPerPassTest(RepoKeyCase):
                 mapping={SHORT: TRACKER},
             )
         self.assertEqual(tickets, {UNIT_R1: (TRACKER, NUMBER)})
-        self.assertEqual(finished_for, {(TRACKER, NUMBER): (UNIT_R1, "worker")})
+        self.assertEqual(finished_for, {(TRACKER, NUMBER): (UNIT_R1, "worker", "ok")})
         self.assertIn(UNIT_R1, states)
 
     def test_given_the_pass_map_orphan_inputs_never_resolve_their_own(self):

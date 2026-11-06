@@ -5,7 +5,10 @@ the command in a transient scope with the lane's limits and releases
 the slot on exit. Past the wait deadline the waiter leaves with 75,
 keeping the public meaning (no free slot, try later). `run --plan`
 reports the verdict without queueing or running anything. `status`
-shows holders, waiters and learned costs. Exit codes follow the public
+shows holders, waiters and learned costs. `rollup` regenerates the
+portable per-key cost summary from the raw run ledger: stdout always
+carries the JSON document, and `--out PATH` additionally writes the
+same bytes for the operator to commit. Exit codes follow the public
 table: 0 ok, 1 nothing to do (or a wait that would block, for `--plan`),
 3 the scope could not be created, 4 usage or configuration, 75 no slot.
 """
@@ -196,10 +199,35 @@ def cmd_run(args, *, run_lane=None, root=None, now=None):
     return result.exit_code
 
 
+def cmd_rollup(args, *, state_dir=None, now=None):
+    """Run the verb. The ledger lives in the state dir; tests pass fakes."""
+    from korapy import heavy, paths
+
+    try:
+        rows, sources, skipped = heavy.collect_ledger_rows(state_dir)
+    except heavy.HeavyError as err:
+        _err(str(err))
+        return USAGE
+    document = heavy.build_rollup(rows, sources, now=now)
+    text = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    sys.stdout.write(text)
+    if skipped:
+        print(f"korapy heavy: skipped {skipped} corrupt ledger rows", file=sys.stderr)
+    if getattr(args, "out", None):
+        try:
+            paths.atomic_write_text(args.out, text)
+        except OSError as err:
+            _err(f"cannot write the rollup to {args.out}: {err}")
+            return USAGE
+    return OK
+
+
 def cmd_heavy(args):
     """Run the verb. The seams default to the live ones; tests pass fakes."""
     if args.heavy_verb == "status":
         return cmd_status(args)
+    if args.heavy_verb == "rollup":
+        return cmd_rollup(args)
     return cmd_run(args)
 
 
@@ -244,4 +272,13 @@ def add_parser(sub) -> None:
         help="holders, waiters and learned costs",
     )
     status.add_argument("--json", action="store_true", help="machine-readable output")
+    rollup = verbs.add_parser(
+        "rollup",
+        help="regenerate the portable per-key cost summary",
+    )
+    rollup.add_argument(
+        "--out",
+        default=None,
+        help="additionally write the same JSON document to PATH",
+    )
     heavy_parser.set_defaults(func=cmd_heavy)

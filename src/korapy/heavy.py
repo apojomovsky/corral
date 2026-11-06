@@ -1,13 +1,16 @@
-"""The heavy lane: weighted slots, the queue file, scope runs and the ledger.
+"""The heavy lane: weighted slots, the queue file, scope runs, learned
+estimates and the rollup.
 
-Tickets 1 to 3 of the heavy-lane design: the lane budget check, the
+Tickets 1 to 4 of the heavy-lane design: the lane budget check, the
 transient scope argv on the ``units`` precedent, per-command routing
 for takeoff with role ``takeoff``, one ledger row per run with the host
-descriptor, the queue file with its lock sidecar, and fair order with
-bounded backfill plus reaping of dead holders and stale waiters.
-Weights still come from config; learned estimates, the pressure gate
-and the bypass arrive in later tickets. The ``heavy`` verbs live in
-``heavycli`` as thin parsers over this module.
+descriptor, the queue file with its lock sidecar, fair order with
+bounded backfill plus reaping of dead holders and stale waiters, and
+the section 6 estimator (robust per-key statistics over the raw rows,
+the wait-deadline and ETA feeds, flaky detection) with the portable
+rollup document. Weights start from config and learn from measurement;
+the ``heavy`` verbs live in ``heavycli`` as thin parsers over this
+module.
 
 Config lives in the project's top-level ``[heavy]`` table, carried raw
 on the resolved settings (the ``[profiles]`` precedent) and validated
@@ -87,6 +90,21 @@ DEFAULT_STARVED_RATIO = 0.2
 
 #: The only ledger period so far: one file per host per calendar month.
 DEFAULT_LEDGER_PERIOD = "month"
+
+#: The wait-deadline multiplier over the duration p90. The estimator
+#: ticket scales the flat queue wait with it, so a long suite waits
+#: longer than a quick lint by construction.
+DEFAULT_WAIT_FACTOR = 3.0
+
+#: Learned estimates (design section 6.3): the trailing rows within the
+#: trailing days that one key learns from, and the sample count below
+#: which the prediction is the maximum observed, not an average.
+ESTIMATE_WINDOW_DAYS = 90
+ESTIMATE_WINDOW_ROWS = 20
+ESTIMATE_MIN_ROWS = 3
+
+#: The trailing exits a key's flaky flag reads.
+FLAKY_WINDOW_ROWS = 10
 
 #: The lane state: host id, lane file and lock sidecar live directly
 #: under it; the raw runs already do.
@@ -198,6 +216,7 @@ class Config:
     starved_ratio: float = DEFAULT_STARVED_RATIO
     ledger_period: str = DEFAULT_LEDGER_PERIOD
     wait_timeout_s: int = DEFAULT_WAIT_TIMEOUT_S
+    wait_factor: float = DEFAULT_WAIT_FACTOR
     max_skips: int = DEFAULT_MAX_SKIPS
 
 
@@ -294,6 +313,7 @@ def check_table(raw, where):
             "starved_ratio",
             "ledger_period",
             "wait_timeout_s",
+            "wait_factor",
             "max_skips",
         ):
             raise settings.SettingsError(f"{where}: [heavy] has no key {key!r}")
@@ -325,6 +345,16 @@ def check_table(raw, where):
         raise settings.SettingsError(
             f"{where}: [heavy] ledger_period only supports 'month' so far, not {period!r}"
         )
+    factor = raw.get("wait_factor", DEFAULT_WAIT_FACTOR)
+    if (
+        isinstance(factor, bool)
+        or not isinstance(factor, (int, float))
+        or not math.isfinite(factor)
+        or factor <= 0
+    ):
+        raise settings.SettingsError(
+            f"{where}: [heavy] wait_factor must be a positive number, not {factor!r}"
+        )
     caps = {}
     for key in ("cpu_m", "memory_mb"):
         if key in raw:
@@ -342,6 +372,7 @@ def check_table(raw, where):
         starved_ratio=float(ratio),
         ledger_period=period,
         wait_timeout_s=wait_timeout_s,
+        wait_factor=float(factor),
         max_skips=max_skips,
     )
 
@@ -1820,3 +1851,455 @@ def run_through_lane(
     finally:
         release_lane(waiter["id"], budget, state_dir=state_dir, lock_timeout=lock_timeout)
     return LaneRun(result=result, waited_s=waited)
+
+
+class Estimate(NamedTuple):
+    """One key's learned estimate over its window of raw rows.
+
+    ``cpu_m`` and ``memory_mb`` are the predicted peak weight (the high
+    percentile, or the maximum observed for a young key); the duration
+    and peak percentiles feed ETAs, deadlines and the rollup. A None
+    prediction means the window held no usable value, so the caller
+    falls back per dimension to the configured default. Nothing here is
+    clamped to a lane cap: caps are host-local, and the rollup carrying
+    them would misprice every other host.
+    """
+
+    key: str
+    samples: int
+    cpu_m: int | None
+    memory_mb: int | None
+    dur_s_p50: float | None
+    dur_s_p90: float | None
+    peak_mb_p50: int | None
+    peak_mb_p90: int | None
+    flaky: bool
+    avg_cores: float | None
+
+
+def estimate_key(repo, argv_hash, role):
+    """The portable per-key estimate name: repo, argv hash and role.
+
+    The same key indexes the status costs and the rollup, so a hand
+    reader with ``jq`` reproduces every estimate from the raw rows.
+    """
+    for name, value in (("repo", repo), ("argv hash", argv_hash), ("role", role)):
+        if not isinstance(value, str) or not value:
+            raise HeavyError(f"estimate {name} must be a non-empty name, not {value!r}")
+    return f"{repo}|{argv_hash}|{role}"
+
+
+def _parse_at(value):
+    """An ISO timestamp as epoch seconds, or None when it does not parse.
+
+    Naive timestamps read as UTC. A finite non-negative epoch passes
+    through, so normalization is idempotent: the read seam hands
+    normalized rows to the estimator without a second spelling. The
+    writer always stamps aware time; anything else belongs to a hand
+    row the estimate cannot place.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(value) and value >= 0 else None
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.timestamp()
+
+
+def _number(value):
+    """A finite number as a float, or None for anything else.
+
+    Booleans, NaN and infinities are not measurements: a ledger row
+    carrying one fails validation instead of poisoning an average.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def normalize_row(row):
+    """One ledger row as estimate input, or None when it fails validation.
+
+    Required: the repo, argv hash and role names plus a parseable ``at``
+    timestamp, so the window can place the row. Measurements (``wall_s``,
+    ``cpu_s``, ``peak_mb``) are optional per field but must be
+    non-negative numbers when present: a vanished cgroup records nulls,
+    and nulls simply sit out of their set. ``starved`` defaults to False
+    and ``exit`` to None when absent; unknown fields are ignored, and a
+    missing schema version reads as today's. A newer schema version
+    fails: its fields may mean something else. Normalization is
+    idempotent: feeding a normalized row back answers the same row.
+    """
+    if not isinstance(row, Mapping):
+        return None
+    version = row.get("schema_version", SCHEMA_VERSION)
+    if isinstance(version, bool) or version != SCHEMA_VERSION:
+        return None
+    repo = row.get("repo")
+    digest = row.get("argv_hash")
+    role = row.get("role")
+    if not all(isinstance(value, str) and value for value in (repo, digest, role)):
+        return None
+    at = _parse_at(row.get("at"))
+    if at is None:
+        return None
+    measures = {}
+    for name in ("wall_s", "cpu_s", "peak_mb"):
+        raw = row.get(name)
+        if raw is None:
+            measures[name] = None
+            continue
+        value = _number(raw)
+        if value is None or value < 0:
+            return None
+        measures[name] = value
+    starved = row.get("starved", False)
+    if not isinstance(starved, bool):
+        return None
+    exit_code = row.get("exit")
+    if exit_code is not None and (isinstance(exit_code, bool) or not isinstance(exit_code, int)):
+        return None
+    return {
+        "repo": repo,
+        "argv_hash": digest,
+        "role": role,
+        "at": at,
+        "wall_s": measures["wall_s"],
+        "cpu_s": measures["cpu_s"],
+        "peak_mb": measures["peak_mb"],
+        "starved": starved,
+        "exit": exit_code,
+    }
+
+
+def _percentile(sorted_values, pct):
+    """The nearest-rank percentile over ascending values.
+
+    The caller sorts; a hand reader with ``jq`` repeats it with
+    ``sort | .[ceil(p * length / 100) - 1]``. Ranks past the ends clamp
+    instead of failing, so a one-row set answers its own value.
+    """
+    rank = math.ceil(pct / 100 * len(sorted_values)) - 1
+    return sorted_values[max(0, min(rank, len(sorted_values) - 1))]
+
+
+def is_flaky(exits):
+    """Whether trailing exits read as flaky: 2+ zero and 2+ nonzero.
+
+    Exit history is signal, never enforcement: nothing refuses a flaky
+    key. Only the trailing window counts, and unknown exits sit out.
+    """
+    trailing = [
+        code
+        for code in list(exits)[-FLAKY_WINDOW_ROWS:]
+        if isinstance(code, int) and not isinstance(code, bool)
+    ]
+    return sum(1 for code in trailing if code == 0) >= 2 and (
+        sum(1 for code in trailing if code != 0) >= 2
+    )
+
+
+def _summarize(key, window):
+    """One key's estimate over its window, oldest first, at most 20 rows.
+
+    The peak set uses every measured peak (starvation never shrinks a
+    high-water mark); the duration set skips starved rows, so contention
+    cannot shorten the typical run; the CPU series averages each run's
+    parallelism from its own counters. Fewer than 3 rows predicts the
+    maximum observed, so the first measurement corrects a cautious
+    default at once instead of averaging it down.
+    """
+    peaks = sorted(row["peak_mb"] for row in window if row["peak_mb"] is not None)
+    durations = sorted(
+        row["wall_s"] for row in window if not row["starved"] and row["wall_s"] is not None
+    )
+    rates = sorted(
+        round(row["cpu_s"] / row["wall_s"] * 1000)
+        for row in window
+        if row["cpu_s"] is not None and row["wall_s"]
+    )
+    young = len(window) < ESTIMATE_MIN_ROWS
+    if not peaks:
+        peak_p50 = peak_p90 = None
+    elif young:
+        peak_p90 = max(peaks)
+        peak_p50 = _percentile(peaks, 50)
+    else:
+        peak_p90 = _percentile(peaks, 90)
+        peak_p50 = _percentile(peaks, 50)
+    if not durations:
+        dur_p50 = dur_p90 = None
+    else:
+        dur_p50 = _percentile(durations, 50)
+        dur_p90 = _percentile(durations, 90)
+    return Estimate(
+        key=key,
+        samples=len(window),
+        cpu_m=max(rates) if young and rates else (_percentile(rates, 90) if rates else None),
+        memory_mb=None if peak_p90 is None else int(round(peak_p90)),
+        dur_s_p50=dur_p50,
+        dur_s_p90=dur_p90,
+        peak_mb_p50=None if peak_p50 is None else int(round(peak_p50)),
+        peak_mb_p90=None if peak_p90 is None else int(round(peak_p90)),
+        flaky=is_flaky(
+            [row["exit"] for row in window[-FLAKY_WINDOW_ROWS:] if row["exit"] is not None]
+        ),
+        avg_cores=round(sum(rates) / len(rates) / 1000, 3) if rates else None,
+    )
+
+
+def estimates_for(rows, *, now=None):
+    """Per-key estimates over raw ledger rows, keyed by ``estimate_key``.
+
+    Pure: validation, the trailing-90-day window, the trailing 20 rows
+    and the role fallback all happen here, so the queue, the status view
+    and the rollup share one math. A role with fewer than 3 rows falls
+    back to the role-agnostic rows of its command; roles never borrow
+    across commands, and a changed command cold-starts under its new
+    hash. Rows from the future sit out: they cannot trail. Invalid rows
+    sit out silently; the readers that count them (the rollup verb, the
+    status view) count at the read seam.
+    """
+    if now is None:
+        moment = time.time()
+    elif isinstance(now, bool) or not isinstance(now, (int, float)) or not math.isfinite(now):
+        raise HeavyError(f"estimate time {now!r} must be an epoch timestamp")
+    else:
+        moment = now
+    earliest = moment - ESTIMATE_WINDOW_DAYS * 86400
+    fresh = sorted(
+        (
+            row
+            for row in (normalize_row(row) for row in rows)
+            if row is not None and earliest <= row["at"] <= moment
+        ),
+        key=lambda row: row["at"],
+    )
+    groups: dict = {}
+    for row in fresh:
+        groups.setdefault((row["repo"], row["argv_hash"], row["role"]), []).append(row)
+    pooled: dict = {}
+    for (repo, digest, _role), group in groups.items():
+        pooled.setdefault((repo, digest), []).extend(group)
+    for command_rows in pooled.values():
+        # Time order, oldest first: concatenating per-role groups is not a
+        # merge when two roles interleave, so the fallback slice below and
+        # the trailing flaky read in _summarize would see the wrong rows.
+        # The sort is stable, so equal timestamps keep first-seen order.
+        command_rows.sort(key=lambda row: row["at"])
+    estimates = {}
+    for (repo, digest, role), group in groups.items():
+        if len(group) >= ESTIMATE_MIN_ROWS:
+            window = group[-ESTIMATE_WINDOW_ROWS:]
+        else:
+            window = pooled[(repo, digest)][-ESTIMATE_WINDOW_ROWS:]
+        key = estimate_key(repo, digest, role)
+        estimates[key] = _summarize(key, window)
+    return estimates
+
+
+def _clamp_weight(value, limit):
+    """One weight dimension rounded to whole units inside ``[1, limit]``.
+
+    No limit means no upper bound; the floor of 1 keeps a prediction
+    from rounding to zero and running free.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise HeavyError(f"weight value {value!r} must be a number")
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, (int, float)) or not math.isfinite(limit)
+    ):
+        raise HeavyError(f"weight cap {limit!r} must be a number")
+    rounded = max(1, int(round(value)))
+    if limit is not None:
+        rounded = min(rounded, max(1, int(limit)))
+    return rounded
+
+
+def request_weight(estimate, default, cap):
+    """The admission weight for one key: the predicted peak, else the default.
+
+    Each dimension falls back separately, so a key with peak data but no
+    CPU data still learns its memory. The clamp keeps a weight inside
+    what the lane could admit; a None cap (no enforcement) skips the
+    upper bound but never the floor.
+    """
+    if not isinstance(default, Weight):
+        raise HeavyError(f"default must be a lane Weight, not {default!r}")
+    if cap is not None and not isinstance(cap, resources.Usage):
+        raise HeavyError(f"cap must be a resource Usage, not {cap!r}")
+    cpu = default.cpu_m if estimate is None or estimate.cpu_m is None else estimate.cpu_m
+    memory = (
+        default.memory_mb if estimate is None or estimate.memory_mb is None else estimate.memory_mb
+    )
+    return Weight(
+        cpu_m=_clamp_weight(cpu, cap.cpu_m if cap is not None else None),
+        memory_mb=_clamp_weight(memory, cap.memory_mb if cap is not None else None),
+    )
+
+
+def wait_deadline_s(timeout_s, factor, p90_s):
+    """The wait deadline in seconds: the floor, or longer for a long suite.
+
+    ``max(timeout_s, ceil(factor * p90_s))`` with the configured factor,
+    so the deadline scales with the typical run. No estimate (a cold
+    key) waits the floor. An explicit per-run timeout still overrides
+    absolutely at the verb; this is the computed default it overrides.
+    """
+    if (
+        isinstance(timeout_s, bool)
+        or not isinstance(timeout_s, (int, float))
+        or not math.isfinite(timeout_s)
+        or timeout_s < 0
+    ):
+        raise HeavyError(f"timeout {timeout_s!r} must be a non-negative number of seconds")
+    if (
+        isinstance(factor, bool)
+        or not isinstance(factor, (int, float))
+        or not math.isfinite(factor)
+        or factor <= 0
+    ):
+        raise HeavyError(f"wait factor {factor!r} must be a positive number")
+    if p90_s is None:
+        return timeout_s
+    if (
+        isinstance(p90_s, bool)
+        or not isinstance(p90_s, (int, float))
+        or not math.isfinite(p90_s)
+        or p90_s < 0
+    ):
+        raise HeavyError(f"duration p90 {p90_s!r} must be a non-negative number of seconds")
+    return max(timeout_s, math.ceil(factor * p90_s))
+
+
+def _eta_seconds(value, what):
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise HeavyError(f"{what} {value!r} must be non-negative seconds")
+    return value
+
+
+def holder_eta_s(p50_s, elapsed_s):
+    """A holder's remaining seconds: typical minus elapsed, never negative.
+
+    Either side unknown reads as unknown: the status view shows no ETA
+    instead of inventing one.
+    """
+    typical = _eta_seconds(p50_s, "typical duration")
+    elapsed = _eta_seconds(elapsed_s, "elapsed time")
+    if typical is None or elapsed is None:
+        return None
+    return max(0.0, typical - elapsed)
+
+
+def waiter_eta_s(blocking_s):
+    """A waiter's ETA: the sum of the blocking durations ahead of it.
+
+    One unknown duration poisons the sum to unknown; nothing ahead sums
+    to zero. Approximate by construction: durations are typicals, and
+    backfill may admit past the head.
+    """
+    total = 0.0
+    for duration in blocking_s:
+        if duration is None:
+            return None
+        total += _eta_seconds(duration, "blocking duration")
+    return total
+
+
+#: The rollup file name under the lane dir.
+ROLLUP_FILE = "rollup.json"
+
+
+def rollup_path(state_dir=None):
+    """The default rollup location: ``<state>/heavy/rollup.json``.
+
+    The one resolver for it; ``--out`` writes a copy wherever the
+    operator points it, and the operator commits that copy.
+    """
+    return os.path.join(state_dir or paths.state_dir(), HEAVY_DIR, ROLLUP_FILE)
+
+
+def collect_ledger_rows(state_dir=None):
+    """Raw ledger rows across the host's run files, plus what was skipped.
+
+    Returns ``(rows, sources, skipped)``: the normalized rows oldest
+    first across every ``*.jsonl`` run file, the absorbed basenames in
+    sort order, and the count of lines that failed validation. A missing
+    runs dir reads as empty (nothing learned yet, not a failure); an
+    unreadable dir or file refuses, naming it. Corrupt lines never block
+    the rollup: they count, and the verb names the count on stderr.
+    """
+    runs = os.path.join(state_dir or paths.state_dir(), HEAVY_DIR, RUNS_DIR)
+    rows, sources, skipped = [], [], 0
+    try:
+        names = sorted(os.listdir(runs))
+    except FileNotFoundError:
+        return rows, sources, skipped
+    except OSError as err:
+        raise HeavyError(f"cannot list the run ledger at {runs}: {err}") from None
+    for name in names:
+        if not name.endswith(".jsonl"):
+            continue
+        sources.append(name)
+        try:
+            with open(os.path.join(runs, name), encoding="utf-8") as handle:
+                lines = handle.read().splitlines()
+        except OSError as err:
+            raise HeavyError(
+                f"cannot read the run ledger at {os.path.join(runs, name)}: {err}"
+            ) from None
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                document = json.loads(line)
+            except ValueError:
+                skipped += 1
+                continue
+            normalized = normalize_row(document)
+            if normalized is None:
+                skipped += 1
+                continue
+            rows.append(normalized)
+    return rows, sources, skipped
+
+
+def build_rollup(rows, sources, *, now=None):
+    """The portable per-key summary over raw rows.
+
+    Carries hashes, never argv text or paths, so the document is safe to
+    commit to the project's ops repo and warm a fresh host. Keys with no
+    usable rows in the window stay out (an empty key set is nothing
+    learned yet, not a failure). Cross-host work figures arrive with the
+    later calibration ticket; until then the summary is local-only.
+    """
+    estimates = estimates_for(rows, now=now)
+    keys = {}
+    for key in sorted(estimates):
+        estimate = estimates[key]
+        keys[key] = {
+            "peak_mb_p50": estimate.peak_mb_p50,
+            "peak_mb_p90": estimate.peak_mb_p90,
+            "dur_s_p50": estimate.dur_s_p50,
+            "dur_s_p90": estimate.dur_s_p90,
+            "samples": estimate.samples,
+            "flaky": estimate.flaky,
+            "avg_cores": estimate.avg_cores,
+        }
+    return {"schema_version": SCHEMA_VERSION, "sources": list(sources), "keys": keys}
