@@ -205,7 +205,21 @@ class RoutingCase(HeavyCase):
             "p",
         )
         self.assertEqual(heavy.weight_for(cfg, "make check"), heavy.Weight(3000, 6144))
-        self.assertEqual(heavy.weight_for(cfg, "make lint"), heavy.Weight(1000, 1024))
+
+    def test_unlisted_command_is_a_usage_error(self):
+        cfg = heavy.check_table(
+            {
+                "default_weight": {"cpu_m": 1000, "memory_mb": 1024},
+                "commands": {"make check": {"cpu_m": 3000, "memory_mb": 6144}},
+            },
+            "p",
+        )
+        with self.assertRaises(heavy.HeavyError):
+            heavy.weight_for(cfg, "make lint")
+
+    def test_weight_without_config_is_a_usage_error(self):
+        with self.assertRaises(heavy.HeavyError):
+            heavy.weight_for(None, "make check")
 
     def test_routing_without_config_never_matches(self):
         self.assertFalse(heavy.is_heavy(None, "make check"))
@@ -318,6 +332,12 @@ class ScopeArgvCase(HeavyCase):
         with self.assertRaises(heavy.HeavyError):
             heavy.scope_argv("heavy-x", [["make"]], "/w", {})
 
+    def test_bare_string_command_is_refused(self):
+        with self.assertRaises(heavy.HeavyError):
+            heavy.scope_argv("heavy-x", "make check", "/w", {})
+        with self.assertRaises(heavy.HeavyError):
+            heavy.scope_argv("heavy-x", b"make check", "/w", {})
+
 
 class RepoKeyCase(HeavyCase):
     def _repo(self, name="myrepo", with_file=True):
@@ -429,6 +449,13 @@ class HostLabelCase(HeavyCase):
         with self.assertRaises(heavy.HeavyError):
             heavy.ledger_path(label="../escape", period="2026-11")
 
+    def test_hostile_period_is_refused(self):
+        label = "9c2e0123456789abcdef0123456789ab"
+        for bad in ("../escape", "2026-11.jsonl", "2026-13", "nov-2026", ""):
+            with self.subTest(period=bad):
+                with self.assertRaises(heavy.HeavyError):
+                    heavy.ledger_path(label=label, period=bad)
+
 
 class HostInfoCase(HeavyCase):
     def test_host_info_reads_the_fixtures(self):
@@ -447,6 +474,15 @@ class HostInfoCase(HeavyCase):
         self.assertIsInstance(info["cores"], int)
         self.assertIsNone(info["mem_mb"])
         self.assertEqual(info["python"], "3.11")
+
+    def test_zero_core_count_reads_as_unknown(self):
+        info = heavy.host_info(
+            read=lambda path: "MemTotal:       16777216 kB\n",
+            cpu_count=0,
+            python_version="3.11",
+        )
+        self.assertIsNone(info["cores"])
+        self.assertEqual(info["mem_mb"], 16384.0)
 
     def test_bad_core_counts_read_as_unknown(self):
         for bad in (True, False, -1):
@@ -682,6 +718,17 @@ class RunHeavyCase(HeavyCase):
     def test_default_run_raises_when_the_program_is_missing(self):
         with self.assertRaises(OSError):
             heavy.default_run(["korapy-no-such-program", "--version"], self.tmp, 30)
+
+    def test_default_run_reraises_a_timeout(self):
+        import subprocess as sp
+
+        with mock.patch.object(sp, "run", side_effect=sp.TimeoutExpired(["systemd-run"], 30)):
+            with self.assertRaises(sp.TimeoutExpired):
+                heavy.default_run(["systemd-run", "--version"], self.tmp, 30)
+
+    def test_stop_scope_needs_its_run_seam(self):
+        with self.assertRaises(TypeError):
+            heavy.stop_scope("heavy-abc123")  # ty: ignore[missing-argument]
 
     def test_manager_like_command_stderr_reads_as_a_lane_failure(self):
         # The twin the units start path accepts: a command whose own

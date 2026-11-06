@@ -28,7 +28,7 @@ def cmd_takeoff(args, *, ls_remote=None, run_cmd=None, heavy_run=None):
         heavy_run = functools.partial(
             heavy.run_heavy,
             run=heavy.default_run,
-            teardown=heavy.stop_scope,
+            teardown=functools.partial(heavy.stop_scope, run=heavy.default_run),
             scope_cgroup=heavy.show_cgroup,
         )
     try:

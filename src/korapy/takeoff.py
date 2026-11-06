@@ -520,8 +520,9 @@ def _wanted_commands(commands, test_command, with_test):
 def _planned_checks(wanted):
     """One `planned` row per command: the plan lists what would run.
 
-    Nothing executes and the suite lock is never taken. With no commands
-    the group reports ok, the same row a run would report.
+    Nothing executes: neither `run_cmd` nor the lane runner is called.
+    With no commands the group reports ok, the same row a run would
+    report.
     """
     if not wanted:
         return [Check("checks", OK, "no takeoff commands configured", "")]

@@ -84,6 +84,10 @@ UNIT_PREFIX = "heavy-"
 #: else in the label file is corruption or a hand edit, refused fail-closed.
 LABEL_RE = re.compile(r"[0-9a-f]{32}")
 
+#: A ledger period is one calendar month: only a ``YYYY-MM`` value stays a
+#: filename, so a corrupt or hand-edited period never escapes the runs dir.
+PERIOD_RE = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+
 
 class HeavyError(Exception):
     """The lane run failed: bad usage, bad config or a failed scope (exit 4)."""
@@ -235,8 +239,19 @@ def is_heavy(cfg, command):
 
 
 def weight_for(cfg, command):
-    """The config weight for ``command``: its entry, else the default."""
-    return cfg.commands.get(command, cfg.default)
+    """The config weight for ``command``: its entry (an empty entry queues
+    at the default weight, resolved in ``check_table``).
+
+    A missing config or an unlisted command is HeavyError (exit 4): a
+    caller that forgot the ``is_heavy`` guard gets a clean refusal,
+    never a silent default.
+    """
+    if cfg is None:
+        raise HeavyError(f"command {command!r} is not listed: the lane is off")
+    try:
+        return cfg.commands[command]
+    except (KeyError, TypeError):
+        raise HeavyError(f"command {command!r} is not listed in [heavy.commands]") from None
 
 
 def lane_budget(cfg, host, *, where):
@@ -318,7 +333,12 @@ def _check_unit(unit):
 
 
 def _check_command(command):
-    items = list(command)
+    if isinstance(command, (str, bytes)):
+        raise HeavyError(f"command {command!r} must be a list of argument strings")
+    try:
+        items = list(command)
+    except TypeError:
+        raise HeavyError(f"command {command!r} must be a list of argument strings") from None
     if not items or any(not isinstance(item, str) for item in items):
         raise HeavyError(f"command {command[:1]!r} must be a list of argument strings")
     if items[0].startswith("-"):
@@ -391,10 +411,14 @@ def default_run(argv, cwd, timeout):
 
     A program that cannot start raises OSError for the caller to bucket
     (a missing scope program is a lane failure, never a command exit);
-    any other spawn failure reads as exit 127.
+    a past-timeout run re-raises TimeoutExpired (the run never
+    completed, so no exit may stand in for it); any other spawn failure
+    reads as exit 127.
     """
     try:
         return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise
     except subprocess.SubprocessError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
@@ -421,12 +445,15 @@ def show_cgroup(unit, run=None):
     return None
 
 
-def stop_scope(unit, run=None):
-    """Release a lane scope. A manager failure raises, never silently leaks."""
+def stop_scope(unit, run):
+    """Release a lane scope. A manager failure raises, never silently leaks.
+
+    ``run`` is required: a missed fake fails closed instead of reaching
+    the live manager.
+    """
     _check_unit(unit)
-    runner = run or default_run
     try:
-        proc = runner(["systemctl", "--user", "stop", unit], None, 60)
+        proc = run(["systemctl", "--user", "stop", unit], None, 60)
     except (OSError, subprocess.SubprocessError) as err:
         raise ScopeUnreachable(f"cannot stop scope {unit}: {err}") from None
     if proc is None or getattr(proc, "returncode", 1) != 0:
@@ -488,7 +515,8 @@ def ledger_path(label=None, period=None, state_dir=None):
 
     One file per host per period, so two hosts never write the same
     file. The one resolver for it. An explicit label is validated like a
-    stored one, so a hostile value never becomes a path.
+    stored one and the period must be a calendar month, so a hostile
+    value never becomes a path.
     """
     base = state_dir or paths.state_dir()
     if label is None:
@@ -497,6 +525,8 @@ def ledger_path(label=None, period=None, state_dir=None):
         _check_label(label, os.path.join(base, HEAVY_DIR, HOST_ID_FILE))
     if period is None:
         period = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
+    if PERIOD_RE.fullmatch(period) is None:
+        raise HeavyError(f"the ledger period {period!r} is not a calendar month (YYYY-MM)")
     return os.path.join(base, HEAVY_DIR, RUNS_DIR, f"{label}-{period}.jsonl")
 
 
@@ -516,9 +546,9 @@ def host_info(*, read=None, cpu_count=None, python_version=None):
     """The host descriptor for a ledger row: cores, memory and interpreter.
 
     A missing core count defaults to the live count, so production rows
-    carry cores from day one; unknown (undetermined, boolean, negative)
-    reads as None, never raising: a row with an unknown host still
-    records the run. The reader seam is injectable for tests.
+    carry cores from day one; unknown (undetermined, boolean or
+    non-positive) reads as None, never raising: a row with an unknown
+    host still records the run. The reader seam is injectable for tests.
     """
     reader = read or _read_text
     try:
@@ -544,7 +574,7 @@ def host_info(*, read=None, cpu_count=None, python_version=None):
             cores = int(cpu_count) if cpu_count is not None else None
         except (TypeError, ValueError):
             cores = None
-        if cores is not None and cores < 0:
+        if cores is not None and cores <= 0:
             cores = None
     return {
         "cores": cores,
@@ -727,7 +757,7 @@ def run_heavy(
         memory_max, cpu_quota = None, None
     else:
         memory_max, cpu_quota = weight.memory_mb, weight.cpu_m
-    scope = scope_argv(unit, list(argv), cwd, env, memory_max=memory_max, cpu_quota=cpu_quota)
+    scope = scope_argv(unit, argv, cwd, env, memory_max=memory_max, cpu_quota=cpu_quota)
     try:
         proc = run(scope, cwd, timeout)
     except OSError as err:
