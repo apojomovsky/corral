@@ -59,6 +59,18 @@ def _status_args(json=False):
     return argparse.Namespace(heavy_verb="status", json=json)
 
 
+def _cool():
+    from korapy import pressure
+
+    return pressure.Reading(load_per_cpu=0.4, mem_available_pct=60.0)
+
+
+def _hot():
+    from korapy import pressure
+
+    return pressure.Reading(load_per_cpu=9.9, mem_available_pct=60.0)
+
+
 def _lane_run(exit_code=0, stdout="out\n", stderr="err\n", waited_s=2.5):
     return heavy.LaneRun(
         result=heavy.RunResult(
@@ -291,7 +303,10 @@ class PlanCase(HeavyCliCase):
 
         self._project()
         code, out, _ = self._read_stdout(
-            heavycli.cmd_run, _run_args(["make", "check"], plan=True), root=self.tmp
+            heavycli.cmd_run,
+            _run_args(["make", "check"], plan=True),
+            root=self.tmp,
+            pressure=_cool(),
         )
         self.assertEqual(code, 0)
         self.assertIn("would run", out)
@@ -304,6 +319,7 @@ class PlanCase(HeavyCliCase):
             heavycli.cmd_run,
             _run_args(["make", "check"], plan=True, json=True),
             root=self.tmp,
+            pressure=_cool(),
         )
         self.assertEqual(code, 0)
         doc = json.loads(out)
@@ -328,10 +344,26 @@ class PlanCase(HeavyCliCase):
             handle.write("[resources.host]\ncpu_m = 8000\nmemory_mb = 16384\npids = 200\n")
         self._seed_lane()
         code, out, _ = self._read_stdout(
-            heavycli.cmd_run, _run_args(["make", "lint"], plan=True), root=self.tmp
+            heavycli.cmd_run,
+            _run_args(["make", "lint"], plan=True),
+            root=self.tmp,
+            pressure=_cool(),
         )
         self.assertEqual(code, 1)
         self.assertIn("would wait", out)
+
+    def test_plan_saturated_pressure_is_exit_1(self):
+        from korapy import heavycli
+
+        self._project()
+        code, out, _ = self._read_stdout(
+            heavycli.cmd_run,
+            _run_args(["make", "check"], plan=True),
+            root=self.tmp,
+            pressure=_hot(),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("saturated", out)
 
     def test_plan_missing_command_is_exit_4(self):
         from korapy import heavycli
