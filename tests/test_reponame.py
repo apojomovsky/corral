@@ -313,6 +313,27 @@ class LiveBlockersTest(unittest.TestCase):
         self.assertIn(HOLDER, found[0])
         self.assertIn(f"{OLD}#1", found[0])
 
+    def test_claims_join_routes_live_tickets_through_tracker_key(self):
+        from unittest import mock
+
+        from korapy import drive
+
+        real = drive._tracker_key
+        seen = []
+
+        def spy(ticket, mapping):
+            seen.append(ticket)
+            return real(ticket, mapping)
+
+        with mock.patch.object(drive, "_tracker_key", side_effect=spy):
+            found = self.blockers(
+                claims=[(OLD, 1, HOLDER)],
+                live_units=frozenset({(SHORT, 1)}),
+                mapping={SHORT: OLD},
+            )
+        self.assertEqual(len(found), 1)
+        self.assertIn((SHORT, 1), seen)
+
     def test_live_unit_without_a_claim_does_not_block(self):
         self.assertEqual(
             self.blockers(live_units=frozenset({(SHORT, 2)})),
