@@ -279,9 +279,21 @@ def cmd_drive(args: argparse.Namespace) -> int:
             except projects.ProjectsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
+            resolved = {}
+            for project in registered:
+                try:
+                    names = settings.repo_names(project.root)
+                except settings.SettingsError as err:
+                    print(f"korapy drive: {err}", file=sys.stderr)
+                    return drive.USAGE
+                entries, problem = syncli.repo_operators(project.root, names, syncli._git)
+                if problem is not None:
+                    print(f"korapy drive: {problem}", file=sys.stderr)
+                    return drive.USAGE
+                resolved[project.root] = entries
             moment = time.time()
             try:
-                repo_map = drive.production_repo_map(registered)
+                repo_map = drive.production_repo_map(registered, resolved=resolved)
                 planned_states, _, planned_tickets = drive.production_stuck_inputs(
                     registered, now=moment, mapping=repo_map
                 )
@@ -292,6 +304,10 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 planned_reviews = drive.production_review_reader(
                     registered, git=syncli._git, mapping=repo_map
                 )
+                driven = {
+                    project.name: drive.driven_repos(project, resolved=resolved)
+                    for project in registered
+                }
             except settings.SettingsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
@@ -325,6 +341,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 live_units=planned_live,
                 repo_map=repo_map,
                 review_reader=planned_reviews,
+                driven=driven,
             )
         try:
             registered = projects.load_all()
@@ -362,6 +379,9 @@ def cmd_drive(args: argparse.Namespace) -> int:
         def tracker_factory(repo, _by_repo=by_repo):
             return _by_repo[repo]
 
+        driven = {
+            project.name: drive.driven_repos(project, resolved=resolved) for project in registered
+        }
         moment = time.time()
         try:
             repo_map = drive.production_repo_map(registered, resolved=resolved)
@@ -405,6 +425,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             repo_map=repo_map,
             review_reader=review_reader,
             pulls_for=drive.tracker_pulls_for(tracker_factory),
+            driven=driven,
         )
 
 
