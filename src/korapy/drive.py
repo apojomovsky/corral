@@ -322,8 +322,10 @@ def gate(
     injected seam (`read_labels`); nothing is launched,
     claimed or written. With no pulls on the row the linked-pull check
     is skipped, which is what `--plan` builds: it never contacts the
-    tracker. Unreadable pulls (None) refuse the start instead, failing
-    closed like the hold labels.
+    tracker. Unreadable pulls (None) refuse every kind instead, failing
+    closed like the hold labels, so a hold label sitting only on a
+    linked pull is never missed; the first read error rides the row and
+    names the cause in the skip.
     """
     if candidate.request is None:
         row = candidate.row
@@ -431,9 +433,13 @@ def gate(
                     "merge-ready, skipped",
                 )
 
+    if row.pulls is None:
+        cause = getattr(row, "pulls_error", "") or ""
+        detail = f" ({cause})" if cause else ""
+        return _skip(
+            candidate, kind, "row", f"{ref}: linked pulls unreadable, {kind} refused{detail}"
+        )
     if not holder and kind == "start":
-        if row.pulls is None:
-            return _skip(candidate, kind, "row", f"{ref}: linked pulls unreadable, start refused")
         opened = [pull for pull in row.pulls or () if getattr(pull, "state", "") == "open"]
         if opened:
             return _skip(
@@ -1282,14 +1288,16 @@ def tracker_pulls_for(tracker_factory):
     return pulls_for
 
 
-def linked_pulls_map(items, pulls_for):
+def linked_pulls_map(items, pulls_for, *, errors=None):
     """{(repo, number): linked pulls} for these store items, one read each.
 
     The pass's one linked-pull source: the row builders (eligibility
     and gating) read from this map, so the policies and the gate see
     the same pulls with no second lookup. An unreadable ticket maps to
     None, and readers fail that ticket closed; a ticket the seam reads
-    as empty maps to ().
+    as empty maps to (). When `errors` is given, the first error string
+    per unreadable ticket is recorded there, so the rows built from the
+    map can name the cause instead of reading every failure alike.
     """
     found = {}
     for item in items:
@@ -1298,8 +1306,10 @@ def linked_pulls_map(items, pulls_for):
             continue
         try:
             found[key] = tuple(pulls_for(item.repo, item.number) or ())
-        except Exception:
+        except Exception as exc:
             found[key] = None
+            if errors is not None:
+                errors.setdefault(key, str(exc) or type(exc).__name__)
     return found
 
 
@@ -1418,7 +1428,7 @@ def _read_inputs(
     ), None
 
 
-def _released_rows(items, released, *, pulls_by_key=None):
+def _released_rows(items, released, *, pulls_by_key=None, pulls_errors=None):
     """{(repo, number): row} with this pass's releases applied. Pure.
 
     The gate and the missing-record log read the same map, so a freed
@@ -1426,12 +1436,15 @@ def _released_rows(items, released, *, pulls_by_key=None):
     held. One builder keeps the two from disagreeing on the holder.
     `pulls_by_key` carries the linked pulls the pass read through the
     tracker (None marks an unreadable ticket); with none every row
-    reads empty. The gate reads the same row pulls, so the two never
-    disagree.
+    reads empty. `pulls_errors` carries the first error per unreadable
+    ticket, so the rows name the cause. The gate reads the same row
+    pulls, so the two never disagree.
     """
     by_key = {
         (row.repo, row.number): row
-        for row in eligibility.rows_from_items(items, pulls_by_key=pulls_by_key)
+        for row in eligibility.rows_from_items(
+            items, pulls_by_key=pulls_by_key, pulls_errors=pulls_errors
+        )
     }
     for key in released or ():
         prior = by_key.get(key)
@@ -1495,8 +1508,11 @@ def _gate_all(
             problems = []
     else:
         problems = []
-    pulls_by_key = linked_pulls_map(items, pulls_for) if pulls_for is not None else None
-    by_key = _released_rows(items, released, pulls_by_key=pulls_by_key)
+    pull_errors: dict = {}
+    pulls_by_key = (
+        linked_pulls_map(items, pulls_for, errors=pull_errors) if pulls_for is not None else None
+    )
+    by_key = _released_rows(items, released, pulls_by_key=pulls_by_key, pulls_errors=pull_errors)
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     candidates = []
     for project in registered:
@@ -1507,7 +1523,9 @@ def _gate_all(
                 problems.append(f"korapy drive: {problem}")
                 continue
         try:
-            outcome = eligibility.for_project(project, items, now=now, pulls_by_key=pulls_by_key)
+            outcome = eligibility.for_project(
+                project, items, now=now, pulls_by_key=pulls_by_key, pulls_errors=pull_errors
+            )
         except eligibility.EligibilityError as problem:
             problems.append(f"korapy drive: {problem}")
             continue

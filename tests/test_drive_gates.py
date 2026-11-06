@@ -9,6 +9,7 @@ host read, so nothing reaches the network, subprocesses or real dirs.
 import inspect
 import io
 import os
+from dataclasses import replace
 import tempfile
 import unittest
 from unittest import mock
@@ -926,6 +927,33 @@ class OpenPullGateTest(unittest.TestCase):
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("unreadable", gated.reason)
 
+    def test_an_unreadable_pull_lookup_refuses_a_review(self):
+        gated = gate(
+            entry(kind="review", row_=row(pulls=None)),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_fix(self):
+        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x", pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_resume(self):
+        gated = gate(entry(kind="resume", row_=row(agent="drive-host-1-x", pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_names_the_cause(self):
+        candidate = entry(
+            row_=replace(row(pulls=None), pulls_error="tracker down"),
+        )
+        gated = gate(candidate)
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+        self.assertIn("tracker down", gated.reason)
+
     def test_no_linked_pulls_means_a_fresh_start(self):
         gated = gate(entry(row_=row(pulls=())))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
@@ -954,6 +982,24 @@ class LinkedPullsMapTest(unittest.TestCase):
         pulls_for = drive.tracker_pulls_for(lambda repo: fake)
         found = drive.linked_pulls_map([board_item()], pulls_for)
         self.assertIsNone(found[("app", 7)])
+
+    def test_an_unreadable_ticket_records_the_first_error(self):
+        fake = FakeTracker()
+        fake.linked_errors[("app", 7)] = "tracker down"
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        errors: dict = {}
+        found = drive.linked_pulls_map([board_item()], pulls_for, errors=errors)
+        self.assertIsNone(found[("app", 7)])
+        self.assertEqual(errors[("app", 7)], "tracker down")
+
+    def test_a_readable_ticket_records_no_error(self):
+        fake = FakeTracker()
+        fake.linked[("app", 7)] = []
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        errors: dict = {}
+        found = drive.linked_pulls_map([board_item()], pulls_for, errors=errors)
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(errors, {})
 
     def test_non_pull_links_never_reach_the_row(self):
         fake = FakeTracker()
