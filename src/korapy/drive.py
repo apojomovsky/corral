@@ -54,6 +54,7 @@ from korapy import (
     quota,
     quota_ledger,
     registry,
+    reviewrecord,
     settings,
     sync,
     trackers,
@@ -62,7 +63,7 @@ from korapy import (
 )
 from korapy import syncli
 from korapy import tracker as iface
-from korapy.eligibility import StartRequest, TicketRow
+from korapy.eligibility import LinkedPull, StartRequest, TicketRow
 
 OK, NO, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
@@ -78,6 +79,15 @@ settings.register(
     str,
     "",
     "display name for the host segment of minted agent ids (empty hashes the hostname)",
+)
+
+settings.register(
+    "drive.fix_round_threshold",
+    str,
+    "normal",
+    "lowest review finding severity that still opens a fix round "
+    "(high, normal or low): an approving review below it is merge-ready",
+    check=reviewrecord.check_threshold,
 )
 
 #: The lock file inside the state dir.
@@ -272,26 +282,39 @@ def gate(
     agent_roles=None,
     agent_states=None,
     agent_tickets=None,
+    reviews=None,
+    fix_threshold="normal",
+    pulls_for=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
     Row state first (missing, non-open, external, withdrawn), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
-    role)} for the newest finished entry per ticket), then the hold and
+    role)} for the newest finished entry per ticket), then the review
+    threshold and the linked-pull check, then the hold and
     decision labels, then admission, then the quota gate. A review
     proceeds only for PR-ready rows: unclaimed with a finished worker
     behind them, whose id the reviewer passes as its author, or claimed
     by that finished worker itself, which the reviewer takes over. Rows
     reviewed since the last work are merge-ready and ignored, and a fix
-    round requested after the fix already landed is skipped. A fix or
+    round requested after the fix already landed is skipped. An
+    unclaimed row whose latest review record (`reviews`, keyed by
+    (repo, number)) approves with no finding at or above
+    `fix_threshold` is merge-ready too: no fix round opens for lows,
+    and no fresh start launches on approved work. A fresh start on an
+    unclaimed row with an open linked pull (`pulls_for`, the injected
+    seam reading them through the tracker) is refused: the pull, not a
+    new worker, carries the ticket. A fix or
     resume behind a reviewer holder (from `agent_roles`, resolved to
     its registry entry by ticket through the one resolver, since a
     drive-id holder never names a unit-name entry) skips with the
     claim kept, matching the claiming pass, so `--plan` prints the
     verdict the real pass would print. Every input is plain data or an
-    injected seam (`read_labels`); nothing is launched, claimed or
-    written.
+    injected seam (`read_labels`, `pulls_for`); nothing is launched,
+    claimed or written. With no `pulls_for` the linked-pull check is
+    skipped, which is what `--plan` does: it never contacts the
+    tracker.
     """
     if candidate.request is None:
         row = candidate.row
@@ -369,6 +392,39 @@ def gate(
                 kind,
                 "row",
                 f"{ref}: fix already landed, skipped",
+            )
+
+    if not holder and request.kind in ("start", "review", "fix", "resume"):
+        newest = (finished or {}).get((row.repo, row.number))
+        if newest is None or newest[1] == "reviewer":
+            record = (reviews or {}).get((row.repo, row.number))
+            if (
+                record is not None
+                and reviewrecord.approves(record)
+                and not reviewrecord.fix_wanted(record, fix_threshold or "normal")
+            ):
+                return _skip(
+                    candidate,
+                    kind,
+                    "row",
+                    f"{ref}: latest review {record.get('verdict')} wants no fix round, "
+                    "merge-ready, skipped",
+                )
+
+    if not holder and kind == "start" and pulls_for is not None:
+        try:
+            linked = pulls_for(row.repo, row.number) or ()
+        except Exception as err:
+            return _skip(
+                candidate, kind, "row", f"{ref}: linked pulls unreadable ({err}), start refused"
+            )
+        opened = [pull for pull in linked if getattr(pull, "state", "") == "open"]
+        if opened:
+            return _skip(
+                candidate,
+                kind,
+                "row",
+                f"{ref}: pull #{opened[0].number} is open, not a fresh start, skipped",
             )
 
     held = hold.reason(
@@ -1058,10 +1114,11 @@ def _project_quota(project, pool):
 def _store_labels(store, now):
     """A `read_labels` seam over cached store rows: reads, never a tracker.
 
-    Only issue rows exist in the store (the reviewer pass has not
-    populated linked pulls yet), so a pull read fails closed as
+    Only issue rows exist in the store, so a pull read fails closed as
     unreadable, like a missing row: the hold gate skips instead of
-    passing a ticket whose pull labels it could not see.
+    passing a ticket whose pull labels it could not see. Linked pulls
+    themselves never live in the store; the gate reads them through the
+    `pulls_for` seam, which queries the tracker.
     """
 
     def read(kind, repo, number):
@@ -1073,6 +1130,50 @@ def _store_labels(store, now):
         return list(found.labels or [])
 
     return read
+
+
+def review_records_for(items, *, read):
+    """{(repo, number): latest review record} for rows with one on file.
+
+    `read` is the injected review-record reader ((repo, number) ->
+    record or None, for example `reviewrecord.latest_record`); a row it
+    cannot read counts as having no record, exactly as before. The pass
+    builds this map once from its rows and the gate reads it, so the
+    record files are listed once per pass, not once per candidate.
+    """
+    found = {}
+    for item in items or ():
+        try:
+            record = read(item.repo, item.number)
+        except Exception:
+            continue
+        if record is not None:
+            found[(item.repo, item.number)] = record
+    return found
+
+
+def tracker_pulls_for(tracker_factory):
+    """A `pulls_for` seam over the pass's per-repo trackers.
+
+    Each call reads the ticket's linked pull requests through its
+    tracker's `linked_pulls` and keeps their numbers and states as
+    `LinkedPull` rows for the gate. A repo with no tracker reads as no
+    linked pulls; a tracker failure propagates, and the gate fails the
+    fresh start closed instead of starting blind.
+    """
+
+    def pulls_for(repo, number):
+        try:
+            tracker = tracker_factory(repo)
+        except KeyError:
+            return ()
+        return tuple(
+            LinkedPull(number=item.number, state=item.state)
+            for item in tracker.linked_pulls(repo, number)
+            if getattr(item, "kind", "pr") == "pr"
+        )
+
+    return pulls_for
 
 
 #: The proceeding kinds the summary counts after starts, in order.
@@ -1208,6 +1309,9 @@ def _gate_all(
     agent_roles=None,
     agent_states=None,
     agent_tickets=None,
+    reviews=None,
+    fix_threshold=None,
+    pulls_for=None,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -1222,8 +1326,23 @@ def _gate_all(
     the reviewer and fix-round readiness; `agent_roles` ({agent id:
     role} for visible entries), resolved through `agent_states` and
     `agent_tickets` by ticket, feeds the gate's reviewer-holder skip,
-    so a plan matches the claiming pass. Nothing is written.
+    so a plan matches the claiming pass. `reviews` ({(repo, number):
+    latest review record}) feeds the gate's fix-round threshold;
+    `fix_threshold` (None reads the `drive.fix_round_threshold` host
+    setting) is the lowest finding severity that still opens a fix
+    round; `pulls_for` (None skips the check, which is what `--plan`
+    does) feeds the gate's open-pull refusal. Nothing is written.
     """
+    if fix_threshold is None:
+        try:
+            fix_threshold = settings.load(root=None)["drive.fix_round_threshold"]
+        except settings.SettingsError as problem:
+            problems = [f"korapy drive: {problem}"]
+            fix_threshold = "normal"
+        else:
+            problems = []
+    else:
+        problems = []
     rows = eligibility.rows_from_items(items)
     by_key = {(row.repo, row.number): row for row in rows}
     for key in released or ():
@@ -1231,7 +1350,6 @@ def _gate_all(
         if prior is not None:
             by_key[key] = replace(prior, agent="")
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
-    problems = []
     candidates = []
     for project in registered:
         if project.name not in quota_for:
@@ -1311,6 +1429,9 @@ def _gate_all(
             agent_roles=agent_roles,
             agent_states=agent_states,
             agent_tickets=agent_tickets,
+            reviews=reviews,
+            fix_threshold=fix_threshold,
+            pulls_for=pulls_for,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1339,6 +1460,8 @@ def _pass(
     agent_tickets=None,
     live_units=None,
     repo_map=None,
+    review_reader=None,
+    pulls_for=None,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
@@ -1354,6 +1477,11 @@ def _pass(
     finished reviewer row simulates as released. The production CLI
     supplies the host units. `repo_map` is the pass's one
     short-to-tracker map, threaded to the admission live set.
+    `review_reader` feeds the gate's fix-round threshold from the
+    session dirs (reads only, like the registry); with none the
+    threshold sees no records, exactly as before. `pulls_for` feeds
+    the gate's open-pull refusal; with none the check is skipped,
+    which is what `--plan` does: it never contacts the tracker.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1390,6 +1518,7 @@ def _pass(
     finished = resolve_finished(
         finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
     )
+    reviews = review_records_for(items, read=review_reader) if review_reader is not None else None
     gated_rows, problems, _ = _gate_all(
         items,
         registered,
@@ -1407,6 +1536,8 @@ def _pass(
         agent_roles=agent_roles,
         agent_states=agent_states,
         agent_tickets=agent_tickets,
+        reviews=reviews,
+        pulls_for=pulls_for,
     )
     table = [
         Candidate(
@@ -3896,6 +4027,8 @@ def _launching_pass(
     hub_epoch_of=None,
     hub=None,
     repo_map=None,
+    review_reader=None,
+    pulls_for=None,
 ) -> int:
     """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
@@ -4109,6 +4242,10 @@ def _launching_pass(
         except sqlite3.Error as problem:
             print(f"korapy drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
+    if review_reader is not None:
+        reviews = review_records_for(_items, read=review_reader)
+    else:
+        reviews = None
     gated_rows, problems, eligible_keys = _gate_all(
         _items,
         registered,
@@ -4126,6 +4263,8 @@ def _launching_pass(
         agent_roles=agent_roles,
         agent_states=agent_states,
         agent_tickets=agent_tickets,
+        reviews=reviews,
+        pulls_for=pulls_for,
     )
     if host is None:
         try:
@@ -4332,6 +4471,8 @@ def run_pass(
     hub_epoch_of=None,
     hub=None,
     repo_map=None,
+    review_reader=None,
+    pulls_for=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
@@ -4384,7 +4525,12 @@ def run_pass(
     nothing. When `journal_path` is set, the non-plan pass journals its
     decisions, restarts and give-ups included; when `day_path` and
     `max_starts` are set, starts beyond the day's budget become `cap`
-    skips and the pass ends with exit 1. `now` defaults to the wall
+    skips and the pass ends with exit 1. `review_reader`
+    feeds the gate's fix-round threshold from the ticket session dirs
+    (reads only, like the registry); with none the threshold sees no
+    records, exactly as before. `pulls_for` feeds the gate's open-pull
+    refusal; with none the check is skipped, which is what `--plan`
+    does: it never contacts the tracker. `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one
@@ -4425,6 +4571,8 @@ def run_pass(
             agent_tickets=agent_tickets,
             live_units=live_units,
             repo_map=repo_map,
+            review_reader=review_reader,
+            pulls_for=pulls_for,
             **args,
         )
     try:
@@ -4456,6 +4604,8 @@ def run_pass(
                 hub_epoch_of=hub_epoch_of,
                 hub=hub,
                 repo_map=repo_map,
+                review_reader=review_reader,
+                pulls_for=pulls_for,
                 **args,
             )
     except LockHeld as held:

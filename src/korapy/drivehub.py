@@ -17,7 +17,7 @@ import time
 
 from korapy import board, drive
 from korapy import hub as hubmod
-from korapy import paths, projects, settings, syncli, trackers, units
+from korapy import paths, projects, reviewrecord, settings, syncli, trackers, units
 
 
 class HubMode:
@@ -321,6 +321,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 agent_tickets=planned_tickets,
                 live_units=planned_live,
                 repo_map=repo_map,
+                review_reader=reviewrecord.latest_record,
             )
         try:
             registered = projects.load_all()
@@ -384,6 +385,8 @@ def cmd_drive(args: argparse.Namespace) -> int:
             max_starts=max_starts,
             hub=hub,
             repo_map=repo_map,
+            review_reader=reviewrecord.latest_record,
+            pulls_for=drive.tracker_pulls_for(tracker_factory),
         )
 
 

@@ -304,6 +304,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 #
@@ -318,6 +319,9 @@ TAIL = """# Defaults: uncomment to override.
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
 # hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
+#
+# [merge]
+# merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
@@ -436,6 +440,7 @@ commits.conventional = false
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 #
@@ -449,6 +454,9 @@ commits.conventional = false
 # hub.lease_ttl_s = 90  # seconds a hub claim grant stays valid
 # hub.stale_after_s = 90  # seconds after the last heartbeat a host reads stale on the merged dashboard
 # hub.url = ""  # address of the hub, for example http://host-1:8000 (empty means single-host)
+#
+# [merge]
+# merge.method = "squash"  # how korapy merge lands a PR: a squash, or a merge commit
 #
 # [prompts]
 # prompts.reviewer = ""  # override file for the reviewer prompt (relative to the ops root)
