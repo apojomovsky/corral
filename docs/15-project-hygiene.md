@@ -132,8 +132,9 @@ repeated (the AGENTS.md rule for repeated facts).
 Bases come from a fixed vocabulary, each resolved by its
 existing helper: `cache` from `paths.cache_dir()`, `state`
 from `paths.state_dir()`, `sessions` from
-`paths.sessions_dir()`, and `worktree` from `worktrees.root()`
-for the rule's repo clone. `path` is relative; an absolute
+`paths.sessions_dir()`, and `worktree` from
+`worktrees.root(main_clone, root)` for the rule's repo
+clone. `path` is relative; an absolute
 `path`, a `..` escape, or a symlink that resolves outside the
 base is refused. The root must sit strictly below its base,
 never equal to it.
@@ -155,8 +156,14 @@ reason. Refused roots:
 - a root that is, or contains, the heavy-lane ledger dir
   (`heavy.ledger_path`), the host ledger file
   (`host_ledger.ledger_path`), or any `reviews/` record dir;
-- an image `prefix` that is empty, or that matches no
-  repository filter the lister accepts.
+- an image `prefix` that is empty, that does not start
+  with the rule's `repo` followed by `-` or `/` (repo
+  scoping, so `acme-dev` is fine for repo `acme` but
+  `other-dev` is refused), or that overlaps another
+  rule's prefix (one prefix starts with the other).
+  Repo scoping makes cross-project races impossible by
+  construction; the overlap refusal covers two rules in
+  the same repo racing `docker rmi` over the same image.
 
 Validation failure refuses the command before anything is
 planned: no partial plan from a half-valid file. Doubt at
@@ -220,7 +227,10 @@ registry entry for the ticket is done, no live unit holds it
 the newest mtime under the leaf is older than
 `retention_days`. Leaf names that do not parse as ticket dirs
 (`paths.parse_ticket_dirname`) are `UNPROVEN` keep rows:
-"has no registry entry: cannot prove nothing is lost". A
+"has no registry entry: cannot prove nothing is lost".
+Leaves whose parsed repo differs from the rule's `repo` are
+skipped with a note ("belongs to repo `<other>`, rule is
+for `<repo>"), never candidates under this rule. A
 `reviews/` subtree is never a candidate; when a leaf holds
 one, apply removes everything except it.
 
@@ -246,7 +256,7 @@ Proof failures are plan rows, never silent. In human output,
 following the `diskcli.format_plan` shape:
 
 ```text
-  [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (4120 bytes): kept: touched 2d ago, rule keeps 7d
+  [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (5000 bytes): kept: touched 2d ago, rule keeps 7d
   note: dropped /home/someone/cache/acme/scratch/link: is a symlink
 ```
 
@@ -351,11 +361,11 @@ existing rows:
 
 ```text
 pressure: low
-  /home/someone/state/korapy: 4.10 GB free (8%)
-  [safe] hygiene-image acme-dev:a94c199d (3.21 GB): rule acme-images; no container uses 16270d5; built 8d ago, floor 3d
-  [keep] hygiene-image acme-dev:712ce40 (3.21 GB): kept: built 21h ago, floor is 3d
-  [safe] hygiene-dir /home/someone/cache/acme/scratch/run-4 (2.01 GB): rule acme-scratch; untouched for 9d, a regular entry inside the cache dir
-  [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (4.10 MB): kept: touched 2d ago, rule keeps 7d
+  /home/someone/state/korapy: 6.00 GB free (12%)
+  [safe] hygiene-image acme-dev:aa00001 (2.00 GB): rule acme-images; no container uses deadbee; built 8d ago, floor 3d
+  [keep] hygiene-image acme-dev:aa00002 (2.00 GB): kept: built 21h ago, floor is 3d
+  [safe] hygiene-dir /home/someone/cache/acme/scratch/run-4 (1.50 GB): rule acme-scratch; untouched for 9d, a regular entry inside the cache dir
+  [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (5.00 MB): kept: touched 2d ago, rule keeps 7d
 ```
 
 With `--apply`, each safe row is re-verified just before
@@ -412,11 +422,14 @@ fakes at the section 6 seams, and none touches Docker or the
 real filesystem in tests.
 
 1. Config and validation: `hygiene.rules`, the strict keys,
-   the exit 4 refusals, plus the resolver test that pins
+   the exit 4 refusals (including image prefixes that do
+   not start with the rule's repo and prefixes that
+   overlap across rules), plus the resolver test that pins
    one fact one place.
 2. Directory planning: age, count and size selectors as pure
    code over injected scans, with adversarial fakes
-   (symlink, unreadable mtime, escape).
+   (symlink, unreadable mtime, escape, an mtime tie under
+   `count` proving the documented name order).
 3. Image planning: prefix filtering and the unreferenced
    proof over injected image and container listings,
    including a tag that moves between plan and apply.
@@ -424,7 +437,9 @@ real filesystem in tests.
    names kept as unproven, `reviews/` never a candidate.
 5. Disk wiring: plan section, `--apply` with re-verification,
    human and `--json` output, the ledger and review
-   exclusions, the big-dir skip for managed roots.
+   exclusions, the big-dir skip for managed roots, the
+   README `--apply` sentence and the `diskcli.py` help
+   text once hygiene rows become apply-eligible.
 6. Probe follow-ups: settle section 8 on a scratch host and
    file the builder-cache decision (adopt or refuse) with
    evidence.
