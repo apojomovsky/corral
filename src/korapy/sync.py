@@ -30,6 +30,12 @@ settings.register(
 )
 settings.register("board.poll_pages", int, 5, "board poll page cap per pass (default: small)")
 settings.register(
+    "board.add_per_pass",
+    int,
+    20,
+    "missing board issues added per repo per pass (default: 20; 0 or less adopts nothing)",
+)
+settings.register(
     "board.schema_max_age_s",
     int,
     3600,
@@ -75,6 +81,9 @@ class SyncResult(NamedTuple):
     refused: tuple[
         str, ...
     ] = ()  # validation-rejection lines: the tracker answered (exit 1, not 3)
+    adopt_errors: tuple[
+        str, ...
+    ] = ()  # failed board adds, retried next pass, never counted toward an exit
 
 
 def _reading(item: iface.TrackerItem) -> board.Item:
@@ -148,6 +157,37 @@ def sync_repo(
     return SyncResult(seen, nxt, (), store_errors=tuple(store_errors))
 
 
+def _adopt_after_poll(reader, schema, repo, found, *, page_after, resume, now):
+    """Add the tracker's missing issues to the board: ``(adopt, outage, refused)``.
+
+    The adopt runs only on a complete view: the poll started at the
+    head (no resume token) and reached the end, so the polled items are
+    the whole membership and adding cannot duplicate. A reader without
+    an adopt cap (``board_adopt_limit``) skips the adopt. A failed add
+    is one adopt line naming the issue, retried on the next pass and
+    never counted toward an exit; a rate limit halts the run with an
+    outage line, the rest carrying to the next pass.
+    """
+    limit = getattr(reader, "board_adopt_limit", None)
+    if limit is None or resume is not None or page_after is not None:
+        return (), (), ()
+    present = {(item.repo, item.number) for item in found}
+    try:
+        adopted = reader.adopt_missing(schema.project_id, repo, present, limit=limit, now=now)
+    except iface.TrackerRejected as err:
+        return (), (), (f"{repo}: {err}",)
+    except iface.TrackerError as err:
+        return (), (f"{repo}: {err}",), ()
+    errors: list[str] = []
+    if adopted.stopped is not None:
+        message, retry_after = adopted.stopped
+        errors.append(
+            f"{repo}: board add rate limited, retry after {retry_after:g}s"
+            f" ({message}); the rest carries to the next pass"
+        )
+    return tuple(adopted.refused), tuple(errors), ()
+
+
 def sync_board_repo(
     store: board.Store,
     reader,
@@ -178,13 +218,18 @@ def sync_board_repo(
     list, whatever the stored type) removes one. A board-only edit
     still moves the row forward, because a board-sourced reading
     carries the maximum of the issue and board times.
+
+    A complete poll (started at the head, reached the end) also adopts
+    the tracker repo's missing open and recently closed issues onto the
+    board through the reader, up to its adopt cap; a truncated poll
+    skips the adopt, since partial membership cannot prove anything
+    missing. Failed adds are reported without failing the sync.
     """
     old = store.get_cursor(repo, BOARD_CURSOR_NAME)
+    page_after = store.get_cursor(repo, BOARD_PAGE_NAME)
     try:
         before = iface.parse_cursor(old) if old is not None else None
-        found, resume = reader.poll(
-            schema, after=store.get_cursor(repo, BOARD_PAGE_NAME), max_pages=max_pages
-        )
+        found, resume = reader.poll(schema, after=page_after, max_pages=max_pages)
     except iface.TrackerRejected as err:
         return SyncResult(0, old, (), refused=(f"{repo}: {err}",))
     except iface.TrackerError as err:
@@ -198,17 +243,34 @@ def sync_board_repo(
             store_errors.append(str(err))
             continue
         seen += 1
+    adopt_errors, adopt_outage, adopt_refused = _adopt_after_poll(
+        reader, schema, repo, found, page_after=page_after, resume=resume, now=now
+    )
     if resume is None:
         store.clear_cursor(repo, BOARD_PAGE_NAME)
     else:
         store.set_cursor(repo, BOARD_PAGE_NAME, resume)
     if not found:
-        return SyncResult(0, old, (), store_errors=tuple(store_errors))
+        return SyncResult(
+            0,
+            old,
+            tuple(adopt_outage),
+            store_errors=tuple(store_errors),
+            refused=tuple(adopt_refused),
+            adopt_errors=tuple(adopt_errors),
+        )
     cursor = iface.format_cursor(max(item.updated_at for item in found))
     if before is not None and before > iface.parse_cursor(cursor):
         cursor = old
     _store_cursor(store, repo, cursor, name=BOARD_CURSOR_NAME)
-    return SyncResult(seen, cursor, (), store_errors=tuple(store_errors))
+    return SyncResult(
+        seen,
+        cursor,
+        tuple(adopt_outage),
+        store_errors=tuple(store_errors),
+        refused=tuple(adopt_refused),
+        adopt_errors=tuple(adopt_errors),
+    )
 
 
 def resync_repo(
