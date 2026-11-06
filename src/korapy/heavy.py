@@ -69,7 +69,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from korapy import gitenv, paths, resources, settings
+from korapy import gitenv, paths, pressure, resources, settings
 
 #: The version stamped on every ledger row.
 SCHEMA_VERSION = 1
@@ -1379,18 +1379,83 @@ def lane_fits(used, weight, budget):
     )
 
 
-def plan_report(weight, lane, budget):
+def _pressure_number(value):
+    """One pressure side as a non-negative number, else unknown (None)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return float(value)
+
+
+def _pressure_sides(reading):
+    """(load_per_cpu, mem_available_pct) from a reading, unknowns as None."""
+    if reading is None:
+        return None, None
+    if isinstance(reading, pressure.Reading):
+        return _pressure_number(reading.load_per_cpu), _pressure_number(reading.mem_available_pct)
+    if isinstance(reading, resources.Pressure):
+        return _pressure_number(reading.load_per_cpu), _pressure_number(reading.mem_available_pct)
+    if isinstance(reading, Mapping):
+        return _pressure_number(reading.get("load_per_cpu")), _pressure_number(
+            reading.get("mem_available_pct")
+        )
+    raise HeavyError(f"pressure reading must be a reading, not {reading!r}")
+
+
+def _pressure_line(caps):
+    """The saturation line: caps parsed, None reading as the built-ins."""
+    if caps is None:
+        return resources.PressureCaps()
+    if isinstance(caps, resources.PressureCaps):
+        return caps
+    if isinstance(caps, Mapping):
+        return resources.caps(caps)
+    raise HeavyError(f"pressure caps must be caps, not {caps!r}")
+
+
+def pressure_blocks(reading, caps=None):
+    """Whether pressure delays lane admission, with the tripped side named.
+
+    Pure: the admission-time reading and the shared
+    `[resources.pressure]` caps in, the verdict out. An unknown reading
+    (absent files, unparsable content) never blocks; a half-blind
+    reading still decides on the half it can see. The caps are the same
+    line the launch gate reads, so one setting names saturation for
+    both. Returns (blocked, reason): reason empty when unblocked.
+    """
+    load, mem = _pressure_sides(reading)
+    line = _pressure_line(caps)
+    hot, detail = pressure.saturated(
+        pressure.Reading(load_per_cpu=load, mem_available_pct=mem),
+        max_load_per_cpu=line.max_load_per_cpu,
+        min_mem_available_pct=line.min_mem_available_pct,
+    )
+    return hot, detail
+
+
+def plan_report(weight, lane, budget, *, pressure=None, pressure_caps=None):
     """The read-only verdict for one request weight: admit, position, reason.
 
     Pure: the weight, the current lane and the live budget in, the
-    verdict out, without joining the queue. A planned admission that
-    would wait reports admitted false with the head reason and the
-    queue position (every current waiter stands ahead of a new
-    request); a planned admission with a free slot reports true.
+    verdict out, without joining the queue. Saturated pressure refuses
+    even with shares free; unknown pressure never blocks. A planned
+    admission that would wait reports admitted false with the head
+    reason and the queue position (every current waiter stands ahead of
+    a new request); a planned admission with a free slot reports true.
     """
     if not isinstance(weight, Weight):
         raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
     mine = {"cpu_m": weight.cpu_m, "memory_mb": weight.memory_mb}
+    blocked, detail = pressure_blocks(pressure, pressure_caps)
+    if blocked:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "admitted": False,
+            "position": len(lane["waiters"]),
+            "weight": mine,
+            "reason": (f"host saturated ({detail}): admission waits for the load to drop"),
+        }
     if budget is None:
         return {
             "schema_version": SCHEMA_VERSION,
@@ -1481,6 +1546,139 @@ def _check_max_skips(value):
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise HeavyError(f"max_skips {value!r} must be a non-negative number of passes")
     return value
+
+
+def _check_now(now):
+    """An epoch timestamp, else a HeavyError."""
+    if isinstance(now, bool) or not isinstance(now, (int, float)):
+        raise HeavyError(f"time {now!r} must be an epoch timestamp")
+    if not math.isfinite(now):
+        raise HeavyError(f"time {now!r} must be an epoch timestamp")
+    return float(now)
+
+
+def _check_wait_factor(value):
+    """A positive wait multiplier, else a HeavyError."""
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value <= 0
+    ):
+        raise HeavyError(f"wait factor {value!r} must be a positive number")
+    return float(value)
+
+
+def stuck_waiters(lane, now):
+    """Waiters still listed past their stored wait deadline.
+
+    Pure: the lane and one clock reading in, the stuck rows out. A live
+    waiter would have exited 75 and removed itself by its deadline, so a
+    row past it belongs to a dead process or a wedged wait. Stale
+    reaping cures these on the next admit pass; the doctor only names
+    them.
+    """
+    moment = _check_now(now)
+    stuck = []
+    for waiter in lane.get("waiters", []):
+        if not isinstance(waiter, Mapping):
+            continue
+        try:
+            deadline = _parse_moment(waiter["deadline_at"], "a waiter deadline", "<lane>")
+        except HeavyError:
+            continue
+        if moment > deadline:
+            stuck.append(waiter)
+    return stuck
+
+
+def _estimate_p90(estimate):
+    """The duration p90 of one estimate value, or None when unknown."""
+    if estimate is None:
+        return None
+    if isinstance(estimate, Estimate):
+        return estimate.dur_s_p90
+    if isinstance(estimate, Mapping):
+        return _eta_seconds(estimate.get("dur_s_p90"), "duration p90")
+    return None
+
+
+def stuck_holders(lane, estimates, now, wait_factor):
+    """Holders running past wait_factor times their duration p90.
+
+    Pure: the lane, the per-key estimates, one clock reading and the
+    configured factor in, (holder, elapsed, p90) tuples out. A holder
+    carries no repo or role, so it matches every estimate whose key
+    names its argv hash; the match uses the largest p90, so one slow
+    role does not condemn the rest. A holder with no matching estimate
+    is never stuck: unknown never accuses. The doctor only names these;
+    pressure never touches a holder.
+    """
+    moment = _check_now(now)
+    factor = _check_wait_factor(wait_factor)
+    rows = estimates if isinstance(estimates, Mapping) else {}
+    stuck = []
+    for holder in lane.get("holders", []):
+        if not isinstance(holder, Mapping):
+            continue
+        digest = holder.get("argv_hash")
+        if not isinstance(digest, str) or not digest:
+            continue
+        p90s = [
+            p90
+            for key, estimate in rows.items()
+            if isinstance(key, str) and f"|{digest}|" in key
+            for p90 in [_estimate_p90(estimate)]
+            if p90 is not None
+        ]
+        if not p90s:
+            continue
+        try:
+            since = _parse_moment(holder["since"], "a holder start", "<lane>")
+        except HeavyError:
+            continue
+        elapsed = moment - since
+        if elapsed > factor * max(p90s):
+            stuck.append((holder, elapsed, max(p90s)))
+    return stuck
+
+
+def count_outcomes(recent):
+    """Outcome name to row count over the recent ring.
+
+    Pure: unknown shapes count nothing, so a hand-edited ring never
+    breaks the status view. The doctor reads the bypassed count from
+    here; the lane itself never enforces on it.
+    """
+    counts: dict = {}
+    for row in recent or []:
+        if not isinstance(row, Mapping):
+            continue
+        outcome = row.get("outcome")
+        if not isinstance(outcome, str) or not outcome:
+            continue
+        counts[outcome] = counts.get(outcome, 0) + 1
+    return counts
+
+
+def corrupt_lane_detail(num_bytes, mtime):
+    """The doctor detail for an unparsable lane file, per the design.
+
+    Names the byte count and the last write time, then the documented
+    repair: move the file aside and let the next join recreate an empty
+    lane. The corrupt file is archived, never deleted, so nothing is
+    lost.
+    """
+    if isinstance(mtime, bool) or not isinstance(mtime, (int, float)):
+        when = "unknown time"
+    elif not math.isfinite(mtime):
+        when = "unknown time"
+    else:
+        when = _iso(float(mtime))
+    return (
+        f"heavy: lane.json unparsable, {num_bytes} bytes, last write {when}; "
+        "repair by moving it aside"
+    )
 
 
 def _waiter_stale(waiter, now, is_alive):
@@ -1601,6 +1799,23 @@ def _promote(lane, path, pos, now, unit, budget):
     return holder
 
 
+def _live_budget(budget, budget_fn):
+    """The lane budget for this admit pass: re-resolved when asked.
+
+    `budget_fn` returns the live budget from settings; None keeps the
+    fixed budget the run started with. The design resolves the live
+    budget every pass and refreshes the cached copy on the next write,
+    so a changed cap applies without restarting the wait. A fixed
+    budget of None (no enforcement) stays None.
+    """
+    if budget_fn is None:
+        return budget
+    live = budget_fn()
+    if live is not None and not isinstance(live, resources.Usage):
+        raise HeavyError(f"budget must be a resource Usage, not {live!r}")
+    return live
+
+
 def poll_once(
     waiter_id,
     weight,
@@ -1613,6 +1828,9 @@ def poll_once(
     scope_exists=None,
     is_alive=None,
     lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+    pressure=None,
+    pressure_caps=None,
+    budget_fn=None,
 ):
     """One admit pass for `waiter_id`: reap, promote, wait, or expire.
 
@@ -1620,16 +1838,20 @@ def poll_once(
     cap together. The pass first reaps dead holders (their scope unit
     is gone, freeing the weight with a reaped row in recent and no
     ledger row) and stale waiters (dead pid, or deadline plus grace),
-    then admits: the fitting head becomes the holder, else backfill
-    promotes the caller when it is the first fitting later waiter and
-    neither it nor the head reached the skip bound. Each waiter passed
-    over by a backfill admission gains one `skipped`. The fitting head
-    is the head's own promotion; anyone else unfitting gets None and
-    keeps waiting. Past the deadline the waiter row goes and LaneTimeout
-    (exit 75) reports it; a gone row reads the same way. `unit` names
-    the scope the run will take, so the holder row carries it from
-    admission. `scope_exists` and `is_alive` are the liveness seams;
-    None means assume live, so a caller without the seam never reaps.
+    re-resolves the live budget when `budget_fn` is given, then admits:
+    saturated pressure delays everybody this round (nobody is
+    promoted, unknown pressure never blocks); else the fitting head
+    becomes the holder, else backfill promotes the caller when it is
+    the first fitting later waiter and neither it nor the head reached
+    the skip bound. Each waiter passed over by a backfill admission
+    gains one `skipped`. The fitting head is the head's own promotion;
+    anyone else unfitting gets None and keeps waiting. Past the
+    deadline the waiter row goes and LaneTimeout (exit 75) reports it,
+    even on a saturated round; a gone row reads the same way. `unit`
+    names the scope the run will take, so the holder row carries it
+    from admission. `scope_exists` and `is_alive` are the liveness
+    seams; None means assume live, so a caller without the seam never
+    reaps.
     """
     if not isinstance(weight, Weight):
         raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
@@ -1642,28 +1864,44 @@ def poll_once(
         lane = _read_locked(path)
         changed = _reap_holders(lane, now, scope_exists)
         changed |= _reap_waiters(lane, now, is_alive)
+        live = _live_budget(budget, budget_fn)
         index = next(
             (pos for pos, row in enumerate(lane["waiters"]) if row["id"] == waiter_id), None
         )
         if index is None:
             if changed:
+                lane["budget"] = _budget_copy(live)
                 _store_locked(path, lane)
             raise LaneTimeout(f"waiter {waiter_id[:8]} is gone from the lane")
         mine = lane["waiters"][index]
         deadline = _parse_moment(mine["deadline_at"], "a waiter deadline", path)
-        if index == 0 and lane_fits(holder_sum(lane), weight, budget):
-            return _promote(lane, path, index, now, unit, budget)
-        pick = _backfill_pick(lane, budget, max_skips)
+        blocked, _detail = pressure_blocks(pressure, pressure_caps)
+        if blocked:
+            if now >= deadline:
+                lane["waiters"].pop(index)
+                lane["budget"] = _budget_copy(live)
+                _store_locked(path, lane)
+                raise LaneTimeout(
+                    f"waiter {waiter_id[:8]} waited past its deadline with no free slot"
+                )
+            if changed:
+                lane["budget"] = _budget_copy(live)
+                _store_locked(path, lane)
+            return None
+        if index == 0 and lane_fits(holder_sum(lane), weight, live):
+            return _promote(lane, path, index, now, unit, live)
+        pick = _backfill_pick(lane, live, max_skips)
         if pick is not None and lane["waiters"][pick]["id"] == waiter_id:
             for pos in range(pick):
                 lane["waiters"][pos]["skipped"] += 1
-            return _promote(lane, path, pick, now, unit, budget)
+            return _promote(lane, path, pick, now, unit, live)
         if now >= deadline:
             lane["waiters"].pop(index)
-            lane["budget"] = _budget_copy(budget)
+            lane["budget"] = _budget_copy(live)
             _store_locked(path, lane)
             raise LaneTimeout(f"waiter {waiter_id[:8]} waited past its deadline with no free slot")
         if changed:
+            lane["budget"] = _budget_copy(live)
             _store_locked(path, lane)
         return None
 
@@ -1681,6 +1919,10 @@ def wait_for_slot(
     scope_exists=None,
     is_alive=None,
     lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+    pressure=None,
+    pressure_caps=None,
+    pressure_fn=None,
+    budget_fn=None,
 ):
     """Poll `poll_once` until the waiter is admitted or expires.
 
@@ -1689,22 +1931,30 @@ def wait_for_slot(
     to the module sleep seam; the tests script both. `unit` names the
     scope the run will take and lands on the holder row at admission.
     `max_skips` bounds backfill; `scope_exists` and `is_alive` are the
-    liveness seams, None meaning assume live.
+    liveness seams, None meaning assume live. `pressure_fn` reads the
+    live pressure every pass (a fixed `pressure` stays one reading);
+    `budget_fn` re-resolves the live budget every pass; both default to
+    the fixed values, so callers without the seams keep the old shape.
     """
     clock = now or time.time
     rest = asleep or _sleep
     while True:
+        moment = clock()
+        live_pressure = pressure_fn() if pressure_fn is not None else pressure
         holder = poll_once(
             waiter_id,
             weight,
             budget,
-            clock(),
+            moment,
             state_dir,
             unit=unit,
             max_skips=max_skips,
             scope_exists=scope_exists,
             is_alive=is_alive,
             lock_timeout=lock_timeout,
+            pressure=live_pressure,
+            pressure_caps=pressure_caps,
+            budget_fn=budget_fn,
         )
         if holder is not None:
             return holder
@@ -1778,6 +2028,9 @@ def run_through_lane(
     scope_exists=None,
     is_alive=None,
     lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+    pressure_caps=None,
+    pressure_fn=None,
+    budget_fn=None,
 ):
     """Queue one command, run it in a transient scope, release the slot.
 
@@ -1789,8 +2042,15 @@ def run_through_lane(
     are required seams with no default. `timeout_s` caps this queue
     wait; `timeout` caps the command run. `max_skips` bounds backfill;
     `scope_exists` and `is_alive` are the liveness seams, None meaning
-    assume live. Returns a LaneRun: the finished run plus the seconds
-    waited.
+    assume live. `pressure` is the ledger row's host pressure, carried
+    through to ``run_heavy`` when given; otherwise the row carries the
+    admitting pass's reading. `pressure_fn` reads the live queue
+    pressure every admit pass (saturated delays everybody, unknown
+    never blocks) against `pressure_caps`, the shared
+    `[resources.pressure]` line. `budget_fn` re-resolves the live lane
+    budget every pass and at run start; without it the fixed `budget`
+    holds the whole run. Returns a LaneRun: the finished run plus the
+    seconds waited.
     """
     items = _check_command(argv)
     if not isinstance(weight, Weight):
@@ -1806,13 +2066,23 @@ def run_through_lane(
     waiter = join_lane(
         items,
         weight,
-        budget,
+        _live_budget(budget, budget_fn),
         state_dir=state_dir,
         arrived=arrived,
         pid=me,
         timeout_s=timeout_s,
         lock_timeout=lock_timeout,
     )
+    admitted: dict = {}
+    queue_pressure_fn = None
+    if pressure_fn is not None:
+        live_pressure_fn = pressure_fn
+
+        def queue_pressure_fn():
+            reading = live_pressure_fn()
+            admitted["reading"] = reading
+            return reading
+
     wait_for_slot(
         waiter["id"],
         weight,
@@ -1825,8 +2095,13 @@ def run_through_lane(
         scope_exists=scope_exists,
         is_alive=is_alive,
         lock_timeout=lock_timeout,
+        pressure_caps=pressure_caps,
+        pressure_fn=queue_pressure_fn,
+        budget_fn=budget_fn,
     )
     waited = round(clock() - arrived, 3)
+    live = _live_budget(budget, budget_fn)
+    ledger_pressure = pressure if pressure is not None else admitted.get("reading")
     try:
         result = run_heavy(
             items,
@@ -1835,21 +2110,21 @@ def run_through_lane(
             role=role,
             repo=repo_key(cwd),
             weight=weight,
-            budget=budget,
+            budget=live,
             run=run,
             teardown=teardown,
             scope_cgroup=scope_cgroup,
             read=read,
             clock=clock,
             host=host,
-            pressure=pressure,
+            pressure=ledger_pressure,
             timeout=timeout,
             starved_ratio=starved_ratio,
             waited_s=waited,
             unit=scope_unit,
         )
     finally:
-        release_lane(waiter["id"], budget, state_dir=state_dir, lock_timeout=lock_timeout)
+        release_lane(waiter["id"], live, state_dir=state_dir, lock_timeout=lock_timeout)
     return LaneRun(result=result, waited_s=waited)
 
 

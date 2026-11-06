@@ -4,8 +4,9 @@ Runs the incremental feed for the ops root's repositories (each
 ``[[repo]]`` entry; ``tracker.repo`` when set, else the clone's
 origin), with ``--resync`` for a full rebuild and ``--audit N`` for
 the rolling re-read of the N rows verified least recently. Exit codes:
-0 synced, 1 nothing changed, 3 tracker unreachable, 4 usage or
-configuration error. A read the tracker answers with a validation
+0 synced, 1 nothing changed, 2 a rename or a drive pass holds the
+drive lock, 3 tracker unreachable, 4 usage or configuration error.
+A read the tracker answers with a validation
 rejection is refused, not unreachable: its line is reported and the
 repo keeps its cursor, and a pass whose only failures are refused
 reads exits 1. Corrupt stored rows are usage errors: a sync that
@@ -31,7 +32,7 @@ from korapy import tracker as iface
 from korapy.gitenv import clean_env
 from korapy.github import forge as ghforge
 
-OK, NOTHING, UNREACHABLE, USAGE = 0, 1, 3, 4
+OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
 
 def _err(text, err):
@@ -164,6 +165,8 @@ def sync_root(
     err,
     push=False,
     tracker_factory=None,
+    lock=None,
+    lock_path=None,
 ) -> int:
     """Sync each named repo entry (or every entry) and report. All seams
     injected; exit codes follow the module docstring.
@@ -172,8 +175,61 @@ def sync_root(
     one factory from the entry's resolved settings (labels or board);
     when omitted the single ``tracker`` serves every repo. Board repos
     run the feed step then the board step; a board-variant repo whose
-    tracker has no board reader is exit 4 naming the repo.
+    tracker has no board reader is exit 4 naming the repo. ``lock`` is
+    the drive-lock seam (``drive.drive_lock``, taking ``lock_path``
+    from the one resolver ``drive.lock_path``), required: the whole
+    pass runs under it, so a sync of the old name cannot land rows
+    under the old key while a rename migrates them; a held lock
+    refuses with exit 2 naming the holder, and a missing lock fails
+    closed with exit 4 instead of syncing unguarded.
     """
+    if lock is None:
+        _err("cannot sync without the drive lock: refusing unguarded", err)
+        return USAGE
+    from korapy import drive
+
+    try:
+        with lock(lock_path):
+            return _sync_body(
+                root,
+                names,
+                resync=resync,
+                audit=audit,
+                as_json=as_json,
+                tracker=tracker,
+                store=store,
+                git=git,
+                now=now,
+                out=out,
+                err=err,
+                push=push,
+                tracker_factory=tracker_factory,
+            )
+    except drive.LockHeld as held:
+        _err(str(held), err)
+        return RACE
+    except drive.LockError as problem:
+        _err(str(problem), err)
+        return USAGE
+
+
+def _sync_body(
+    root,
+    names,
+    *,
+    resync,
+    audit,
+    as_json,
+    tracker,
+    store,
+    git,
+    now,
+    out,
+    err,
+    push=False,
+    tracker_factory=None,
+) -> int:
+    """The resolve, sync and mirror behind `sync_root`: run unlocked."""
     try:
         wanted = settings.repo_names(root)
     except settings.SettingsError as problem:
@@ -340,7 +396,7 @@ def sync_root(
 
 
 def cmd_sync(args: argparse.Namespace) -> int:
-    from korapy import trackers
+    from korapy import drive, trackers
 
     root = settings.find_root(os.getcwd())
     if root is None:
@@ -381,6 +437,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
             err=sys.stderr,
             push=args.push,
             tracker_factory=by_repo.__getitem__,
+            lock=drive.drive_lock,
+            lock_path=drive.lock_path(),
         )
 
 
