@@ -389,6 +389,23 @@ class BoardPopulate(NamedTuple):
     refused: tuple[str, ...]
 
 
+class BoardAdopt(NamedTuple):
+    """The adopt-missing outcome for one board pass: added, kept, refused.
+
+    The pass adds open and recently closed issues missing from the
+    board, up to its cap, through the one shared adder; each entry of
+    ``refused`` is a fix line for one issue the pass could not add,
+    retried on the next pass. ``stopped`` carries the rate limit that
+    halted the run as ``(message, retry_after)``, or ``None`` when the
+    run finished; the rest carries to the next pass.
+    """
+
+    added: tuple[str, ...]
+    kept: tuple[str, ...]
+    refused: tuple[str, ...]
+    stopped: tuple[str, float] | None
+
+
 def render_provision(repo: str, provision: BoardProvision) -> str:
     """One board ensure report as ``setup`` output lines. Pure.
 

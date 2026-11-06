@@ -85,6 +85,7 @@ def entry(name="app", repo="acme/app", variant="labels", board=None):
         variant=variant,
         board=board,
         max_pages=20,
+        adopt_limit=20,
     )
 
 

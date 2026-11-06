@@ -879,6 +879,37 @@ refused per issue and exits 1 when any refusal occurred, 3 when the
 tracker fell over mid-list; a re-run converges because presence is
 re-read each time.
 
+### The board step adopts every pass
+
+Decision: the board step every `drive` pass and `korapy sync` runs
+also adopts the tracker repo's missing issues onto the board, so a
+new issue appears without anyone running `setup --populate`. Setup
+keeps its explicit bulk adoption; the pass keeps the board current by
+itself.
+
+The pass adopt, implemented once in the GitHub adapter behind the one
+adder setup uses (`add_missing_issues` in `github/board.py`, the same
+function for both paths, reporting `added`, `kept`, `refused`, and a
+`stopped` rate-limit marker as `tracker.BoardAdopt`):
+
+1. The step compares the tracker listing against the board items its
+   own poll just read: only a complete poll (started at the head,
+   reached the end) adopts, since partial membership cannot prove
+   anything missing; a poll stopped by the page cap skips the adopt
+   that pass.
+2. Candidates are the repo's **open issues and recently closed ones**
+   (closed within the last three days; older closed issues stay
+   history for people to add by hand). Pull requests are never
+   adopted: their linked issue's card shows them.
+3. At most `board.add_per_pass` issues are added per repo per pass
+   (default `20`), so a first catch-up never bursts the pacing
+   budget; the remainder carries to the next pass.
+4. Every add goes through the paced mutation path, so the shared
+   GraphQL bucket meters the pass; a cooldown or rate limit stops the
+   adopt cleanly with the rest left for the next pass.
+5. A failed add is logged with the issue number and retried on the
+   next pass; it never fails the sync and exit codes are unchanged.
+
 ### What the first sync does
 
 Nothing new is built here; this is the existing machinery meeting a
@@ -902,9 +933,11 @@ fresh board, stated so nobody has to re-derive it:
   poll, and a targeted read of it fails closed
   (`BoardBackedTracker.item` raises "unknown board item"), so a
   freshness-gated claim on it skips instead of trusting a stale row.
-  That is the correct failure, and it is why `--populate` completeness
-  matters more than its speed; section 5 names the doctor row that
-  catches the gap once the seam for it exists.
+  That is the correct failure. The pass adopt above closes the gap in
+  the common case, so this now bites only while the adopt cannot run
+  (a truncated poll, a cap backlog, or the adopt disabled); `--populate`
+  stays the explicit bulk path, and section 5 names the doctor row
+  that catches whatever gap is left.
 
 ## 5. Doctor
 
