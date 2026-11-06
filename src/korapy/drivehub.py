@@ -331,18 +331,28 @@ def cmd_drive(args: argparse.Namespace) -> int:
         except projects.ProjectsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
-        operators, problem = drive.production_operators(registered, syncli._git)
-        if problem is not None:
-            print(f"korapy drive: {problem}", file=sys.stderr)
-            return drive.USAGE
-        by_repo: dict = {}
+        resolved = {}
         for project in registered:
             try:
                 names = settings.repo_names(project.root)
             except settings.SettingsError as err:
                 print(f"korapy drive: {err}", file=sys.stderr)
                 return drive.USAGE
-            mapping, problem = trackers.production_trackers(project.root, names, git=syncli._git)
+            entries, problem = syncli.repo_operators(project.root, names, syncli._git)
+            if problem is not None:
+                print(f"korapy drive: {problem}", file=sys.stderr)
+                return drive.USAGE
+            resolved[project.root] = entries
+        operators, problem = drive.production_operators(registered, syncli._git, resolved=resolved)
+        if problem is not None:
+            print(f"korapy drive: {problem}", file=sys.stderr)
+            return drive.USAGE
+        by_repo: dict = {}
+        for project in registered:
+            root_entries = resolved[project.root]
+            mapping, problem = trackers.production_trackers(
+                project.root, list(root_entries), git=syncli._git, entries=root_entries
+            )
             if problem is not None:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
@@ -354,7 +364,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
 
         moment = time.time()
         try:
-            repo_map = drive.production_repo_map(registered)
+            repo_map = drive.production_repo_map(registered, resolved=resolved)
             stuck_states, stuck_stale, stuck_tickets = drive.production_stuck_inputs(
                 registered, now=moment, mapping=repo_map
             )

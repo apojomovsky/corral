@@ -961,6 +961,7 @@ def run_heavy(
     if (
         isinstance(waited_s, bool)
         or not isinstance(waited_s, (int, float))
+        or not math.isfinite(waited_s)
         or waited_s != waited_s
         or waited_s < 0
     ):
@@ -1346,7 +1347,11 @@ def join_lane(
         raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
     _check_timeout(timeout_s)
     moment = time.time() if arrived is None else arrived
-    if isinstance(moment, bool) or not isinstance(moment, (int, float)):
+    if (
+        isinstance(moment, bool)
+        or not isinstance(moment, (int, float))
+        or not math.isfinite(moment)
+    ):
         raise HeavyError(f"arrival {moment!r} must be an epoch timestamp")
     me = os.getpid() if pid is None else pid
     if isinstance(me, bool) or not isinstance(me, int) or me < 0:
@@ -2442,9 +2447,9 @@ def _summarize(key, window):
     """One key's estimate over its window, oldest first, at most 20 rows.
 
     The peak set uses every measured peak (starvation never shrinks a
-    high-water mark); the duration set skips starved rows, so contention
-    cannot shorten the typical run; the CPU series averages each run's
-    parallelism from its own counters. Fewer than 3 rows predicts the
+    high-water mark); the duration and CPU-parallelism sets skip starved
+    rows, so contention can neither shorten the typical run nor deflate
+    the rate that prices admission. Fewer than 3 rows predicts the
     maximum observed, so the first measurement corrects a cautious
     default at once instead of averaging it down.
     """
@@ -2455,7 +2460,7 @@ def _summarize(key, window):
     rates = sorted(
         round(row["cpu_s"] / row["wall_s"] * 1000)
         for row in window
-        if row["cpu_s"] is not None and row["wall_s"]
+        if not row["starved"] and row["cpu_s"] is not None and row["wall_s"]
     )
     young = len(window) < ESTIMATE_MIN_ROWS
     if not peaks:
