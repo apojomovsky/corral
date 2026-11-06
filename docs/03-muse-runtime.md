@@ -1,10 +1,11 @@
 # 03: the muse runtime adapter
 
-Status: design, not built. This doc fixes the second adapter, `muse`
-(the Muse Code CLI), next to `omp` in
+Status: built (T1 to T5, T7 and T9; T6 is the host-side quota reader,
+outside korapy, and the gaps T8 closes stay UNVERIFIED). This doc fixes
+the second adapter, `muse` (the Muse Code CLI), next to `omp` in
 `src/korapy/runtimes/`. Nothing here changes the launch, resume, tail or
 stop flow in `src/korapy/launch.py`, the unit model, the registry,
-admission, exit codes, or any CLI verb. T9 names the muse runtime in
+admission, exit codes, or any CLI verb. T9 named the muse runtime in
 `README.md` and in the design docs.
 The only index change is the row for this doc in `docs/README.md`.
 
@@ -21,20 +22,19 @@ here, only shapes. Home paths below are generic stand-ins:
 ## 0. Where it fits
 
 One new module, `src/korapy/runtimes/muse.py`, exposing the same
-`Runtime` protocol as the other two (`argv`, `env`, `write_config`,
-`with_models`, `resume_handle`, `activity_file`), plus two small
-helpers this runtime needs: `resolve(session_id)` (session id to
-session file) and `classify(returncode, stderr_text, stream_text)`
-(provider error classification, section 5). `activity_file(session)`
-returns the unit's `out.log` path when present and `None` otherwise,
-because `launch.py` tail calls it unconditionally; without it a muse
-session would crash `korapy tail`.
+`Runtime` protocol as `omp` (`argv`, `env`, `write_config`,
+`with_models`, `resume_handle`, `activity_file`, `options_schema`),
+plus two small helpers this runtime needs: `resolve(session_id)`
+(session id to session file) and `classify(returncode, stderr_text,
+stream_text)` (provider error classification, section 5).
+`activity_file(session)` returns the unit's `out.log` path when present
+and `None` otherwise, because `launch.py` tail calls it unconditionally;
+without it a muse session would crash `korapy tail`.
 `runtimes/__init__.py` gains the name:
 `NAMES` becomes `("omp", "muse")`, `get("muse")` returns the
 adapter, and profiles accept `muse` as a runtime. `DEFAULT_RUNTIME` stays
-`omp`; `record`/`recorded` are unchanged. `settings.PROVIDERS` already
-lists `korapy.runtimes`, and this design adds no new setting (section
-1), so settings need no change.
+`omp`; `record`/`recorded` are unchanged, and this design adds no new
+setting (section 1), so settings need no change.
 
 Model ids: `quota.chain_provider` takes the part before the first `/`,
 so a chain entry `muse/muse-spark-1.3` names provider `muse` and the
@@ -413,7 +413,7 @@ raising the no-activity `LaunchError`).
 ## 10. Implementation tickets
 
 Each is one agent of work with its own tests; none needs a new
-public interface beyond `agents.runtime: muse`.
+public interface beyond a profile `runtime` of `muse`.
 
 - T1: argv and registration. Build `muse.binary`, `muse.argv`
   (worker, reviewer, resume), wire `NAMES`/`get`, keep
