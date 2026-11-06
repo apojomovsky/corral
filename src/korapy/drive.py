@@ -84,7 +84,7 @@ settings.register(
 settings.register(
     "drive.fix_round_threshold",
     str,
-    "normal",
+    reviewrecord.DEFAULT_FIX_THRESHOLD,
     "lowest review finding severity that still opens a fix round "
     "(high, normal or low): an approving review below it is merge-ready",
     check=reviewrecord.check_threshold,
@@ -283,7 +283,7 @@ def gate(
     agent_states=None,
     agent_tickets=None,
     reviews=None,
-    fix_threshold="normal",
+    fix_threshold=reviewrecord.DEFAULT_FIX_THRESHOLD,
     pulls_for=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
@@ -415,7 +415,9 @@ def gate(
             if (
                 record is not None
                 and reviewrecord.approves(record)
-                and not reviewrecord.fix_wanted(record, fix_threshold or "normal")
+                and not reviewrecord.fix_wanted(
+                    record, fix_threshold or reviewrecord.DEFAULT_FIX_THRESHOLD
+                )
             ):
                 return _skip(
                     candidate,
@@ -1456,7 +1458,7 @@ def _gate_all(
             fix_threshold = settings.load(root=None)["drive.fix_round_threshold"]
         except settings.SettingsError as problem:
             problems = [f"korapy drive: {problem}"]
-            fix_threshold = "normal"
+            fix_threshold = reviewrecord.DEFAULT_FIX_THRESHOLD
         else:
             problems = []
     else:

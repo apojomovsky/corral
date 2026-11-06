@@ -4,6 +4,7 @@ Offline: records land in temp session roots; commit resolution runs real
 git against throwaway repositories in temp dirs.
 """
 
+import inspect
 import io
 import json
 import os
@@ -13,7 +14,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from korapy import cli, mergeup, paths, reviewcli, reviewrecord
+from korapy import cli, drive, mergeup, paths, reviewcli, reviewrecord, settings
 from tests.test_forge import FakeForge, make_pr
 
 REPO = "lib"
@@ -399,6 +400,13 @@ class SeverityThresholdTest(unittest.TestCase):
         findings = [{"severity": "normal", "text": "missing test"}]
         self.assertTrue(reviewrecord.meets_threshold(findings))
 
+    def test_mixed_low_and_normal_findings_meet_the_default_threshold(self):
+        findings = [
+            {"severity": "low", "text": "typo"},
+            {"severity": "normal", "text": "missing test"},
+        ]
+        self.assertTrue(reviewrecord.meets_threshold(findings))
+
     def test_a_high_finding_meets_a_normal_threshold(self):
         findings = [{"severity": "high", "text": "data loss"}]
         self.assertTrue(reviewrecord.meets_threshold(findings, "normal"))
@@ -435,6 +443,14 @@ class SeverityThresholdTest(unittest.TestCase):
 
     def test_approve_with_a_normal_finding_wants_a_fix(self):
         record = self.record("approve-with-findings", [{"severity": "normal", "text": "t"}])
+        self.assertTrue(reviewrecord.fix_wanted(record))
+
+    def test_approve_with_mixed_low_and_normal_findings_wants_a_fix(self):
+        findings = [
+            {"severity": "low", "text": "typo"},
+            {"severity": "normal", "text": "missing test"},
+        ]
+        record = self.record("approve-with-findings", findings)
         self.assertTrue(reviewrecord.fix_wanted(record))
 
     def test_a_block_wants_a_fix_even_without_findings(self):
@@ -505,6 +521,26 @@ class SeverityThresholdTest(unittest.TestCase):
         self.assertIsNotNone(found)
         assert found is not None
         self.assertEqual(found["findings"], [{"severity": "low", "text": "t"}])
+
+
+class DefaultThresholdAgreementTest(unittest.TestCase):
+    """Every fix-round threshold default is the one shared constant.
+
+    The settings default, the gate default and the reviewrecord
+    defaults all grade findings the same way; a drift in any one of
+    them reopens lows-only fix rounds or skips deserved ones.
+    """
+
+    def test_the_default_threshold_is_normal(self):
+        self.assertEqual(reviewrecord.DEFAULT_FIX_THRESHOLD, "normal")
+
+    def test_every_threshold_default_is_the_constant(self):
+        want = reviewrecord.DEFAULT_FIX_THRESHOLD
+        for func in (reviewrecord.meets_threshold, reviewrecord.fix_wanted):
+            with self.subTest(func=func.__name__):
+                self.assertEqual(inspect.signature(func).parameters["threshold"].default, want)
+        self.assertEqual(inspect.signature(drive.gate).parameters["fix_threshold"].default, want)
+        self.assertEqual(settings.REGISTRY["drive.fix_round_threshold"].default, want)
 
 
 if __name__ == "__main__":

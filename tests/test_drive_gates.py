@@ -906,6 +906,16 @@ class OpenPullGateTest(unittest.TestCase):
         gated = gate(entry(), pulls_for=linked(9, state="closed"))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
+    def test_two_open_linked_pulls_name_the_first(self):
+        pulls = lambda repo, number: (
+            LinkedPull(number=9, state="open"),
+            LinkedPull(number=4, state="open"),
+        )
+        gated = gate(entry(), pulls_for=pulls)
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+        self.assertNotIn("#4", gated.reason)
+
     def test_an_unreadable_pull_lookup_refuses_the_start(self):
         def broken(repo, number):
             raise ValueError("tracker down")
@@ -967,6 +977,26 @@ class ReviewThresholdGateTest(unittest.TestCase):
         )
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
         self.assertIn("fresh start", gated.reason)
+
+    def test_a_normal_finding_below_a_high_threshold_is_merge_ready(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): normal_record()},
+            fix_threshold="high",
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_falsy_threshold_falls_back_to_the_default(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+            fix_threshold="",
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
 
     def test_a_block_verdict_still_opens_a_fix_round(self):
         gated = gate(
