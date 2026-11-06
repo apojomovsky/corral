@@ -193,9 +193,7 @@ class OneMapPerPassTest(RepoKeyCase):
         registered = list(self.registered) + [
             projects_mod.Project(name="green", unit_prefix="green-agent-", root=other),
         ]
-        self.assertEqual(
-            drive.production_repo_map(registered, git=dead_git), {SHORT: TRACKER}
-        )
+        self.assertEqual(drive.production_repo_map(registered, git=dead_git), {SHORT: TRACKER})
 
     def test_the_admission_live_set_keys_on_the_tracker_repo(self):
         triples = {("blue", SHORT, NUMBER), ("blue", "other/repo", 9)}
