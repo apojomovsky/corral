@@ -4,6 +4,7 @@ Offline: profiles are plain data checked against the account pool and each
 runtime adapter's options schema. No files, no subprocesses, no network.
 """
 
+import types
 import unittest
 from unittest import mock
 
@@ -222,6 +223,15 @@ class NoSilentFallback(unittest.TestCase):
 
 
 class BuiltinDefault(unittest.TestCase):
+    def test_a_non_dict_mapping_still_finds_the_declared_default(self):
+        parsed = profiles.validate({"default": raw_profile("omp")}, ["provider-a"])
+        found = profiles.declared_default(types.MappingProxyType(dict(parsed)))
+        self.assertEqual(found, parsed["default"])
+
+    def test_a_non_dict_mapping_without_a_default_finds_nothing(self):
+        parsed = profiles.validate({"slim": raw_profile("omp")}, ["provider-a"])
+        self.assertIsNone(profiles.declared_default(types.MappingProxyType(dict(parsed))))
+
     def test_the_builtin_default_keeps_the_shipped_default_runtime(self):
         self.assertEqual(profiles.DEFAULT_PROFILE_NAME, "default")
         self.assertEqual(profiles.BUILTIN_DEFAULT.name, "default")
