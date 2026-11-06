@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 from korapy import admission, board, cli, drive, drivehub, launch, quota_ledger, settings
+from korapy import syncli
 from korapy import tracker
 from korapy import projects as projects_mod
 from tests.test_tracker import FakeTracker, reading
@@ -525,6 +526,46 @@ class CmdDriveTest(unittest.TestCase):
         self.assertEqual(code, 4)
 
 
+class CmdDriveMapFailureTest(unittest.TestCase):
+    """A broken project config at map-build time refuses the pass.
+
+    `production_repo_map` raising `SettingsError` through `cmd_drive`
+    exits 4 in both the plan and the claiming path, naming the
+    problem, instead of joining the pass against a guessed map.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-map-")
+        self.addCleanup(self.tmp.cleanup)
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def run_cmd(self, plan):
+        host_settings = settings.resolve(
+            env={}, flags={"drive.max_starts_per_day": 50, "board.hold_label": "paused"}
+        )
+        with (
+            mock.patch.object(drive.board, "open_store", return_value=mock.MagicMock()),
+            mock.patch.object(drive.settings, "load", return_value=host_settings),
+            mock.patch.object(drive.projects, "load_all", return_value=[]),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=settings.SettingsError("test config names no tracker repo"),
+            ),
+            mock.patch.object(drive.sys, "stdout", self.out),
+            mock.patch.object(drive.sys, "stderr", self.err),
+        ):
+            return drivehub.cmd_drive(argparse.Namespace(plan=plan, drive_verb=None))
+
+    def test_plan_with_a_broken_repo_map_is_a_usage_error(self):
+        self.assertEqual(self.run_cmd(plan=True), 4)
+        self.assertIn("korapy drive: test config names no tracker repo", self.err.getvalue())
+
+    def test_claiming_with_a_broken_repo_map_is_a_usage_error(self):
+        self.assertEqual(self.run_cmd(plan=False), 4)
+        self.assertIn("korapy drive: test config names no tracker repo", self.err.getvalue())
+
+
 class HoldLabelWiringTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-hold-")
@@ -643,6 +684,76 @@ class HoldLabelWiringTest(unittest.TestCase):
         code, seen, _, _, _, _ = self.passing_cmd(plan=False)
         self.assertEqual(code, 0)
         self.assertEqual(seen["projects_fn"](), [])
+
+
+class ClaimingPassResolvesOnceTest(unittest.TestCase):
+    """The claiming pass resolves short-to-tracker once per root and shares it.
+
+    One `repo_operators` call per registered root feeds the string
+    map, the operators and the tracker factory, so a config edit
+    between the builds cannot leave the factory without the map's
+    repo: the factory serves every repo the map names.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-once-")
+        self.addCleanup(self.tmp.cleanup)
+        self.state = os.path.join(self.tmp.name, "state")
+        self.config = os.path.join(self.tmp.name, "config")
+        self.root = os.path.join(self.tmp.name, "ops")
+        os.makedirs(os.path.join(self.config, "projects.d"))
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n')
+        with open(
+            os.path.join(self.config, "projects.d", "blue.toml"), "w", encoding="utf-8"
+        ) as handle:
+            handle.write(f"name = 'blue'\nunit_prefix = 'blue-agent-'\nroot = {self.root!r}\n")
+        store = stored(os.path.join(self.state, "board.sqlite"), [])
+        store.close()
+        self.seen = {}
+        self.out, self.err = io.StringIO(), io.StringIO()
+        env = {"KORAPY_STATE": self.state, "KORAPY_CONFIG": self.config}
+        self._env_patch = mock.patch.dict(os.environ, env)
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+
+    def test_one_resolution_feeds_the_map_the_operators_and_the_factory(self):
+        real_operators = syncli.repo_operators
+        calls = []
+
+        def counting(root, names, git):
+            calls.append(root)
+            return real_operators(root, names, git)
+
+        def fake_run_pass(**kwargs):
+            self.seen.update(kwargs)
+            return 0
+
+        with (
+            mock.patch.object(syncli, "repo_operators", side_effect=counting),
+            mock.patch.object(drive, "production_stuck_inputs", return_value=({}, 600.0, {})),
+            mock.patch.object(drive, "production_finished_for", return_value={}),
+            mock.patch.object(drive, "production_agent_roles", return_value={}),
+            mock.patch.object(
+                drive, "production_orphan_inputs", return_value=(set(), set(), 3600.0)
+            ),
+            mock.patch.object(drive, "production_launcher", return_value=mock.MagicMock()),
+            mock.patch.object(drive, "production_stopper", return_value=None),
+            mock.patch.object(drive, "run_pass", side_effect=fake_run_pass),
+            mock.patch.object(drive.sys, "stdout", self.out),
+            mock.patch.object(drive.sys, "stderr", self.err),
+        ):
+            code = drivehub.cmd_drive(argparse.Namespace(plan=False, drive_verb=None))
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [self.root])
+        self.assertEqual(self.seen.get("repo_map"), {"app": "acme/app"})
+        self.assertEqual(self.seen.get("operators"), {"acme/app": ["acme"]})
+        factory = self.seen.get("tracker_factory")
+        self.assertIsNotNone(factory)
+        assert factory is not None
+        for repo in self.seen["repo_map"].values():
+            self.assertIsNotNone(factory(repo))
 
 
 class DriveSyncExitTest(unittest.TestCase):
