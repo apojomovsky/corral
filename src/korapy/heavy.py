@@ -1093,6 +1093,12 @@ def estimates_for(rows, *, now=None):
     pooled: dict = {}
     for (repo, digest, _role), group in groups.items():
         pooled.setdefault((repo, digest), []).extend(group)
+    for command_rows in pooled.values():
+        # Time order, oldest first: concatenating per-role groups is not a
+        # merge when two roles interleave, so the fallback slice below and
+        # the trailing flaky read in _summarize would see the wrong rows.
+        # The sort is stable, so equal timestamps keep first-seen order.
+        command_rows.sort(key=lambda row: row["at"])
     estimates = {}
     for (repo, digest, role), group in groups.items():
         if len(group) >= ESTIMATE_MIN_ROWS:

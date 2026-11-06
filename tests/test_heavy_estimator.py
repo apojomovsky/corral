@@ -228,6 +228,26 @@ class RoleFallbackCase(EstimatorCase):
         estimates = heavy.estimates_for(rows, now=NOW)
         self.assertEqual(estimates["a-project|bbb|takeoff"].memory_mb, 900)
 
+    def test_fallback_window_reads_the_most_recent_rows_across_roles(self):
+        rows = [
+            _row(
+                role="takeoff",
+                peak_mb=float((22 - i) * 100),
+                days_ago=float(i),
+                exit=0 if i >= 10 else 1,
+            )
+            for i in range(21, 0, -1)
+        ]
+        rows += [
+            _row(role="hand", peak_mb=99999.0, days_ago=20.5, exit=0),
+            _row(role="hand", peak_mb=2200.0, days_ago=0.0, exit=0),
+        ]
+        estimates = heavy.estimates_for(rows, now=NOW)
+        hand = estimates["a-project|abc123|hand"]
+        self.assertEqual(hand.samples, 20)
+        self.assertEqual(hand.memory_mb, 2000)
+        self.assertFalse(hand.flaky)
+
 
 class FlakyCase(EstimatorCase):
     def test_mixed_exits_read_as_flaky(self):
