@@ -859,5 +859,152 @@ class PassWiringTest(unittest.TestCase):
         self.assertIn("app#7: start", out.getvalue())
 
 
+def linked(*numbers, state="open"):
+    """A pulls_for seam returning the given linked pull numbers."""
+    return lambda repo, number: tuple(LinkedPull(number=n, state=state) for n in numbers)
+
+
+def lows_record():
+    return {"verdict": "approve-with-findings", "findings": [{"severity": "low", "text": "t"}]}
+
+
+def normal_record():
+    return {"verdict": "approve-with-findings", "findings": [{"severity": "normal", "text": "t"}]}
+
+
+class OpenPullGateTest(unittest.TestCase):
+    def test_a_fresh_start_with_an_open_linked_pull_skips(self):
+        gated = gate(entry(), pulls_for=linked(9))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+        self.assertIn("not a fresh start", gated.reason)
+
+    def test_an_unclaimed_fix_with_an_open_linked_pull_skips(self):
+        gated = gate(entry(kind="fix"), pulls_for=linked(9))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("skip", "start", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+
+    def test_an_unclaimed_resume_with_an_open_linked_pull_skips(self):
+        gated = gate(entry(kind="resume"), pulls_for=linked(9))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+
+    def test_a_fix_on_a_claimed_row_proceeds_despite_an_open_pull(self):
+        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x")), pulls_for=linked(9))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+        self.assertNotIn("pull #", gated.reason)
+
+    def test_a_review_proceeds_despite_an_open_pull(self):
+        gated = gate(
+            entry(kind="review"),
+            finished={("app", 7): ("drive-w-1", "worker")},
+            pulls_for=linked(9),
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+
+    def test_a_closed_linked_pull_does_not_block_a_start(self):
+        gated = gate(entry(), pulls_for=linked(9, state="closed"))
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_an_unreadable_pull_lookup_refuses_the_start(self):
+        def broken(repo, number):
+            raise ValueError("tracker down")
+
+        gated = gate(entry(), pulls_for=broken)
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_no_pull_seam_means_no_pull_check(self):
+        gated = gate(entry(), pulls_for=None)
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class ReviewThresholdGateTest(unittest.TestCase):
+    def reviewed(self, role="reviewer"):
+        return {("app", 7): ("drive-r-1", role)}
+
+    def test_a_fix_after_a_lows_only_review_is_merge_ready(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_start_after_a_lows_only_review_is_merge_ready(self):
+        gated = gate(
+            entry(),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_review_after_a_lows_only_review_is_merge_ready(self):
+        gated = gate(
+            entry(kind="review"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_plain_approve_is_merge_ready(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): {"verdict": "approve", "findings": []}},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_normal_finding_still_opens_a_fix_round(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): normal_record()},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+        self.assertIn("fresh start", gated.reason)
+
+    def test_a_block_verdict_still_opens_a_fix_round(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): {"verdict": "block", "findings": []}},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_a_low_threshold_keeps_lows_fixing(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+            fix_threshold="low",
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_new_work_after_a_lows_review_is_not_merge_ready(self):
+        gated = gate(
+            entry(kind="review"),
+            finished={("app", 7): ("drive-w-2", "worker")},
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
+
+    def test_a_fix_on_a_claimed_row_ignores_the_threshold(self):
+        gated = gate(
+            entry(kind="fix", row_=row(agent="drive-host-1-x")),
+            finished={("app", 7): ("drive-r-1", "reviewer")},
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
+
+    def test_no_record_keeps_todays_fix_round(self):
+        gated = gate(entry(kind="fix"), finished=self.reviewed())
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
 if __name__ == "__main__":
     unittest.main()
