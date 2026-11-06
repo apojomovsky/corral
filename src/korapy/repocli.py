@@ -11,8 +11,9 @@ cursors, in a single transaction, with a backup left beside the store.
 Exit codes: 0 migrated (or a plan with changes), 1 nothing to do (an
 unknown old name, the same name twice, a second run, or a plan with no
 changes), 2 a live agent or a live-held claim blocks the move (named),
-4 a bad name, a target that already holds rows, or an unreadable store
-or config.
+or a drive pass holds its lock (named), 3 the live-unit scan cannot
+reach systemd, 4 a bad name, a target that already holds rows, an
+unreadable store or config, or a lock that cannot be set up.
 """
 
 import argparse
@@ -59,6 +60,33 @@ def _backup_target(store_path, now):
     return target
 
 
+def _remove_fresh_backup(path):
+    """Remove the backup this run wrote after a refused move. Best effort.
+
+    Only this run's file is ever removed: `_backup_target` hands out a
+    path that holds no backup, and `backup_into` refuses to clobber one,
+    so the file at `path` is ours. Earlier backups are never touched; a
+    refused run rotates nothing, and a later success prunes by retention.
+    """
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def units_exit(problem) -> int:
+    """The exit code for a units failure during the liveness scan.
+
+    Unreachable (systemd cannot be reached) returns UNREACHABLE; any
+    other units failure keeps its own code.
+    """
+    from korapy import units
+
+    if isinstance(problem, units.Unreachable):
+        return UNREACHABLE
+    return problem.exit_code
+
+
 def rename_root(
     old,
     new,
@@ -74,6 +102,8 @@ def rename_root(
     out,
     err,
     plan=False,
+    lock=None,
+    lock_path=None,
 ) -> int:
     """Migrate one tracker repo's store keys, or plan the move. All seams injected.
 
@@ -82,8 +112,75 @@ def rename_root(
     live unit, and ``mapping`` resolves short entry names to tracker
     repos. ``project_shorts`` is ``{project: [shorts]}`` for the owners
     fallback; ``owners`` names the projects owning the renamed repo
-    outright. Exit codes follow the module docstring.
+    outright. ``lock`` is the drive-lock seam (``drive.drive_lock``,
+    taking ``lock_path`` from the one resolver ``drive.lock_path``):
+    the move holds it for the whole liveness scan, backup and key
+    migration, so a concurrent drive pass cannot claim between the scan
+    and the move; a held lock refuses with exit 2 naming the holder. A
+    plan holds no lock and writes nothing, like ``drive --plan``. None
+    skips mutual exclusion (tests); production passes the real lock.
+    Exit codes follow the module docstring.
     """
+    if lock is not None and not plan:
+        from korapy import drive
+
+        try:
+            with lock(lock_path):
+                return _rename_body(
+                    old,
+                    new,
+                    store=store,
+                    store_path=store_path,
+                    registry_entries=registry_entries,
+                    live_units=live_units,
+                    mapping=mapping,
+                    project_shorts=project_shorts,
+                    owners=owners,
+                    now=now,
+                    out=out,
+                    err=err,
+                    plan=plan,
+                )
+        except drive.LockHeld as held:
+            _err(str(held), err)
+            return RACE
+        except drive.LockError as problem:
+            _err(str(problem), err)
+            return USAGE
+    return _rename_body(
+        old,
+        new,
+        store=store,
+        store_path=store_path,
+        registry_entries=registry_entries,
+        live_units=live_units,
+        mapping=mapping,
+        project_shorts=project_shorts,
+        owners=owners,
+        now=now,
+        out=out,
+        err=err,
+        plan=plan,
+    )
+
+
+def _rename_body(
+    old,
+    new,
+    *,
+    store,
+    store_path,
+    registry_entries,
+    live_units,
+    mapping,
+    project_shorts,
+    owners,
+    now,
+    out,
+    err,
+    plan,
+) -> int:
+    """The parse, scan, backup and move behind `rename_root`: run unlocked."""
     mapping = dict(mapping or {})
     try:
         old, new = reponame.parse_names(old, new)
@@ -139,9 +236,11 @@ def rename_root(
     try:
         counts = store.rename_repo(old, new)
     except board.RenameRefused as problem:
+        _remove_fresh_backup(backup)
         _err(str(problem), err)
         return USAGE
     except board.StoreError as problem:
+        _remove_fresh_backup(backup)
         _err(str(problem), err)
         return USAGE
     reponame.prune_backups(os.path.dirname(store_path))
@@ -191,7 +290,7 @@ def cmd_repo(args: argparse.Namespace) -> int:
         return USAGE
     except units.UnitsError as problem:
         print(f"korapy repo rename: {problem}", file=sys.stderr)
-        return problem.exit_code
+        return units_exit(problem)
     with store:
         return rename_root(
             args.old,
@@ -206,6 +305,8 @@ def cmd_repo(args: argparse.Namespace) -> int:
             out=sys.stdout,
             err=sys.stderr,
             plan=args.plan,
+            lock=drive.drive_lock,
+            lock_path=drive.lock_path(),
         )
 
 

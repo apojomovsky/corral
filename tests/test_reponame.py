@@ -484,6 +484,20 @@ class CanonicalMatchesTest(unittest.TestCase):
         self.assertIsNone(reponame.canonical_matches(None, None))
 
 
+class UnitsExitTest(unittest.TestCase):
+    def test_unreachable_returns_the_constant(self):
+        from korapy import repocli, units
+
+        self.assertEqual(repocli.UNREACHABLE, 3)
+        self.assertEqual(repocli.units_exit(units.Unreachable("cannot reach systemd: boom")), 3)
+
+    def test_other_units_errors_keep_their_code(self):
+        from korapy import repocli, units
+
+        self.assertEqual(repocli.units_exit(units.UnitsError("bad prefix")), 4)
+        self.assertEqual(repocli.units_exit(units.UnitExists("taken")), 2)
+
+
 class LosingStore:
     """A store that loses the rename race: reads delegate, the move refuses.
 
@@ -502,6 +516,58 @@ class LosingStore:
         raise board.RenameRefused(
             f"{new} already holds store rows: refusing a merge of two repositories"
         )
+
+
+class FailingStore(LosingStore):
+    """A store whose move fails late: the backup lands, then the move errors.
+
+    Exercises the refused-after-backup path for a store failure that is
+    not a merge refusal: the fresh backup must go, older ones must stay.
+    """
+
+    def rename_repo(self, old, new):
+        raise board.StoreError(f"cannot move {old} to {new}: disk is full")
+
+
+class HeldLock:
+    """A drive lock another pass holds: acquiring it refuses."""
+
+    def __init__(self, path="/state/drive.lock"):
+        self.path = path
+        self.calls = []
+
+    def __call__(self, path):
+        from korapy import drive
+
+        self.calls.append(path)
+        raise drive.LockHeld(f"another drive pass is already running (lock {path})")
+
+
+class RecordingLock:
+    """A free drive lock recording its span: proves what runs under it."""
+
+    def __init__(self):
+        self.paths = []
+        self.depth = 0
+        self.held = False
+
+    def __call__(self, path):
+        import contextlib
+
+        outer = self
+
+        @contextlib.contextmanager
+        def guard():
+            outer.paths.append(path)
+            outer.depth += 1
+            outer.held = True
+            try:
+                yield guard
+            finally:
+                outer.depth -= 1
+                outer.held = outer.depth > 0
+
+        return guard()
 
 
 class RenameRootCase(TempStoreTest):
@@ -699,6 +765,64 @@ class RenameRootCase(TempStoreTest):
         kept = [name for name in os.listdir(self.tmp.name) if name.startswith("board-backup-")]
         for name in priors:
             self.assertIn(name, kept)
+
+    def test_held_drive_lock_refuses_naming_the_holder(self):
+        self.setUpStore()
+        held = HeldLock()
+        code = self.rename(lock=held, lock_path="/state/drive.lock")
+        self.assertEqual(code, 2)
+        self.assertIn("another drive pass", self.err.getvalue())
+        self.assertIn("/state/drive.lock", self.err.getvalue())
+        self.assertEqual(held.calls, ["/state/drive.lock"])
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.store.rename_counts(NEW)["items"], 0)
+        self.assertEqual(self.backups(), [])
+
+    def test_lock_covers_the_backup_and_the_migration(self):
+        self.setUpStore()
+        rec = RecordingLock()
+        seen = {}
+        real_backup = self.store.backup_into
+        real_rename = self.store.rename_repo
+
+        def backup_into(path):
+            seen["backup"] = rec.held
+            return real_backup(path)
+
+        def rename_repo(old, new):
+            seen["rename"] = rec.held
+            return real_rename(old, new)
+
+        self.store.backup_into = backup_into
+        self.store.rename_repo = rename_repo
+        code = self.rename(lock=rec, lock_path="/state/drive.lock")
+        self.assertEqual(code, 0)
+        self.assertEqual(seen, {"backup": True, "rename": True})
+        self.assertEqual(rec.paths, ["/state/drive.lock"])
+
+    def test_plan_holds_no_lock(self):
+        self.setUpStore()
+        rec = RecordingLock()
+        code = self.rename(plan=True, lock=rec, lock_path="/state/drive.lock")
+        self.assertEqual(code, 0)
+        self.assertEqual(rec.paths, [])
+        self.assertIn(f"{OLD} -> {NEW}", self.out.getvalue())
+
+    def test_refused_after_backup_removes_only_the_fresh_backup(self):
+        self.setUpStore()
+        before = self.fill_retention()
+        code = self.rename(store=LosingStore(self.store))
+        self.assertEqual(code, 4)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), before)
+
+    def test_store_error_after_backup_removes_only_the_fresh_backup(self):
+        self.setUpStore()
+        before = self.fill_retention()
+        code = self.rename(store=FailingStore(self.store))
+        self.assertEqual(code, 4)
+        self.assertIn("disk is full", self.err.getvalue())
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), before)
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
 
 
 class TrackerRowTest(unittest.TestCase):
