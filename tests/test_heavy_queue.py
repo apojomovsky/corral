@@ -251,6 +251,11 @@ class JoinCase(QueueCase):
             with self.subTest(timeout=bad), self.assertRaises(heavy.HeavyError):
                 self._join(timeout_s=bad)
 
+    def test_nonfinite_arrival_is_refused(self):
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(arrived=bad), self.assertRaises(heavy.HeavyError):
+                self._join(arrived=bad)
+
     def test_join_creates_the_lane_dir(self):
         self._join()
         self.assertTrue(os.path.isfile(heavy.lane_path()))
@@ -672,6 +677,26 @@ class RunThroughLaneCase(QueueCase):
                 timeout=1800,
                 waited_s=-1,
             )
+
+    def test_run_heavy_refuses_a_nonfinite_waited_value(self):
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(waited=bad):
+                run = _FakeRunner(code=0)
+                with self.assertRaises(heavy.HeavyError):
+                    heavy.run_heavy(
+                        ["make", "check"],
+                        self.tmp,
+                        {},
+                        role="hand",
+                        repo="myrepo",
+                        weight=WEIGHT,
+                        budget=BUDGET,
+                        run=run,
+                        teardown=mock.Mock(),
+                        scope_cgroup=mock.Mock(return_value=None),
+                        timeout=1800,
+                        waited_s=bad,
+                    )
 
     def test_run_heavy_records_waited_seconds(self):
         run = _FakeRunner(code=0)
