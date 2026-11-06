@@ -3028,37 +3028,66 @@ def production_agent_roles(*, now):
     }
 
 
-def production_stuck_project(registered, repo):
+def production_stuck_project(registered, repo, *, mapping=None, git=None):
     """The registered project name owning tracker repo `repo`, or None.
 
-    The first project whose ops root maps the repo wins; entries that
-    do not map it are skipped. Pure settings reads, no subprocess when
-    the entry names its tracker repo explicitly.
+    The spelling resolves once through `reviewrecord.local_repo` over
+    the pass map (the same map the stuck, orphan and finished builders
+    join against), so the stop path and the joins never disagree; the
+    owner is then the first project whose root feeds that spelling.
+    The pass map cannot name the owning root, so the stop path keeps
+    its own per-root owner lookup: only an exact tracker-repo feed
+    names a project, and a short or otherwise unmapped spelling names
+    none, instead of stopping a stranger's units under a guessed
+    spelling. A key the map cannot translate falls back to the
+    per-root scan, so a tracker repo shadowed out of the pass map by
+    an earlier project sharing its short name still stops under its
+    unambiguous owner. `mapping` is the pass's one short-to-tracker
+    map; with none, the builder resolves its own. `git` names the
+    origin-lookup seam for entries without an explicit tracker repo;
+    None is the real runner. Pure settings reads, no subprocess when
+    every entry names its tracker repo explicitly.
     """
+    runner = syncli._git if git is None else git
+    mapping = _resolved_map(registered, mapping, runner)
+    try:
+        short = reviewrecord.local_repo(repo, mapping)
+    except ValueError:
+        for project in registered:
+            try:
+                _local_repo(project.root, repo, git=runner)
+            except launch.LaunchError:
+                continue
+            return project.name
+        return None
     for project in registered:
         try:
-            _local_repo(project.root, repo)
-        except launch.LaunchError:
+            root_map = syncli.root_short_map(project.root, runner)
+        except settings.SettingsError:
             continue
-        return project.name
+        if root_map.get(short) == repo:
+            return project.name
     return None
 
 
-def production_stopper(registered):
+def production_stopper(registered, *, mapping=None, git=None):
     """The stuck step's stop seam over `launch.stop` with production I/O.
 
-    Resolves the owning project per ticket, then stops the ticket's
-    logged live units. Every argument the stop path needs is fixed here;
-    tests inject a fake instead.
+    Resolves the owning project per ticket over the pass map, then
+    stops the ticket's logged live units. Every argument the stop path
+    needs is fixed here; tests inject a fake instead. `mapping` is the
+    pass's one short-to-tracker map; with none, each stop resolves its
+    own. `git` names the origin-lookup seam; None is the real runner.
     """
+    runner = syncli._git if git is None else git
     listings = lambda prefix: units.list_units(prefix, run=units.default_run)
 
     def stop_unit(repo, number):
-        name = production_stuck_project(registered, repo)
+        name = production_stuck_project(registered, repo, mapping=mapping, git=runner)
         if name is None:
             raise units.UnitsError(f"no registered project feeds tracker repo {repo!r}")
         entry = next(item for item in registered if item.name == name)
-        local = _local_repo(entry.root, repo)
+        local = _local_repo(entry.root, repo, git=runner)
         tgt = launch.target(entry.root, local)
         return launch.stop(tgt, number, list_fn=listings, stop_fn=units.systemctl_stop)
 
@@ -3932,7 +3961,7 @@ def _claim_and_launch(
     return rows, started, blocked, launched
 
 
-def _local_repo(root, repo):
+def _local_repo(root, repo, *, git=None):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
     The reverse of the one short-to-tracker resolver: the spelling
@@ -3942,10 +3971,12 @@ def _local_repo(root, repo):
     tracker repo names it wins, an entry name that merely equals
     `repo` is not a mapping, and a reported problem is surfaced,
     never masked. Anything else is a `LaunchError` naming the root
-    and the repo.
+    and the repo. `git` names the origin-lookup seam for entries
+    without an explicit tracker repo; None is the real runner.
     """
+    runner = worktrees.git if git is None else git
     try:
-        mapping = syncli.root_short_map(root, worktrees.git)
+        mapping = syncli.root_short_map(root, runner)
     except settings.SettingsError as problem:
         raise launch.LaunchError(str(problem)) from None
     try:

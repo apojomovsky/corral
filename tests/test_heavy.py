@@ -338,6 +338,10 @@ class ScopeArgvCase(HeavyCase):
         with self.assertRaises(heavy.HeavyError):
             heavy.scope_argv("heavy-x", b"make check", "/w", {})
 
+    def test_generator_command_with_a_bad_item_is_refused(self):
+        with self.assertRaises(heavy.HeavyError):
+            heavy.scope_argv("heavy-x", (item for item in ["a", 1]), "/w", {})
+
 
 class RepoKeyCase(HeavyCase):
     def _repo(self, name="myrepo", with_file=True):
@@ -451,7 +455,7 @@ class HostLabelCase(HeavyCase):
 
     def test_hostile_period_is_refused(self):
         label = "9c2e0123456789abcdef0123456789ab"
-        for bad in ("../escape", "2026-11.jsonl", "2026-13", "nov-2026", ""):
+        for bad in ("../escape", "2026-11.jsonl", "2026-13", "nov-2026", "", 202601):
             with self.subTest(period=bad):
                 with self.assertRaises(heavy.HeavyError):
                     heavy.ledger_path(label=label, period=bad)
