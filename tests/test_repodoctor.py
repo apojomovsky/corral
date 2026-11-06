@@ -128,6 +128,43 @@ class RowOrder(unittest.TestCase):
         )
 
 
+class PushRow(unittest.TestCase):
+    SSH_ORIGIN = "git@github.com:acme/demo.git"
+    HTTPS_ORIGIN = "https://example.com/acme/demo.git"
+
+    def push_row(self, **over):
+        params = {"origin": self.SSH_ORIGIN, "branch": "ok", "labels": "ok"}
+        params.update(over)
+        return by_name(rows(site(**params)))["push:demo"]
+
+    def test_no_push_reading_means_no_push_row(self):
+        self.assertNotIn("push:demo", by_name(rows(site(origin=self.SSH_ORIGIN))))
+
+    def test_no_origin_means_no_push_row(self):
+        self.assertNotIn("push:demo", by_name(rows(site())))
+
+    def test_ssh_push_is_ok(self):
+        row = self.push_row(push="ssh")
+        self.assertEqual(row.status, "ok")
+        self.assertIn("SSH", row.detail)
+        self.assertEqual(row.fix, "")
+
+    def test_https_fallback_is_ok_with_a_note(self):
+        row = self.push_row(push="https")
+        self.assertEqual(row.status, "ok")
+        self.assertIn("HTTPS", row.detail)
+
+    def test_an_unpushable_remote_fails_naming_both_fixes(self):
+        row = self.push_row(push="refuse")
+        self.assertEqual(row.status, "fail")
+        self.assertIn("gh auth login", row.fix)
+        self.assertIn("agent", row.detail + row.fix)
+
+    def test_a_push_failure_fails_the_report(self):
+        checks = rows(site(origin=self.SSH_ORIGIN, push="refuse"))
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+
 class TrackerRenameRow(unittest.TestCase):
     def tracker_rows(self, **over):
         params = {
@@ -193,13 +230,14 @@ class LoadRepoSites(unittest.TestCase):
         self.clone = write_ops(self.root)
         chdir(self, self.root)
 
-    def load(self, git=None, factory=None, settings_error=None):
+    def load(self, git=None, factory=None, settings_error=None, push_probe=None):
         if factory is None:
             factory = {}.__getitem__
         return doctor.load_repo_sites(
             settings_error,
             git=git if git is not None else FakeGit(root=self.clone),
             tracker_factory=factory,
+            push_probe=push_probe,
         )
 
     def test_settings_failure_means_no_sites(self):
@@ -477,6 +515,52 @@ class FreshScaffoldEndToEnd(unittest.TestCase):
         self.assertEqual(found[f"remote:{FIXTURE}"].status, "ok")
         self.assertEqual(found[f"labels:{FIXTURE}"].status, "ok")
         self.assertEqual(doctor.exit_code(checks), 0)
+
+
+class LoadPushProbe(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-repodoctor-push-")
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+        self.clone = write_ops(self.root)
+        chdir(self, self.root)
+
+    def load(self, url, push_probe):
+        fake = FakeTracker(labels=[("acme/demo", NAMES)])
+        return doctor.load_repo_sites(
+            None,
+            git=FakeGit(root=self.clone, origin_url=url),
+            tracker_factory={"acme/demo": fake}.__getitem__,
+            push_probe=push_probe,
+        )
+
+    SSH = "git@github.com:acme/demo.git"
+    HTTPS = "https://github.com/acme/demo.git"
+
+    def test_no_probe_means_no_push_row(self):
+        (site,) = self.load(self.SSH, None)
+        self.assertIsNone(site.push)
+        self.assertNotIn("push:demo", by_name(rows(site)))
+
+    def test_a_healthy_agent_reads_ssh(self):
+        (site,) = self.load(self.SSH, (True, False))
+        self.assertEqual(site.push, "ssh")
+
+    def test_a_dead_agent_with_gh_reads_https(self):
+        (site,) = self.load(self.SSH, (False, True))
+        self.assertEqual(site.push, "https")
+        self.assertIn("HTTPS", by_name(rows(site))["push:demo"].detail)
+
+    def test_neither_path_reads_refuse_and_fails_the_report(self):
+        (site,) = self.load(self.SSH, (False, False))
+        self.assertEqual(site.push, "refuse")
+        checks = rows(site)
+        self.assertEqual(by_name(checks)["push:demo"].status, "fail")
+        self.assertEqual(doctor.exit_code(checks), 1)
+
+    def test_a_https_origin_reads_ssh_without_probing(self):
+        (site,) = self.load(self.HTTPS, (False, False))
+        self.assertEqual(site.push, "ssh")
 
 
 if __name__ == "__main__":
