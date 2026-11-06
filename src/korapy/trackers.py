@@ -393,18 +393,25 @@ def production_board_provisioner(*, run=None, pacer=None) -> GithubBoardProvisio
     return GithubBoardProvisioner(gh.run if run is None else run, pacer=pacer)
 
 
-def production_trackers(root, names, *, git) -> tuple[dict[str, RepoTracker], str | None]:
+def production_trackers(
+    root, names, *, git, entries=None
+) -> tuple[dict[str, RepoTracker], str | None]:
     """``({entry name: RepoTracker}, None)`` for one ops root, or ``({}, problem)``.
 
     Resolves each entry once through the shared ``repo_operators`` and
     the settings resolver, then builds each tracker through the one
     factory. ``names`` are entry names, already defaulted by the caller.
+    ``entries`` is the root's already-resolved ``{name: (tracker repo,
+    operators)}`` entries: with it the pass shares its one resolution
+    instead of resolving again; with none, the builder resolves its
+    own.
     """
     from korapy import settings, syncli
 
-    entries, problem = syncli.repo_operators(root, list(names), git)
-    if problem is not None:
-        return {}, problem
+    if entries is None:
+        entries, problem = syncli.repo_operators(root, list(names), git)
+        if problem is not None:
+            return {}, problem
     mapping: dict[str, RepoTracker] = {}
     for name in names:
         if name not in entries:
