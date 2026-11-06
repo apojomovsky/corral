@@ -1052,6 +1052,85 @@ class MissingReviewRecordGateTest(unittest.TestCase):
         )
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
+    def test_a_kept_claim_never_skips_as_review_missing(self):
+        for kind in ("start", "review", "fix", "resume"):
+            with self.subTest(kind=kind):
+                gated = gate(
+                    entry(kind=kind, row_=row(agent="drive-r-1")),
+                    finished=self.reviewed_ok(),
+                    reviews={},
+                )
+                self.assertNotEqual(gated.code, "review-missing")
+
+    def test_a_short_finished_entry_reads_as_unreviewed(self):
+        gated = gate(entry(), finished={("app", 7): ("drive-r-1",)}, reviews={})
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class MissingReviewRecordsTest(unittest.TestCase):
+    def finished_ok(self):
+        return {("app", 7): ("drive-r-1", "reviewer", "ok")}
+
+    def test_an_unheld_open_row_lists_the_finished_reviewer(self):
+        found = drive.missing_review_records(self.finished_ok(), {}, {("app", 7): row()})
+        self.assertEqual(found, [("app", 7, "drive-r-1")])
+
+    def test_a_kept_claim_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {}, {("app", 7): row(agent="drive-r-1")}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_closed_row_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {}, {("app", 7): row(state="closed")}
+        )
+        self.assertEqual(found, [])
+
+    def test_an_external_row_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {}, {("app", 7): row(external=True)}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_ticket_without_a_row_lists_nothing(self):
+        self.assertEqual(drive.missing_review_records(self.finished_ok(), {}, {}), [])
+
+    def test_a_recorded_review_lists_nothing(self):
+        found = drive.missing_review_records(
+            self.finished_ok(), {("app", 7): lows_record()}, {("app", 7): row()}
+        )
+        self.assertEqual(found, [])
+
+    def test_a_failed_reviewer_lists_nothing(self):
+        finished = {("app", 7): ("drive-r-1", "reviewer", "failed")}
+        found = drive.missing_review_records(finished, {}, {("app", 7): row()})
+        self.assertEqual(found, [])
+
+    def test_no_review_map_lists_nothing(self):
+        found = drive.missing_review_records(self.finished_ok(), None, {("app", 7): row()})
+        self.assertEqual(found, [])
+
+    def test_no_finished_map_lists_nothing(self):
+        found = drive.missing_review_records(None, {}, {("app", 7): row()})
+        self.assertEqual(found, [])
+
+    def test_only_unheld_open_rows_list_in_ticket_order(self):
+        finished = {
+            ("app", 9): ("drive-r-9", "reviewer", "ok"),
+            ("app", 7): ("drive-r-1", "reviewer", "ok"),
+            ("app", 8): ("drive-r-8", "reviewer", "ok"),
+        }
+        rows = {
+            ("app", 9): row(number=9),
+            ("app", 7): row(agent="drive-r-1"),
+            ("app", 8): row(number=8),
+        }
+        self.assertEqual(
+            drive.missing_review_records(finished, {}, rows),
+            [("app", 8, "drive-r-8"), ("app", 9, "drive-r-9")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
