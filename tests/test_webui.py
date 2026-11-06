@@ -392,14 +392,15 @@ class SourceDiscipline(unittest.TestCase):
         self.assertIn("lastFingerprint = null", block)
         self.assertIn("lastDoc = null", block)
 
-    def test_usage_triple_tolerates_a_null_share(self):
+    def test_project_share_tolerates_a_null_share(self):
         # A null by_project share on a new server shape must read as
         # unknown, not throw inside the poll loop.
         text = web_bytes("views.js").decode("utf-8")
-        start = text.find("function usageTriple(")
+        start = text.find("function projectShareLine(")
         self.assertGreater(start, -1)
         body = text[start : text.find("\n}\n", start)]
-        self.assertIn("typeof triple", body)
+        self.assertIn("typeof share", body)
+        self.assertIn("unknown", body)
 
     def test_pressure_degrades_to_verbatim(self):
         # A non-numeric pressure reading must read as its raw value,
