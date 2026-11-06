@@ -2,10 +2,14 @@
 
 It stays short: no command, settings or exit-code tables (those live in
 `docs/commands.md` and `docs/configuration.md`), no wide tables, no
-em-dashes. Reading the file touches nothing outside the tree.
+em-dashes. The repository's own owner and name appear only in the
+README's CI badge and clone URL: the address tests pin both URL forms
+and scan the rest of the tracked tree for the login. Local git reads
+only (the remote URL, the tracked file list); no network, no state.
 """
 
 import re
+import subprocess
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +18,59 @@ from korapy import drive, eligibility, runtimes
 
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
+
+# The repository's own public path, in one place: the owner this
+# checkout was cloned from, and the repository's current name. The
+# configured remote still carries the pre-rename name, so the name is
+# pinned here while the owner is cross-checked against the remote
+# whenever one is configured. This module holds the tree's only copy
+# outside the README's two allowed URL forms, so the scan below
+# exempts it by path.
+_PINNED_OWNER = "apojomovsky"
+_PINNED_NAME = "korapy"
+
+# Tracked files the login may appear in: the copyright notice, the
+# README's two allowed URL forms, and this module's single copy above.
+_EXEMPT = frozenset({"LICENSE", "README.md", "tests/test_readme.py"})
+
+_REMOTE_OWNER_RE = re.compile(r"github\.com[/:](?P<owner>[^/\s:]+)/")
+
+
+def _remote_owner() -> str | None:
+    """The owner segment of origin's URL, or None when git has no answer."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    match = _REMOTE_OWNER_RE.search(proc.stdout.strip())
+    return match.group("owner") if match else None
+
+
+def _tracked_files() -> list[Path]:
+    """Every tracked file, via the local index, else a tree walk."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        proc = None
+    if proc is not None and proc.returncode == 0:
+        return [ROOT / entry for entry in proc.stdout.split("\0") if entry]
+    return sorted(
+        path
+        for path in ROOT.rglob("*")
+        if path.is_file() and ".git" not in path.relative_to(ROOT).parts
+    )
 
 
 def readme_text():
@@ -98,16 +155,8 @@ class FrontDoor(unittest.TestCase):
             with self.subTest(badge=badge):
                 self.assertIn(badge, head)
 
-    def test_the_badges_need_no_owner_path(self):
-        head = self.text.split("## ", 1)[0]
-        self.assertNotIn("actions/workflow/status", head)
-        self.assertNotIn("github.com/", head)
-        self.assertIn("CI badge goes here", head)
-
-    def test_the_readme_names_no_owner_or_old_name(self):
-        lowered = self.text.lower()
-        self.assertNotIn("github.com/", self.text)
-        self.assertNotIn("corral", lowered)
+    def test_the_old_name_stays_out_of_the_readme(self):
+        self.assertNotIn("corral", self.text.lower())
 
     def test_the_opinions_link_to_the_design(self):
         opinions = self.text.split("## Opinions", 1)[1].split("## ", 1)[0]
@@ -116,6 +165,49 @@ class FrontDoor(unittest.TestCase):
         self.assertLessEqual(len(bullets), 5, f"Opinions has {len(bullets)} bullets")
         for bullet in bullets:
             self.assertLessEqual(len(bullet.splitlines()), 1)
+
+
+class RepositoryAddress(unittest.TestCase):
+    """The one approved exception: the README names the repo's own path."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.text = readme_text()
+        cls.badge_image = (
+            f"https://github.com/{_PINNED_OWNER}/{_PINNED_NAME}/actions/workflows/ci.yml/badge.svg"
+        )
+        cls.badge_link = f"https://github.com/{_PINNED_OWNER}/{_PINNED_NAME}/actions/workflows/ci"
+        cls.clone_line = f"git clone https://github.com/{_PINNED_OWNER}/{_PINNED_NAME}"
+
+    def test_the_pinned_owner_matches_the_remote(self):
+        remote = _remote_owner()
+        if remote is None:
+            self.skipTest("no git remote configured")
+        self.assertEqual(remote, _PINNED_OWNER)
+
+    def test_the_ci_badge_points_at_this_repository(self):
+        head = self.text.split("## ", 1)[0]
+        self.assertNotIn("CI badge goes here", head)
+        self.assertIn(f"[![CI]({self.badge_image})]({self.badge_link})", head)
+
+    def test_the_install_section_names_the_clone_url(self):
+        install = self.text.split("## Requirements and install", 1)[1].split("## ", 1)[0]
+        self.assertIn(self.clone_line, install)
+
+    def test_the_owner_path_appears_only_in_the_allowed_forms(self):
+        rest = self.text
+        for allowed in (self.badge_image, self.badge_link, self.clone_line):
+            rest = rest.replace(allowed, "")
+        self.assertNotIn("github.com/", rest)
+
+    def test_the_owner_login_stays_out_of_the_rest_of_the_tree(self):
+        marker = _PINNED_OWNER.encode("ascii")
+        offenders = [
+            str(path.relative_to(ROOT))
+            for path in _tracked_files()
+            if str(path.relative_to(ROOT)) not in _EXEMPT and marker in path.read_bytes()
+        ]
+        self.assertEqual(offenders, [])
 
 
 class QuickstartOutputs(unittest.TestCase):
