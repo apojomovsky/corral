@@ -346,6 +346,25 @@ class StuckCase(unittest.TestCase):
         lane = _lane(holders=[self._holder()])
         self.assertEqual(heavy.stuck_holders(lane, {}, ARRIVED + 100000.0, 3.0), [])
 
+    def test_holder_ignores_malformed_estimate_keys(self):
+        lane = _lane(holders=[self._holder()])
+        estimates = {
+            "h1": _estimate(p90=1.0),
+            "a-project|h1": _estimate(p90=1.0),
+            "a-project|h1|takeoff|extra": _estimate(p90=1.0),
+        }
+        self.assertEqual(heavy.stuck_holders(lane, estimates, ARRIVED + 100000.0, 3.0), [])
+
+    def test_holder_matches_every_repo_at_the_largest_p90(self):
+        lane = _lane(holders=[self._holder()])
+        estimates = {
+            "a-project|h1|takeoff": _estimate(p90=100.0),
+            "b-project|h1|takeoff": _estimate(p90=500.0),
+        }
+        self.assertEqual(heavy.stuck_holders(lane, estimates, ARRIVED + 400.0, 3.0), [])
+        stuck = heavy.stuck_holders(lane, estimates, ARRIVED + 1600.0, 3.0)
+        self.assertEqual([(h["id"], p90) for h, _e, p90 in stuck], [(HOLDER_ID, 500.0)])
+
     def test_bypassed_rows_count(self):
         recent = [
             {"outcome": "bypassed", "reason": "release fix"},
@@ -496,6 +515,203 @@ class DoctorHeavyCase(unittest.TestCase):
         }
         self.assertEqual(rows["heavy-stuck"].status, "warn")
         self.assertIn(HOLDER_ID[:8], rows["heavy-stuck"].detail)
+
+    def test_stuck_holder_detail_names_the_wait_factor(self):
+        from korapy import resourcedoctor
+
+        lane = _lane(
+            holders=[
+                {
+                    "id": HOLDER_ID,
+                    "command": ["make", "check"],
+                    "argv_hash": "h1",
+                    "weight": {"cpu_m": 1000, "memory_mb": 1024},
+                    "since": ARRIVED_ISO,
+                }
+            ]
+        )
+        rows = {
+            row.name: row
+            for row in resourcedoctor.check(
+                self._readings(
+                    heavy_lane=lane,
+                    heavy_now=ARRIVED + 400.0,
+                    heavy_estimates={"a-project|h1|takeoff": _estimate(p90=100.0)},
+                )
+            )
+        }
+        self.assertEqual(rows["heavy-stuck"].status, "warn")
+        self.assertIn("running 400s past 3.0x100s typical", rows["heavy-stuck"].detail)
+
+    def test_stuck_holder_detail_names_a_configured_wait_factor(self):
+        from korapy import resourcedoctor
+
+        lane = _lane(
+            holders=[
+                {
+                    "id": HOLDER_ID,
+                    "command": ["make", "check"],
+                    "argv_hash": "h1",
+                    "weight": {"cpu_m": 1000, "memory_mb": 1024},
+                    "since": ARRIVED_ISO,
+                }
+            ]
+        )
+        rows = {
+            row.name: row
+            for row in resourcedoctor.check(
+                self._readings(
+                    heavy_lane=lane,
+                    heavy_now=ARRIVED + 250.0,
+                    heavy_estimates={"a-project|h1|takeoff": _estimate(p90=100.0)},
+                    heavy_wait_factor=2.0,
+                )
+            )
+        }
+        self.assertEqual(rows["heavy-stuck"].status, "warn")
+        self.assertIn("running 250s past 2.0x100s typical", rows["heavy-stuck"].detail)
+
+
+class HeavyLoaderCase(unittest.TestCase):
+    """The doctor heavy loaders over a temp state dir, fakes at the seams.
+
+    A corrupt `lane.json` on disk loads as an error and fails with the
+    documented move-aside repair; a busy lock loads as no lane; an
+    unreadable stat still loads the lane; the configured wait factor
+    loads, defaulting when unset. No test touches real state dirs.
+    """
+
+    tmp: str
+
+    def setUp(self):
+        _sandbox(self)
+
+    def _readings(self, **overrides):
+        from korapy import resourcedoctor
+
+        fields: dict[str, Any] = {
+            "host": resources.Usage(cpu_m=8000, memory_mb=16000, pids=4096),
+            "shares": {},
+            "foreign": [],
+            "gone_s": 600.0,
+            "now": ARRIVED,
+            "limits_error": None,
+            "priced_roles": frozenset(),
+            "live_roles": (),
+            "controllers": frozenset({"cpu", "memory", "pids"}),
+            "controllers_error": None,
+            "ledger": {"projects": {}, "foreign": []},
+            "ledger_error": None,
+            "ledger_path": "/state/host-resources.json",
+            "marker": "/state",
+            "marker_error": None,
+            "state_dir": "/state",
+            "marker_path": "/state/marker",
+            "sensor_errors": (),
+            "slices": {},
+            "config_path": "/config/config.toml",
+        }
+        fields.update(overrides)
+        return resourcedoctor.ResourceReadings(**fields)
+
+    def _write_lane(self, text):
+        path = heavy.lane_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_corrupt_lane_file_fails_with_the_repair(self):
+        from korapy import doctor, resourcedoctor
+
+        path = self._write_lane("not json")
+        lane, error, got_path, size, mtime = doctor._load_heavy_lane()
+        self.assertIsNone(lane)
+        self.assertIn("unparsable", error or "")
+        self.assertEqual(got_path, path)
+        rows = {
+            row.name: row
+            for row in resourcedoctor.check(
+                self._readings(
+                    heavy_lane=lane,
+                    heavy_error=error,
+                    heavy_path=got_path,
+                    heavy_bytes=size,
+                    heavy_mtime=mtime,
+                    heavy_now=ARRIVED,
+                )
+            )
+        }
+        self.assertEqual(rows["heavy"].status, "fail")
+        self.assertIn("lane.json unparsable", rows["heavy"].detail)
+        self.assertIn("moving it aside", rows["heavy"].detail)
+        self.assertIn("corrupt-", rows["heavy"].fix)
+        self.assertNotIn("heavy-stuck", rows)
+
+    def test_locked_lane_loads_as_no_lane(self):
+        import json as _json
+
+        from korapy import doctor, resourcedoctor
+
+        path = self._write_lane(_json.dumps(_lane()))
+        with mock.patch.object(
+            doctor.heavy,
+            "read_lane",
+            side_effect=heavy.LaneLocked("lane is locked by another process"),
+        ):
+            lane, error, got_path, size, mtime = doctor._load_heavy_lane()
+        self.assertIsNone(lane)
+        self.assertIsNone(error)
+        self.assertEqual(got_path, path)
+        self.assertIsNotNone(size)
+        rows = {
+            row.name: row
+            for row in resourcedoctor.check(
+                self._readings(
+                    heavy_lane=lane,
+                    heavy_error=error,
+                    heavy_path=got_path,
+                    heavy_now=ARRIVED,
+                )
+            )
+        }
+        self.assertEqual(rows["heavy"].status, "ok")
+        self.assertIn("0 holder(s), 0 waiter(s)", rows["heavy"].detail)
+
+    def test_unreadable_stat_still_loads_the_lane(self):
+        import json as _json
+
+        from korapy import doctor
+
+        path = self._write_lane(_json.dumps(_lane()))
+        real_stat = os.stat
+
+        def _no_stat(probe, *args, **kwargs):
+            if probe == path:
+                raise OSError("cannot stat")
+            return real_stat(probe, *args, **kwargs)
+
+        with mock.patch.object(doctor.os, "stat", side_effect=_no_stat):
+            lane, error, got_path, size, mtime = doctor._load_heavy_lane()
+        self.assertIsNone(error)
+        self.assertIsNone(size)
+        self.assertIsNone(mtime)
+        self.assertEqual(got_path, path)
+        self.assertEqual(lane["holders"], [])
+        self.assertEqual(lane["waiters"], [])
+
+    def test_configured_wait_factor_loads(self):
+        from korapy import doctor
+
+        resolved = settings.resolve(project={"heavy": {"wait_factor": 2.5}}, env={})
+        self.assertEqual(doctor._load_heavy_wait_factor(resolved), 2.5)
+
+    def test_missing_wait_factor_defaults(self):
+        from korapy import doctor
+
+        self.assertEqual(doctor._load_heavy_wait_factor(None), heavy.DEFAULT_WAIT_FACTOR)
+        resolved = settings.resolve(project={}, env={})
+        self.assertEqual(doctor._load_heavy_wait_factor(resolved), heavy.DEFAULT_WAIT_FACTOR)
 
 
 if __name__ == "__main__":
