@@ -13,6 +13,7 @@ injected plain data. No `gh`, no systemd, no network, no real state
 dir.
 """
 
+import inspect
 import io
 import os
 import tempfile
@@ -328,6 +329,173 @@ class ResolverTest(OwnReposCase):
         (project,) = [item for item in self.projects() if item.name == "blue"]
         with self.assertRaises(settings.SettingsError):
             drive.driven_repos(project, resolved={})
+
+
+class FailClosedTest(OwnReposCase):
+    """A pass told nothing drives nothing: omission fails closed."""
+
+    def test_every_pass_entry_point_requires_driven(self):
+        targets = (
+            drive._gate_all,
+            drive._pass,
+            drive.handle_stuck,
+            drive._claim_and_launch,
+            drive._launching_pass,
+            drive.run_pass,
+        )
+        for target in targets:
+            with self.subTest(pass_fn=target.__name__):
+                parameter = inspect.signature(target).parameters["driven"]
+                self.assertIs(parameter.default, inspect.Parameter.empty)
+
+    def test_run_pass_without_driven_raises(self):
+        store = stored(self.db, [(APP, 7, "open")])
+        self.addCleanup(store.close)
+        out, err = io.StringIO(), io.StringIO()
+        with self.assertRaises(TypeError):
+            drive.run_pass(  # ty: ignore[missing-argument]
+                plan=True,
+                store=store,
+                lock_path=self.lock,
+                out=out,
+                err=err,
+                now=NOW,
+                projects_fn=lambda: self.projects(),
+                live=frozenset(),
+                limits=admission.Limits(total=4),
+                quotas={},
+                ledger={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                present_agents=frozenset(),
+                live_units=frozenset(),
+                gone_s=3600.0,
+            )
+
+    def test_none_driven_names_everything_foreign_and_starts_nothing(self):
+        store = stored(self.db, [(APP, 7, "open"), (WEB, 9, "open")])
+        self.addCleanup(store.close)
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(store, out, err, plan=True, projects=self.projects(), driven=None)
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        self.assertIn("project blue: ignored 2 foreign rows", text)
+        self.assertIn("project green: ignored 2 foreign rows", text)
+        self.assertIn("0 candidate(s)", text)
+
+    def test_none_driven_claims_and_starts_nothing(self):
+        store = stored(self.db, [(APP, 7, "open"), (WEB, 9, "open")])
+        self.addCleanup(store.close)
+        launcher = FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(
+            store,
+            out,
+            err,
+            plan=False,
+            projects=self.projects(),
+            driven=None,
+            launcher=launcher,
+            host=HOST,
+            stale_after=3600.0,
+            tracker_factory=None,
+        )
+        self.assertEqual(code, 0, out.getvalue() + err.getvalue())
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of(APP, 7))
+        self.assertIsNone(store.claim_of(WEB, 9))
+
+    def test_claim_path_with_none_driven_refuses(self):
+        store = stored(self.db, [(APP, 7, "open")])
+        self.addCleanup(store.close)
+        gated = drive.Gated(
+            project="blue",
+            repo=APP,
+            number=7,
+            kind="start",
+            verdict="start",
+            reason=f"{APP}#7: unclaimed, start slot",
+            code="",
+        )
+        with self.assertRaises(drive.ForeignRepoError):
+            drive._claim_and_launch(
+                store,
+                [gated],
+                tracker_factory=None,
+                operators={},
+                launcher=FakeLauncher(),
+                host=HOST,
+                now=NOW,
+                stale_after=3600.0,
+                driven=None,
+            )
+        self.assertIsNone(store.claim_of(APP, 7))
+
+    def test_stuck_sweep_with_none_driven_leaves_a_claim_held(self):
+        store = stored(self.db, [(APP, 7, "open")])
+        self.addCleanup(store.close)
+        store.claim(APP, 7, HOLDER, HOST, now=NOW - 8000.0)
+        stop, launcher = FakeStop(), FakeLauncher()
+        out, err = io.StringIO(), io.StringIO()
+        restarted, capped = drive.handle_stuck(
+            store,
+            agent_states={},
+            stale_s=600.0,
+            gone_s=3600.0,
+            live_units=frozenset(),
+            now=NOW,
+            host=HOST,
+            stuck_project=lambda repo, number: "blue",
+            stop_unit=stop,
+            restarter=launcher,
+            tracker_factory=None,
+            restarts_path=None,
+            out=out,
+            err=err,
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            requested={(APP, 7)},
+            driven=None,
+        )
+        self.assertEqual((restarted, capped), (0, False))
+        self.assertEqual(stop.calls, [])
+        self.assertEqual(launcher.calls, [])
+        found = store.claim_of(APP, 7)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found.agent, HOLDER)
+
+
+class IgnoredCountTest(OwnReposCase):
+    """The ignored-foreign-rows count covers only open store rows."""
+
+    def test_closed_rows_and_phantom_requests_are_not_counted(self):
+        from tests.test_drive import policy_source
+
+        store = stored(self.db, [(APP, 7, "open"), (OTHER, 11, "open"), (OTHER, 12, "closed")])
+        self.addCleanup(store.close)
+        path = os.path.join(self.policy_dir, "blue.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(policy_source([(APP, 7, "start"), (OTHER, 99, "start")]))
+        blue = projects_mod.Project(
+            name="blue",
+            unit_prefix="blue-agent-",
+            root=self.blue_root,
+            eligibility=path + ":eligible",
+        )
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(
+            store,
+            out,
+            err,
+            plan=True,
+            projects=[blue],
+            driven={"blue": frozenset({APP})},
+        )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        self.assertIn("project blue: ignored 1 foreign row", text)
+        self.assertIn(f"blue {APP}#7", text)
 
 
 class StuckScopeTest(OwnReposCase):

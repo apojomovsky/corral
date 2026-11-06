@@ -244,6 +244,7 @@ class OneMapPerPassTest(RepoKeyCase):
                 live_units=frozenset(),
                 gone_s=3600.0,
                 repo_map={SHORT: TRACKER},
+                driven={"blue": frozenset({TRACKER})},
             )
         self.assertEqual(code, 0, err.getvalue())
         self.assertEqual(err.getvalue(), "")
@@ -283,6 +284,7 @@ class OneMapPerPassTest(RepoKeyCase):
                 live_units=None,
                 gone_s=None,
                 repo_map={SHORT: TRACKER},
+                driven={"blue": frozenset({TRACKER})},
             )
         self.assertEqual(code, 0, err.getvalue())
         self.assertEqual(seen.get("mapping"), {SHORT: TRACKER})
@@ -338,6 +340,7 @@ class FinishedKeptTest(RepoKeyCase):
             "read_labels": lambda kind, repo, number: [],
             "hold_label": "hold",
             "requested": {(TRACKER, NUMBER)},
+            "driven": {"blue": frozenset({TRACKER})},
         }
         values.update(over)
         stop, launcher = values["stop_unit"], values["restarter"]
