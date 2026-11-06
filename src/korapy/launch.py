@@ -24,6 +24,7 @@ A live unit the log does not prove ours is left running and named (see
 is live at all.
 """
 
+import json
 import os
 import socket
 import sqlite3
@@ -594,12 +595,16 @@ def select_profile(
 
     The declarations validate (exit 4), the six layers resolve, and the
     `--model`/`--runtime` refinements apply to the winner for this run
-    only, noted in the provenance source. With no `[profiles.*]` table
-    declared and no flag, the layers fall through to the built-in default
-    without touching the board store. The resolver runs before the caller
-    makes anything, so a bad profile fails before any worktree or unit
-    exists. `store` is the board store (or a fake with `.item`); `tracker`
-    re-reads stale rows live, and None trusts the cached row.
+    only, noted in the provenance source. A `--runtime` refinement
+    re-validates the profile's options against the effective adapter's
+    schema: keys from one runtime never land in another's config, and
+    unknown keys fail exit 4 naming the key and the runtime. With no
+    `[profiles.*]` table declared and no flag, the layers fall through
+    to the built-in default without touching the board store. The
+    resolver runs before the caller makes anything, so a bad profile
+    fails before any worktree or unit exists. `store` is the board store
+    (or a fake with `.item`); `tracker` re-reads stale rows live, and
+    None trusts the cached row.
     """
     pool = accounts.providers() if pool is None else pool
     parsed = profiles.validate(tgt.resolved.profiles, pool)
@@ -633,6 +638,13 @@ def select_profile(
     )
     refined = runtime if runtime is not None else profile.runtime
     _adapter(refined)
+    if runtime is not None:
+        # The options validated against the declared runtime; the refined
+        # run validates them again against the effective adapter, so a
+        # `--runtime` switch never writes one runtime's keys verbatim into
+        # another's config. Unknown keys fail exit 4 naming the key and
+        # the runtime.
+        profiles.validate_options(profile.name, refined, profile.options)
     bits = []
     if runtime is not None:
         bits.append(f"--runtime {runtime}")
@@ -1006,6 +1018,51 @@ def _recorded_role(session):
     return role
 
 
+#: The session file holding the launch's raw `--runtime-config`, so a
+#: resume with `--profile` or `--runtime` can re-apply the operator's
+#: overrides under the chains. One fact, one place: this module is the
+#: only writer and reader of the file.
+RUNTIME_CONFIG_FILE = "runtime_config.json"
+
+
+def _record_runtime_config(session, runtime_config):
+    """Record the launch's raw `--runtime-config` in the session dir.
+
+    A launch without overrides removes any record, so a rebuilt config
+    never inherits another run's overrides. Records the raw dict, not
+    the merged config, so the resume can lay it over the new profile's
+    options through `_session_config` again.
+    """
+    target = os.path.join(session, RUNTIME_CONFIG_FILE)
+    if runtime_config:
+        paths.atomic_write_text(target, json.dumps(runtime_config, indent=1, sort_keys=True) + "\n")
+    else:
+        try:
+            os.remove(target)
+        except FileNotFoundError:
+            pass
+
+
+def _recorded_runtime_config(session):
+    """The launch's raw `--runtime-config`, or None when it had none.
+
+    A missing file reads as no overrides. A corrupt one fails closed
+    (exit 4): silently dropping overrides would run the agent on the
+    wrong setup.
+    """
+    target = os.path.join(session, RUNTIME_CONFIG_FILE)
+    try:
+        with open(target, encoding="utf-8") as handle:
+            raw = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as err:
+        raise LaunchError(f"cannot read the agent's runtime config record: {err}") from None
+    if not isinstance(raw, dict):
+        raise LaunchError(f"the runtime config record {target} must hold a JSON object")
+    return raw
+
+
 def _session_config(adapter, options, runtime_config, chains):
     """The per-launch config: profile options under `--runtime-config`, chains on top.
 
@@ -1029,10 +1086,11 @@ def _write_session(
     Writes into a fresh role generation dir, so no record is ever
     inherited from another role's session. The per-launch config lays
     the profile's `options` under `--runtime-config` (see
-    `_session_config`). Returns the fresh muse session id for a muse
-    launch, else None. The id is generated here, recorded here and
-    passed to `argv` by the caller, so the recorded id and the run's
-    id cannot differ.
+    `_session_config`), and the raw `--runtime-config` is recorded
+    beside it for a later flagged resume. Returns the fresh muse
+    session id for a muse launch, else None. The id is generated here,
+    recorded here and passed to `argv` by the caller, so the recorded
+    id and the run's id cannot differ.
     """
     try:
         os.makedirs(session, exist_ok=True)
@@ -1042,6 +1100,7 @@ def _write_session(
             paths.atomic_write_text(os.path.join(session, ROLE_FILE), role + "\n")
         config = _session_config(adapter, options, runtime_config, chains)
         adapter.write_config(session, config)
+        _record_runtime_config(session, runtime_config)
         if adapter.name == muse.NAME:
             session_id = muse.new_session_id()
             muse.record_session_id(session, session_id)
@@ -1093,8 +1152,11 @@ def resume(
     for the resumed run instead, the same way it does at launch, and the
     new profile is recorded over the old one. A resume with `--profile`
     or `--runtime` also rebuilds the session config from the new
-    profile's options and chains through `_session_config`; any other
-    resume keeps the recorded setup. A lone `--runtime` without
+    profile's options, the launch's recorded `--runtime-config` (still
+    winning over the new options) and chains through `_session_config`;
+    any other resume keeps the recorded setup. The new adapter's resume
+    handle is checked before anything is rewritten, so a refused flagged
+    resume leaves the session untouched. A lone `--runtime` without
     any declared profile still switches the run to that runtime.
     The reviewer mode is the one the launch ran with: a resumed reviewer
     stays read-only.
@@ -1196,11 +1258,21 @@ def resume(
             raise _no_session(tgt, number, role, "session to resume")
         if selection is not None:
             adapter = _adapter(selection.runtime)
+            # The new adapter's handle decides before anything is
+            # rewritten: a refused flagged resume leaves the config and
+            # the profile record byte-identical, so a later flagless
+            # resume still runs the recorded setup.
+            handle = adapter.resume_handle(session)
+            if handle is None:
+                raise LaunchError(
+                    f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
+                )
             if profile is not None or runtime is not None:
                 try:
+                    kept = _recorded_runtime_config(session)
                     adapter.write_config(
                         session,
-                        _session_config(adapter, selection.profile.options, None, selection.chains),
+                        _session_config(adapter, selection.profile.options, kept, selection.chains),
                     )
                 except (ValueError, TypeError, OSError) as err:
                     raise LaunchError(f"cannot write the agent's session: {err}") from None
@@ -1225,12 +1297,12 @@ def resume(
             else:
                 session_runtime = runtimes.recorded(session)
                 adapter = _adapter(session_runtime)
+            handle = adapter.resume_handle(session)
+            if handle is None:
+                raise LaunchError(
+                    f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
+                )
         recorded = _recorded_role(session)
-        handle = adapter.resume_handle(session)
-        if handle is None:
-            raise LaunchError(
-                f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
-            )
         if adapter.name == muse.NAME:
             try:
                 muse.write_message(session, message)
