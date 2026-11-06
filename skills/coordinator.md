@@ -99,7 +99,8 @@ Retry a refused merge never; retry a held lock after a sleep:
 ```sh
 while true; do
   korapy merge REPO NUMBER --pr N --head SHA --json > merge.json; code=$?
-  if [ $code -eq 0 ] || [ $code -eq 2 ]; then break; fi
+  [ $code -eq 0 ] && break
+  [ $code -eq 2 ] && sleep 30 && continue
   jq -r '.checks[] | "\(.status) \(.name): \(.detail)"' merge.json; exit 1
 done
 ```

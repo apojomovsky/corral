@@ -17,6 +17,9 @@ from korapy import cli
 SKILL = pathlib.Path(__file__).resolve().parents[1] / "skills" / "coordinator.md"
 
 COMMAND_RE = re.compile(r"`(korapy(?=\s)[^`]*)`")
+SHELL_BLOCK_RE = re.compile(r"```sh\n(.*?)```", re.DOTALL)
+SUCCESS_BREAK_RE = re.compile(r"\[\s*\$code\s+-eq\s+0\s*\]\s*&&\s*break")
+HELD_RETRY_RE = re.compile(r"\[\s*\$code\s+-eq\s+2\s*\]\s*&&\s*sleep\s+\S+\s*&&\s*continue")
 
 EXPECTED_VERBS = frozenset(
     {
@@ -138,6 +141,31 @@ class CoordinatorSkillTest(unittest.TestCase):
         for snippet in ("75", "free slot", "reviewer", "author", "session"):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, self.text)
+
+    def test_the_merge_loop_retries_a_held_lock(self):
+        blocks = SHELL_BLOCK_RE.findall(self.text)
+        merge_loops = [block for block in blocks if "korapy merge" in block]
+        self.assertTrue(merge_loops, "the skill names no merge retry loop")
+        for block in merge_loops:
+            with self.subTest(block=block):
+                self.assertRegex(
+                    block,
+                    SUCCESS_BREAK_RE,
+                    "the merge loop breaks only on exit 0",
+                )
+                self.assertRegex(
+                    block,
+                    HELD_RETRY_RE,
+                    "exit 2 sleeps and retries instead of breaking",
+                )
+                for line in block.splitlines():
+                    if "-eq 2" in line:
+                        self.assertNotIn(
+                            "break",
+                            line,
+                            "exit 2 must not terminate the loop as success",
+                        )
+                self.assertIn("exit 1", block, "other exits stop the loop")
 
 
 if __name__ == "__main__":
