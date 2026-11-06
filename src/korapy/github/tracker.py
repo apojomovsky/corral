@@ -192,14 +192,16 @@ class GithubTracker:
             self._forks[key] = True if fork is None else bool(fork)
         return self._forks[key]
 
-    def _parse(self, repo, payload) -> iface.TrackerItem:
+    def _parse(self, repo, payload, *, forks=True) -> iface.TrackerItem:
         """One issues- or pulls-endpoint object as a ``TrackerItem``.
 
         Anything short of the full shape is a ``TrackerError``, never a
         guess; a PR whose fork info cannot be read is ``from_fork``.
         Pulls-endpoint objects carry ``head`` instead of the issues
         endpoint's ``pull_request`` marker, which is how they read as
-        ``kind="pr"``.
+        ``kind="pr"``. With ``forks`` False the fork lookup is skipped
+        (the item reads as not from a fork): the pulls index needs no
+        fork info and must not spend a call per pull request on it.
         """
         if not isinstance(payload, dict):
             raise _fail(f"item is not an object: {payload!r}")
@@ -244,7 +246,9 @@ class GithubTracker:
             assignees=assignees,
             url=url,
             updated_at=updated_at,
-            from_fork=self._from_fork(repo, number) if kind == "pr" else False,
+            from_fork=(self._from_fork(repo, number) if forks else False)
+            if kind == "pr"
+            else False,
             agent=field_value_of(labels, "agent"),
             status=field_value_of(labels, "status"),
             # The REST feed carries no board concepts: an empty reading
@@ -326,28 +330,39 @@ class GithubTracker:
         for entry in self._feed(repo, None):
             yield self._parse(repo, entry)
 
-    def linked_pulls(self, repo: str, number: int) -> list:
-        """Every open pull request linked to ``repo#number``.
+    def pulls_index(self, repo: str, max_calls: int) -> iface.PullsIndex:
+        """The open pull requests on ``repo``, keyed by linked ticket.
 
-        Lists the repo's open pull requests oldest first and keeps the
-        ones whose title or body links the ticket through
+        Lists the repo's open pull requests oldest first, one paged
+        listing shared by every ticket, and files each pull request
+        under the tickets its title or body links through
         ``body_linked_issue_refs`` (close keywords and ``Refs`` lines,
-        outside fenced code). Pages until a short page ends the list,
-        like the feed; a missing or malformed page is a
-        ``TrackerError``, never a partial list.
+        outside fenced code; same-repo links only). Pages until a
+        short page ends the list, like the feed, or ``max_calls``
+        pages run out (then the index is partial and ``complete`` is
+        False). A missing or malformed page is a ``TrackerError``,
+        never a partial list. The parse skips the per-pull fork
+        lookup: the index needs no fork info, and one extra call per
+        pull request is what the per-ticket lookup cost before.
         """
-        peers = []
+        by_issue: dict[int, list] = {}
+        calls = 0
         page = 1
+        budget = max(1, max_calls)
         while True:
             base = f"repos/{repo}/pulls?state=open&sort=updated&direction=asc&per_page={PER_PAGE}"
             entries = self._page(base if page == 1 else f"{base}&page={page}")
+            calls += 1
             for entry in entries:
-                item = self._parse(repo, entry)
+                item = self._parse(repo, entry, forks=False)
                 text = f"{item.title}\n{item.body}"
-                if (repo, int(number)) in body_linked_issue_refs(text, repo):
-                    peers.append(item)
+                for linked_repo, linked_number in body_linked_issue_refs(text, repo):
+                    if linked_repo == repo:
+                        by_issue.setdefault(int(linked_number), []).append(item)
             if len(entries) < PER_PAGE:
-                return peers
+                return iface.PullsIndex(by_issue, calls, True)
+            if calls >= budget:
+                return iface.PullsIndex(by_issue, calls, False)
             page += 1
 
     def _write_error(self, err: Exception) -> iface.TrackerError:
