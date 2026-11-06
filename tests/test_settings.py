@@ -121,6 +121,10 @@ class Errors(unittest.TestCase):
                 handle.write('[[repo]]\nname = "b"\n[[repo]]\nname = "a"\n')
             self.assertEqual(S.repo_names(root), ["b", "a"])
 
+    def test_entry_names_uses_the_single_parse_in_order(self):
+        table = {"repo": [{"name": "b"}, {"name": "a"}]}
+        self.assertEqual(S.entry_names(table, "korapy.toml"), ["b", "a"])
+
     def test_repo_names_is_empty_without_root_or_file(self):
         self.assertEqual(S.repo_names(None), [])
         with tempfile.TemporaryDirectory(prefix="korapy-settings-") as root:
