@@ -163,6 +163,15 @@ class BoardBackedTracker(BoardTracker):
         """Names of the bootstrap labels absent on ``repo``, through the adapter."""
         return self._issues.missing_labels(repo)
 
+    def canonical_repo(self, repo: str) -> str:
+        """The tracker's canonical name, through the REST adapter.
+
+        Labels and names live on the repository whatever the tracker
+        variant, so a board repo answers through the same adapter call
+        as a labels one.
+        """
+        return self._issues.canonical_repo(repo)
+
     def _fetch_single(self, project_id, repo, number):
         """The board item node behind ``repo#number``, else ``TrackerError``."""
         owner, name = _split_repo(repo)

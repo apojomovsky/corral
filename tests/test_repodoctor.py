@@ -197,7 +197,10 @@ class LoadRepoSites(unittest.TestCase):
             git=FakeGit(root=self.clone, origin_url=url),
             factory={"acme/demo": fake}.__getitem__,
         )
-        self.assertEqual(sites, (repodoctor.RepoSite("demo", url, branch="ok", labels="ok"),))
+        self.assertEqual(
+            sites,
+            (repodoctor.RepoSite("demo", url, branch="ok", labels="ok", tracker_repo="acme/demo"),),
+        )
         found = by_name(rows(*sites))
         self.assertEqual(found["labels:demo"].status, "ok")
         self.assertEqual(found["remote:demo"].status, "ok")
@@ -418,7 +421,14 @@ class FreshScaffoldEndToEnd(unittest.TestCase):
             git=FakeGit(root=target, origin_url=url),
             tracker_factory={"acme/demo": fake}.__getitem__,
         )
-        self.assertEqual(sites, (repodoctor.RepoSite(FIXTURE, url, branch="ok", labels="ok"),))
+        self.assertEqual(
+            sites,
+            (
+                repodoctor.RepoSite(
+                    FIXTURE, url, branch="ok", labels="ok", tracker_repo="acme/demo"
+                ),
+            ),
+        )
         checks = doctor.run_checks(env(repo_sites=sites))
         found = by_name(checks)
         self.assertEqual(found[f"remote:{FIXTURE}"].status, "ok")

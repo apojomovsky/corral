@@ -291,8 +291,8 @@ def gate(
     Row state first (missing, non-open, external, withdrawn), then claim
     routing by request kind against the row's holder, then the reviewer
     and fix-round readiness from `finished` ({(repo, number): (agent id,
-    role)} for the newest finished entry per ticket), then the review
-    threshold and the linked-pull check, then the hold and
+    role, outcome)} for the newest finished entry per ticket), then the
+    review threshold and the linked-pull check, then the hold and
     decision labels, then admission, then the quota gate. A review
     proceeds only for PR-ready rows: unclaimed with a finished worker
     behind them, whose id the reviewer passes as its author, or claimed
@@ -302,7 +302,12 @@ def gate(
     unclaimed row whose latest review record (`reviews`, keyed by
     (repo, number)) approves with no finding at or above
     `fix_threshold` is merge-ready too: no fix round opens for lows,
-    and no fresh start launches on approved work. A fresh start on an
+    and no fresh start launches on approved work. A finished reviewer
+    with outcome `ok` and no review record for the ticket is a protocol
+    failure, never a finding: the row skips with code `review-missing`
+    for every kind, so no worker, fix round or re-review starts on it.
+    With no review map (`reviews` None) the check cannot run and the
+    row gates as before. A fresh start on an
     unclaimed row with an open linked pull (`pulls_for`, the injected
     seam reading them through the tracker) is refused: the pull, not a
     new worker, carries the ticket. A fix or
@@ -367,6 +372,22 @@ def gate(
                 kind,
                 "claim",
                 f"{ref}: foreign claim by `{holder}`, never touched",
+            )
+
+    if not holder:
+        newest = (finished or {}).get((row.repo, row.number))
+        if (
+            newest is not None
+            and newest[1] == "reviewer"
+            and _finished_outcome(newest) == "ok"
+            and reviews is not None
+            and (row.repo, row.number) not in reviews
+        ):
+            return _skip(
+                candidate,
+                kind,
+                "review-missing",
+                f"{ref}: reviewer finished without a review record, review missing, skipped",
             )
 
     if not holder and request.kind in ("review", "fix", "resume"):
@@ -1177,6 +1198,48 @@ def production_review_reader(registered, *, git, mapping=None):
     return reviewrecord.store_reader(mapping)
 
 
+def missing_review_records(finished, reviews) -> list:
+    """[(repo, number, agent)] finished reviewers (outcome ok) with no record. Pure.
+
+    `finished` is the newest finished entry per ticket, `reviews` the
+    latest record per ticket. With no review map (`reviews` None) the
+    check cannot run and nothing is missing: the gate reads the same
+    guard, so the log line and the skip verdicts never disagree. A
+    non-`ok` outcome is not a protocol failure and never lists. Sorted
+    for a stable once-per-pass log line.
+    """
+    if finished is None or reviews is None:
+        return []
+    found = []
+    for (repo, number), newest in finished.items():
+        if newest[1] != "reviewer":
+            continue
+        if _finished_outcome(newest) != "ok":
+            continue
+        if (repo, number) in reviews:
+            continue
+        found.append((repo, number, newest[0]))
+    return sorted(found)
+
+
+def log_missing_reviews(out, finished, reviews) -> int:
+    """Print the once-per-pass missing-record lines. Returns the count.
+
+    One line per ticket from `missing_review_records`, naming the
+    ticket and the finished reviewer id. Both passes call this after
+    gating, so the line and the `review-missing` skip verdicts agree.
+    """
+    count = 0
+    for repo, number, agent in missing_review_records(finished, reviews):
+        print(
+            f"{repo}#{number}: reviewer finished without a review record (`{agent}`), "
+            "review missing, skipped",
+            file=out,
+        )
+        count += 1
+    return count
+
+
 def tracker_pulls_for(tracker_factory):
     """A `pulls_for` seam over the pass's per-repo trackers.
 
@@ -1504,9 +1567,12 @@ def _pass(
     short-to-tracker map, threaded to the admission live set.
     `review_reader` feeds the gate's fix-round threshold from the
     session dirs (reads only, like the registry); with none the
-    threshold sees no records, exactly as before. `pulls_for` feeds
-    the gate's open-pull refusal; with none the check is skipped,
-    which is what `--plan` does: it never contacts the tracker.
+    threshold sees no records, exactly as before. Both passes also
+    log each finished reviewer (outcome `ok`) with no record once,
+    naming the ticket and the reviewer, before the table. `pulls_for`
+    feeds the gate's open-pull refusal; with none the check is
+    skipped, which is what `--plan` does: it never contacts the
+    tracker.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1568,6 +1634,7 @@ def _pass(
         reviews=reviews,
         pulls_for=pulls_for,
     )
+    log_missing_reviews(out, finished, reviews)
     table = [
         Candidate(
             project=gated.project,
@@ -2207,9 +2274,11 @@ def reviewed_claims(authors, finished, live_units=None) -> dict:
     `authors` is this pass's {(repo, number): worker id} capture and
     `finished` the newest finished entry per ticket: a ticket whose
     current holder matches a finished reviewer entry is merge-ready, so
-    its row is free for a fix round. A finished worker entry (or an
-    unknown role, which reads as unreviewed work) keeps the claim for
-    the reviewer takeover instead. Tickets in `live_units` are never
+    its row is free for a fix round. Whether the round opens is the
+    gate's call: a finished reviewer with outcome `ok` and no review
+    record skips as `review-missing` instead. A finished worker entry
+    (or an unknown role, which reads as unreviewed work) keeps the
+    claim for the reviewer takeover instead. Tickets in `live_units` are never
     freed: the real pass keeps a live unit's claim whatever the
     registry says, and the plan pass filters the same way so both
     passes gate those rows as still claimed. Missing maps read as
@@ -2312,30 +2381,51 @@ def _capture_finished_holders(store, *, agent_states, agent_tickets=None, err) -
         return {}
 
 
+def _finished_outcome(value) -> str | None:
+    """The outcome of one finished entry value, or None when unrecorded. Pure.
+
+    Production values are (agent id, role, outcome) triples; an older
+    injected (agent id, role) pair reads as no outcome, which never
+    triggers the missing-record check.
+    """
+    if value is None or len(value) < 3:
+        return None
+    return value[2]
+
+
 def resolve_finished(finished_for, released, *, agent_states=None, agent_tickets=None) -> dict:
-    """{(repo, number): (agent id, role)} newest finished entry per ticket. Pure.
+    """{(repo, number): (agent id, role, outcome)} newest finished entry. Pure.
 
     `finished_for` is the cross-pass map from finished registry entries
-    (agent id to role, `None` when the entry records none); `released`
-    is this pass's {(repo, number): worker id} capture. A same-pass
-    capture always wins: it just happened, so it is the newest event.
-    It keeps the cross-pass role only for the same ticket's entry:
-    the cross-pass agent id is a unit name while the capture holds
-    the opaque drive id, so raw ids never compare equal. The capture
-    holder is resolved to its registry entry through the one
-    resolver (`entry_for_claim`, by ticket) and the role carries
-    over only when that entry is the cross-pass one; anything newer
-    reads as unknown (`None`), which the gate reads as unreviewed
-    work. Without a ticket index only raw ids compare, which keeps
-    the same-namespace unit tests exact.
+    ((agent id, role, outcome), `None` when the entry records none of
+    them; an older (agent id, role) pair reads as no outcome);
+    `released` is this pass's {(repo, number): worker id} capture. A
+    same-pass capture always wins: it just happened, so it is the
+    newest event. It keeps the cross-pass role and outcome only for
+    the same ticket's entry: the cross-pass agent id is a unit name
+    while the capture holds the opaque drive id, so raw ids never
+    compare equal. The capture holder is resolved to its registry entry
+    through the one resolver (`entry_for_claim`, by ticket) and the
+    role and outcome carry over only when that entry is the cross-pass
+    one; anything newer reads as unknown (`None`), which the gate
+    reads as unreviewed work. Without a ticket index only raw ids
+    compare, which keeps the same-namespace unit tests exact.
     """
-    resolved = dict(finished_for or {})
+
+    def carried(prior):
+        role = prior[1] if len(prior) > 1 else None
+        return role, _finished_outcome(prior)
+
+    resolved = {}
+    for ticket, prior in (finished_for or {}).items():
+        role, outcome = carried(prior)
+        resolved[ticket] = (prior[0], role, outcome)
     for ticket, agent in (released or {}).items():
-        role = None
+        role, outcome = None, None
         prior = resolved.get(ticket)
         if prior is not None:
             if prior[0] == agent:
-                role = prior[1]
+                role, outcome = prior[1], prior[2]
             else:
                 entry = entry_for_claim(
                     _holder_claim(agent, ticket[0], ticket[1]),
@@ -2343,8 +2433,8 @@ def resolve_finished(finished_for, released, *, agent_states=None, agent_tickets
                     agent_tickets=agent_tickets,
                 )
                 if entry is not None and entry[0] == prior[0]:
-                    role = prior[1]
-        resolved[ticket] = (agent, role)
+                    role, outcome = prior[1], prior[2]
+        resolved[ticket] = (agent, role, outcome)
     return resolved
 
 
@@ -2402,7 +2492,7 @@ def fix_message(repo, number) -> str:
 def production_finished_for(
     registered, *, now, cfg=None, path=None, git=None, mapping=None
 ) -> dict:
-    """{(repo, number): (agent id, role)} for the newest finished entry. Reads only.
+    """{(repo, number): (agent id, role, outcome)} for the newest entry. Reads only.
 
     Built from the host registry: finished entries kept for RETAIN_S,
     newest first by end time, entries without a ticket skipped. Keys
@@ -2414,8 +2504,10 @@ def production_finished_for(
     one short-to-tracker map (`production_repo_map`): every builder in
     one pass gets the same one, so a config edit between them cannot
     make two joins disagree; with none, the builder resolves its own.
-    The role is `""` for entries that record none; the gate treats only
-    a known reviewer role as reviewed.
+    The role is `""` for entries that record none; the gate treats
+    only a known reviewer role as reviewed. The outcome is the `done`
+    outcome (`ok`, `failed` or `stopped`, `None` when the entry never
+    recorded one); the missing-record check fires only on `ok`.
     """
     mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
     found: dict = {}
@@ -2428,10 +2520,10 @@ def production_finished_for(
         key = _tracker_key(ticket, mapping)
         at = entry.get("ended_at") or entry.get("last_seen") or 0
         prior = found.get(key)
-        if prior is not None and prior[2] >= at:
+        if prior is not None and prior[3] >= at:
             continue
-        found[key] = (entry["id"], entry.get("role") or "", at)
-    return {key: (agent, role) for key, (agent, role, _) in found.items()}
+        found[key] = (entry["id"], entry.get("role") or "", entry.get("outcome"), at)
+    return {key: (agent, role, outcome) for key, (agent, role, outcome, _) in found.items()}
 
 
 def cap_label(day_cap) -> str:
@@ -2805,8 +2897,9 @@ def production_repo_map(registered, *, git=None):
     """`{short [[repo]] name: tracker repo}` across registered roots.
 
     The one resolver for the tracker repo behind a registry entry's
-    short ticket repo: each root's entries resolve through the shared
-    `repo_operators`, and the first project naming a short name wins.
+    short ticket repo: each root resolves through the shared
+    `syncli.root_short_map`, and the first project naming a short
+    name wins.
     A configuration problem raises SettingsError, so the pass refuses
     with exit 4 instead of joining against a guess. The CLI builds it
     once per pass and threads it into the admission live set, the
@@ -2820,11 +2913,7 @@ def production_repo_map(registered, *, git=None):
     git = syncli._git if git is None else git
     found = {}
     for project in registered:
-        names = settings.repo_names(project.root)
-        entries, problem = syncli.repo_operators(project.root, names, git)
-        if problem is not None:
-            raise settings.SettingsError(problem)
-        for name, (tracker_repo, _operators) in entries.items():
+        for name, tracker_repo in syncli.root_short_map(project.root, git).items():
             found.setdefault(name, tracker_repo)
     return found
 
@@ -3800,19 +3889,26 @@ def _claim_and_launch(
 def _local_repo(root, repo):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
-    The reverse of the one short-to-tracker resolver, read through the
-    same shared `repo_operators`: only the entry whose resolved tracker
-    repo names it wins, an entry name that merely equals `repo` is not
-    a mapping, and a reported problem is surfaced, never masked.
-    Anything else is a `LaunchError` naming the root and the repo.
+    The reverse of the one short-to-tracker resolver: the spelling
+    itself is decided by `reviewrecord.local_repo` over the root's
+    shared short-to-tracker map, so this never grows a second copy
+    of the tracker-to-short join. Only the entry whose resolved
+    tracker repo names it wins, an entry name that merely equals
+    `repo` is not a mapping, and a reported problem is surfaced,
+    never masked. Anything else is a `LaunchError` naming the root
+    and the repo.
     """
-    entries, problem = syncli.repo_operators(root, settings.repo_names(root), worktrees.git)
-    if problem is not None:
-        raise launch.LaunchError(problem)
-    for name, (tracker_repo, _operators) in entries.items():
-        if tracker_repo == repo:
-            return name
-    raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
+    try:
+        mapping = syncli.root_short_map(root, worktrees.git)
+    except settings.SettingsError as problem:
+        raise launch.LaunchError(str(problem)) from None
+    try:
+        short = reviewrecord.local_repo(repo, mapping)
+    except ValueError as err:
+        raise launch.LaunchError(f"{root}: {err}") from None
+    if mapping.get(short) != repo:
+        raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
+    return short
 
 
 def _overlay_text(root):
@@ -4295,6 +4391,7 @@ def _launching_pass(
         reviews=reviews,
         pulls_for=pulls_for,
     )
+    log_missing_reviews(out, finished, reviews)
     if host is None:
         try:
             configured = settings.load(root=None)["drive.agent_host"]
@@ -4540,9 +4637,10 @@ def run_pass(
     over the hub table the pass builds. `hub` is the injected hub
     facade for the claim path and the reconnect (None means
     single-host: zero hub calls). `finished_for`
-    ({(repo, number): (agent id, role)} for the newest finished entry per
-    ticket) feeds the reviewer and fix-round readiness alongside the
-    same-pass capture. `agent_roles` ({agent id: role} for visible
+    ({(repo, number): (agent id, role, outcome)} for the newest finished
+    entry per ticket) feeds the reviewer and fix-round readiness
+    alongside the same-pass capture, and the missing-record check.
+    `agent_roles` ({agent id: role} for visible
     entries) serializes a fix behind a reviewer holder; unknown
     holders proceed as before. `agent_tickets` ({agent id: (repo,
     number)} for visible entries naming a ticket) is the ticket index
