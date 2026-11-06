@@ -1,11 +1,20 @@
 # 03: the muse runtime adapter
 
 Status: built (T1 to T5, T7 and T9; T6 is the host-side quota reader,
-outside korapy, and the gaps T8 closes stay UNVERIFIED). This doc fixes
+outside korapy, and T8 keeps the three genuinely open gaps: the trust
+file untouched in a fresh directory, the auth/rate-limit/quota
+wordings, and resume across a date roll). This doc fixes
 the second adapter, `muse` (the Muse Code CLI), next to `omp` in
-`src/korapy/runtimes/`. Nothing here changes the launch, resume, tail or
-stop flow in `src/korapy/launch.py`, the unit model, the registry,
-admission, exit codes, or any CLI verb. T9 named the muse runtime in
+`src/korapy/runtimes/`. Launch, resume, tail and stop flow through the
+shared code in `src/korapy/launch.py`, with three muse-specific steps
+there: `_write_session` generates the run's uuid with
+`muse.new_session_id` and records it with `muse.record_session_id`,
+passing it to `argv` as `session_id` (`_drop_session_id` removes the
+record when the launch fails before the unit starts), and `resume`
+writes the message with `muse.write_message` before building the
+resume argv. Nothing here changes the unit model, the registry,
+admission, exit codes, or any CLI verb; tail and stop need no
+muse-specific handling. T9 named the muse runtime in
 `README.md` and in the design docs.
 The only index change is the row for this doc in `docs/README.md`.
 
@@ -34,7 +43,8 @@ without it a muse session would crash `korapy tail`.
 `NAMES` becomes `("omp", "muse")`, `get("muse")` returns the
 adapter, and profiles accept `muse` as a runtime. `DEFAULT_RUNTIME` stays
 `omp`; `record`/`recorded` are unchanged, and this design adds no new
-setting (section 1), so settings need no change.
+top-level setting beyond the two profile options (section 1), so
+settings need no change.
 
 Model ids: `quota.chain_provider` takes the part before the first `/`,
 so a chain entry `muse/muse-spark-1.3` names provider `muse` and the
@@ -106,15 +116,18 @@ What each flag is, and the evidence:
   text); `--no-foreign-personal-context` keeps personal rules and
   skills out; `--disable-request-user-input` keeps the agent from
   blocking on a question.
-- `--reasoning-effort high`: fixed. Observed: the default is already
-  `high` (`muse exec --help`), and the flag is refused under
-  `--provider echo` (meta-only), so its runtime effect is UNVERIFIED
-  but its shape is verified. It is fixed rather than a setting,
-  following the `omp.FORCED` precedent: one fact, one place, and no
-  new settings surface. A project that needs another tier is a later
-  setting, not this design.
-- `--parallel-tool-calls`: fixed on. Observed: refused under
-  `--provider echo` (meta-only), shape verified in `--help`.
+- `--reasoning-effort <tier>`: a profile option (`reasoning_effort`
+  in `muse.options_schema`), defaulting to `high`. Observed: the
+  binary default is already `high` (`muse exec --help`), and the flag
+  is refused under `--provider echo` (meta-only), so its runtime
+  effect is UNVERIFIED but its shape is verified. A profile that
+  needs another tier sets the option; the adapter refuses a tier
+  outside the binary's tiers before the run starts.
+- `--parallel-tool-calls`: a profile option (`parallel_tool_calls`
+  in `muse.options_schema`), defaulting to on. Observed: refused under
+  `--provider echo` (meta-only), shape verified in `--help`. A profile
+  that needs serial tool calls sets the option to false and the flag
+  is dropped.
 - `--disable-write`: fixed for reviewers only. Observed: accepted
   under `--provider echo`, exit 0.
 - `max_time`: accepted by the protocol, ignored by the adapter. The
@@ -124,7 +137,9 @@ What each flag is, and the evidence:
   unit's `RuntimeMaxSec` (`RUNTIME_MAX_S`) still bounds the run.
 
 Settings versus fixed, in one line: the models declaration picks the
-model; every flag is fixed. No new `korapy.toml` setting.
+model; the effort tier and the tool-call shape are profile options
+defaulting to today's values (`high` and on); every other flag is
+fixed. No other `korapy.toml` setting.
 
 ## 2. Per-launch overlay and the home config it never touches
 
@@ -137,7 +152,9 @@ an unknown key (`-c bogus.key=1`) refuses the run with exit 2
 `write_config` persists the effective per-launch config as `muse.json`
 in korapy's session dir with the existing atomic helper, as an audit
 record. `argv` derives the run from it: `config["model"]` becomes
-`--model`, every other entry becomes `-c KEY=<json>`. `env` returns no
+`--model`, every other entry except the profile options
+`reasoning_effort` and `parallel_tool_calls` (which `argv` consumes as
+flags) becomes `-c KEY=<json>`. `env` returns no
 home-pointing entries (there is no config-pointer equivalent; `-c`
 needs no pointer). `with_models` sets `config["model"]` to the default
 role's head and keeps every other key.
@@ -174,9 +191,11 @@ files, and a `subagent/` tree. The date is the run date.
 
 - `resolve(session_id)` is the one helper that maps an id to its file:
   it globs `sessions/*/*/*/<uuid>/session.jsonl` and takes the newest
-  by `(mtime, basename)`, the `omp.resume_handle` rule, so equal
-  mtimes never depend on directory order, returning `None` when
-  absent. One fact, one place.
+  by `(mtime, path)`, comparing absolute paths, so equal mtimes never
+  depend on directory order, returning `None` when absent. One fact,
+  one place. (Unlike `omp.resume_handle`, which breaks its own ties by
+  basename within one session dir, every `session.jsonl` basename here
+  is the same, so the full path is the tie-break.)
 - `resume_handle(session_dir)` does not scan: korapy chose the uuid at
   launch, so launch records it in korapy's own session dir (a
   `muse_session_id` file next to the `runtime` record) and resume reads
@@ -386,7 +405,7 @@ New `tests/test_runtimes_muse.py` (session dirs are temp dirs):
   or `~/.local/share/muse/`; the full flag allowlist is pinned, so an
   added persisting flag fails.
 - sessions: `resolve` finds the newest `<uuid>/session.jsonl` across
-  date dirs by `(mtime, basename)` and returns `None` when absent;
+  date dirs by `(mtime, path)` and returns `None` when absent;
   `resume_handle` returns the recorded uuid; `activity_file` returns
   the session `out.log` path when present and `None` otherwise;
   `record`/`recorded`/`get("muse")` behave.
@@ -400,7 +419,7 @@ Extended `tests/test_tail.py` (canned lines, temp files):
   `task.lifecycle.*`, reconciliation and link records show nothing;
   unknown `payload_type` and non-JSON lines show nothing.
 - `tool.result` cases use the sanitized fixture cut from the first
-  real worker run (T8): tool and outcome render one line, records
+  real worker run: tool and outcome render one line, records
   without facts and prompt duplicates render nothing.
 
 Extended `tests/test_launch.py` (existing fake seams only): launch,
@@ -426,12 +445,11 @@ public interface beyond a profile `runtime` of `muse`.
   `resume_handle`, `resolve`, `activity_file`, and the launch/resume
   path through the existing fake seams. Acceptance: launch then
   resume in tests uses one uuid; `resolve` finds a canned date tree
-  newest by `(mtime, basename)`; `activity_file` returns the session
+  newest by `(mtime, path)`; `activity_file` returns the session
   `out.log` when present and `None` otherwise; missing file is a
   launch error.
 - T4: tail rendering. Extend `tail.render` with the muse rules from
-  section 3 and its tests, with `tool.result` asserting skip until
-  T8 lands its fixture. Acceptance: the tail tests pass, fed through
+  section 3 and its tests. Acceptance: the tail tests pass, fed through
   `activity_file` (a missing file raises the no-activity
   `LaunchError`); omp rendering unchanged.
 - T5: error classification. Build `classify` with the verified exit-2
@@ -450,11 +468,10 @@ public interface beyond a profile `runtime` of `muse`.
   tests. Acceptance: `korapy deps` reports muse; canned `2.x` output
   fails with the cutover hint.
 - T8: close the UNVERIFIED gaps. With maintainer-approved spend only:
-  one real run each for `--model` value flow, `tool.result` shape,
-  trust-file untouched in a fresh directory, auth/rate-limit/quota
-  wording, and resume across a date roll. Acceptance: each gap in
-  sections 1 to 5 is replaced by a fixture and a test, or restated
-  with the blocking reason; no other code changes.
+  one real run each for the trust file untouched in a fresh directory,
+  auth/rate-limit/quota wording, and resume across a date roll.
+  Acceptance: each gap in sections 2, 4 and 5 is replaced by a fixture
+  and a test, or restated with the blocking reason; no other code changes.
 - T9: README and docs name the muse runtime. List muse next to omp
   in `README.md` (kept in step with `runtimes.NAMES` by
   a test in `tests/test_readme.py`) and fix the same stale statement
