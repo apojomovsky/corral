@@ -212,17 +212,23 @@ def _commit_rules():
 
 
 def _ticket_repo(ops_root, main_clone, short_map):
-    """`(repo, matched)`: the ticket's repo spelling for the main clone.
+    """`(ticket_repo, short, matched)` for the main clone.
 
-    The covering `[[repo]]` entry names the ticket's repo; the spelling
-    resolves through the once-built short-to-tracker map, so the match
-    and the later translation share one map instead of parsing the
-    project file twice. A matched entry the map cannot translate keeps
-    its entry name. With no ops root or no covering entry the main
-    clone's directory name is the fallback, so the gate still runs:
-    the fallback derives the same name for writing and reading a
-    record. Two entries covering the same clone are refused instead of
-    picked by name.
+    The covering `[[repo]]` entry names the ticket's repo: `short` is
+    that entry name, and `ticket_repo` is its spelling through the
+    once-built short-to-tracker map, so the match and the later
+    translation share one map instead of parsing the project file
+    twice. A matched entry the map cannot translate keeps its entry
+    name. With no ops root or no covering entry the main clone's
+    directory name is the fallback, so the gate still runs: the
+    fallback derives the same name for writing and reading a record.
+    Two entries covering the same clone are refused instead of picked
+    by name.
+
+    `short` travels alongside the ticket spelling because the reverse
+    lookup is lossy: when two shorts feed one tracker repo the first
+    entry wins, so the caller loads settings with `short` and reads
+    the record through the translated spelling only.
     """
     if ops_root is not None:
         try:
@@ -230,8 +236,8 @@ def _ticket_repo(ops_root, main_clone, short_map):
         except settings.SettingsError as err:
             raise TakeoffError(str(err)) from None
         if name is not None:
-            return short_map.get(name, name), True
-    return os.path.basename(main_clone), False
+            return short_map.get(name, name), name, True
+    return os.path.basename(main_clone), None, False
 
 
 def _check_base(branch, cwd, ls_remote):
@@ -686,14 +692,14 @@ def run_takeoff(
         raise TakeoffError(str(err)) from None
     main_clone = os.path.realpath(gitenv.worktree_main_checkout(toplevel) or toplevel)
     short_map = syncli.short_to_tracker(ops_root, _git)
-    repo, matched = _ticket_repo(ops_root, main_clone, short_map)
+    ticket_repo, short, matched = _ticket_repo(ops_root, main_clone, short_map)
     try:
-        repo = reviewrecord.local_repo(repo, short_map)
+        record_repo = reviewrecord.local_repo(ticket_repo, short_map)
     except ValueError as err:
         raise TakeoffError(str(err)) from None
     try:
         if matched:
-            resolved = settings.load(root=ops_root, repo=repo)
+            resolved = settings.load(root=ops_root, repo=short)
         else:
             resolved = settings.load(root=ops_root)
     except settings.SettingsError as err:
@@ -751,7 +757,9 @@ def run_takeoff(
     if "review" in skip_set:
         checks.append(_flag_skip("review"))
     else:
-        checks.append(_check_review(resolved["review.required"], repo, number, toplevel, base))
+        checks.append(
+            _check_review(resolved["review.required"], record_repo, number, toplevel, base)
+        )
     timeout_s = resolved["checks.timeout_s"]
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
         raise TakeoffError("checks.timeout_s must be a positive number of seconds")
