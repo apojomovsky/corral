@@ -294,6 +294,12 @@ class OmpApprovalOption(SessionCase):
         self.assertNotIn("--auto-approve", argv)
         self.assertEqual(argv[-1], PROMPT)
 
+    def test_rewriting_without_options_removes_the_stale_options_file(self):
+        omp.RUNTIME.write_config(self.sdir, {"auto_approve": False})
+        omp.RUNTIME.write_config(self.sdir, {})
+        self.assertFalse(os.path.exists(os.path.join(self.sdir, "options.json")))
+        self.assertIn("--auto-approve", omp.RUNTIME.argv(self.sdir, PROMPT))
+
     def test_a_non_boolean_auto_approve_refuses_the_run(self):
         omp.RUNTIME.write_config(self.sdir, {"auto_approve": "yes"})
         with self.assertRaises(ValueError):

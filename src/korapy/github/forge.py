@@ -93,6 +93,24 @@ def _merge_sha(payload, number, state):
     return _sha(payload.get("merge_commit_sha"), f"PR {number} merge sha")
 
 
+def _merge_parent_shas(payload, number):
+    """The parent SHAs of a merge-commit response, else ``ForgeError``.
+
+    Anything but a dict holding a list of ``{"sha": ...}`` dicts with
+    full SHAs is an unusable answer, never a guess.
+    """
+    if not isinstance(payload, dict):
+        raise _shape(f"PR {number} merge commit is not an object")
+    parents = payload.get("parents")
+    if not isinstance(parents, list):
+        raise _shape(f"PR {number} merge commit has no parent list")
+    shas = []
+    for parent in parents:
+        sha = parent.get("sha") if isinstance(parent, dict) else None
+        shas.append(_sha(sha, f"PR {number} merge parent"))
+    return shas
+
+
 def _parse_pull(payload, number):
     """A single-PR response to a ``PullRequest``. Raises ``ForgeError``
     on anything that is not the expected shape, never a guess."""
@@ -317,16 +335,18 @@ class GithubForge:
         return _parse_pull(payload, number)
 
     def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
-        """Squash-merge PR ``number`` pinned to ``head_sha``.
+        """Merge PR ``number`` pinned to ``head_sha`` with ``method``.
 
         The pin travels in the merge call itself, so the provider
         merges exactly the approved head or nothing. The fresh
         post-merge read must report ``merged`` with the reported merge
         SHA tied to that head; anything else fails closed because the
-        merge happened but is unverified. A PR that is not open at the
-        pinned head is ``ForgeRefused``, never merged.
+        merge happened but is unverified. For a merge commit the merge
+        commit's parents must include the pinned head: a merge that
+        kept other commits is unverified, never returned. A PR that is
+        not open at the pinned head is ``ForgeRefused``, never merged.
         """
-        if method != "squash":
+        if method not in ("squash", "merge"):
             raise forge.ForgeError(f"unsupported merge method {method!r}")
         if not _REPO.fullmatch(repo or ""):
             raise forge.ForgeError(f"unusable forge repo {repo!r}")
@@ -344,7 +364,7 @@ class GithubForge:
                     "PUT",
                     f"repos/{repo}/pulls/{number}/merge",
                     "-f",
-                    "merge_method=squash",
+                    f"merge_method={method}",
                     "-f",
                     f"sha={head_sha}",
                 ]
@@ -363,7 +383,29 @@ class GithubForge:
         verified = self.pull_request(repo, number)
         if verified.state != forge.MERGED or verified.merge_sha != reported:
             raise forge.ForgeError(f"PR {number} merge unverified: want {reported}")
+        if method == "merge":
+            self._check_merge_parents(repo, number, reported, head_sha)
         return reported
+
+    def _check_merge_parents(self, repo: str, number: int, reported: str, head_sha: str) -> None:
+        """Require the merge commit's parents to include the pinned head.
+
+        A squash reads no commit (its post-merge tie is the merged
+        state plus the reported SHA); a merge commit proves the
+        provider kept the approved head by parenting it. Anything else
+        is unverified (``ForgeError``), never a refusal: the merge
+        happened but is unproven.
+        """
+        try:
+            payload = json.loads(self._get(f"repos/{repo}/commits/{reported}"))
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable merge commit answer for PR {number}: {err}") from err
+        if head_sha not in _merge_parent_shas(payload, number):
+            raise forge.ForgeError(
+                f"PR {number} merge unverified: {head_sha} is no parent of {reported}"
+            )
 
     def pr_index(self, repo: str) -> dict[str, str]:
         """``{head branch: state}`` for every PR ever opened on ``repo``.
