@@ -84,7 +84,7 @@ settings.register(
 settings.register(
     "drive.fix_round_threshold",
     str,
-    "normal",
+    reviewrecord.DEFAULT_FIX_THRESHOLD,
     "lowest review finding severity that still opens a fix round "
     "(high, normal or low): an approving review below it is merge-ready",
     check=reviewrecord.check_threshold,
@@ -283,8 +283,7 @@ def gate(
     agent_states=None,
     agent_tickets=None,
     reviews=None,
-    fix_threshold="normal",
-    pulls_for=None,
+    fix_threshold=None,
 ) -> Gated:
     """The section 3 gate order for one candidate, cheapest first. Pure.
 
@@ -302,24 +301,29 @@ def gate(
     unclaimed row whose latest review record (`reviews`, keyed by
     (repo, number)) approves with no finding at or above
     `fix_threshold` is merge-ready too: no fix round opens for lows,
-    and no fresh start launches on approved work. A finished reviewer
+    and no fresh start launches on approved work. None (the default)
+    reads the shared default threshold, so the gate follows it past
+    import time; a falsy value falls back the same way. A finished reviewer
     with outcome `ok` and no review record for the ticket is a protocol
     failure, never a finding: the row skips with code `review-missing`
     for every kind, so no worker, fix round or re-review starts on it.
     With no review map (`reviews` None) the check cannot run and the
     row gates as before. A fresh start on an
-    unclaimed row with an open linked pull (`pulls_for`, the injected
-    seam reading them through the tracker) is refused: the pull, not a
-    new worker, carries the ticket. A fix or
+    unclaimed row with an open linked pull (`row.pulls`, read once per
+    pass through the tracker when the rows were built) is refused: the
+    pull, not a new worker, carries the ticket. The row pulls are the
+    one linked-pull source the policies read too, so the two never
+    disagree and the check costs no second lookup. A fix or
     resume behind a reviewer holder (from `agent_roles`, resolved to
     its registry entry by ticket through the one resolver, since a
     drive-id holder never names a unit-name entry) skips with the
     claim kept, matching the claiming pass, so `--plan` prints the
     verdict the real pass would print. Every input is plain data or an
-    injected seam (`read_labels`, `pulls_for`); nothing is launched,
-    claimed or written. With no `pulls_for` the linked-pull check is
-    skipped, which is what `--plan` does: it never contacts the
-    tracker.
+    injected seam (`read_labels`); nothing is launched,
+    claimed or written. With no pulls on the row the linked-pull check
+    is skipped, which is what `--plan` builds: it never contacts the
+    tracker. Unreadable pulls (None) refuse the start instead, failing
+    closed like the hold labels.
     """
     if candidate.request is None:
         row = candidate.row
@@ -415,7 +419,9 @@ def gate(
             if (
                 record is not None
                 and reviewrecord.approves(record)
-                and not reviewrecord.fix_wanted(record, fix_threshold or "normal")
+                and not reviewrecord.fix_wanted(
+                    record, fix_threshold or reviewrecord.DEFAULT_FIX_THRESHOLD
+                )
             ):
                 return _skip(
                     candidate,
@@ -425,14 +431,10 @@ def gate(
                     "merge-ready, skipped",
                 )
 
-    if not holder and kind == "start" and pulls_for is not None:
-        try:
-            linked = pulls_for(row.repo, row.number) or ()
-        except Exception as err:
-            return _skip(
-                candidate, kind, "row", f"{ref}: linked pulls unreadable ({err}), start refused"
-            )
-        opened = [pull for pull in linked if getattr(pull, "state", "") == "open"]
+    if not holder and kind == "start":
+        if row.pulls is None:
+            return _skip(candidate, kind, "row", f"{ref}: linked pulls unreadable, start refused")
+        opened = [pull for pull in row.pulls or () if getattr(pull, "state", "") == "open"]
         if opened:
             return _skip(
                 candidate,
@@ -1131,8 +1133,8 @@ def _store_labels(store, now):
     Only issue rows exist in the store, so a pull read fails closed as
     unreadable, like a missing row: the hold gate skips instead of
     passing a ticket whose pull labels it could not see. Linked pulls
-    themselves never live in the store; the gate reads them through the
-    `pulls_for` seam, which queries the tracker.
+    themselves never live in the store; the pass reads them through the
+    `pulls_for` seam, which queries the tracker, and the rows carry them.
     """
 
     def read(kind, repo, number):
@@ -1260,9 +1262,10 @@ def tracker_pulls_for(tracker_factory):
 
     Each call reads the ticket's linked pull requests through its
     tracker's `linked_pulls` and keeps their numbers and states as
-    `LinkedPull` rows for the gate. A repo with no tracker reads as no
-    linked pulls; a tracker failure propagates, and the gate fails the
-    fresh start closed instead of starting blind.
+    `LinkedPull` rows for the pass's row building. A repo with no
+    tracker reads as no linked pulls; a tracker failure propagates,
+    and the pass map marks the ticket unreadable instead of starting
+    blind.
     """
 
     def pulls_for(repo, number):
@@ -1277,6 +1280,27 @@ def tracker_pulls_for(tracker_factory):
         )
 
     return pulls_for
+
+
+def linked_pulls_map(items, pulls_for):
+    """{(repo, number): linked pulls} for these store items, one read each.
+
+    The pass's one linked-pull source: the row builders (eligibility
+    and gating) read from this map, so the policies and the gate see
+    the same pulls with no second lookup. An unreadable ticket maps to
+    None, and readers fail that ticket closed; a ticket the seam reads
+    as empty maps to ().
+    """
+    found = {}
+    for item in items:
+        key = (item.repo, item.number)
+        if key in found:
+            continue
+        try:
+            found[key] = tuple(pulls_for(item.repo, item.number) or ())
+        except Exception:
+            found[key] = None
+    return found
 
 
 #: The proceeding kinds the summary counts after starts, in order.
@@ -1394,14 +1418,21 @@ def _read_inputs(
     ), None
 
 
-def _released_rows(items, released):
+def _released_rows(items, released, *, pulls_by_key=None):
     """{(repo, number): row} with this pass's releases applied. Pure.
 
     The gate and the missing-record log read the same map, so a freed
     row gates and logs as unheld while a kept claim gates and logs as
     held. One builder keeps the two from disagreeing on the holder.
+    `pulls_by_key` carries the linked pulls the pass read through the
+    tracker (None marks an unreadable ticket); with none every row
+    reads empty. The gate reads the same row pulls, so the two never
+    disagree.
     """
-    by_key = {(row.repo, row.number): row for row in eligibility.rows_from_items(items)}
+    by_key = {
+        (row.repo, row.number): row
+        for row in eligibility.rows_from_items(items, pulls_by_key=pulls_by_key)
+    }
     for key in released or ():
         prior = by_key.get(key)
         if prior is not None:
@@ -1448,20 +1479,24 @@ def _gate_all(
     latest review record}) feeds the gate's fix-round threshold;
     `fix_threshold` (None reads the `drive.fix_round_threshold` host
     setting) is the lowest finding severity that still opens a fix
-    round; `pulls_for` (None skips the check, which is what `--plan`
-    does) feeds the gate's open-pull refusal. Nothing is written.
+    round; `pulls_for` (None builds rows with no pulls, which is what
+    `--plan` does: it never contacts the tracker) feeds the pass's one
+    linked-pull map, which the eligibility rows and the gate rows share,
+    so the policies and the gate read the same row pulls with no second
+    lookup. Nothing is written.
     """
     if fix_threshold is None:
         try:
             fix_threshold = settings.load(root=None)["drive.fix_round_threshold"]
         except settings.SettingsError as problem:
             problems = [f"korapy drive: {problem}"]
-            fix_threshold = "normal"
+            fix_threshold = reviewrecord.DEFAULT_FIX_THRESHOLD
         else:
             problems = []
     else:
         problems = []
-    by_key = _released_rows(items, released)
+    pulls_by_key = linked_pulls_map(items, pulls_for) if pulls_for is not None else None
+    by_key = _released_rows(items, released, pulls_by_key=pulls_by_key)
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     candidates = []
     for project in registered:
@@ -1472,7 +1507,7 @@ def _gate_all(
                 problems.append(f"korapy drive: {problem}")
                 continue
         try:
-            outcome = eligibility.for_project(project, items, now=now)
+            outcome = eligibility.for_project(project, items, now=now, pulls_by_key=pulls_by_key)
         except eligibility.EligibilityError as problem:
             problems.append(f"korapy drive: {problem}")
             continue
@@ -1544,7 +1579,6 @@ def _gate_all(
             agent_tickets=agent_tickets,
             reviews=reviews,
             fix_threshold=fix_threshold,
-            pulls_for=pulls_for,
         )
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
@@ -1596,9 +1630,9 @@ def _pass(
     log each unheld finished reviewer (outcome `ok`) with no record
     once, naming the ticket and the reviewer, before the table, so a
     kept claim never logs a line the gate did not skip on. `pulls_for`
-    feeds the gate's open-pull refusal; with none the check is
-    skipped, which is what `--plan` does: it never contacts the
-    tracker.
+    feeds the pass's one linked-pull map, which the eligibility rows
+    and the gate rows share; with none every row reads empty, which is
+    what `--plan` builds: it never contacts the tracker.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -4756,9 +4790,10 @@ def run_pass(
     skips and the pass ends with exit 1. `review_reader`
     feeds the gate's fix-round threshold from the ticket session dirs
     (reads only, like the registry); with none the threshold sees no
-    records, exactly as before. `pulls_for` feeds the gate's open-pull
-    refusal; with none the check is skipped, which is what `--plan`
-    does: it never contacts the tracker. `now` defaults to the wall
+    records, exactly as before. `pulls_for` feeds the pass's one
+    linked-pull map, which the eligibility rows and the gate rows share;
+    with none every row reads empty, which is what `--plan` builds: it
+    never contacts the tracker. `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one

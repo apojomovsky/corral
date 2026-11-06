@@ -81,6 +81,43 @@ class TypesTest(unittest.TestCase):
         rows = eligibility.rows_from_items([item(number=7), item(number=9)])
         self.assertEqual([row.number for row in rows], [7, 9])
 
+
+class RowPullsTest(unittest.TestCase):
+    """TicketRow.pulls arrives from the tracker, not hardcoded empty.
+
+    The row builder takes the pass's linked-pull map (plain data keyed
+    by (repo, number)); the gate and the policies read the same pulls
+    from the row, so the two never disagree.
+    """
+
+    def test_row_from_item_defaults_to_no_pulls(self):
+        self.assertEqual(eligibility.row_from_item(item()).pulls, ())
+
+    def test_row_from_item_carries_given_pulls(self):
+        pulls = (eligibility.LinkedPull(number=9, state="open"),)
+        row = eligibility.row_from_item(item(), pulls=pulls)
+        self.assertEqual(row.pulls, pulls)
+
+    def test_rows_from_items_populates_pulls_from_the_map(self):
+        pulls = (eligibility.LinkedPull(number=12, state="open"),)
+        rows = eligibility.rows_from_items(
+            [item(number=7), item(number=9)],
+            pulls_by_key={("app", 7): pulls},
+        )
+        self.assertEqual(rows[0].pulls, pulls)
+        self.assertEqual(rows[1].pulls, ())
+
+    def test_rows_from_items_without_a_map_leaves_pulls_empty(self):
+        rows = eligibility.rows_from_items([item(number=7)])
+        self.assertEqual(rows[0].pulls, ())
+
+    def test_rows_from_items_keeps_an_unreadable_ticket_marked(self):
+        rows = eligibility.rows_from_items(
+            [item(number=7)],
+            pulls_by_key={("app", 7): None},
+        )
+        self.assertIsNone(rows[0].pulls)
+
     def test_ticket_row_defaults_extra_to_empty(self):
         self.assertEqual(eligibility.TicketRow(repo="app", number=7).extra, {})
         self.assertEqual(eligibility.TicketRow(repo="app", number=7, extra=None).extra, {})
@@ -410,6 +447,38 @@ class ForProjectTest(unittest.TestCase):
         self.assertEqual(
             [(request.repo, request.number) for request in outcome.requests],
             [("api", 2), ("app", 9), ("app", 7)],
+        )
+
+    def test_a_project_sees_linked_pulls_from_the_map(self):
+        project = projects.Project(
+            name="blue",
+            unit_prefix="blue-agent",
+            root="/srv/ops/blue",
+            eligibility="korapy.policies:basic",
+        )
+        outcome = eligibility.for_project(
+            project,
+            [item()],
+            now=2000.0,
+            pulls_by_key={
+                ("app", 7): (eligibility.LinkedPull(number=9, state="open"),),
+            },
+        )
+        self.assertIsNone(outcome.skipped)
+        self.assertEqual(outcome.requests, [])
+
+    def test_a_project_without_a_map_sees_no_pulls(self):
+        project = projects.Project(
+            name="blue",
+            unit_prefix="blue-agent",
+            root="/srv/ops/blue",
+            eligibility="korapy.policies:basic",
+        )
+        outcome = eligibility.for_project(project, [item()], now=2000.0)
+        self.assertIsNone(outcome.skipped)
+        self.assertEqual(
+            [(request.repo, request.number) for request in outcome.requests],
+            [("app", 7)],
         )
 
     def test_a_bad_entry_is_exit_four_naming_project_and_entry(self):
