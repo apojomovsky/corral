@@ -1,0 +1,36 @@
+{
+  "keys": {
+    "a-project|h1|takeoff": {
+      "avg_cores": 2.0,
+      "dur_s_p50": 180.0,
+      "dur_s_p90": 200.0,
+      "flaky": false,
+      "peak_mb_p50": 5100,
+      "peak_mb_p90": 5300,
+      "samples": 4
+    },
+    "a-project|h2|hand": {
+      "avg_cores": 2.0,
+      "dur_s_p50": 50.0,
+      "dur_s_p90": 150.0,
+      "flaky": false,
+      "peak_mb_p50": 1000,
+      "peak_mb_p90": 6000,
+      "samples": 2
+    },
+    "a-project|h3|takeoff": {
+      "avg_cores": 2.0,
+      "dur_s_p50": 60.0,
+      "dur_s_p90": 60.0,
+      "flaky": true,
+      "peak_mb_p50": 2000,
+      "peak_mb_p90": 2000,
+      "samples": 4
+    }
+  },
+  "schema_version": 1,
+  "sources": [
+    "9c2e0123456789abcdef0123456789ab-2026-10.jsonl",
+    "9c2e0123456789abcdef0123456789ab-2026-11.jsonl"
+  ]
+}

@@ -202,6 +202,7 @@ class CoreTest(MergeCase):
                 self.do_merge(fake, plan=True)
         self.assertIn("cannot open the merge lock", str(caught.exception))
         self.assertEqual(fake.calls, [])
+        self.assertEqual(fake.requested, [])
 
     def test_plan_reports_without_merging(self):
         fake = self.fake()
@@ -580,10 +581,12 @@ class CliTest(MergeCase):
                 raise OSError(errno.EACCES, "Permission denied")
             return real_open(p, *args, **kwargs)
 
+        fake = self.fake()
         with mock.patch.object(merge.os, "open", side_effect=bad_open):
-            code, _, err = self.call(self.args(plan=True), self.fake())
+            code, _, err = self.call(self.args(plan=True), fake)
         self.assertEqual(code, 4)
         self.assertIn("cannot open the merge lock", err)
+        self.assertEqual(fake.requested, [])
 
     def test_method_flag_reaches_the_forge(self):
         fake = self.fake()
