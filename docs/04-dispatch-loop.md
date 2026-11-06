@@ -127,12 +127,13 @@ highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
 The store carries no linked pulls (pull-request rows are never ticket
-rows, and the sync drops them), so the rows a policy sees arrive with
-`pulls` empty and `basic`'s own pull filter stays dormant on them. The
-live check lives one layer down instead: the pass reads each
-fresh-start candidate's linked pulls through the tracker
-(`Tracker.linked_pulls`, implemented once by each adapter) and the
-shared gate refuses the start while one is open (section 3). Which
+rows, and the sync drops them), so the pass reads each ticket's linked
+pulls through the tracker (`Tracker.linked_pulls`, implemented once by
+each adapter) once per pass and the rows a policy sees arrive with
+`pulls` populated: `basic`'s own pull filter refuses a ticket with an
+open linked pull, and the shared gate reads the same row pulls (section
+3), so the two never disagree and no second lookup runs. `--plan`
+builds rows with `pulls` empty: it never contacts the tracker. Which
 findings reopen work is the gate's call too: it grades the ticket's
 latest review record against the fix-round threshold, so a policy only
 decides to ask, never whether the asking succeeds (section 5).
@@ -216,11 +217,11 @@ Per-candidate gate order, cheapest first:
    review map at all, gates as before. Then the fresh-start check: a
    `start` (including a `fix` or `resume` reclassified as one) on an
    unclaimed row with an open linked pull request skips, since the
-   pull carries the ticket. The linked pulls come from
-   `Tracker.linked_pulls`, one tracker call per fresh-start
-   candidate; an unreadable answer fails closed (skip, record
-   "unreadable"). `--plan` skips this check: it never contacts the
-   tracker.
+   pull carries the ticket. The linked pulls come from the row, which
+   the pass populated from `Tracker.linked_pulls` with one tracker
+   call per ticket per pass; an unreadable read fails closed (skip,
+   record "unreadable"). `--plan` builds rows with no pulls and skips
+   this check: it never contacts the tracker.
 4. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is

@@ -138,8 +138,9 @@ def cmd_status(args, *, state_dir=None, now=None):
             parts = [f"heavy: recent {row.get('outcome', '?')}"]
             if row.get("reason"):
                 parts.append(str(row["reason"]))
-            if row.get("command"):
-                parts.append(" ".join(str(word) for word in row["command"]))
+            command = row.get("command")
+            if isinstance(command, (list, tuple)):
+                parts.append(" ".join(str(word) for word in command))
             print(" ".join(parts))
     else:
         print("heavy: recent: none yet")
