@@ -98,6 +98,14 @@ class NoReadings(unittest.TestCase):
             ],
         )
 
+    def test_heavy_wait_factor_defaults_to_canonical_constant(self):
+        from korapy import heavy
+
+        self.assertEqual(
+            resourcedoctor.ResourceReadings._field_defaults["heavy_wait_factor"],
+            heavy.DEFAULT_WAIT_FACTOR,
+        )
+
 
 class UnsetBudget(unittest.TestCase):
     def test_unset_host_warns_and_skips_slices(self):

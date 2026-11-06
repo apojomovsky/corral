@@ -96,7 +96,7 @@ class ResourceReadings(NamedTuple):
     heavy_mtime: float | None = None
     heavy_now: float = 0.0
     heavy_estimates: Mapping[str, object] | None = None
-    heavy_wait_factor: float = 3.0
+    heavy_wait_factor: float = heavy.DEFAULT_WAIT_FACTOR
 
 
 class ResourceRow(NamedTuple):

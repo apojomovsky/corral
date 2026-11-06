@@ -14,6 +14,7 @@ import inspect
 import io
 import json
 import os
+import pathlib
 import re
 import shutil
 import socket
@@ -459,7 +460,7 @@ class CollectDivergence(unittest.TestCase):
 class ServeSettingsTest(unittest.TestCase):
     def test_serve_settings_have_documented_defaults(self):
         self.assertEqual(settings.REGISTRY["serve.bind"].default, "127.0.0.1")
-        self.assertEqual(settings.REGISTRY["serve.port"].default, 0)
+        self.assertEqual(settings.REGISTRY["serve.port"].default, serve.SERVE_PORT_DEFAULT)
         self.assertEqual(settings.REGISTRY["serve.origins"].default, [])
         self.assertEqual(settings.REGISTRY["serve.snapshot_ttl_s"].default, 2)
         self.assertEqual(settings.REGISTRY["serve.tail_max"].default, 200)
@@ -797,7 +798,7 @@ class ServeCommandTest(unittest.TestCase):
                     with redirect_stdout(out):
                         self.assertEqual(args.func(args), 0)
         made.assert_called_once()
-        self.assertIn("listening on 8.8.8.8:4321", out.getvalue())
+        self.assertIn("dashboard at http://8.8.8.8:4321/", out.getvalue())
 
     def test_world_readable_token_warns_on_loopback_and_serves(self):
         class FakeServer:
@@ -824,7 +825,7 @@ class ServeCommandTest(unittest.TestCase):
                     with redirect_stdout(out), redirect_stderr(err):
                         self.assertEqual(args.func(args), 0)
             self.assertIn("readable beyond its owner", err.getvalue())
-            self.assertIn("listening on 127.0.0.1:4321", out.getvalue())
+            self.assertIn("dashboard at http://127.0.0.1:4321/", out.getvalue())
 
     def test_world_readable_token_refuses_remote(self):
         with tempfile.TemporaryDirectory(prefix="korapy-serve-cmd-") as tmp:
@@ -2778,6 +2779,218 @@ class SnapshotTtlWiring(ServeCommandTest):
                     with redirect_stdout(out):
                         self.assertEqual(args.func(args), 0)
         self.assertEqual(made.call_args.kwargs["snapshot_ttl_s"], 9)
+
+
+def _serve_subparser():
+    """The `serve` subparser, so help-text tests read what the CLI shows."""
+    parser = cli.build_parser()
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return action.choices["serve"]
+    raise AssertionError("no serve subparser")
+
+
+def _port_help():
+    """The `--port` help text of the `serve` verb."""
+    for action in _serve_subparser()._actions:
+        if "--port" in action.option_strings:
+            return action.help or ""
+    raise AssertionError("no --port flag on serve")
+
+
+class ServePortDefaultTest(unittest.TestCase):
+    def test_default_port_is_fixed_and_unprivileged(self):
+        self.assertEqual(serve.SERVE_PORT_DEFAULT, 8420)
+        self.assertGreaterEqual(serve.SERVE_PORT_DEFAULT, 1024)
+        self.assertLessEqual(serve.SERVE_PORT_DEFAULT, 65535)
+        self.assertNotEqual(serve.SERVE_PORT_DEFAULT, 0)
+
+    def test_setting_default_is_the_constant(self):
+        self.assertEqual(settings.REGISTRY["serve.port"].default, serve.SERVE_PORT_DEFAULT)
+
+    def test_setting_help_names_the_choice_and_zero(self):
+        text = str(settings.REGISTRY["serve.port"].help)
+        self.assertIn(str(serve.SERVE_PORT_DEFAULT), text)
+        self.assertIn("0", text)
+
+    def test_port_help_quotes_the_default_and_zero(self):
+        text = _port_help()
+        self.assertIn(str(serve.SERVE_PORT_DEFAULT), text)
+        self.assertIn("0", text)
+
+    def test_docs_quote_the_default_port(self):
+        root = pathlib.Path(__file__).resolve().parents[1]
+        files = (
+            root / "README.md",
+            root / "docs" / "guide.md",
+            root / "docs" / "12-web-dashboard.md",
+            root / "docs" / "05-dashboard-api.md",
+        )
+        for path in files:
+            with self.subTest(path=str(path)):
+                self.assertIn(str(serve.SERVE_PORT_DEFAULT), path.read_text(encoding="utf-8"))
+
+
+class StartupLinesTest(unittest.TestCase):
+    def test_loopback_is_a_clickable_url(self):
+        self.assertEqual(
+            serve.startup_lines("127.0.0.1", 4321),
+            ["korapy serve: dashboard at http://127.0.0.1:4321/"],
+        )
+
+    def test_bytes_host_decodes_to_the_same_url(self):
+        for host in (b"127.0.0.1", bytearray(b"127.0.0.1")):
+            with self.subTest(host=type(host).__name__):
+                self.assertEqual(
+                    serve.startup_lines(host, 4321),
+                    ["korapy serve: dashboard at http://127.0.0.1:4321/"],
+                )
+
+    def test_ipv6_url_carries_brackets(self):
+        self.assertEqual(
+            serve.startup_lines("::1", 4321),
+            ["korapy serve: dashboard at http://[::1]:4321/"],
+        )
+
+    def test_wildcard_names_the_bind_and_the_client_address(self):
+        for bind in ("0.0.0.0", "::"):
+            with self.subTest(bind=bind):
+                text = "\n".join(serve.startup_lines(bind, 8420))
+                self.assertIn(f"{bind}:8420", text)
+                self.assertIn("LAN address", text)
+
+    def test_token_line_names_the_file_and_the_one_time_prompt(self):
+        lines = serve.startup_lines(
+            "0.0.0.0", 8420, token_required=True, token_path="/x/config/token"
+        )
+        text = "\n".join(lines)
+        self.assertIn("/x/config/token", text)
+        self.assertIn("asks for it once", text)
+
+    def test_no_token_line_on_loopback_without_a_token(self):
+        self.assertEqual(len(serve.startup_lines("127.0.0.1", 8420)), 1)
+
+
+class ConfigurableServer:
+    """A `make_server` stand-in with a chosen bound address."""
+
+    address = ("127.0.0.1", 4321)
+
+    def serve_forever(self):
+        pass
+
+    def server_close(self):
+        pass
+
+    @property
+    def server_address(self):
+        return type(self).address
+
+
+class ServeStartupTest(ServeCommandTest):
+    def run_capture(self, argv, config=None, address=("127.0.0.1", 4321)):
+        """The exit code, stdout, stderr, and `make_server` call of one run."""
+        config_dir = tempfile.mkdtemp(prefix="korapy-serve-startup-config-")
+        self.addCleanup(shutil.rmtree, config_dir)
+        state_dir = tempfile.mkdtemp(prefix="korapy-serve-startup-state-")
+        self.addCleanup(shutil.rmtree, state_dir)
+        if config is not None:
+            with open(os.path.join(config_dir, "config.toml"), "w", encoding="utf-8") as handle:
+                handle.write(config)
+        ConfigurableServer.address = address
+        env = {"KORAPY_CONFIG": config_dir, "KORAPY_STATE": state_dir}
+        args = self.parse(*argv)
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch.object(serve, "make_server", return_value=ConfigurableServer()) as made:
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    code = args.func(args)
+        return code, out.getvalue(), err.getvalue(), made
+
+    def test_default_port_reaches_the_server(self):
+        code, out, _, made = self.run_capture([], address=("127.0.0.1", 8420))
+        self.assertEqual(code, 0)
+        self.assertEqual(made.call_args.kwargs["port"], serve.SERVE_PORT_DEFAULT)
+        self.assertIn("korapy serve: dashboard at http://127.0.0.1:8420/", out)
+
+    def test_flag_beats_config(self):
+        code, _, _, made = self.run_capture(["--port", "4322"], config="[serve]\nport = 4321\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(made.call_args.kwargs["port"], 4322)
+
+    def test_config_sets_the_port(self):
+        code, _, _, made = self.run_capture([], config="[serve]\nport = 4321\n")
+        self.assertEqual(code, 0)
+        self.assertEqual(made.call_args.kwargs["port"], 4321)
+
+    def test_explicit_zero_prints_the_bound_port(self):
+        code, out, _, made = self.run_capture(["--port", "0"], address=("127.0.0.1", 54321))
+        self.assertEqual(code, 0)
+        self.assertEqual(made.call_args.kwargs["port"], 0)
+        self.assertIn("korapy serve: dashboard at http://127.0.0.1:54321/", out)
+
+    def test_held_port_suggests_another_or_a_free_one(self):
+        holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            holder.bind(("127.0.0.1", 0))
+            holder.listen(1)
+            held = holder.getsockname()[1]
+            config_dir = tempfile.mkdtemp(prefix="korapy-serve-held-config-")
+            self.addCleanup(shutil.rmtree, config_dir)
+            state_dir = tempfile.mkdtemp(prefix="korapy-serve-held-state-")
+            self.addCleanup(shutil.rmtree, state_dir)
+            env = {"KORAPY_CONFIG": config_dir, "KORAPY_STATE": state_dir}
+            args = self.parse("--port", str(held))
+            with mock.patch.dict(os.environ, env, clear=False):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    with redirect_stdout(io.StringIO()):
+                        code = args.func(args)
+        finally:
+            holder.close()
+        self.assertEqual(code, 2)
+        self.assertIn("--port 0", err.getvalue())
+
+    def test_remote_startup_names_the_token_file_never_its_content(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-startup-") as tmp:
+            with open(os.path.join(tmp, "token"), "w", encoding="utf-8") as handle:
+                handle.write("tok-secret-1\n")
+            os.chmod(os.path.join(tmp, "token"), 0o600)
+            config_dir = tempfile.mkdtemp(prefix="korapy-serve-token-config-")
+            self.addCleanup(shutil.rmtree, config_dir)
+            args = self.parse("--bind", "8.8.8.8", "--allow-remote")
+            ConfigurableServer.address = ("8.8.8.8", 4321)
+            with mock.patch.dict(
+                os.environ,
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
+                clear=False,
+            ):
+                with mock.patch.object(serve, "make_server", return_value=ConfigurableServer()):
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(args.func(args), 0)
+        token_path = os.path.join(tmp, "token")
+        self.assertIn(token_path, out.getvalue())
+        self.assertNotIn("tok-secret-1", out.getvalue())
+
+    def test_wildcard_startup_guides_the_client(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-wild-") as tmp:
+            with open(os.path.join(tmp, "token"), "w", encoding="utf-8") as handle:
+                handle.write("tok-1\n")
+            os.chmod(os.path.join(tmp, "token"), 0o600)
+            args = self.parse("--bind", "0.0.0.0", "--allow-remote")
+            ConfigurableServer.address = ("0.0.0.0", 8420)
+            with mock.patch.dict(
+                os.environ,
+                {"KORAPY_CONFIG": tmp, "KORAPY_STATE": tmp},
+                clear=False,
+            ):
+                with mock.patch.object(serve, "make_server", return_value=ConfigurableServer()):
+                    out = io.StringIO()
+                    with redirect_stdout(out):
+                        self.assertEqual(args.func(args), 0)
+        self.assertIn("0.0.0.0:8420", out.getvalue())
+        self.assertIn("LAN address", out.getvalue())
 
 
 if __name__ == "__main__":

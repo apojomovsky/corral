@@ -8,6 +8,10 @@
   --danger-bg: #fdf0f0;
   --danger-fg: #8f1d1d;
   --stale-bg: #f4f4f4;
+  --ok: #1a7f37;
+  --low: #9a6700;
+  --high: #b42318;
+  --stale: #715f00;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -20,6 +24,10 @@
     --danger-bg: #3a1a1a;
     --danger-fg: #ffb3b3;
     --stale-bg: #222222;
+    --ok: #4ac26b;
+    --low: #d4a017;
+    --high: #ff7b72;
+    --stale: #c9a227;
   }
 }
 
@@ -34,6 +42,16 @@ body {
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   font-size: 1rem;
   line-height: 1.45;
+}
+
+h1 {
+  font-size: 1.5rem;
+  margin: 0 0 0.5rem;
+}
+
+abbr[title] {
+  text-decoration: underline dotted;
+  cursor: help;
 }
 
 #topbar {
@@ -71,7 +89,8 @@ button {
 }
 
 button:focus-visible,
-input:focus-visible {
+input:focus-visible,
+summary:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -89,7 +108,7 @@ input:focus-visible {
 
 main {
   padding: 1rem;
-  max-width: 60rem;
+  max-width: 70rem;
 }
 
 main.stale #status-card,
@@ -184,6 +203,19 @@ main.stale #detail {
   display: none;
 }
 
+/* The overview cards: one responsive grid, the fleet strip across
+the whole row, the rest one or two columns by width. */
+#cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(24rem, 100%), 1fr));
+  gap: 1rem;
+  padding: 1rem;
+}
+
+#cards > .card {
+  margin: 0;
+}
+
 .card {
   margin: 1rem 0;
   padding: 0.75rem 1rem;
@@ -191,9 +223,13 @@ main.stale #detail {
   border-radius: 6px;
 }
 
+.card.strip {
+  grid-column: 1 / -1;
+}
+
 .card h2 {
-  margin: 0 0 0.5rem;
-  font-size: 1.1rem;
+  margin: 0 0 0.25rem;
+  font-size: 1.125rem;
 }
 
 .card h3 {
@@ -203,6 +239,12 @@ main.stale #detail {
 
 .card p {
   margin: 0.25rem 0;
+  overflow-wrap: break-word;
+}
+
+.card .desc {
+  color: var(--muted);
+  font-size: 0.875rem;
 }
 
 .card.error {
@@ -210,22 +252,139 @@ main.stale #detail {
   color: var(--danger-fg);
 }
 
-.card ul,
-#agents ul {
+.card ul {
   margin: 0.25rem 0;
   padding-left: 1.25rem;
 }
 
-.card li,
-#agents li {
+.card li {
   margin: 0.25rem 0;
   font-variant-numeric: tabular-nums;
 }
 
-.bar svg {
+/* Headline number: live agents, first and biggest. */
+.headline {
+  margin: 0.5rem 0;
+}
+
+.headline strong {
+  font-size: 2rem;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Finished history: collapsed by default, in the strip and per group. */
+details.finished {
+  margin-top: 0.5rem;
+}
+
+details.finished > summary {
+  cursor: pointer;
+  padding: 0.5rem 0;
+  color: var(--muted);
+}
+
+/* Labelled fields: the label names the fact, the value states it,
+the help says what it means. */
+dl.fields {
+  margin: 0.5rem 0;
+}
+
+dl.fields .field {
+  display: grid;
+  grid-template-columns: 9rem 1fr;
+  gap: 0.125rem 0.75rem;
+  margin: 0.5rem 0;
+}
+
+dl.fields dt {
+  font-weight: 600;
+}
+
+dl.fields dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: break-word;
+}
+
+dl.fields dd.help {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* Percentage meters: the bar carries the state color, the words
+beside it carry the state name, so nothing reads by color alone. */
+.meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.meter svg {
   display: inline-block;
   vertical-align: middle;
-  margin-right: 0.5rem;
+}
+
+.meter.ok {
+  color: var(--ok);
+}
+
+.meter.low {
+  color: var(--low);
+}
+
+.meter.high {
+  color: var(--high);
+}
+
+.meter.stale {
+  color: var(--stale);
+}
+
+.meter.unknown {
+  color: var(--muted);
+}
+
+/* Agents: one table per project group, finished behind a toggle. */
+#agents h3 {
+  margin: 1rem 0 0.25rem;
+  font-size: 1rem;
+}
+
+#agents .agent-group:first-child h3 {
+  margin-top: 0.5rem;
+}
+
+table.agents {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+  font-variant-numeric: tabular-nums;
+  margin: 0.5rem 0;
+}
+
+table.agents th,
+table.agents td {
+  text-align: left;
+  padding: 0.375rem 0.5rem;
+  vertical-align: top;
+  overflow-wrap: break-word;
+}
+
+table.agents thead th {
+  color: var(--muted);
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+}
+
+table.agents tbody td {
+  border-top: 1px solid var(--line);
+}
+
+table.agents td.id a {
+  color: var(--accent);
 }
 
 #token input {
@@ -292,5 +451,46 @@ main.stale #detail {
 @media (max-width: 700px) {
   main {
     padding: 0.75rem;
+  }
+
+  #cards {
+    grid-template-columns: 1fr;
+    padding: 0.75rem;
+  }
+
+  dl.fields .field {
+    grid-template-columns: 1fr;
+  }
+
+  /* Tables become stacked cards: each cell names its header. */
+  table.agents thead {
+    display: none;
+  }
+
+  table.agents,
+  table.agents tbody,
+  table.agents tr,
+  table.agents td {
+    display: block;
+  }
+
+  table.agents tr {
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    margin: 0.5rem 0;
+    padding: 0.25rem 0.5rem;
+  }
+
+  table.agents td {
+    border: none;
+    display: grid;
+    grid-template-columns: 5.5rem 1fr;
+    gap: 0.5rem;
+    padding: 0.25rem 0;
+  }
+
+  table.agents td::before {
+    content: attr(data-th);
+    color: var(--muted);
   }
 }
