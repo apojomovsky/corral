@@ -156,6 +156,8 @@ class CmdRollupCase(RollupCliCase):
             {"schema_version": 1, "sources": [], "keys": {}},
         )
         self.assertEqual(err.getvalue(), "")
+        with open(heavy.rollup_path(self.tmp), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), out.getvalue())
 
     def test_rows_roll_up_on_stdout(self):
         _write_row(self.tmp, _row())
@@ -176,6 +178,57 @@ class CmdRollupCase(RollupCliCase):
         with redirect_stdout(out):
             code = heavycli.cmd_rollup(self._args(out=target), state_dir=self.tmp)
         self.assertEqual(code, 0)
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), out.getvalue())
+
+    def test_rollup_refreshes_the_default_file(self):
+        _write_row(self.tmp, _row())
+        _write_row(self.tmp, _row())
+        default = heavy.rollup_path(self.tmp)
+        self.assertFalse(os.path.exists(default))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = heavycli.cmd_rollup(self._args(), state_dir=self.tmp)
+        self.assertEqual(code, 0)
+        with open(default, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), out.getvalue())
+
+    def test_default_refresh_failure_is_a_usage_error(self):
+        _write_row(self.tmp, _row())
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch("korapy.paths.atomic_write_text", side_effect=OSError("denied")),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            code = heavycli.cmd_rollup(self._args(), state_dir=self.tmp)
+        self.assertEqual(code, 4)
+        self.assertIn("cannot write", err.getvalue())
+        self.assertTrue(json.loads(out.getvalue())["keys"])
+
+    def test_default_failure_still_writes_the_requested_out_file(self):
+        from korapy import paths as _paths
+
+        _write_row(self.tmp, _row())
+        default = heavy.rollup_path(self.tmp)
+        target = os.path.join(self.tmp, "ops", "rollup.json")
+        os.makedirs(os.path.join(self.tmp, "ops"), exist_ok=True)
+        real_write = _paths.atomic_write_text
+
+        def _fail_default(path, text):
+            if path == default:
+                raise OSError("denied")
+            return real_write(path, text)
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch("korapy.paths.atomic_write_text", side_effect=_fail_default),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            code = heavycli.cmd_rollup(self._args(out=target), state_dir=self.tmp)
+        self.assertEqual(code, 4)
+        self.assertIn(default, err.getvalue())
         with open(target, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), out.getvalue())
 

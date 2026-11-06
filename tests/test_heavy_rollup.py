@@ -302,6 +302,22 @@ class CollectCase(RollupCase):
         self.assertEqual([row["argv_hash"] for row in rows], ["ha", "hb"])
         self.assertLess(rows[0]["at"], rows[1]["at"])
 
+    def test_collect_breaks_equal_timestamp_ties_by_file_order(self):
+        first = json.dumps(_raw(argv_hash="hb", days_ago=1.0), sort_keys=True)
+        second = json.dumps(_raw(argv_hash="ha", days_ago=1.0), sort_keys=True)
+        _write_runs(
+            self.tmp,
+            {
+                "b-host-2026-11.jsonl": [second],
+                "a-host-2026-11.jsonl": [first],
+            },
+        )
+        rows, sources, skipped = heavy.collect_ledger_rows(self.tmp)
+        self.assertEqual(sources, ["a-host-2026-11.jsonl", "b-host-2026-11.jsonl"])
+        self.assertEqual(skipped, 0)
+        self.assertEqual(rows[0]["at"], rows[1]["at"])
+        self.assertEqual([row["argv_hash"] for row in rows], ["hb", "ha"])
+
     def test_collect_reads_every_file_and_counts_the_corrupt(self):
         _write_runs(self.tmp, _fixture())
         rows, sources, skipped = heavy.collect_ledger_rows(self.tmp)
