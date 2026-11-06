@@ -113,6 +113,18 @@ _CONCEPT_ATTRS = iface.BOARD_CONCEPT_ATTRS
 #: ``_want_kind`` below.
 _SELECT_CONCEPTS = frozenset({"board_status", "priority", "area", "pool"})
 
+#: The field-value shapes korapy reads. Every other value kind (date,
+#: number, iteration, label, user, milestone, pull request, repository,
+#: reviewer) arrives without a selected field fragment and is skipped,
+#: never validated. Both read paths and the write scan key on this one
+#: set, so the skip contract cannot fork.
+_READ_TYPENAMES = frozenset(
+    {
+        "ProjectV2ItemFieldTextValue",
+        "ProjectV2ItemFieldSingleSelectValue",
+    }
+)
+
 
 def _want_kind(concept) -> str:
     """``"single_select"`` or ``"text"`` for one board concept."""
@@ -143,6 +155,37 @@ _REF_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9_.-]+#
 
 def _fail(text) -> iface.TrackerError:
     return iface.TrackerError(f"unusable board answer: {text}")
+
+
+def _checked_text(entry, what) -> str:
+    """Stripped text of a text value node, ``""`` for null, else ``TrackerError``.
+
+    The one text-shape check for both value readers: the poll path and
+    the write scan pass their own label, so the messages name the
+    concept or the field each path knows.
+    """
+    text = entry["text"]
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        raise _fail(f"bad board value for {what}: {text!r}")
+    return text.strip()
+
+
+def _checked_option(entry, what):
+    """``(optionId, name)`` of a single-select value node, else ``TrackerError``.
+
+    The one option-shape check for both value readers, like
+    ``_checked_text``: a non-string id or name is malformed, never an
+    absent value the caller would silently keep or overwrite.
+    """
+    oid = entry.get("optionId")
+    if not isinstance(oid, str) or not oid:
+        raise _fail(f"bad board value for {what}: {oid!r}")
+    name = entry.get("name")
+    if not isinstance(name, str):
+        raise _fail(f"bad board value for {what}: {name!r}")
+    return oid, name
 
 
 def parse_blocked_by(text):
@@ -438,8 +481,9 @@ class BoardReader:
         """``(texts, selects)`` for one board node's field values, strict.
 
         Shared by the poll path and the targeted single-item read: every
-        entry is validated through ``_read_value``, so anything short of
-        the value shape fails closed on both paths.
+        entry is validated through ``_read_value``. Entries of a kind
+        korapy does not read are skipped; anything short of the value
+        shape of a kind it does read fails closed on both paths.
         """
         values = node.get("fieldValues")
         entries = values.get("nodes") if isinstance(values, dict) else None
@@ -493,12 +537,17 @@ class BoardReader:
     def _read_value(self, by_field, entry):
         """One field-value node as ``(concept, kind, value)``.
 
-        ``(None, None, None)`` for a field no concept maps; an unset
-        single-select reads as absent. A value of the wrong kind for a
-        mapped concept is a ``TrackerError``.
+        ``(None, None, None)`` for a value of a kind korapy does not
+        read and for a field no concept maps; an unset single-select
+        reads as absent. A value of the wrong kind for a mapped
+        concept, or a malformed value of a kind korapy does read, is
+        a ``TrackerError``.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
+        typename = entry.get("__typename")
+        if typename is not None and typename not in _READ_TYPENAMES:
+            return None, None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
@@ -509,23 +558,13 @@ class BoardReader:
         if _want_kind(concept) == "text":
             if "text" not in entry:
                 raise _fail(f"board value for {concept} is not text")
-            text = entry["text"]
-            if text is None:
-                text = ""
-            if not isinstance(text, str):
-                raise _fail(f"bad board value for {concept}: {text!r}")
-            return concept, "text", text.strip()
+            return concept, "text", _checked_text(entry, concept)
         oid = entry.get("optionId")
         if oid is None:
             if "text" in entry:
                 raise _fail(f"board value for {concept} is not a select")
             return None, None, None
-        if not isinstance(oid, str) or not oid:
-            raise _fail(f"bad board value for {concept}: {oid!r}")
-        name = entry.get("name")
-        if not isinstance(name, str):
-            raise _fail(f"bad board value for {concept}: {name!r}")
-        return concept, "select", (oid, name)
+        return concept, "select", _checked_option(entry, concept)
 
     def _concepts(self, selects, texts, milestone):
         """Board values plus the milestone as the reading's ``extra``.
@@ -715,6 +754,8 @@ class BoardTracker(BoardReader):
         selects = set()
         for entry in entries:
             fid, text = self._locate_value(entry)
+            if fid is None:
+                continue
             if text is None:
                 selects.add(fid)
             else:
@@ -726,23 +767,37 @@ class BoardTracker(BoardReader):
     def _locate_value(self, entry):
         """``(field id, stripped text or None)`` for one field-value node.
 
-        A select value reads as ``None``; an unset value reads as ``""``.
-        Anything short of the value shape is a ``TrackerError``.
+        A select value reads as ``None``; an unset value reads as ``""``;
+        a value of a kind korapy does not read is ``(None, None)`` and the
+        caller skips it. Anything short of the value shape of a kind
+        korapy does read is a ``TrackerError``: both shapes go through
+        the shared ``_checked_text`` and ``_checked_option`` checks, so
+        the scan fails exactly where the poll path fails.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
+        typename = entry.get("__typename")
+        if typename is not None and typename not in _READ_TYPENAMES:
+            return None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
             raise _fail(f"bad board value field {field!r}")
-        if "text" in entry:
-            text = entry["text"]
-            if text is None:
+        if typename == "ProjectV2ItemFieldTextValue":
+            if "text" not in entry:
+                raise _fail(f"board value for {fid} is not text")
+            return fid, _checked_text(entry, fid)
+        if typename == "ProjectV2ItemFieldSingleSelectValue":
+            if entry.get("optionId") is None:
+                if "text" in entry:
+                    raise _fail(f"board value for {fid} is not a select")
                 return fid, ""
-            if not isinstance(text, str):
-                raise _fail(f"bad board value text {text!r}")
-            return fid, text.strip()
+            _checked_option(entry, fid)
+            return fid, None
+        if "text" in entry:
+            return fid, _checked_text(entry, fid)
         if entry.get("optionId") is not None:
+            _checked_option(entry, fid)
             return fid, None
         return fid, ""
 

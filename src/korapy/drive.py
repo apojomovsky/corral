@@ -53,6 +53,7 @@ from korapy import (
     prompts,
     quota,
     quota_ledger,
+    quotacli,
     registry,
     reviewrecord,
     settings,
@@ -1131,6 +1132,74 @@ def _project_quota(project, pool):
         low_pct=resolved["quota.low_pct"],
         unknown_blocks=resolved["quota.unknown_blocks"],
     )
+
+
+def stale_quota_providers(pool, ledger, now, *, refresh_after_s) -> list:
+    """Names in pool order whose ledger entry needs a fresh read. Pure.
+
+    A provider needs one when it has no entry, when its last attempt
+    (a successful `read_at` or a recorded failure's `at`) is older
+    than `refresh_after_s`, or when its entry names no usable
+    timestamp: without one the entry can never prove freshness, so it
+    reads. A non-numeric age reads everything: the pass leans toward
+    fresh data, never toward none.
+    """
+    try:
+        age = float(refresh_after_s)
+    except (TypeError, ValueError):
+        age = 0.0
+    base = ledger if isinstance(ledger, dict) else {}
+    readings = base.get("readings", {}) or {}
+    if not isinstance(readings, dict):
+        readings = {}
+    stale = []
+    for provider in pool or ():
+        name = getattr(provider, "name", provider)
+        entry = readings.get(name)
+        stamp = None
+        if isinstance(entry, dict):
+            if isinstance(entry.get("windows"), dict):
+                stamp = entry.get("read_at")
+            elif "error" in entry:
+                stamp = entry.get("at")
+        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+            stale.append(name)
+            continue
+        try:
+            old = now - float(stamp)
+        except (TypeError, ValueError):
+            stale.append(name)
+            continue
+        if not old <= age:
+            stale.append(name)
+    return stale
+
+
+def refresh_stale(pool, ledger, now, *, refresh_after_s, load_reader=accounts.load_reader):
+    """Re-read every stale provider through the reader seam.
+
+    Returns `(ledger, results)`: `results` maps each refreshed name to
+    its `(ok, detail)` exactly as `quotacli.refresh` reports them.
+    Only stale providers are read, each at most once per pass. A
+    reader that fails, times out, or does not build records its
+    trimmed error in the ledger like the `quota refresh` verb does,
+    and never raises: one bad provider must not stop the pass. The
+    read is read-only toward the provider: it records windows or a
+    failure, and never posts a mark.
+    """
+    fresh, results = ledger, {}
+    for name in stale_quota_providers(pool, ledger, now, refresh_after_s=refresh_after_s):
+        try:
+            fresh, seen = quotacli.refresh(pool, fresh, now, only=name, load_reader=load_reader)
+        except Exception as err:  # noqa: BLE001 - a bad reader must not stop the pass
+            detail = quota_ledger.trim_error(str(err))
+            try:
+                fresh = quota_ledger.record_failure(fresh, name, str(err), now)
+            except quota_ledger.LedgerError:
+                continue
+            seen = {name: (False, detail)}
+        results.update(seen)
+    return fresh, results
 
 
 def _store_labels(store, now):
@@ -4307,6 +4376,8 @@ def _launching_pass(
     repo_map=None,
     review_reader=None,
     pulls_for=None,
+    quota_refresh_after_s=None,
+    quota_load_reader=None,
 ) -> int:
     """One claiming pass: sync, release, gate, claim, launch, mirror, print.
 
@@ -4349,7 +4420,16 @@ def _launching_pass(
     refused with the usage error (exit 4): a host that cannot name
     itself must never reconcile. `repo_map` is the pass's one
     short-to-tracker map, threaded to the admission live set and to
-    orphan recovery.
+    orphan recovery. `quota_refresh_after_s` re-reads every provider
+    whose ledger entry is older than that many seconds through the
+    reader seam before gating, once per pass, so admission and the
+    dashboard see a fresh ledger; with none no reader runs, exactly as
+    before. Failures record like the `quota refresh` verb and print
+    one line each, and never change the exit code.
+    `quota_load_reader` builds the readers (None loads them the way
+    the verb does); the refreshed ledger persists through the ledger
+    lock only when the pass loaded it itself, never over an injected
+    one.
     """
     events: list[dict] = []
     released = 0
@@ -4438,6 +4518,42 @@ def _launching_pass(
         quota_for,
         pool,
     ) = ctx
+    if quota_refresh_after_s is not None and pool:
+        loader = quota_load_reader if quota_load_reader is not None else accounts.load_reader
+        quota_results: dict = {}
+        if ledger is None:
+
+            def _quota_change(stored):
+                updated, seen = refresh_stale(
+                    pool,
+                    stored,
+                    now,
+                    refresh_after_s=quota_refresh_after_s,
+                    load_reader=loader,
+                )
+                quota_results.update(seen)
+                return updated if seen else None
+
+            try:
+                ledger_data = quota_ledger.update(_quota_change)
+            except (quota_ledger.LedgerError, OSError) as problem:
+                print(f"korapy drive: cannot refresh quota ({problem})", file=err)
+        else:
+            try:
+                ledger_data, seen = refresh_stale(
+                    pool,
+                    ledger_data,
+                    now,
+                    refresh_after_s=quota_refresh_after_s,
+                    load_reader=loader,
+                )
+            except Exception as problem:  # noqa: BLE001 - quota never stops the pass
+                print(f"korapy drive: cannot refresh quota ({problem})", file=err)
+            else:
+                quota_results.update(seen)
+        for name, (ok, detail) in quota_results.items():
+            if not ok:
+                print(f"korapy drive: quota {name}: {detail}", file=err)
     day_today = None
     day_used = 0
     start_budget = None
@@ -4752,6 +4868,8 @@ def run_pass(
     repo_map=None,
     review_reader=None,
     pulls_for=None,
+    quota_refresh_after_s=None,
+    quota_load_reader=None,
 ) -> int:
     """One pass: gate and print, or sync, claim, launch, mirror and print.
 
@@ -4811,7 +4929,10 @@ def run_pass(
     records, exactly as before. `pulls_for` feeds the pass's one
     linked-pull map, which the eligibility rows and the gate rows share;
     with none every row reads empty, which is what `--plan` builds: it
-    never contacts the tracker. `now` defaults to the wall
+    never contacts the tracker. `quota_refresh_after_s`
+    re-reads stale quota before gating in the non-plan pass only;
+    `--plan` never takes it, so a dry run runs no reader.
+    `quota_load_reader` builds those readers. `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
     production reads the host. `repo_map` is the pass's one
@@ -4887,6 +5008,8 @@ def run_pass(
                 repo_map=repo_map,
                 review_reader=review_reader,
                 pulls_for=pulls_for,
+                quota_refresh_after_s=quota_refresh_after_s,
+                quota_load_reader=quota_load_reader,
                 **args,
             )
     except LockHeld as held:

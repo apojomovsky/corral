@@ -429,13 +429,20 @@ class QuotaSettings(unittest.TestCase):
     def test_unknown_blocks_defaults_to_false(self):
         self.assertEqual(settings.REGISTRY["quota.unknown_blocks"].default, False)
 
+    def test_refresh_after_s_defaults_to_900(self):
+        self.assertEqual(settings.REGISTRY["quota.refresh_after_s"].default, 900)
+
     def test_quota_registers_its_settings(self):
         self.assertIn("korapy.quota", settings.PROVIDERS)
 
     def test_a_host_file_may_set_quota_keys(self):
-        resolved = settings.resolve(host={"quota": {"low_pct": 95, "unknown_blocks": True}}, env={})
+        resolved = settings.resolve(
+            host={"quota": {"low_pct": 95, "unknown_blocks": True, "refresh_after_s": 60}},
+            env={},
+        )
         self.assertEqual(resolved["quota.low_pct"], 95)
         self.assertEqual(resolved["quota.unknown_blocks"], True)
+        self.assertEqual(resolved["quota.refresh_after_s"], 60)
 
 
 if __name__ == "__main__":

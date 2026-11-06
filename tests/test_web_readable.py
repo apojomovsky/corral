@@ -112,6 +112,14 @@ class QuotaAge(unittest.TestCase):
         self.assertIn("older than its freshness bound counts as stale", views)
         self.assertIn("korapy quota refresh", views)
 
+    def test_quota_card_renders_the_snapshot_stale_reason(self):
+        # The card renders the snapshot's stale_reason field as-is;
+        # the words come from the server helper, never a second
+        # derivation in the page.
+        views = web_text("views.js")
+        self.assertIn("stale_reason", views)
+        self.assertIn("quotaProvider", views)
+
     def test_window_reset_reads_as_local_time_with_countdown(self):
         # The reset line is composed, not pasted: the local clock plus
         # the countdown, so the suite pins the composition itself.

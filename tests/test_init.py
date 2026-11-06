@@ -331,6 +331,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
+# quota.refresh_after_s = 900  # seconds after a read before the drive pass refreshes it
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
 #
 # [registry]
@@ -467,6 +468,7 @@ commits.conventional = false
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
+# quota.refresh_after_s = 900  # seconds after a read before the drive pass refreshes it
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
 #
 # [registry]

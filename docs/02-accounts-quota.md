@@ -82,6 +82,27 @@ korapy checks every chain entry against the pool. An unknown provider is a confi
 - `korapy quota unmark <provider> [--reason R]`: release a mark early, for a bad reading or a fat-fingered `--until`.
 - Library: `korapy.quota.gate(...)`, named in the design doc's contract section; its signature is fixed in slice 3.
 
+## Refreshing in the dispatch pass
+
+Nobody runs `korapy quota refresh` by hand on a schedule, so the
+dispatch pass does it: every non-plan pass re-reads each provider
+whose last attempt (a successful `read_at` or a recorded failure's
+`at`) is older than the `quota.refresh_after_s` setting (default 900
+seconds), through the same reader seam and the same record-or-failure
+recording the verb uses, at most once per provider per pass. The
+refresh runs before gating, so admission and the dashboard see the
+fresh ledger in the same pass. A reader that fails or times out
+records its trimmed error and prints one line; it never blocks or
+crashes the pass, and the exit code never changes because of it. The
+pass persists the refreshed ledger through the ledger lock only when
+it loaded the ledger itself; `--plan` runs no reader at all. A stale
+reading keeps the admission behavior it always had
+(`quota.unknown_blocks`); the refresh only makes the reading younger.
+
+Every view names each reading's age and, when it is stale, why:
+`never ran`, `reader failed`, or `too old`. `korapy quota`, the
+snapshot (text and dashboard), and the doctor all show them.
+
 ## Not in this step
 
 Pacing (a baseline share per window), calibration and tapering belong to a reader or a later step. They are generic in idea, but existing implementations tie them to one provider's windows, so they get their own design.
