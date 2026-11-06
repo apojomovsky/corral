@@ -922,7 +922,10 @@ AGENTS.md). Later tickets build on earlier ones.
    pid-liveness and clock seams. Criteria: backfill
    admits a small job past a big head; the skip bound
    stops starvation; a reaped holder frees its weight
-   with no ledger row; pid reuse leaks nothing.
+   with no ledger row; pid reuse leaks nothing. Note from
+   ticket 2: until this ticket lands, a waiter row that
+   outlives its owner can wedge the lane head until manual
+   repair; the stale-waiter reaping here cures that window.
 4. The estimator and the rollup verb. Per-cgroup capture
    through injected readers, the section 6.3 rules
    (median plus p90, small-sample maximum, starved
@@ -940,7 +943,11 @@ AGENTS.md). Later tickets build on earlier ones.
    for lane health, stuck-waiter and stuck-holder rows,
    bypass counts, the corrupt-`lane.json` row.
    Criteria: saturated refuses while shares are free;
-   absent files read unknown; every row renders.
+   absent files read unknown; every row renders. Note from
+   ticket 2: the lane budget is resolved once per run, not
+   every admit pass, while section 4 says admission resolves
+   the live budget from settings every pass; this ticket owns
+   re-resolving per pass.
 6. Bypass, roles, journal surface and docs. `--bypass`
    with required reason, `--role` with the takeoff
    default through the module call, `recent[]` ring,

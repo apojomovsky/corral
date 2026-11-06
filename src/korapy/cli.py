@@ -15,6 +15,7 @@ from korapy import (
     drivehub,
     gccli,
     githubcli,
+    heavycli,
     hubcli,
     init,
     launch,
@@ -243,6 +244,7 @@ def build_parser() -> argparse.ArgumentParser:
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
     githubcli.add_parser(sub)
+    heavycli.add_parser(sub)
     quotacli.add_parser(sub)
     repocli.add_parser(sub)
     serve.add_parser(sub)
