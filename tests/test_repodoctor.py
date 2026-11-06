@@ -128,6 +128,49 @@ class RowOrder(unittest.TestCase):
         )
 
 
+class TrackerRenameRow(unittest.TestCase):
+    def tracker_rows(self, **over):
+        params = {
+            "name": "demo",
+            "origin": "https://example.com/o/demo.git",
+            "branch": "ok",
+            "labels": "ok",
+            "tracker_repo": "acme/old",
+            "canonical": "acme/new",
+        }
+        params.update(over)
+        found = {}
+        for row in repodoctor.check_sites((repodoctor.RepoSite(**params),)):
+            found[row.name] = row
+        return found
+
+    def test_rename_warns_naming_configured_then_answered(self):
+        row = self.tracker_rows()["tracker:demo"]
+        self.assertEqual(row.status, "warn")
+        self.assertEqual(
+            row.detail,
+            "demo: configured as acme/old but the tracker answers acme/new:"
+            " the repository was renamed",
+        )
+
+    def test_rename_fix_orders_old_then_new(self):
+        row = self.tracker_rows()["tracker:demo"]
+        self.assertIn("korapy repo rename acme/old acme/new", row.fix)
+
+    def test_matching_names_are_ok(self):
+        row = self.tracker_rows(canonical="acme/old")["tracker:demo"]
+        self.assertEqual(row.status, "ok")
+        self.assertIn("as configured", row.detail)
+
+    def test_case_only_is_not_a_rename(self):
+        row = self.tracker_rows(canonical="ACME/OLD")["tracker:demo"]
+        self.assertEqual(row.status, "ok")
+
+    def test_unknown_names_mean_no_tracker_row(self):
+        self.assertNotIn("tracker:demo", self.tracker_rows(tracker_repo=None))
+        self.assertNotIn("tracker:demo", self.tracker_rows(canonical=None))
+
+
 def write_ops(root, name="demo", body=None):
     """An ops root with one `[[repo]]` entry pointing at a `clone` dir."""
     os.makedirs(os.path.join(root, "clone"), exist_ok=True)
