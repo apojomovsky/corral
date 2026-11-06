@@ -1713,23 +1713,31 @@ def _pass(
     return USAGE if problems else OK
 
 
-def production_operators(registered, git):
+def production_operators(registered, git, *, resolved=None):
     """`{tracker_repo: operators}` across every registered project's root.
 
     Resolves through the shared helper, the same way sync and mirror
     do, so the pass's sync, freshness re-reads and mirror agree with
-    both CLIs on which authors are internal. Returns (mapping, None),
-    or (None, problem) on the first configuration error.
+    both CLIs on which authors are internal. `resolved` maps each
+    registered root to its already-resolved `{name: (tracker repo,
+    operators)}` entries: with it the pass shares its one resolution
+    instead of resolving again (every root in `registered` must have
+    an entry); with none, the builder resolves its own. Returns
+    (mapping, None), or (None, problem) on the first configuration
+    error.
     """
     mapping = {}
     for project in registered:
-        try:
-            names = settings.repo_names(project.root)
-        except settings.SettingsError as err:
-            return None, str(err)
-        entries, problem = syncli.repo_operators(project.root, names, git)
-        if problem is not None:
-            return None, problem
+        if resolved is None:
+            try:
+                names = settings.repo_names(project.root)
+            except settings.SettingsError as err:
+                return None, str(err)
+            entries, problem = syncli.repo_operators(project.root, names, git)
+            if problem is not None:
+                return None, problem
+        else:
+            entries = resolved[project.root]
         for _name, (tracker_repo, ops) in entries.items():
             mapping.setdefault(tracker_repo, ops)
     return mapping, None
@@ -2973,7 +2981,7 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         events.append({"event": "give_up", "at": now, "ticket": ref, "agent": claim.agent})
 
 
-def production_repo_map(registered, *, git=None):
+def production_repo_map(registered, *, git=None, resolved=None):
     """`{short [[repo]] name: tracker repo}` across registered roots.
 
     The one resolver for the tracker repo behind a registry entry's
@@ -2981,9 +2989,13 @@ def production_repo_map(registered, *, git=None):
     `syncli.root_short_map`, and the first project naming a short
     name wins.
     A configuration problem raises SettingsError, so the pass refuses
-    with exit 4 instead of joining against a guess. The CLI builds it
-    once per pass and threads it into the admission live set, the
-    stuck, finished and orphan builders and `run_pass`, so a
+    with exit 4 instead of joining against a guess. `resolved` maps
+    each registered root to its already-resolved `{name: (tracker
+    repo, operators)}` entries: with it the pass shares its one
+    resolution instead of resolving again (every root in `registered`
+    must have an entry); with none, the builder resolves its own. The
+    CLI builds it once per pass and threads it into the admission live
+    set, the stuck, finished and orphan builders and `run_pass`, so a
     `korapy.toml` edit between two of them cannot make two joins
     disagree, and each repo lacking an explicit `tracker.repo` shells
     git once per pass. `git` names the origin-lookup seam; None is the
@@ -2993,7 +3005,13 @@ def production_repo_map(registered, *, git=None):
     git = syncli._git if git is None else git
     found = {}
     for project in registered:
-        for name, tracker_repo in syncli.root_short_map(project.root, git).items():
+        if resolved is None:
+            shorts = syncli.root_short_map(project.root, git)
+        else:
+            shorts = {
+                name: tracker_repo for name, (tracker_repo, _ops) in resolved[project.root].items()
+            }
+        for name, tracker_repo in shorts.items():
             found.setdefault(name, tracker_repo)
     return found
 
