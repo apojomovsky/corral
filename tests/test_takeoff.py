@@ -801,6 +801,32 @@ class TakeoffCase(unittest.TestCase):
         )
         self.assertEqual((short_map, ticket_repo, short, matched), ({}, "main", None, False))
 
+    def test_repo_state_matches_a_relative_clone_path_from_a_foreign_directory(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-takeoff-relative-")
+        self.addCleanup(tmp.cleanup)
+        root = os.path.realpath(tmp.name)
+        ops = os.path.join(root, "ops")
+        clone = os.path.join(root, "clone")
+        # Nested, so a relative clone.path resolved against the working
+        # directory lands somewhere else: only the ops root is correct.
+        foreign = os.path.join(root, "elsewhere", "deep")
+        os.makedirs(ops)
+        os.makedirs(clone)
+        os.makedirs(foreign)
+        with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\nclone.path = "../clone"\ntracker.repo = "acme/app"\n'
+            )
+        previous = os.getcwd()
+        os.chdir(foreign)
+        try:
+            state = takeoff._repo_state(ops, os.path.realpath(clone), self.run_cmd)
+        finally:
+            os.chdir(previous)
+        short_map, ticket_repo, short, matched, _resolved = state
+        self.assertEqual(short_map, {"app": "acme/app"})
+        self.assertEqual((ticket_repo, short, matched), ("acme/app", "app", True))
+
     def test_takeoff_commands_run_through_the_seam(self):
         self.write_ops(
             "[[repo]]\n"

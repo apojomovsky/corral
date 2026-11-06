@@ -549,6 +549,17 @@ def read_host(env=None):
     return _load(os.path.join(paths.config_dir(env), HOST_CONFIG_NAME))
 
 
+def entry_names(table, project_name):
+    """Names of the ``[[repo]]`` entries in one parsed project table.
+
+    `table` is the pre-read project file (see `read_project`): the one
+    validated derivation of entry names, shared by matching and the
+    tracker map instead of re-reading entry names from the raw table.
+    """
+    entries, _, _ = _repo_entries(table.get("repo", []), project_name)
+    return list(entries)
+
+
 def repo_names(root):
     """Names of the ``[[repo]]`` entries in the ops root's korapy.toml,
     in file order. Empty when there is no root or no file."""
@@ -556,8 +567,7 @@ def repo_names(root):
     if not root:
         return []
     project_path = os.path.join(root, PROJECT_FILE)
-    entries, _, _ = _repo_entries(read_project(root).get("repo", []), project_path)
-    return list(entries)
+    return entry_names(read_project(root), project_path)
 
 
 def match_covering(table, root, clone, project_name):

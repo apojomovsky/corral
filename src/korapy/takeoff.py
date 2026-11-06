@@ -248,11 +248,11 @@ def _repo_state(ops_root, main_clone, git):
     project_path = os.path.join(ops_root, settings.PROJECT_FILE)
     try:
         name = settings.match_covering(table, ops_root, main_clone, project_path)
+        # The match validated this parse; the names below are the same
+        # validated derivation, without reading the file a second time.
+        names = settings.entry_names(table, project_path)
     except settings.SettingsError as err:
         raise TakeoffError(str(err)) from None
-    # The match above validated this parse, so these are the validated
-    # entry names, without reading the file a second time.
-    names = [entry.get("name") for entry in table.get("repo", []) if isinstance(entry, dict)]
     entries, problem = syncli.repo_operators(ops_root, names, git, project=table, host=host)
     if problem is not None or entries is None:
         short_map: dict = {}
