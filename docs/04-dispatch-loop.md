@@ -126,6 +126,17 @@ never withdraws them by omission. Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
+The store carries no linked pulls (pull-request rows are never ticket
+rows, and the sync drops them), so the rows a policy sees arrive with
+`pulls` empty and `basic`'s own pull filter stays dormant on them. The
+live check lives one layer down instead: the pass reads each
+fresh-start candidate's linked pulls through the tracker
+(`Tracker.linked_pulls`, implemented once by each adapter) and the
+shared gate refuses the start while one is open (section 3). Which
+findings reopen work is the gate's call too: it grades the ticket's
+latest review record against the fix-round threshold, so a policy only
+decides to ask, never whether the asking succeeds (section 5).
+
 ## 3. Ordering and fairness; caps, quota and hold; what exit 75 does
 
 Each pass builds one candidate list: every project's requests,
@@ -182,14 +193,32 @@ Per-candidate gate order, cheapest first:
    - Claimed row plus `review`: skip while the worker still holds
      the claim. The review is scheduled on a later pass, after the
      worker finishes and the takeover above schedules it.
-3. Hold: `hold.reason` over the ticket and linked PR labels.
+3. Review threshold and linked pulls, both on unclaimed rows only.
+   The pass reads the ticket's latest review record once per pass
+   from the session dirs and grades it here: an approving verdict
+   (`approve` or `approve-with-findings`) whose findings all sit
+   below the `drive.fix_round_threshold` setting (default `normal`)
+   is merge-ready, so a fix, resume, review or start requested on it
+   skips instead of launching. A `block` verdict, or any finding at
+   or above the threshold, opens exactly one fix round through the
+   normal launch path. Severities outside the `high`, `normal`, `low`
+   vocabulary read as above the threshold: the loop never silently
+   merges a finding it cannot grade. Then the fresh-start check: a
+   `start` (including a `fix` or `resume` reclassified as one) on an
+   unclaimed row with an open linked pull request skips, since the
+   pull carries the ticket. The linked pulls come from
+   `Tracker.linked_pulls`, one tracker call per fresh-start
+   candidate; an unreadable answer fails closed (skip, record
+   "unreadable"). `--plan` skips this check: it never contacts the
+   tracker.
+4. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
    not started, resumed or reviewed by the loop.
-4. Admission (`admission.admit` against live state from
+5. Admission (`admission.admit` against live state from
    `launch.admission_state`): project ceiling and repo cap first, then
    the host total with the floor rule.
-5. Quota gate over the project's chains against the shared ledger. A
+6. Quota gate over the project's chains against the shared ledger. A
    refused role is a skip for that candidate only; another project's
    chains may route around the exhausted provider.
 
@@ -308,10 +337,17 @@ States and who moves them:
   pool, and each reviewer id is minted fresh at start time, so there
   is nothing to compare a row against. No `author` field is added to
   `TicketRow` because scheduling never needs it.
-- Changes requested: the loop schedules a fix round as `resume` when
-  the worker's unit or registry entry is still usable, else a fresh
-  `fix` start on the same ticket and branch. Fix rounds count against
-  the restart budget below.
+- Changes requested: the review record's findings decide. A finding
+  at or above the `drive.fix_round_threshold` setting (default
+  `normal`), or a `block` verdict, schedules a fix round as `resume`
+  when the worker's unit or registry entry is still usable, else a
+  fresh `fix` start on the same ticket and branch. Fix rounds count
+  against the restart budget below.
+- Approved with only lows: the ticket is merge-ready and the loop
+  launches nothing. The lows stay in the review record for the
+  coordinator (or a future merge verb) to file as issues; no fix
+  round churns on approved work, and no fresh worker starts on a
+  ticket whose pull request is already open.
 - Merge-ready: the loop does nothing. A maintainer merges. The loop
   never merges, never closes, never assigns.
 

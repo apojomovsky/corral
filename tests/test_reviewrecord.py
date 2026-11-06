@@ -364,5 +364,148 @@ class VerbTest(unittest.TestCase):
         self.assertEqual(code, 4)
 
 
+class SeverityThresholdTest(unittest.TestCase):
+    """The fix-round threshold over review findings. Pure, no sessions dir."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = tmp.name
+
+    def record(self, verdict, findings, **kw):
+        return {
+            "repo": REPO,
+            "number": 1,
+            "verdict": verdict,
+            "findings": findings,
+            **kw,
+        }
+
+    def test_severities_rank_highest_first(self):
+        ranks = [reviewrecord.severity_rank(name) for name in ("high", "normal", "low")]
+        self.assertEqual(ranks, sorted(ranks, reverse=True))
+        self.assertEqual(len(set(ranks)), 3)
+
+    def test_an_unknown_severity_ranks_above_high(self):
+        self.assertGreater(reviewrecord.severity_rank("note"), reviewrecord.severity_rank("high"))
+        self.assertGreater(reviewrecord.severity_rank(""), reviewrecord.severity_rank("high"))
+        self.assertGreater(reviewrecord.severity_rank(None), reviewrecord.severity_rank("high"))
+
+    def test_lows_only_do_not_meet_the_default_threshold(self):
+        findings = [{"severity": "low", "text": "typo"}]
+        self.assertFalse(reviewrecord.meets_threshold(findings))
+
+    def test_a_normal_finding_meets_the_default_threshold(self):
+        findings = [{"severity": "normal", "text": "missing test"}]
+        self.assertTrue(reviewrecord.meets_threshold(findings))
+
+    def test_a_high_finding_meets_a_normal_threshold(self):
+        findings = [{"severity": "high", "text": "data loss"}]
+        self.assertTrue(reviewrecord.meets_threshold(findings, "normal"))
+
+    def test_a_low_finding_meets_a_low_threshold(self):
+        findings = [{"severity": "low", "text": "typo"}]
+        self.assertTrue(reviewrecord.meets_threshold(findings, "low"))
+
+    def test_a_normal_finding_misses_a_high_threshold(self):
+        findings = [{"severity": "normal", "text": "missing test"}]
+        self.assertFalse(reviewrecord.meets_threshold(findings, "high"))
+
+    def test_no_findings_meet_no_threshold(self):
+        self.assertFalse(reviewrecord.meets_threshold([]))
+
+    def test_an_unknown_severity_meets_every_threshold(self):
+        findings = [{"severity": "note", "text": "ungraded"}]
+        for threshold in ("high", "normal", "low"):
+            self.assertTrue(reviewrecord.meets_threshold(findings, threshold), threshold)
+
+    def test_an_unknown_threshold_is_refused(self):
+        with self.assertRaises(ValueError):
+            reviewrecord.meets_threshold([{"severity": "low"}], "urgent")
+
+    def test_no_record_wants_no_fix(self):
+        self.assertFalse(reviewrecord.fix_wanted(None))
+
+    def test_a_plain_approve_wants_no_fix(self):
+        self.assertFalse(reviewrecord.fix_wanted(self.record("approve", [])))
+
+    def test_approve_with_lows_only_wants_no_fix(self):
+        record = self.record("approve-with-findings", [{"severity": "low", "text": "t"}])
+        self.assertFalse(reviewrecord.fix_wanted(record))
+
+    def test_approve_with_a_normal_finding_wants_a_fix(self):
+        record = self.record("approve-with-findings", [{"severity": "normal", "text": "t"}])
+        self.assertTrue(reviewrecord.fix_wanted(record))
+
+    def test_a_block_wants_a_fix_even_without_findings(self):
+        self.assertTrue(reviewrecord.fix_wanted(self.record("block", [])))
+
+    def test_a_low_threshold_keeps_lows_fixing(self):
+        record = self.record("approve-with-findings", [{"severity": "low", "text": "t"}])
+        self.assertTrue(reviewrecord.fix_wanted(record, "low"))
+
+    def test_check_threshold_accepts_the_vocabulary(self):
+        for value in ("high", "normal", "low"):
+            self.assertEqual(reviewrecord.check_threshold(value), value)
+
+    def test_check_threshold_normalizes_case_and_blanks(self):
+        self.assertEqual(reviewrecord.check_threshold(" Normal "), "normal")
+
+    def test_check_threshold_refuses_anything_else(self):
+        for value in ("", "urgent", "note", None, 42):
+            with self.assertRaises(ValueError, msg=repr(value)):
+                reviewrecord.check_threshold(value)
+
+    def write_record(self, commit, verdict="approve-with-findings", findings=(), at=0.0):
+        path = reviewrecord.record_path(REPO, 1, commit, sessions_root=self.root)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(
+                {
+                    "repo": REPO,
+                    "number": 1,
+                    "commit": commit,
+                    "reviewer": "reviewer-1",
+                    "author": "author-1",
+                    "verdict": verdict,
+                    "findings": list(findings),
+                    "at": at,
+                },
+                handle,
+            )
+        return path
+
+    def test_latest_record_is_none_without_reviews(self):
+        self.assertIsNone(reviewrecord.latest_record(REPO, 1, sessions_root=self.root))
+
+    def test_latest_record_reads_the_only_review(self):
+        self.write_record("abc123def456", findings=[{"severity": "low", "text": "t"}])
+        found = reviewrecord.latest_record(REPO, 1, sessions_root=self.root)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["verdict"], "approve-with-findings")
+
+    def test_latest_record_prefers_the_newest_review(self):
+        self.write_record("aaa111bbb222", findings=[{"severity": "high", "text": "old"}], at=100.0)
+        self.write_record("ccc333ddd444", findings=[{"severity": "low", "text": "new"}], at=200.0)
+        found = reviewrecord.latest_record(REPO, 1, sessions_root=self.root)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["findings"], [{"severity": "low", "text": "new"}])
+
+    def test_latest_record_ignores_corrupt_files(self):
+        self.write_record("abc123def456", findings=[{"severity": "low", "text": "t"}], at=200.0)
+        bad = os.path.join(
+            reviewrecord.reviews_dir(REPO, 1, sessions_root=self.root), "review-zzz.json"
+        )
+        os.makedirs(os.path.dirname(bad), exist_ok=True)
+        with open(bad, "w", encoding="utf-8") as handle:
+            handle.write("not json{")
+        found = reviewrecord.latest_record(REPO, 1, sessions_root=self.root)
+        self.assertIsNotNone(found)
+        assert found is not None
+        self.assertEqual(found["findings"], [{"severity": "low", "text": "t"}])
+
+
 if __name__ == "__main__":
     unittest.main()
