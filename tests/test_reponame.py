@@ -591,6 +591,8 @@ class RenameRootCase(TempStoreTest):
             "now": NOW,
             "out": self.out,
             "err": self.err,
+            "lock": RecordingLock(),
+            "lock_path": "/state/drive.lock",
         }
         params.update(over)
         return self.cmd(old, new, **params)
@@ -823,6 +825,68 @@ class RenameRootCase(TempStoreTest):
         self.assertIn("disk is full", self.err.getvalue())
         self.assertEqual(sorted(os.listdir(self.tmp.name)), before)
         self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+
+    def test_liveness_gather_runs_inside_the_lock(self):
+        self.setUpStore()
+        rec = RecordingLock()
+        seen = {}
+
+        def gather():
+            seen["held"] = rec.held
+            return ([(entry("agent-1"), registry.LIVE)], frozenset())
+
+        code = self.rename(lock=rec, lock_path="/state/drive.lock", gather=gather)
+        self.assertEqual(code, 2)
+        self.assertIn("agent-1", self.err.getvalue())
+        self.assertTrue(seen.get("held"))
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.backups(), [])
+
+    def test_clobbered_backup_target_is_never_removed(self):
+        from korapy import repocli
+
+        self.setUpStore()
+        target = repocli._backup_target(self.path, NOW)
+
+        class ClobberedStore(LosingStore):
+            def backup_into(self, path):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("someone else")
+                raise board.StoreError(f"cannot back up into {path}: target exists")
+
+        code = self.rename(store=ClobberedStore(self.store))
+        self.assertEqual(code, 4)
+        self.assertIn("target exists", self.err.getvalue())
+        with open(target, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "someone else")
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+
+    def test_missing_lock_fails_closed_outside_plan(self):
+        self.setUpStore()
+        code = self.rename(lock=None)
+        self.assertEqual(code, 4)
+        self.assertIn("lock", self.err.getvalue())
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.store.rename_counts(NEW)["items"], 0)
+        self.assertEqual(self.backups(), [])
+
+    def test_plan_without_a_lock_changes_nothing(self):
+        self.setUpStore()
+        code = self.rename(plan=True, lock=None)
+        self.assertEqual(code, 0)
+        self.assertIn(f"{OLD} -> {NEW}", self.out.getvalue())
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.backups(), [])
+
+    def test_plan_names_the_untouched_session_records(self):
+        self.setUpStore()
+        code = self.rename(plan=True)
+        self.assertEqual(code, 0)
+        text = self.out.getvalue()
+        self.assertIn("session directories", text)
+        self.assertIn("review records", text)
+        self.assertIn("not touched", text)
+        self.assertIn("#479", text)
 
 
 class TrackerRowTest(unittest.TestCase):

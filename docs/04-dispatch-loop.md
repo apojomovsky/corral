@@ -399,7 +399,11 @@ check that serializes a fix behind a live reviewer, the
 finished-role carry that frees a reviewed row, and the orphan
 presence check all read that
 resolver, never a second copy; keying on the holder id instead would
-match no entry and mistake every finished worker for a crash. The takeover releases the worker
+match no entry and mistake every finished worker for a crash. Session
+directories and review records are keyed by the short `[[repo]]` name
+as well, so `korapy repo rename` leaves them in place (see #479); once
+that issue lands and records resolve by store key, the rename must move
+the session directories with the store keys. The takeover releases the worker
 claim and claims a fresh reviewer id in the same handoff, so there is
 never a window where the row is unclaimed. Worker completion takes
 over before any reviewer start and long before merge; merge-ready rows

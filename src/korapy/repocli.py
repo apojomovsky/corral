@@ -63,10 +63,11 @@ def _backup_target(store_path, now):
 def _remove_fresh_backup(path):
     """Remove the backup this run wrote after a refused move. Best effort.
 
-    Only this run's file is ever removed: `_backup_target` hands out a
-    path that holds no backup, and `backup_into` refuses to clobber one,
-    so the file at `path` is ours. Earlier backups are never touched; a
-    refused run rotates nothing, and a later success prunes by retention.
+    Call only when this run's `backup_into` returned cleanly: the flag
+    at the call site proves the file is ours. A path alone never proves
+    it, since a concurrent writer can plant the target between selection
+    and removal. Earlier backups are never touched; a refused run rotates
+    nothing, and a later success prunes by retention.
     """
     try:
         os.remove(path)
@@ -87,6 +88,26 @@ def units_exit(problem) -> int:
     return problem.exit_code
 
 
+def _gathered_liveness(gather, err):
+    """Fresh ``(entries, live_units)`` from ``gather``, or ``(None, exit)``.
+
+    ``gather`` runs wherever the caller holds exclusion, so a unit that
+    starts after the verb does is still seen. A units failure keeps its
+    own exit code (unreachable systemd is 3); a registry failure is a
+    usage error.
+    """
+    from korapy import registry, units
+
+    try:
+        return gather(), None
+    except units.UnitsError as problem:
+        _err(str(problem), err)
+        return None, units_exit(problem)
+    except registry.RegistryError as problem:
+        _err(str(problem), err)
+        return None, USAGE
+
+
 def rename_root(
     old,
     new,
@@ -102,8 +123,9 @@ def rename_root(
     out,
     err,
     plan=False,
-    lock=None,
+    lock,
     lock_path=None,
+    gather=None,
 ) -> int:
     """Migrate one tracker repo's store keys, or plan the move. All seams injected.
 
@@ -113,55 +135,72 @@ def rename_root(
     repos. ``project_shorts`` is ``{project: [shorts]}`` for the owners
     fallback; ``owners`` names the projects owning the renamed repo
     outright. ``lock`` is the drive-lock seam (``drive.drive_lock``,
-    taking ``lock_path`` from the one resolver ``drive.lock_path``):
-    the move holds it for the whole liveness scan, backup and key
-    migration, so a concurrent drive pass cannot claim between the scan
-    and the move; a held lock refuses with exit 2 naming the holder. A
-    plan holds no lock and writes nothing, like ``drive --plan``. None
-    skips mutual exclusion (tests); production passes the real lock.
+    taking ``lock_path`` from the one resolver ``drive.lock_path``),
+    required: the move holds it for the whole liveness scan, backup and
+    key migration, so a concurrent drive pass cannot claim between the
+    scan and the move; a held lock refuses with exit 2 naming the
+    holder, and a missing lock outside ``--plan`` fails closed with
+    exit 4 instead of migrating unguarded. ``gather`` is a zero-arg
+    callable returning fresh ``(registry_entries, live_units)``; it is
+    read inside the lock (outside any lock for a plan), so a snapshot
+    taken before the lock cannot miss an agent that started late. A
+    plan holds no lock and writes nothing, like ``drive --plan``.
     Exit codes follow the module docstring.
     """
-    if lock is not None and not plan:
-        from korapy import drive
+    if plan:
+        if gather is not None:
+            gathered, exit_code = _gathered_liveness(gather, err)
+            if gathered is None:
+                return exit_code
+            registry_entries, live_units = gathered
+        return _rename_body(
+            old,
+            new,
+            store=store,
+            store_path=store_path,
+            registry_entries=registry_entries,
+            live_units=live_units,
+            mapping=mapping,
+            project_shorts=project_shorts,
+            owners=owners,
+            now=now,
+            out=out,
+            err=err,
+            plan=plan,
+        )
+    if lock is None:
+        _err("cannot migrate without the drive lock: refusing unguarded", err)
+        return USAGE
+    from korapy import drive
 
-        try:
-            with lock(lock_path):
-                return _rename_body(
-                    old,
-                    new,
-                    store=store,
-                    store_path=store_path,
-                    registry_entries=registry_entries,
-                    live_units=live_units,
-                    mapping=mapping,
-                    project_shorts=project_shorts,
-                    owners=owners,
-                    now=now,
-                    out=out,
-                    err=err,
-                    plan=plan,
-                )
-        except drive.LockHeld as held:
-            _err(str(held), err)
-            return RACE
-        except drive.LockError as problem:
-            _err(str(problem), err)
-            return USAGE
-    return _rename_body(
-        old,
-        new,
-        store=store,
-        store_path=store_path,
-        registry_entries=registry_entries,
-        live_units=live_units,
-        mapping=mapping,
-        project_shorts=project_shorts,
-        owners=owners,
-        now=now,
-        out=out,
-        err=err,
-        plan=plan,
-    )
+    try:
+        with lock(lock_path):
+            if gather is not None:
+                gathered, exit_code = _gathered_liveness(gather, err)
+                if gathered is None:
+                    return exit_code
+                registry_entries, live_units = gathered
+            return _rename_body(
+                old,
+                new,
+                store=store,
+                store_path=store_path,
+                registry_entries=registry_entries,
+                live_units=live_units,
+                mapping=mapping,
+                project_shorts=project_shorts,
+                owners=owners,
+                now=now,
+                out=out,
+                err=err,
+                plan=plan,
+            )
+    except drive.LockHeld as held:
+        _err(str(held), err)
+        return RACE
+    except drive.LockError as problem:
+        _err(str(problem), err)
+        return USAGE
 
 
 def _rename_body(
@@ -227,20 +266,28 @@ def _rename_body(
     if plan:
         out.write(f"would rename {old} -> {new}: {_counts_text(before)}\n")
         out.write(f"would write backup {backup}\n")
+        out.write(
+            "session directories and review records are keyed by the short"
+            " repository name and are not touched by this verb; see #479\n"
+        )
         return OK
+    backup_created = False
     try:
         store.backup_into(backup)
+        backup_created = True
     except board.StoreError as problem:
         _err(str(problem), err)
         return USAGE
     try:
         counts = store.rename_repo(old, new)
     except board.RenameRefused as problem:
-        _remove_fresh_backup(backup)
+        if backup_created:
+            _remove_fresh_backup(backup)
         _err(str(problem), err)
         return USAGE
     except board.StoreError as problem:
-        _remove_fresh_backup(backup)
+        if backup_created:
+            _remove_fresh_backup(backup)
         _err(str(problem), err)
         return USAGE
     reponame.prune_backups(os.path.dirname(store_path))
@@ -274,6 +321,15 @@ def cmd_repo(args: argparse.Namespace) -> int:
         mapping = drive._tracker_repo_map(registered, git=syncli._git)
         project_shorts = {project.name: settings.repo_names(project.root) for project in registered}
         cfg = registry.config()
+    except (settings.SettingsError, projects.ProjectsError, board.StoreError) as problem:
+        print(f"korapy repo rename: {problem}", file=sys.stderr)
+        return USAGE
+    except registry.RegistryError as problem:
+        print(f"korapy repo rename: {problem}", file=sys.stderr)
+        return USAGE
+
+    def gather():
+        """Fresh liveness inputs; `rename_root` reads these inside the lock."""
         listed = registry.visible(time.time(), cfg=cfg)
         live = set()
         for project in registered:
@@ -282,31 +338,49 @@ def cmd_repo(args: argparse.Namespace) -> int:
                 (project.name, repo, number)
                 for repo, number in units.live_tickets(project.unit_prefix, rows)
             )
-    except (settings.SettingsError, projects.ProjectsError, board.StoreError) as problem:
-        print(f"korapy repo rename: {problem}", file=sys.stderr)
-        return USAGE
-    except registry.RegistryError as problem:
-        print(f"korapy repo rename: {problem}", file=sys.stderr)
-        return USAGE
-    except units.UnitsError as problem:
-        print(f"korapy repo rename: {problem}", file=sys.stderr)
-        return units_exit(problem)
+        return listed, live
+
+    if args.plan:
+        try:
+            entries, live = gather()
+        except registry.RegistryError as problem:
+            print(f"korapy repo rename: {problem}", file=sys.stderr)
+            return USAGE
+        except units.UnitsError as problem:
+            print(f"korapy repo rename: {problem}", file=sys.stderr)
+            return units_exit(problem)
+        with store:
+            return rename_root(
+                args.old,
+                args.new,
+                store=store,
+                store_path=board.db_path(),
+                registry_entries=entries,
+                live_units=live,
+                mapping=mapping,
+                project_shorts=project_shorts,
+                now=time.time(),
+                out=sys.stdout,
+                err=sys.stderr,
+                plan=True,
+                lock=drive.drive_lock,
+                lock_path=drive.lock_path(),
+            )
     with store:
         return rename_root(
             args.old,
             args.new,
             store=store,
             store_path=board.db_path(),
-            registry_entries=listed,
-            live_units=live,
             mapping=mapping,
             project_shorts=project_shorts,
             now=time.time(),
             out=sys.stdout,
             err=sys.stderr,
-            plan=args.plan,
+            plan=False,
             lock=drive.drive_lock,
             lock_path=drive.lock_path(),
+            gather=gather,
         )
 
 
