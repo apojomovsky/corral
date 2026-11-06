@@ -719,3 +719,34 @@ class StoreAssignment(unittest.TestCase):
                 resolve(parsed("fast", "other"), selections, tracker=name, tracker_source=source)
         self.assertIn("profile:fast", str(ctx.exception))
         self.assertIn("pin", str(ctx.exception))
+
+
+class DeclaredDefault(unittest.TestCase):
+    """A declared [profiles.default] replaces the built-in default.
+
+    The converted config that failed here declares only the table (no
+    [profile] selection): resolution must use the declared table, never
+    the built-in default silently.
+    """
+
+    def test_a_declared_default_wins_when_nothing_selects_one(self):
+        table = {"default": profile("default", "muse"), "other": profile("other")}
+        found, provenance = resolve(table)
+        self.assertEqual(found.name, "default")
+        self.assertEqual(found.runtime, "muse")
+        self.assertEqual(provenance.layer, 6)
+        self.assertEqual(provenance.layer_name, "default")
+        self.assertNotIn("built-in", provenance.source)
+
+    def test_explain_marks_the_declared_default_selected(self):
+        table = {"default": profile("default", "muse"), "other": profile("other")}
+        chain = profiles.explain(table, sel(), repo=REPO, role=ROLE, number=NUMBER, now=T0)
+        layer6 = next(entry for entry in chain if entry.layer == 6)
+        self.assertEqual(layer6.state, "selected")
+        self.assertEqual(layer6.profile, "default")
+
+    def test_a_selected_default_still_beats_the_declared_table(self):
+        table = {"default": profile("default", "muse"), "fast": profile("fast")}
+        found, provenance = resolve(table, sel(default="fast"))
+        self.assertEqual(found.name, "fast")
+        self.assertEqual(provenance.layer, 6)
