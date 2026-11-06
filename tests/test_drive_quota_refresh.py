@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 from korapy import accounts, admission, drive, projects, quota_ledger
-from tests.test_drive import policy_source, stored
+from tests.test_drive import driven_for, policy_source, stored
 
 
 T0 = 2000.0
@@ -304,6 +304,7 @@ class PassRefreshTest(unittest.TestCase):
             "gone_s": 3600.0,
         }
         values.update(fields)
+        values.setdefault("driven", driven_for(found, store))
         code = drive.run_pass(**values)
         return code, out.getvalue(), err.getvalue()
 
@@ -483,6 +484,7 @@ class PassRefreshLockBranchTest(unittest.TestCase):
             "gone_s": 3600.0,
         }
         values.update(fields)
+        values.setdefault("driven", driven_for(found, store))
         code = drive.run_pass(**values)
         return code, out.getvalue(), err.getvalue()
 

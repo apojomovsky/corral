@@ -1549,7 +1549,7 @@ def _gate_all(
     reviews=None,
     fix_threshold=None,
     pulls_for=None,
-    driven=None,
+    driven,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
@@ -1573,14 +1573,16 @@ def _gate_all(
     linked-pull map, which the eligibility rows and the gate rows share,
     so the policies and the gate read the same row pulls with no second
     lookup. `driven` ({project name: tracker repos it drives}, through
-    the one `driven_repos` resolver; None scopes nothing) keeps each
-    project on its own repositories: the policy sees only rows for
-    repos the project drives, a request for any other repo is dropped,
-    and rows no registered project drives never enter the held-row
-    loop either, so a foreign row is never a candidate and never
-    claimed. Each project with a dropped row prints how many foreign
-    rows it ignored. Nothing is written.
+    the one `driven_repos` resolver; required, and an empty mapping
+    drives nothing) keeps each project on its own repositories: the
+    policy sees only rows for repos the project drives, a request for
+    any other repo is dropped, and rows no registered project drives
+    never enter the held-row loop either, so a foreign row is never a
+    candidate and never claimed. Each project with a dropped row
+    prints how many foreign rows it ignored. Nothing is written.
     """
+    if driven is None:
+        driven = {}
     if fix_threshold is None:
         try:
             fix_threshold = settings.load(root=None)["drive.fix_round_threshold"]
@@ -1597,26 +1599,24 @@ def _gate_all(
     )
     by_key = _released_rows(items, released, pulls_by_key=pulls_by_key, pulls_errors=pull_errors)
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
-    union = None
-    if driven is not None:
-        union = set()
-        for repos in driven.values():
-            union |= set(repos)
+    union = set()
+    for repos in driven.values():
+        union |= set(repos)
     candidates = []
     for project in registered:
-        allowed = None if driven is None else set(driven.get(project.name, ()))
-        ignored: set = set()
-        if allowed is not None:
-            ignored = {(item.repo, item.number) for item in items if item.repo not in allowed}
+        allowed = set(driven.get(project.name, ()))
+        ignored = {
+            (item.repo, item.number)
+            for item in items
+            if item.repo not in allowed and item.state == "open"
+        }
         if project.name not in quota_for:
             try:
                 quota_for[project.name] = _project_quota(project, pool)
             except settings.SettingsError as problem:
                 problems.append(f"korapy drive: {problem}")
                 continue
-        shown = items
-        if allowed is not None:
-            shown = [item for item in items if item.repo in allowed]
+        shown = [item for item in items if item.repo in allowed]
         try:
             outcome = eligibility.for_project(
                 project, shown, now=now, pulls_by_key=pulls_by_key, pulls_errors=pull_errors
@@ -1629,8 +1629,9 @@ def _gate_all(
             continue
         for requested in outcome.requests:
             key = (requested.repo, requested.number)
-            if allowed is not None and requested.repo not in allowed:
-                ignored.add(key)
+            if requested.repo not in allowed:
+                if key in by_key:
+                    ignored.add(key)
                 continue
             candidates.append(
                 GateInput(project.name, requested, by_key.get(key), waits.get(key, 0.0))
@@ -1649,7 +1650,7 @@ def _gate_all(
     for item in items:
         if item.state != "open" or not item.agent:
             continue
-        if union is not None and item.repo not in union:
+        if item.repo not in union:
             continue
         if (item.repo, item.number) in requested_keys:
             continue
@@ -1733,7 +1734,7 @@ def _pass(
     repo_map=None,
     review_reader=None,
     pulls_for=None,
-    driven=None,
+    driven,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
 
@@ -1759,9 +1760,10 @@ def _pass(
     and the gate rows share; with none every row reads empty, which is
     what `--plan` builds: it never contacts the tracker. `driven`
     ({project name: tracker repos it drives}, through the one
-    `driven_repos` resolver; None scopes nothing) keeps each project
-    on its own repositories, and each project with a dropped row prints
-    how many foreign rows it ignored.
+    `driven_repos` resolver; required, and an empty mapping drives
+    nothing) keeps each project on its own repositories, and each
+    project with a dropped row prints how many foreign rows it
+    ignored.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -2817,15 +2819,15 @@ def handle_stuck(
     hold_label=hold.HOLD_LABEL,
     requested=None,
     agent_tickets=None,
-    driven=None,
+    driven,
 ):
     """Restart or give up on stuck managed claims. Returns (restarted, capped).
 
     Only managed holders older than this pass are considered: the pass
     never restarts, watches or gives up on what it just claimed, and
     foreign claims are never touched. `driven` ({project name: tracker
-    repos it drives}, through the one `driven_repos` resolver; None
-    checks nothing) keeps the sweep on each project's own
+    repos it drives}, through the one `driven_repos` resolver;
+    required, and an empty mapping drives nothing) keeps the sweep on each project's own
     repositories: a stuck row for a repo the owning project does not
     drive is left held with a logbook line, never restarted, released
     or given up on. A holder with no registry entry
@@ -2885,6 +2887,8 @@ def handle_stuck(
     logbook line while the rest of the sweep moves on; anything else
     store-shaped propagates to the caller, like orphans.
     """
+    if driven is None:
+        driven = {}
     live = live_units if live_units is not None else frozenset()
     budgets = load_restarts(restarts_path) if restarts_path is not None else {}
     restarted = 0
@@ -2913,7 +2917,7 @@ def handle_stuck(
                     file=out,
                 )
                 continue
-        if driven is not None and stuck_project is not None:
+        if stuck_project is not None:
             owner = stuck_project(claim.repo, claim.number)
             if owner is not None:
                 allowed = driven.get(owner)
@@ -3539,7 +3543,7 @@ def _claim_and_launch(
     err=None,
     events=None,
     hub=None,
-    driven=None,
+    driven,
 ):
     """Claim each proceeding candidate, launch each claim.
 
@@ -3595,16 +3599,18 @@ def _claim_and_launch(
     adopts the receipt's epoch; a dead hub skips every claim-needing
     row with code `"hub"` while resumes proceed on their local claims.
     `driven` ({project name: tracker repos it drives}, through the one
-    `driven_repos` resolver; None checks nothing) is the second safety
-    net behind the candidate filter: a proceeding row for a repo its
-    project does not drive raises `ForeignRepoError` (exit 4, naming
-    the repo) instead of claiming or starting, in case a future caller
-    bypasses the filter.
+    `driven_repos` resolver; required, and an empty mapping drives
+    nothing) is the second safety net behind the candidate filter: a
+    proceeding row for a repo its project does not drive raises
+    `ForeignRepoError` (exit 4, naming the repo) instead of claiming
+    or starting, in case a future caller bypasses the filter.
     """
     rows: list = []
     started = 0
     blocked = False
     launched: set = set()
+    if driven is None:
+        driven = {}
     budgets = load_restarts(restarts_path) if restarts_path is not None else {}
     stream = out if out is not None else io.StringIO()
     trouble = err if err is not None else io.StringIO()
@@ -3614,13 +3620,12 @@ def _claim_and_launch(
             continue
         ref = f"{gated.repo}#{gated.number}"
         key = (gated.repo, gated.number)
-        if driven is not None:
-            allowed = driven.get(gated.project)
-            if allowed is None or gated.repo not in allowed:
-                raise ForeignRepoError(
-                    f"project {gated.project!r} does not drive repository "
-                    f"{gated.repo!r} ({ref}): refusing to start"
-                )
+        allowed = driven.get(gated.project)
+        if allowed is None or gated.repo not in allowed:
+            raise ForeignRepoError(
+                f"project {gated.project!r} does not drive repository "
+                f"{gated.repo!r} ({ref}): refusing to start"
+            )
         if gated.kind == "review":
             author = (released or {}).get(key)
             if author is None:
@@ -4477,7 +4482,7 @@ def _launching_pass(
     repo_map=None,
     review_reader=None,
     pulls_for=None,
-    driven=None,
+    driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
 ) -> int:
@@ -4523,10 +4528,11 @@ def _launching_pass(
     itself must never reconcile. `repo_map` is the pass's one
     short-to-tracker map, threaded to the admission live set and to
     orphan recovery. `driven` ({project name: tracker repos it
-    drives}, through the one `driven_repos` resolver; None scopes
-    nothing) keeps candidate selection, the claim path and the stuck
-    sweep on each project's own repositories; a foreign row reaching
-    the claim path refuses the pass with exit 4 naming the repo.
+    drives}, through the one `driven_repos` resolver; required, and
+    an empty mapping drives nothing) keeps candidate selection, the
+    claim path and the stuck sweep on each project's own
+    repositories; a foreign row reaching the claim path refuses the
+    pass with exit 4 naming the repo.
     `quota_refresh_after_s` re-reads every provider
     whose ledger entry is older than that many seconds through the
     reader seam before gating, once per pass, so admission and the
@@ -4981,7 +4987,7 @@ def run_pass(
     repo_map=None,
     review_reader=None,
     pulls_for=None,
-    driven=None,
+    driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
 ) -> int:
@@ -5054,9 +5060,10 @@ def run_pass(
     by `production_repo_map` once per production pass; with none, the
     readers that need it resolve their own. `driven` ({project name:
     tracker repos it drives}, through the one `driven_repos`
-    resolver; None scopes nothing) keeps candidate selection, the
-    claim path and the stuck sweep on each project's own
-    repositories; production always passes it. Returns the exit code.
+    resolver; required, and an empty mapping drives nothing) keeps
+    candidate selection, the claim path and the stuck sweep on each
+    project's own repositories; production always passes it. Returns
+    the exit code.
     """
     moment = time.time() if now is None else now
     if pause_path is not None:
