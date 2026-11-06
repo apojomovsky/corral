@@ -94,7 +94,11 @@ def live_blockers(old, new, *, claims, entries, live_units, mapping):
     unit; ``mapping`` resolves short entry names to tracker repos. A
     live or stale registry agent for either name blocks, and so does a
     claim whose ticket has a live unit: migrating under either would
-    orphan in-flight work. Released claims (no holder) never block.
+    orphan in-flight work. Released claims (no holder) never block. An
+    unmapped short name with a matching number blocks too: the mapping
+    comes from the current config while units enumerate live work, and
+    the two can disagree across a config edit, so an unreadable short
+    name is never read as idle.
     """
     wanted = {old, new}
     found = []
@@ -104,7 +108,7 @@ def live_blockers(old, new, *, claims, entries, live_units, mapping):
         for short, live_number in sorted(live_units):
             if live_number != number:
                 continue
-            if mapping.get(short, short) == claim_repo:
+            if short not in mapping or mapping[short] == claim_repo:
                 found.append(f"claim {claim_repo}#{number} by {agent} is held by a live unit")
                 break
     for item_entry, state in entries:
@@ -124,8 +128,8 @@ def canonical_matches(configured, canonical):
 
     Case alone never counts as a rename: tracker lookups are
     case-insensitive, so only a genuinely different name warns. A
-    missing reading matches nothing.
+    missing reading is unknown, never evidence: returns None then.
     """
     if not configured or not canonical:
-        return False
+        return None
     return str(configured).casefold() == str(canonical).casefold()

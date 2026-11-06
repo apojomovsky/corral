@@ -128,7 +128,6 @@ def rename_root(
     except board.StoreError as problem:
         _err(str(problem), err)
         return USAGE
-    reponame.prune_backups(os.path.dirname(store_path))
     try:
         counts = store.rename_repo(old, new)
     except board.RenameRefused as problem:
@@ -137,6 +136,7 @@ def rename_root(
     except board.StoreError as problem:
         _err(str(problem), err)
         return USAGE
+    reponame.prune_backups(os.path.dirname(store_path))
     out.write(f"renamed {old} -> {new}: {_counts_text(counts)}\n")
     out.write(f"backup: {backup}\n")
     out.write(

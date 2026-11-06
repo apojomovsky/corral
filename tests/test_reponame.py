@@ -270,6 +270,36 @@ class LiveBlockersTest(unittest.TestCase):
             [],
         )
 
+    def test_unmapped_short_with_a_matching_number_blocks(self):
+        found = self.blockers(
+            claims=[(OLD, 1, HOLDER)],
+            live_units=frozenset({(SHORT, 1)}),
+            mapping={},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn(HOLDER, found[0])
+        self.assertIn(f"{OLD}#1", found[0])
+
+    def test_unmapped_short_with_another_number_does_not_block(self):
+        self.assertEqual(
+            self.blockers(
+                claims=[(OLD, 1, HOLDER)],
+                live_units=frozenset({(SHORT, 2)}),
+                mapping={},
+            ),
+            [],
+        )
+
+    def test_live_unit_mapped_elsewhere_does_not_block(self):
+        self.assertEqual(
+            self.blockers(
+                claims=[(OLD, 1, HOLDER)],
+                live_units=frozenset({(SHORT, 1)}),
+                mapping={SHORT: "acme/other"},
+            ),
+            [],
+        )
+
     def test_blockers_sort_for_a_stable_report(self):
         found = self.blockers(
             claims=[(OLD, 2, "drive-b"), (OLD, 1, "drive-a")],
@@ -296,11 +326,32 @@ class CanonicalMatchesTest(unittest.TestCase):
 
         self.assertFalse(reponame.canonical_matches(OLD, NEW))
 
-    def test_missing_readings_do_not_match(self):
+    def test_missing_readings_are_unknown(self):
         from korapy import reponame
 
-        self.assertFalse(reponame.canonical_matches(OLD, None))
-        self.assertFalse(reponame.canonical_matches(None, NEW))
+        self.assertIsNone(reponame.canonical_matches(OLD, None))
+        self.assertIsNone(reponame.canonical_matches(None, NEW))
+        self.assertIsNone(reponame.canonical_matches(None, None))
+
+
+class LosingStore:
+    """A store that loses the rename race: reads delegate, the move refuses.
+
+    The pre-check counts read empty for the target, then `rename_repo`
+    refuses as if a concurrent write landed rows in between, so the CLI
+    exercises its refused-after-backup path without real concurrency.
+    """
+
+    def __init__(self, store):
+        self._store = store
+
+    def __getattr__(self, name):
+        return getattr(self._store, name)
+
+    def rename_repo(self, old, new):
+        raise board.RenameRefused(
+            f"{new} already holds store rows: refusing a merge of two repositories"
+        )
 
 
 class RenameRootCase(TempStoreTest):
@@ -445,6 +496,36 @@ class RenameRootCase(TempStoreTest):
                 handle.write("x")
         self.assertEqual(self.rename(), 0)
         self.assertEqual(len(self.backups()), 5)
+
+    def fill_retention(self):
+        from korapy import reponame
+
+        for index in range(5):
+            name = reponame.backup_name(1000.0 + index)
+            with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as handle:
+                handle.write("x")
+        return sorted(os.listdir(self.tmp.name))
+
+    def test_new_holds_rows_refusal_keeps_every_earlier_backup(self):
+        self.setUpStore()
+        self.store.upsert_item(reading(NEW, 9), operators=["alice"], now=1000.0)
+        before = self.fill_retention()
+        code = self.rename()
+        self.assertEqual(code, 4)
+        self.assertIn(NEW, self.err.getvalue())
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), before)
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+
+    def test_lost_race_refusal_keeps_every_earlier_backup(self):
+        self.setUpStore()
+        before = self.fill_retention()
+        priors = [name for name in before if name.startswith("board-backup-")]
+        self.assertEqual(len(priors), 5)
+        code = self.rename(store=LosingStore(self.store))
+        self.assertEqual(code, 4)
+        kept = [name for name in os.listdir(self.tmp.name) if name.startswith("board-backup-")]
+        for name in priors:
+            self.assertIn(name, kept)
 
 
 class TrackerRowTest(unittest.TestCase):
