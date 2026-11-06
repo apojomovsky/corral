@@ -1495,6 +1495,29 @@ class ClaimRaceTest(unittest.TestCase):
         self.assertEqual(launcher.calls, [])
         self.assertIsNone(store.claim_of("app", 7))
 
+    def test_a_review_with_an_empty_finished_entry_is_skipped_without_claiming(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        gated = drive.Gated(
+            project="blue",
+            repo="app",
+            number=7,
+            kind="review",
+            verdict="review",
+            reason="app#7: unclaimed, review slot",
+            code="",
+        )
+        rows, started, blocked, launched, launcher = self.launch(
+            store, gated, released={}, finished={("app", 7): ()}
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].verdict, "skip")
+        self.assertEqual(rows[0].code, "claim")
+        self.assertIn("finished worker id lost", rows[0].reason)
+        self.assertEqual((started, blocked, launched), (0, False, set()))
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNone(store.claim_of("app", 7))
+
     def test_a_reviewer_launch_skipped_without_a_launcher_releases_the_claim(self):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
