@@ -1224,6 +1224,12 @@ class AgentHostTest(unittest.TestCase):
         resolved = settings.resolve(host={}, project={}, env={})
         self.assertEqual(resolved["drive.agent_host"], "")
 
+    def test_fix_round_threshold_defaults_to_normal(self):
+        from korapy import settings
+
+        resolved = settings.resolve(host={}, project={}, env={})
+        self.assertEqual(resolved["drive.fix_round_threshold"], "normal")
+
     def run_pass_without_host(self, agent_host):
         from korapy import settings
 
@@ -1232,7 +1238,7 @@ class AgentHostTest(unittest.TestCase):
         def fake_load(*args, **kwargs):
             root = kwargs.get("root", args[0] if args else None)
             if root is None:
-                return {"drive.agent_host": agent_host}
+                return {"drive.agent_host": agent_host, "drive.fix_round_threshold": "normal"}
             return real_load(*args, **kwargs)
 
         store = stored(self.db, [("app", 7, "open")])
