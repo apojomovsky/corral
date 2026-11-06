@@ -81,6 +81,12 @@ SCHEMA_VERSION = 1
 #: importing the CLI.
 PUBLIC_CODES = frozenset({0, 1, 2, 3, 4, 75})
 
+#: The ledger role takeoff's lane runs carry. The one place the name is
+#: defined: the human CLI reserves it, and takeoff's seam call uses it.
+#: A hand row under this name would pollute the role-keyed estimates
+#: that size takeoff's weights.
+TAKEOFF_ROLE = "takeoff"
+
 #: The conservative first-run weight: unknown jobs queue safely, and
 #: the first measurement corrects them.
 DEFAULT_WEIGHT_CPU_M = 1000

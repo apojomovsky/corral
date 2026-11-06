@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import tempfile
 import types
 import unittest
@@ -301,6 +302,27 @@ class StatusCase(HeavyCliCase):
         code, _, err = self._read_stdout(heavycli.cmd_status, _status_args(json=True))
         self.assertEqual(code, 4)
         self.assertIn("lane.json", err)
+
+    def test_status_text_names_recent_bypass_rows(self):
+        from korapy import heavycli
+
+        self._seed_lane()
+        heavy.record_bypass(["make", "check"], "release fix", now=ARRIVED + 20.0)
+        heavy.release_lane(HOLDER_ID, BUDGET, now=ARRIVED + 21.0)
+        code, out, _ = self._read_stdout(heavycli.cmd_status, _status_args(), now=ARRIVED + 30.0)
+        self.assertEqual(code, 0)
+        self.assertIn("bypassed", out)
+        self.assertIn("release fix", out)
+        self.assertIn("make check", out)
+        self.assertIn("released", out)
+
+    def test_status_text_with_no_recent_says_so(self):
+        from korapy import heavycli
+
+        self._seed_lane()
+        code, out, _ = self._read_stdout(heavycli.cmd_status, _status_args(), now=ARRIVED + 12.0)
+        self.assertEqual(code, 0)
+        self.assertIn("recent", out)
 
 
 class PlanCase(HeavyCliCase):
@@ -719,6 +741,24 @@ class BypassCase(HeavyCliCase):
         )
         self.assertEqual(code, 3)
 
+    def test_bypass_timeout_is_exit_1(self):
+        from korapy import heavycli
+
+        self._project()
+
+        def fake_bypass(*args, **kwargs):
+            raise subprocess.TimeoutExpired(["make", "check"], 30)
+
+        code, _, err = self._read_stdout(
+            heavycli.cmd_run,
+            _run_args(["make", "check"], bypass="hotfix"),
+            root=self.tmp,
+            run_bypass=fake_bypass,
+            pressure=_cool(),
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("timed out", err)
+
     def test_bypass_missing_command_is_exit_4(self):
         from korapy import heavycli
 
@@ -869,6 +909,11 @@ class RoleCase(HeavyCliCase):
 
         self._project()
         self.assertEqual(heavy.repo_key(self.tmp), os.path.basename(self.tmp))
+
+    def test_reserved_roles_hold_the_shared_takeoff_role(self):
+        from korapy import heavycli
+
+        self.assertEqual(heavycli.RESERVED_ROLES, frozenset({heavy.TAKEOFF_ROLE}))
 
 
 class BypassParserCase(HeavyCliCase):
