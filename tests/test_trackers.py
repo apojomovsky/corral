@@ -14,11 +14,15 @@ from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
     BoardFakeRun,
     config,
+    date_value,
     full_schema_fields,
+    label_value,
+    number_value,
     rest_issue,
     schema_payload,
     select_value,
     text_value,
+    user_value,
 )
 from tests.test_tracker import item_payload
 
@@ -142,6 +146,26 @@ class BackedItemTest(unittest.TestCase):
         self.assertEqual(found.extra["priority"], "urgent")
         self.assertEqual(found.priority, "high")
         self.assertEqual(found.updated_at, iface.parse_cursor(T1))
+
+    def test_item_skips_unmapped_field_values(self):
+        run = BoardFakeRun()
+        script_schema(run)
+        script_item(
+            run,
+            7,
+            [
+                text_value("F_agent", "Agent", "agent-1"),
+                select_value("F_prio", "Priority", "opt-p0-id", "P0"),
+                date_value(),
+                number_value(),
+                label_value(),
+                user_value(),
+            ],
+        )
+        rest_issue(run, 7, repo=REPO)
+        found = backed_tracker(run).item(REPO, 7)
+        self.assertEqual(found.agent, "agent-1")
+        self.assertEqual(found.extra["priority"], "urgent")
 
     def test_schema_is_fetched_once_per_instance(self):
         run = BoardFakeRun()
