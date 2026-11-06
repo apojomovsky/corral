@@ -1006,5 +1006,52 @@ class ReviewThresholdGateTest(unittest.TestCase):
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
 
+class MissingReviewRecordGateTest(unittest.TestCase):
+    def reviewed_ok(self):
+        return {("app", 7): ("drive-r-1", "reviewer", "ok")}
+
+    def test_a_start_with_a_finished_reviewer_and_no_record_is_review_missing(self):
+        gated = gate(entry(), finished=self.reviewed_ok(), reviews={})
+        self.assertEqual((gated.verdict, gated.code), ("skip", "review-missing"))
+        self.assertIn("reviewer finished without a review record", gated.reason)
+        self.assertIn("review missing", gated.reason)
+
+    def test_review_fix_and_resume_with_no_record_never_open_work(self):
+        for kind in ("review", "fix", "resume"):
+            with self.subTest(kind=kind):
+                gated = gate(entry(kind=kind), finished=self.reviewed_ok(), reviews={})
+                self.assertEqual((gated.verdict, gated.code), ("skip", "review-missing"))
+                self.assertIn("review missing", gated.reason)
+
+    def test_a_finished_reviewer_with_a_record_stays_merge_ready(self):
+        gated = gate(
+            entry(),
+            finished=self.reviewed_ok(),
+            reviews={("app", 7): lows_record()},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_a_failed_reviewer_without_a_record_keeps_todays_behavior(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished={("app", 7): ("drive-r-1", "reviewer", "failed")},
+            reviews={},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_no_review_map_means_no_missing_record_check(self):
+        gated = gate(entry(kind="fix"), finished=self.reviewed_ok())
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+    def test_a_pair_without_an_outcome_keeps_todays_behavior(self):
+        gated = gate(
+            entry(),
+            finished={("app", 7): ("drive-r-1", "reviewer")},
+            reviews={},
+        )
+        self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
 if __name__ == "__main__":
     unittest.main()

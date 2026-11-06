@@ -203,7 +203,16 @@ Per-candidate gate order, cheapest first:
    or above the threshold, opens exactly one fix round through the
    normal launch path. Severities outside the `high`, `normal`, `low`
    vocabulary read as above the threshold: the loop never silently
-   merges a finding it cannot grade. Then the fresh-start check: a
+   merges a finding it cannot grade. A finished reviewer (registry
+   outcome `ok`) with no record for the ticket is a protocol failure,
+   never a finding: the row skips with code `review-missing` (`review
+   missing`) for every kind, so no worker, fix round or re-review
+   starts on it. The pass logs `reviewer finished without a review
+   record` once per pass with the ticket and the finished reviewer
+   id; the skip shows in the drive journal and in the `snapshot`
+   drive section's skipped-by-reason counts, where a coordinator
+   sees it. Only an `ok` outcome counts: any other outcome, or no
+   review map at all, gates as before. Then the fresh-start check: a
    `start` (including a `fix` or `resume` reclassified as one) on an
    unclaimed row with an open linked pull request skips, since the
    pull carries the ticket. The linked pulls come from
@@ -348,6 +357,17 @@ States and who moves them:
   coordinator (or a future merge verb) to file as issues; no fix
   round churns on approved work, and no fresh worker starts on a
   ticket whose pull request is already open.
+- Reviewer finished with no record: the ticket is not merge-ready
+  and the loop still launches nothing. A reviewer that exits `ok`
+  without writing its record is a protocol failure, not an approval:
+  the claim is released as usual, but the gate refuses every kind
+  with `review-missing` (section 3), so neither a fresh worker nor
+  a fix round touches the approved work. The ticket stays in that
+  visible state until a coordinator resolves it: record the verdict
+  by hand with `korapy review record`, and the normal threshold
+  path resumes on the next pass. The reviewer prompt says this
+  outright: the review is complete only when `korapy review record`
+  succeeded, and a prose verdict alone is not a review.
 - Merge-ready: the loop does nothing. A maintainer merges. The loop
   never merges, never closes, never assigns.
 
@@ -565,6 +585,7 @@ is tested through the seam its production code already injects:
 | Restart budget counts stop-plus-launch restarts in a sliding 24h window, foreign holders never restart, give-up comments and releases | fake units stop seam, fake registry, temp state dir with budget timestamps |
 | Decision comment and `needs-decision` label through the new seam; a failed write keeps the claim | fake `Tracker` recording `comment`/`add_label` calls, scripted `TrackerError` |
 | Reviewer start carries the pre-takeover worker id as `--author` | temp `Store`, fake registry with a `done` entry, author==reviewer refusal case |
+| Finished reviewer (outcome `ok`) with no record: no start, no fix round, `review-missing` skip and one `reviewer finished without a review record` line per pass | temp `Store`, finished reviewer triple with outcome `ok`, review reader returning no record, recording launcher |
 | Day cap stops starts, not resumes; pause file stops all | temp state dir with counter and pause files |
 | `--plan` writes nothing | read-only assertion: store and outbox hashes unchanged |
 | Snapshot `drive` section on missing or corrupt journal | temp state dir, section-error shape |
