@@ -414,19 +414,20 @@ def cmd_rollup(args, *, state_dir=None, now=None):
     if skipped:
         print(f"korapy heavy: skipped {skipped} corrupt ledger rows", file=sys.stderr)
     default = heavy.rollup_path(state_dir)
+    failed = False
     try:
         os.makedirs(os.path.dirname(default), exist_ok=True)
         paths.atomic_write_text(default, text)
     except OSError as err:
         _err(f"cannot write the rollup to {default}: {err}")
-        return USAGE
+        failed = True
     if getattr(args, "out", None):
         try:
             paths.atomic_write_text(args.out, text)
         except OSError as err:
             _err(f"cannot write the rollup to {args.out}: {err}")
-            return USAGE
-    return OK
+            failed = True
+    return USAGE if failed else OK
 
 
 def cmd_heavy(args):

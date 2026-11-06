@@ -186,6 +186,16 @@ class StarvedCase(EstimatorCase):
         self.assertEqual(actual.cpu_m, expected.cpu_m)
         self.assertEqual(actual.avg_cores, expected.avg_cores)
 
+    def test_all_starved_window_leaves_cpu_unpredicted(self):
+        rows = [
+            _row(wall_s=1000.0, cpu_s=100.0, peak_mb=peak, starved=True)
+            for peak in (1000.0, 2000.0, 3000.0, 9000.0)
+        ]
+        (estimate,) = heavy.estimates_for(rows, now=NOW).values()
+        self.assertIsNone(estimate.cpu_m)
+        self.assertIsNone(estimate.avg_cores)
+        self.assertEqual(estimate.memory_mb, 9000)
+
 
 class WindowCase(EstimatorCase):
     def test_rows_past_ninety_days_are_forgotten(self):
