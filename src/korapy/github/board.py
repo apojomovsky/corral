@@ -178,6 +178,16 @@ class BoardReader:
         self._pacer = pacer
         self._issues = GithubTracker(run)
 
+    def _graphql_body(self, query, **variables):
+        """One paced two-alias read as its tolerant ``data`` payload.
+
+        The owner queries ask one login as both halves; the losing half's
+        ``NOT_FOUND`` noise rides beside the winning half's data, which
+        ``gh.graphql`` refuses to return, so this goes through the one
+        two-alias helper instead. Rate limits map like any other read.
+        """
+        return _two_alias_data(query, variables, self._run, self._pacer)
+
     def _graphql(self, query, **variables):
         """One paced GraphQL call as its ``data`` payload, else ``TrackerError``.
 
@@ -253,9 +263,9 @@ class BoardReader:
         after = None
         while True:
             if after is None:
-                payload = self._graphql(_TITLES, login=login)
+                payload = self._graphql_body(_TITLES, login=login)
             else:
-                payload = self._graphql(_TITLES, login=login, after=after)
+                payload = self._graphql_body(_TITLES, login=login, after=after)
             entries, info = _titles_entries(payload)
             boards.extend(
                 iface.OwnerBoard(number=number, title=title) for _, number, title in entries
@@ -271,7 +281,7 @@ class BoardReader:
             if not isinstance(payload, dict):
                 raise _fail("schema is not an object")
             return payload.get("node")
-        payload = self._graphql(
+        payload = self._graphql_body(
             _SCHEMA_BY_NUMBER,
             owner=self._board.project_owner,
             number=self._board.project_number,
@@ -872,8 +882,8 @@ _BY_ID = (
 
 #: The title search: one query asking for the login as both halves, the
 #: way ``_BY_NUMBER`` does. Exactly one half resolves; the other answers
-#: null (with the expected NOT_FOUND noise, which passes the body
-#: classifier). The caller picks the set half from the body.
+#: null (with the expected NOT_FOUND noise, which the one two-alias
+#: helper tolerates). The caller picks the set half from the body.
 _TITLES = """query ProvisionBoardTitles($login: String!, $after: String) {
   user(login: $login) {
     projectsV2(first: 100, after: $after) {
@@ -1205,19 +1215,102 @@ class _BoardForbidden(iface.TrackerError):
     """
 
 
+def _two_alias_data(query, variables, run, pacer):
+    """The ``data`` of a two-alias owner query, tolerating the losing half.
+
+    One paced read through the raw ``run`` seam (``gh.graphql_args``):
+    ``gh api graphql`` exits non-zero on any GraphQL ``errors`` entry even
+    beside partial ``data``, which ``gh.graphql`` refuses to return, so the
+    queries that ask one login as both halves read the body here instead.
+    A ``NOT_FOUND`` entry whose path is exactly the half that resolved to
+    null is the expected noise and is tolerated; a rate-limit entry (or
+    rate-limit wording) starts the shared cooldown and raises
+    ``TrackerRateLimited``; any other entry raises ``TrackerError``. A body
+    whose data resolves nothing is returned as-is: the caller decides a
+    missing board from the data, with its own message.
+    """
+    active = pacer if pacer is not None else gh._pacer()
+    try:
+        active.acquire(cost=gh.GRAPHQL_CALL_COST)
+        out = run(gh.graphql_args(query, variables), paced=True)
+    except gh.GhError as err:
+        text = str(err) or repr(err)
+        if err.kind == "unavailable" or gh.is_rate_limited(text):
+            active.cooldown(gh.retry_after_s(text))
+            raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+        body = _response_body(err)
+        if body is None:
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+    except Exception as err:
+        raise iface.TrackerError(f"board unreachable: {err}") from err
+    else:
+        try:
+            body = json.loads(out)
+        except ValueError:
+            raise iface.TrackerError(f"unusable board answer: {out[:80]!r}") from None
+    if not isinstance(body, dict):
+        raise iface.TrackerError(f"unusable board answer: {body!r}")
+    _check_two_alias_errors(body.get("errors"), body.get("data"), active)
+    data = body.get("data")
+    if data is None or isinstance(data, dict):
+        return data
+    raise iface.TrackerError(f"unusable board answer: {body!r}")
+
+
+def _check_two_alias_errors(errors, data, pacer) -> None:
+    """Raise for error entries besides the losing half's ``NOT_FOUND``.
+
+    The one classifier for two-alias answers, so the schema read, the
+    title list and the provision lookup decide the same way: a rate-limit
+    entry cools the shared bucket down and raises ``TrackerRateLimited``;
+    a ``NOT_FOUND`` on exactly the half that resolved to null passes; and
+    anything else fails closed with ``TrackerError``. No errors passes,
+    and the caller decides a missing board from the data.
+    """
+    if not errors:
+        return
+    if _errors_rate_limited(errors):
+        text = json.dumps(errors)
+        pacer.cooldown(gh.retry_after_s(text))
+        raise iface.TrackerRateLimited(text, gh.retry_after_s(text))
+    if not isinstance(errors, list):
+        raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
+    for entry in errors:
+        if _tolerated_half_error(entry, data):
+            continue
+        raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
+
+
+def _tolerated_half_error(entry, data) -> bool:
+    """Whether one error entry is the losing half's expected ``NOT_FOUND``.
+
+    Only a ``NOT_FOUND`` whose path is exactly one owner half, and that
+    half resolved to null: a ``NOT_FOUND`` anywhere else (or beside a
+    resolved half) fails closed like any other error entry.
+    """
+    if not isinstance(entry, dict) or entry.get("type") != "NOT_FOUND":
+        return False
+    path = entry.get("path")
+    if path not in (["user"], ["organization"]):
+        return False
+    half = path[0]
+    return not isinstance(data, dict) or data.get(half) is None
+
+
 def _check_body_errors(body, pacer) -> None:
     """Raise for the error entries a GraphQL body carries beside its data.
 
-    The one classifier every provision read and mutation runs its failed
-    response through, so the error contract holds on all paths: a
-    RATE_LIMITED entry raises ``TrackerRateLimited``, a FORBIDDEN entry
-    raises ``_BoardForbidden``, and any other entry besides the expected
-    NOT_FOUND noise (the losing half of the owner lookup) raises
-    ``TrackerError`` instead of resolving to a missing board or a
-    refusal. A transient conflict entry therefore fails closed here;
-    only the populate operation retries those. A body with no errors, or
-    only NOT_FOUND entries, passes: the caller decides those from the
-    data.
+    The one classifier every single-alias provision read and mutation runs
+    its failed response through, so the error contract holds on all
+    paths: a RATE_LIMITED entry raises ``TrackerRateLimited``, a
+    FORBIDDEN entry raises ``_BoardForbidden``, and any other entry
+    besides NOT_FOUND entries (a read for a node that is not there)
+    raises ``TrackerError`` instead of resolving to a missing board or a
+    refusal. Two-alias owner queries never reach this classifier; they go
+    through ``_check_two_alias_errors`` instead. A transient conflict
+    entry therefore fails closed here; only the populate operation
+    retries those. A body with no errors, or only NOT_FOUND entries,
+    passes: the caller decides those from the data.
     """
     errors = body.get("errors") if isinstance(body, dict) else None
     if not errors:
@@ -1386,42 +1479,16 @@ class GithubBoardProvisioner:
         except Exception as err:
             raise iface.TrackerError(f"board unreachable: {err}") from err
 
-    def _read_body(self, query, make_missing, **variables):
-        """One paced GraphQL read as its full response body.
+    def _read_owner(self, query, **variables):
+        """One paced two-alias read as its tolerant ``data`` payload.
 
-        The owner lookup expects a NOT_FOUND error on the losing half
-        beside the winning half's data, which ``graphql`` refuses to
-        return; this goes through the raw seam instead, paced as a read,
-        and decides from the body, never from the exit code.
+        The provision lookup asks one login as both halves, the way the
+        reader does; both go through the one two-alias helper, so the
+        losing half's ``NOT_FOUND`` noise never fails the lookup. A body
+        whose data resolves nothing is returned as-is: the caller decides
+        a missing board from the data, with its own message.
         """
-        pacer = self._active_pacer()
-        try:
-            pacer.acquire(cost=gh.GRAPHQL_CALL_COST)
-            out = self._run(gh.graphql_args(query, variables), paced=True)
-        except gh.GhError as err:
-            text = str(err) or repr(err)
-            if err.kind == "unavailable" or gh.is_rate_limited(text):
-                pacer.cooldown(gh.retry_after_s(text))
-                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-            body = _response_body(err)
-            if body is None:
-                if _missing_only(text):
-                    raise make_missing() from err
-                raise iface.TrackerError(f"board unreachable: {text}") from err
-        except Exception as err:
-            raise iface.TrackerError(f"board unreachable: {err}") from err
-        else:
-            try:
-                body = json.loads(out)
-            except ValueError:
-                raise iface.TrackerError(f"unusable board answer: {out[:80]!r}") from None
-        if not isinstance(body, dict):
-            raise iface.TrackerError(f"unusable board answer: {body!r}")
-        _check_body_errors(body, pacer)
-        data = body.get("data")
-        if data is None or isinstance(data, dict):
-            return data
-        raise iface.TrackerError(f"unusable board answer: {body!r}")
+        return _two_alias_data(query, variables, self._run, self._pacer)
 
     def _resolve_owner(self, login):
         """``(kind, node id)`` for one board owner login.
@@ -1437,7 +1504,7 @@ class GithubBoardProvisioner:
                 f"board owner {login!r} resolves to neither a user nor an organization"
             )
 
-        data = self._read_body(_OWNER_QUERY, missing, login=login)
+        data = self._read_owner(_OWNER_QUERY, login=login)
         if not isinstance(data, dict):
             raise missing()
         user = data.get("user")
@@ -1585,7 +1652,7 @@ class GithubBoardProvisioner:
 
         if spec.project_id is not None:
             return self._read_project_by_id(spec.project_id)
-        data = self._read(_BY_NUMBER, missing, owner=spec.owner, number=spec.number)
+        data = self._read_owner(_BY_NUMBER, owner=spec.owner, number=spec.number)
         if not isinstance(data, dict):
             raise missing()
         user = data.get("user")
@@ -1616,9 +1683,9 @@ class GithubBoardProvisioner:
         after = None
         while True:
             if after is None:
-                data = self._read(_TITLES, None, login=spec.owner)
+                data = self._read_owner(_TITLES, login=spec.owner)
             else:
-                data = self._read(_TITLES, None, login=spec.owner, after=after)
+                data = self._read_owner(_TITLES, login=spec.owner, after=after)
             entries, info = _titles_entries(data)
             for eid, number, title in entries:
                 if title == spec.title:

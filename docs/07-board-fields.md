@@ -116,6 +116,12 @@ the real state dir and call the real `run()`, so no test can drive them.
 Both accept an injected `run` and an injected pacer, defaulting to the
 real ones, the same way the REST adapter takes `run`.
 
+Owner lookups ask one login as both a user and an organization; the half
+that does not resolve answers null with a `NOT_FOUND` error beside the
+winning half's data. The adapter reads that body through the raw `run`
+seam and tolerates exactly the losing half's entry, so user-owned and
+organization-owned boards resolve the same way.
+
 Cost per read, budgeted up front: one page of up to 100 items with all
 mapped field values costs one GraphQL read call; field and option
 definitions cost one call per board and are cached (below); one mutation

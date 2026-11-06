@@ -77,8 +77,8 @@ changed spelling; the sixth is deferred with reasons.
    command and role, a conservative cold-start default,
    recency weighting with a small-sample rule, a changed
    command as a new key, and starved samples excluded from
-   duration learning. Hand-tuned weights stay only as the
-   first-run default.
+   duration and CPU-rate learning. Hand-tuned weights stay
+   only as the first-run default.
 4. **Pressure-aware admission.** Adopted as specified:
    pressure delays admission and never touches a running job
    (section 7). The readers already exist
@@ -256,11 +256,14 @@ Purpose: regenerate the portable per-key summary
 (section 6.5) from the raw ledger files.
 
 Arguments: `[--out PATH]`. Standard output always carries
-the rollup JSON document; `--out PATH` additionally writes
-the same bytes atomically to the given path. Exit 0 with
-an empty key set when the ledger is empty (nothing learned
-yet, not a failure), 4 on usage. The verb never commits;
-the operator commits the copy it points at.
+the rollup JSON document, and the verb refreshes the
+default file at `heavy.rollup_path()`
+(`<state>/heavy/rollup.json`) with the same bytes;
+`--out PATH` additionally writes them atomically to the
+given path. Exit 0 with an empty key set when the ledger
+is empty (nothing learned yet, not a failure), 4 on
+usage. The verb never commits; the operator commits the
+copy it points at.
 
 ## 4. State: files and single resolvers
 
@@ -503,7 +506,8 @@ Estimates are robust statistics over the raw rows per
 a hand reader with `jq` can reproduce them. Rules:
 
 - Window: the trailing 20 rows of the key within the
-  trailing 90 days. Duration sets (`wall_s`) exclude rows
+  trailing 90 days. Duration sets (`wall_s`) and CPU
+  parallelism sets (`cpu_s` over `wall_s`) exclude rows
   flagged starved; peak sets (`peak_mb`) use all rows.
 - Small samples: with fewer than 3 rows, the prediction is
   the maximum observed, not an average. A first heavy
@@ -574,11 +578,11 @@ The derived per-key summary is a separate small file meant
 to be committed to a project's private ops repository, so
 a fresh clone or a new host starts with warm estimates:
 `korapy heavy rollup [--out PATH]` (PROPOSED) regenerates
-it from the raw files. The default path resolves through
-`heavy.rollup_path()` (`<state>/heavy/rollup.json`);
-`--out` writes a copy wherever the operator points it, and
-the operator commits it. korapy never commits anything
-itself. The rollup carries its `schema_version`, its
+it from the raw files and refreshes the default file,
+resolved through `heavy.rollup_path()`
+(`<state>/heavy/rollup.json`); `--out` writes a copy
+wherever the operator points it, and the operator commits
+it. korapy never commits anything itself. The rollup carries its `schema_version`, its
 source range, and per key the peak p50 and p90, the
 duration p50 and p90, the sample count, the flaky flag,
 and the portable work figures below. It holds hashes,
