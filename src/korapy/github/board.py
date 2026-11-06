@@ -755,12 +755,12 @@ class BoardTracker(BoardReader):
         The adds run through the one shared adder setup uses. A listing
         that falls over raises ``TrackerError`` instead of adopting on
         partial knowledge; a rate limit halts the run with the rest left
-        for the next pass. A zero limit adopts nothing and lists
-        nothing.
+        for the next pass. A non-positive limit adopts nothing and
+        lists nothing.
         """
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("board adopt needs a project id")
-        if limit == 0:
+        if limit is not None and limit <= 0:
             return iface.BoardAdopt((), (), (), None)
         candidates = [
             ((repo, number), node_id, f"{repo}#{number}")
@@ -1421,9 +1421,11 @@ def add_missing_issues(run, pacer, *, project_id, present, candidates, limit=Non
     ``present`` holds the keys already on the board (opaque to this
     function: node ids for setup, ``(repo, number)`` for the pass) and
     ``candidates`` are ``(key, content id, name)`` in listing order.
-    ``limit`` caps the attempted adds (a refused add still consumes
-    the budget, so a failing run cannot retry the whole backlog in one
-    pass); the rest carries to the next pass. Every add goes through
+    A repeated key is attempted once, so a page-boundary duplicate
+    cannot add twice or burn the cap twice. ``limit`` caps the
+    attempted adds (a refused add still consumes the budget, so a
+    failing run cannot retry the whole backlog in one pass); the rest
+    carries to the next pass. Every add goes through
     the one issue-add path above, paced through the shared bucket; a
     rate limit halts the run with ``stopped`` set, and a failed add is
     one ``refused`` line naming the issue, retried on the next pass.
@@ -1433,7 +1435,11 @@ def add_missing_issues(run, pacer, *, project_id, present, candidates, limit=Non
     kept: list = []
     refused: list = []
     remaining = limit
+    seen: set = set()
     for key, content_id, name in candidates:
+        if key in seen:
+            continue
+        seen.add(key)
         if key in present:
             kept.append(name)
             continue

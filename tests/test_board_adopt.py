@@ -147,6 +147,13 @@ class SharedLoopTest(unittest.TestCase):
         self.assertEqual(again.added, (f"{REPO}#2",))
         self.assertEqual(again.refused, ())
 
+    def test_duplicate_candidate_keys_add_once(self):
+        run = ProvisionFakeRun()
+        add_route(run, [added_answer("ITEM_2")])
+        report = loop(run, candidates=[candidate(2), candidate(2)])
+        self.assertEqual(report.added, (f"{REPO}#2",))
+        self.assertEqual(len(run.mutations()), 1)
+
 
 class AdoptingTrackerTest(unittest.TestCase):
     def tracker(self, run):
@@ -207,6 +214,14 @@ class AdoptingTrackerTest(unittest.TestCase):
         seen = []
         run.rest_fallback = lambda path: seen.append(path) or json.dumps([])
         report = self.adopt(run, limit=0)
+        self.assertEqual(report, tracker.BoardAdopt((), (), (), None))
+        self.assertEqual(seen, [])
+
+    def test_negative_limit_lists_nothing(self):
+        run = BoardFakeRun()
+        seen = []
+        run.rest_fallback = lambda path: seen.append(path) or json.dumps([])
+        report = self.adopt(run, limit=-1)
         self.assertEqual(report, tracker.BoardAdopt((), (), (), None))
         self.assertEqual(seen, [])
 
