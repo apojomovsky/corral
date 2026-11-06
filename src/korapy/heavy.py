@@ -49,6 +49,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -1180,7 +1181,7 @@ def _check_timeout(timeout_s):
     """A queue wait cap in seconds: zero times out at once, negative never waits."""
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
         raise HeavyError(f"timeout {timeout_s!r} must be a number of seconds")
-    if timeout_s != timeout_s or timeout_s < 0:
+    if not math.isfinite(timeout_s) or timeout_s < 0:
         raise HeavyError(f"timeout {timeout_s!r} must be a non-negative number of seconds")
     return timeout_s
 
@@ -1453,13 +1454,16 @@ def release_lane(holder_id, budget, state_dir=None, *, lock_timeout=HEAVY_LOCK_T
 def hand_weight(cfg, name):
     """The weight for a hand `heavy run`: the entry, else the default.
 
-    A missing config reads as the conservative default weight, so a
+    Resolves through ``weight_for`` (the one owner of the config
+    lookup) and falls back to the default weight only where it
+    refuses: a missing config reads as the conservative default, so a
     project with no ``[heavy]`` table still queues safely; an unlisted
     command in a configured project queues at that project's default.
     """
-    if cfg is None:
-        return Weight()
-    return cfg.commands.get(name, cfg.default)
+    try:
+        return weight_for(cfg, name)
+    except HeavyError:
+        return Weight() if cfg is None else cfg.default
 
 
 def command_name(argv):

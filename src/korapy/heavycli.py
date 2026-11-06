@@ -100,6 +100,8 @@ def cmd_run(args, *, run_lane=None, root=None, now=None):
     from korapy import gitenv, heavy, settings
 
     argv = list(args.command or [])
+    if argv[:1] == ["--"]:
+        argv = argv[1:]
     if not argv:
         _err("a command is required: korapy heavy run -- CMD [ARGS...]")
         return USAGE

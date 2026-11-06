@@ -244,6 +244,69 @@ class PlanCase(HeavyCliCase):
         self.assertEqual(seen["timeout_s"], 60)
 
 
+class ParserSeparatorCase(HeavyCliCase):
+    """The documented `--` separator spelling through the real parser.
+
+    `heavy run` takes its command as an argparse REMAINDER, which keeps
+    the literal `--`; the CLI layer strips one separator before the
+    lane validates, so the exact documented spelling reaches the
+    command. A command that really starts with `-` is still refused.
+    """
+
+    def _parse(self, argv):
+        from korapy import cli
+
+        return cli.build_parser().parse_args(argv)
+
+    def test_separator_spelling_reaches_the_command(self):
+        from korapy import heavycli
+
+        self._project()
+        seen = {}
+
+        def fake_lane(argv, cwd, env, **kwargs):
+            seen["argv"] = list(argv)
+            return _lane_run()
+
+        args = self._parse(["heavy", "run", "--", "make", "check"])
+        code, _, _ = self._read_stdout(heavycli.cmd_run, args, root=self.tmp, run_lane=fake_lane)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["argv"], ["make", "check"])
+
+    def test_timeout_before_separator_reaches_the_command(self):
+        from korapy import heavycli
+
+        self._project()
+        seen = {}
+
+        def fake_lane(argv, cwd, env, **kwargs):
+            seen["argv"] = list(argv)
+            seen.update(kwargs)
+            return _lane_run()
+
+        args = self._parse(["heavy", "run", "--timeout", "60", "--", "make", "check"])
+        code, _, _ = self._read_stdout(heavycli.cmd_run, args, root=self.tmp, run_lane=fake_lane)
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["argv"], ["make", "check"])
+        self.assertEqual(seen["timeout_s"], 60.0)
+
+    def test_command_starting_with_a_dash_is_still_refused(self):
+        from korapy import heavycli
+
+        self._project()
+        calls = []
+
+        def fake_lane(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _lane_run()
+
+        args = self._parse(["heavy", "run", "--", "--jobs"])
+        code, _, err = self._read_stdout(heavycli.cmd_run, args, root=self.tmp, run_lane=fake_lane)
+        self.assertEqual(code, 4)
+        self.assertEqual(calls, [])
+        self.assertIn("program name", err)
+
+
 class RunCase(HeavyCliCase):
     def test_run_replays_streams_and_reports_the_exit(self):
         from korapy import heavycli

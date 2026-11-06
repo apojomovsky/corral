@@ -244,6 +244,11 @@ class JoinCase(QueueCase):
         with self.assertRaises(heavy.HeavyError):
             self._join(timeout_s=-5)
 
+    def test_nonfinite_timeout_is_refused(self):
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            with self.subTest(timeout=bad), self.assertRaises(heavy.HeavyError):
+                self._join(timeout_s=bad)
+
     def test_join_creates_the_lane_dir(self):
         self._join()
         self.assertTrue(os.path.isfile(heavy.lane_path()))
@@ -500,6 +505,31 @@ class HandWeightCase(QueueCase):
         )
         self.assertEqual(heavy.hand_weight(cfg, "make check"), WEIGHT)
         self.assertEqual(heavy.hand_weight(cfg, "make lint"), heavy.Weight(1000, 1024))
+
+    def test_hand_weight_agrees_with_weight_for_on_listed_commands(self):
+        cfg = heavy.check_table(
+            {
+                "default_weight": {"cpu_m": 1000, "memory_mb": 1024},
+                "commands": {"make check": {"cpu_m": 3000, "memory_mb": 6144}},
+            },
+            "p",
+        )
+        self.assertEqual(heavy.hand_weight(cfg, "make check"), heavy.weight_for(cfg, "make check"))
+
+    def test_hand_weight_falls_back_only_where_weight_for_refuses(self):
+        cfg = heavy.check_table(
+            {
+                "default_weight": {"cpu_m": 1000, "memory_mb": 1024},
+                "commands": {"make check": {"cpu_m": 3000, "memory_mb": 6144}},
+            },
+            "p",
+        )
+        with self.assertRaises(heavy.HeavyError):
+            heavy.weight_for(cfg, "make lint")
+        self.assertEqual(heavy.hand_weight(cfg, "make lint"), cfg.default)
+        with self.assertRaises(heavy.HeavyError):
+            heavy.weight_for(None, "make check")
+        self.assertEqual(heavy.hand_weight(None, "make check"), heavy.Weight())
 
     def test_command_name_joins_argv(self):
         self.assertEqual(heavy.command_name(["make", "check"]), "make check")
