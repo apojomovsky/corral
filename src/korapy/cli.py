@@ -20,6 +20,7 @@ from korapy import (
     launch,
     launchcli,
     leakcli,
+    mergecli,
     mirrorcli,
     new,
     paths,
@@ -238,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     hubcli.add_parser(sub)
     gccli.add_parser(sub)
     reviewcli.add_parser(sub)
+    mergecli.add_parser(sub)
     agentcli.add_parser(sub)
     ghcli.add_parser(sub)
     githubcli.add_parser(sub)
