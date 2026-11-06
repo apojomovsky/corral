@@ -405,6 +405,7 @@ def add_parser(sub) -> None:
     parser = sub.add_parser(
         "repo",
         help="the repositories behind the board store: migrate keys after a rename",
+        description=__doc__,
     )
     verbs = parser.add_subparsers(dest="repo_verb", required=True)
     p = verbs.add_parser("rename", help="migrate the store's keys to the renamed repo")

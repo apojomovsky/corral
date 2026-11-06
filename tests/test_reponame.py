@@ -520,15 +520,31 @@ class UnitsExitTest(unittest.TestCase):
 
 
 class RepoHelpTest(unittest.TestCase):
+    @staticmethod
+    def production_repo_parser():
+        """The `repo` parser from the parser `main` runs (not the test one)."""
+        import argparse
+
+        from korapy import cli
+
+        parser = cli.build_parser()
+        subs = next(
+            action for action in parser._actions if isinstance(action, argparse._SubParsersAction)
+        )
+        return subs.choices["repo"]
+
     def test_parser_description_is_the_module_docstring(self):
         from korapy import repocli
 
         self.assertEqual(repocli.build_repo_parser().description, repocli.__doc__)
 
-    def test_help_names_stale_entries_as_exit_2_blockers(self):
+    def test_production_parser_description_is_the_module_docstring(self):
         from korapy import repocli
 
-        text = repocli.build_repo_parser().format_help()
+        self.assertEqual(self.production_repo_parser().description, repocli.__doc__)
+
+    def test_help_names_stale_entries_as_exit_2_blockers(self):
+        text = self.production_repo_parser().format_help()
         flat = " ".join(text.split())
         self.assertIn(
             "a live or stale agent entry or a live-held claim blocks the move",
