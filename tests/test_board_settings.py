@@ -52,11 +52,19 @@ class ScalarDefaults(unittest.TestCase):
 
     def test_board_scalars_have_small_sane_defaults(self):
         resolved = resolve()
-        for key in ("board.poll_pages", "board.schema_max_age_s", "board.item_max_age_s"):
+        for key in (
+            "board.poll_pages",
+            "board.schema_max_age_s",
+            "board.item_max_age_s",
+            "board.add_per_pass",
+        ):
             with self.subTest(key=key):
                 value = resolved[key]
                 self.assertIsInstance(value, int)
                 self.assertGreater(value, 0)
+
+    def test_board_adopt_cap_defaults_to_twenty(self):
+        self.assertEqual(resolve()["board.add_per_pass"], 20)
 
     def test_no_board_table_resolves_to_no_board(self):
         self.assertIsNone(resolve().board)

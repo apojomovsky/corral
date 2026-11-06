@@ -284,7 +284,10 @@ owner plus number (names alone are ambiguous across owners; a node id is
 accepted for renames). Scalar board settings in the registry:
 `tracker.variant` (default `"labels"`), `board.poll_pages`,
 `board.schema_max_age_s`, `board.item_max_age_s` for freshness-gated
-reads. The doctor gains one board check per repo in board mode: the board
+reads, and `board.add_per_pass` (default `20`): at most that many
+missing issues the board step adopts per pass, so a first catch-up
+never bursts the pacing budget; the remainder carries to the next
+pass. The doctor gains one board check per repo in board mode: the board
 resolves, every mapped field and every mapped option id exists, and no
 queued writes predate a variant flip. The check names the repo, the
 field, and the missing id; a one-time run after a board edit reports an
@@ -315,6 +318,7 @@ Exit codes are unchanged (AGENTS.md fixes their meaning):
 | Situation | Exit |
 | --- | --- |
 | Board poll degraded to store data, pass otherwise complete | 0, with notes |
+| Board adopt failed some adds, pass otherwise complete | 0, with lines (retried next pass) |
 | Pass synced nothing at all (tracker and board both unreachable) | 3 |
 | Lost claim race on a board-backed row | 2, same `Claimed` path |
 | Bad board config, unknown field or option at config or doctor time, flip with queued writes | 4 |

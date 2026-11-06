@@ -164,8 +164,10 @@ def _board_step(store, tracker, tracker_repo, *, operators, now):
     budget or the board refused): the step records a board-outage line,
     keeps the old cursor, and the pass continues on store data. A row
     the poll cannot apply is already a line in the board result, not a
-    raise. Anything else (a programming error, any other store failure)
-    propagates.
+    raise. A complete poll also adopts the tracker's missing issues
+    through the same reader; failed adds ride along as adopt lines
+    without failing the sync. Anything else (a programming error, any
+    other store failure) propagates.
     """
     try:
         schema = tracker.board_schema()
@@ -345,6 +347,7 @@ def _sync_body(
         board_errors = list(board_result.errors) if board_result is not None else []
         board_refused = list(board_result.refused) if board_result is not None else []
         board_store_errors = list(board_result.store_errors) if board_result is not None else []
+        board_adopt_errors = list(board_result.adopt_errors) if board_result is not None else []
         results[name] = {
             "tracker": tracker_repo,
             "seen": result.items_seen + board_seen,
@@ -353,6 +356,7 @@ def _sync_body(
             "refused": list(result.refused) + board_refused,
             "store_errors": list(result.store_errors) + board_store_errors,
             "conflicts": list(result.conflicts),
+            "adopt_errors": list(board_adopt_errors),
         }
         if board_result is not None:
             results[name]["board_seen"] = board_seen
@@ -369,6 +373,8 @@ def _sync_body(
         for line in result.store_errors:
             _err(line, err)
         for line in board_store_errors:
+            _err(line, err)
+        for line in board_adopt_errors:
             _err(line, err)
         for line in result.conflicts:
             _err(f"claim conflict: {line} (korapy wins)", err)

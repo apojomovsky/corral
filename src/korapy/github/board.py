@@ -736,6 +736,95 @@ class BoardTracker(BoardReader):
             return fid, None
         return fid, ""
 
+    def adopt_missing(self, project_id, repo, present, *, limit, now):
+        """Add the repo's missing open and recently closed issues, up to ``limit``.
+
+        ``present`` holds the ``(repo, number)`` already on the board,
+        from the step's own poll; candidates come from the tracker
+        listing with pull requests and long-closed issues filtered out.
+        The adds run through the one shared adder setup uses. A listing
+        that falls over raises ``TrackerError`` instead of adopting on
+        partial knowledge; a rate limit halts the run with the rest left
+        for the next pass.
+        """
+        if not isinstance(project_id, str) or not project_id:
+            raise ValueError("board adopt needs a project id")
+        candidates = [
+            ((repo, number), node_id, f"{repo}#{number}")
+            for node_id, number in self._adoptable_issue_refs(repo, now)
+        ]
+        return add_missing_issues(
+            self._run,
+            self._pacer,
+            project_id=project_id,
+            present=set(present),
+            candidates=candidates,
+            limit=limit,
+        )
+
+    def _adoptable_issue_refs(self, repo, now):
+        """``(node id, number)`` for the repo's open and recently closed issues.
+
+        Pull requests are never board items this tracker creates, and
+        closed issues older than ``ADOPT_RECENT_DAYS`` stay history for
+        people to add by hand. A malformed page fails closed, never as
+        a partial set.
+        """
+        base = f"repos/{repo}/issues?state=all&per_page=100"
+        page = 1
+        while True:
+            path = base if page == 1 else f"{base}&page={page}"
+            try:
+                payload = json.loads(gh.paced_run(["api", path], run=self._run, pacer=self._pacer))
+            except gh.GhError as err:
+                text = str(err) or repr(err)
+                if gh.is_rate_limited(text):
+                    raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+                raise iface.TrackerError(f"board unreachable: {text}") from err
+            except Exception as err:
+                raise iface.TrackerError(f"board unreachable: {err}") from err
+            if not isinstance(payload, list):
+                raise _fail(f"issues of {repo} are not a list")
+            for entry in payload:
+                if not isinstance(entry, dict):
+                    raise _fail(f"bad issue {entry!r} on {repo}")
+                if "pull_request" in entry:
+                    continue
+                state = entry.get("state")
+                if state not in ("open", "closed"):
+                    raise _fail(f"bad issue state {state!r} on {repo}")
+                number = entry.get("number")
+                node_id = entry.get("node_id")
+                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+                    raise _fail(f"bad issue {entry!r} on {repo}")
+                if not isinstance(node_id, str) or not node_id:
+                    raise _fail(f"bad issue {entry!r} on {repo}")
+                if state == "closed" and not _recently_closed(entry.get("closed_at"), now):
+                    continue
+                yield node_id, number
+            if len(payload) < 100:
+                return
+            page += 1
+
+
+#: How long a closed issue still counts as adoptable: older closed
+#: issues stay history for people to add by hand.
+ADOPT_RECENT_DAYS = 3
+
+
+def _recently_closed(closed_at, now) -> bool:
+    """Whether a closed issue is still adoptable: closed within the window.
+
+    A missing or malformed closed time fails closed, never as adoptable.
+    """
+    if not isinstance(closed_at, str) or not closed_at:
+        raise _fail(f"bad closed time {closed_at!r}")
+    try:
+        closed = iface.parse_cursor(closed_at)
+    except iface.TrackerError:
+        raise _fail(f"bad closed time {closed_at!r}") from None
+    return now - closed <= ADOPT_RECENT_DAYS * 86400
+
 
 #: The owner lookup: one query asking for the login as both halves, so
 #: the adapter learns the owner's node id and user-or-organization kind
@@ -1145,6 +1234,104 @@ def _check_body_errors(body, pacer) -> None:
     raise iface.TrackerError(f"board unreachable: {json.dumps(errors)}")
 
 
+def _mutate(run, pacer, query, **variables):
+    """One paced GraphQL mutation as its ``data`` payload.
+
+    The one mutation path every board write goes through, so setup and
+    the pass pace through the same shared bucket: rate-limit text maps
+    to ``TrackerRateLimited`` through the shared classifier, and a
+    response body surviving on the error is decided by the one body
+    classifier; anything else fails closed, like the board reads and
+    writes.
+    """
+    active = pacer if pacer is not None else gh._pacer()
+    try:
+        return gh.graphql(query, run=run, pacer=pacer, **variables)
+    except gh.GhError as err:
+        text = str(err) or repr(err)
+        if err.kind == "unavailable" or gh.is_rate_limited(text):
+            raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+        body = _response_body(err)
+        if body is not None:
+            _check_body_errors(body, active)
+        raise iface.TrackerError(f"board unreachable: {text}") from err
+    except Exception as err:
+        raise iface.TrackerError(f"board unreachable: {err}") from err
+
+
+def _add_item(run, pacer, project_id, content_id):
+    """One issue added to the board: its item id, or ``_ItemRefused``.
+
+    The one issue add every adopter shares: a temporary move conflict
+    (the first adds after a link or create) retries bounded and never
+    refuses a transient; a permission answer and an exhausted conflict
+    refuse with a fix line instead.
+    """
+    attempts = 0
+    while True:
+        try:
+            payload = _mutate(run, pacer, _ADD_ITEM, projectId=project_id, contentId=content_id)
+        except iface.TrackerRateLimited:
+            raise
+        except _BoardForbidden as err:
+            raise _ItemRefused(
+                "the account may not add items to it; add it on the board by hand, then re-run"
+            ) from err
+        except iface.TrackerError as err:
+            text = str(err)
+            if "(HTTP 403)" in text:
+                raise _ItemRefused(
+                    "the account may not add items to it; add it on the board by hand, then re-run"
+                ) from err
+            if _transient_add_failure(text) and attempts + 1 < _ADD_ATTEMPTS:
+                attempts += 1
+                continue
+            raise _ItemRefused(f"{text}; re-run to retry") from err
+        node = payload.get("addProjectV2ItemById") if isinstance(payload, dict) else None
+        item = node.get("item") if isinstance(node, dict) else None
+        item_id = item.get("id") if isinstance(item, dict) else None
+        if not isinstance(item_id, str) or not item_id:
+            raise _fail(f"unusable board add answer: {payload!r}")
+        return item_id
+
+
+def add_missing_issues(run, pacer, *, project_id, present, candidates, limit=None):
+    """Add each missing candidate to the board: the one shared adder.
+
+    ``present`` holds the keys already on the board (opaque to this
+    function: node ids for setup, ``(repo, number)`` for the pass) and
+    ``candidates`` are ``(key, content id, name)`` in listing order.
+    ``limit`` caps the adds; the rest carries to the next pass. Every
+    add goes through the one issue-add path above, paced through the
+    shared bucket; a rate limit halts the run with ``stopped`` set, and
+    a failed add is one ``refused`` line naming the issue, retried on
+    the next pass. A malformed add answer fails closed.
+    """
+    added: list = []
+    kept: list = []
+    refused: list = []
+    remaining = limit
+    for key, content_id, name in candidates:
+        if key in present:
+            kept.append(name)
+            continue
+        if remaining is not None and remaining <= 0:
+            break
+        try:
+            _add_item(run, pacer, project_id, content_id)
+        except iface.TrackerRateLimited as err:
+            return iface.BoardAdopt(
+                tuple(added), tuple(kept), tuple(refused), (str(err), err.retry_after)
+            )
+        except _ItemRefused as err:
+            refused.append(f"could not add {name} to the board: {err}")
+        else:
+            added.append(name)
+            if remaining is not None:
+                remaining -= 1
+    return iface.BoardAdopt(tuple(added), tuple(kept), tuple(refused), None)
+
+
 class GithubBoardProvisioner:
     """One board's idempotent ensure, over the injected ``run`` seam.
 
@@ -1169,23 +1356,9 @@ class GithubBoardProvisioner:
     def _mutate(self, query, **variables):
         """One paced GraphQL mutation as its ``data`` payload.
 
-        Rate-limit text maps to ``TrackerRateLimited`` through the shared
-        classifier, and a response body surviving on the error is decided
-        by the one body classifier; anything else fails closed, like the
-        board reads and writes.
+        The shared module path above, bound to this provisioner's seam.
         """
-        try:
-            return gh.graphql(query, run=self._run, pacer=self._pacer, **variables)
-        except gh.GhError as err:
-            text = str(err) or repr(err)
-            if err.kind == "unavailable" or gh.is_rate_limited(text):
-                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-            body = _response_body(err)
-            if body is not None:
-                _check_body_errors(body, self._active_pacer())
-            raise iface.TrackerError(f"board unreachable: {text}") from err
-        except Exception as err:
-            raise iface.TrackerError(f"board unreachable: {err}") from err
+        return _mutate(self._run, self._pacer, query, **variables)
 
     def _read(self, query, make_missing, **variables):
         """One paced GraphQL read as its ``data`` payload, tolerating bodies.
@@ -1893,66 +2066,39 @@ class GithubBoardProvisioner:
     def _add_item(self, project_id, content_id):
         """One issue added to the board: its item id, or ``_ItemRefused``.
 
-        A temporary move conflict (the first adds after a link or
-        create) retries bounded and never refuses; a permission answer
-        and an exhausted conflict refuse with a fix line instead.
+        The shared module add above, bound to this provisioner's seam.
         """
-        attempts = 0
-        while True:
-            try:
-                payload = self._mutate(_ADD_ITEM, projectId=project_id, contentId=content_id)
-            except iface.TrackerRateLimited:
-                raise
-            except _BoardForbidden as err:
-                raise _ItemRefused(
-                    "the account may not add items to it; add it on the board by hand, then re-run"
-                ) from err
-            except iface.TrackerError as err:
-                text = str(err)
-                if "(HTTP 403)" in text:
-                    raise _ItemRefused(
-                        "the account may not add items to it; "
-                        "add it on the board by hand, then re-run"
-                    ) from err
-                if _transient_add_failure(text) and attempts + 1 < _ADD_ATTEMPTS:
-                    attempts += 1
-                    continue
-                raise _ItemRefused(f"{text}; re-run to retry") from err
-            node = payload.get("addProjectV2ItemById") if isinstance(payload, dict) else None
-            item = node.get("item") if isinstance(node, dict) else None
-            item_id = item.get("id") if isinstance(item, dict) else None
-            if not isinstance(item_id, str) or not item_id:
-                raise _fail(f"unusable board add answer: {payload!r}")
-            return item_id
+        return _add_item(self._run, self._pacer, project_id, content_id)
 
     def populate(self, project_id, repo):
         """Add the tracker repo's open issues missing from the board.
 
         Item-add only: no field value is ever written. Open issues
         only, whatever their author; closed issues and pull requests
-        are never added. Each issue the run could not add reports its
-        own refused line, and a re-run converges because presence is
-        re-read each time. A listing that falls over raises
+        are never added. The adds run through the one shared adder the
+        board step uses, uncapped; a rate limit still propagates like
+        any other adapter failure. Each issue the run could not add
+        reports its own refused line, and a re-run converges because
+        presence is re-read each time. A listing that falls over raises
         ``TrackerError`` instead of adopting on partial knowledge.
         """
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("board populate needs a project id")
         present = self._board_content_ids(project_id)
-        added: list = []
-        kept: list = []
-        refused: list = []
-        for node_id, number in self._open_issue_refs(repo):
-            name = f"{repo}#{number}"
-            if node_id in present:
-                kept.append(name)
-                continue
-            try:
-                self._add_item(project_id, node_id)
-            except _ItemRefused as err:
-                refused.append(f"could not add {name} to the board: {err}")
-            else:
-                added.append(name)
-        return iface.BoardPopulate(tuple(added), tuple(kept), tuple(refused))
+        candidates = [
+            (node_id, node_id, f"{repo}#{number}")
+            for node_id, number in self._open_issue_refs(repo)
+        ]
+        adopted = add_missing_issues(
+            self._run,
+            self._pacer,
+            project_id=project_id,
+            present=present,
+            candidates=candidates,
+        )
+        if adopted.stopped is not None:
+            raise iface.TrackerRateLimited(*adopted.stopped)
+        return iface.BoardPopulate(adopted.added, adopted.kept, adopted.refused)
 
     def preview_populate(self, project_id, repo):
         """What ``populate`` would add, changing nothing. Read-only.

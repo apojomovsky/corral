@@ -73,15 +73,21 @@ class BoardBackedTracker(BoardTracker):
     new instance, so nothing goes stale across passes.
     """
 
-    def __init__(self, board_config, run, pacer=None, *, max_pages):
+    def __init__(self, board_config, run, pacer=None, *, max_pages, adopt_limit=None):
         super().__init__(board_config, run, pacer, max_pages=max_pages)
         self._project = None
         self._board_schema: BoardSchema | None = None
+        self._adopt_limit = adopt_limit
 
     @property
     def board_poll_pages(self) -> int:
         """The board page cap this instance polls and scans with."""
         return self._max_pages
+
+    @property
+    def board_adopt_limit(self) -> int | None:
+        """The per-pass adopt cap carried from settings, or None when unset."""
+        return self._adopt_limit
 
     def _fetch_project_cached(self):
         """The live board project object, fetched once per instance.
@@ -277,9 +283,10 @@ class SetupEntry(NamedTuple):
     The label half needs a tracker and the board half needs a spec;
     both derive from this, so no caller re-loads settings to recover
     them. ``board`` is the resolved ``[repo.board]`` table (or None
-    when the entry names none), and ``max_pages`` is the resolved
-    board poll cap. No tracker is built here: setup builds it lazily,
-    per entry, inside its loop.
+    when the entry names none), ``max_pages`` is the resolved board
+    poll cap, and ``adopt_limit`` the resolved per-pass adopt cap. No
+    tracker is built here: setup builds it lazily, per entry, inside
+    its loop.
     """
 
     name: str  # the entry name, which the reports print
@@ -288,6 +295,7 @@ class SetupEntry(NamedTuple):
     variant: str  # "labels" | "board", as resolved
     board: object  # the resolved board table, or None
     max_pages: int  # the resolved board poll cap
+    adopt_limit: int  # the resolved per-pass adopt cap
 
 
 def setup_entry(root, name, *, git) -> SetupEntry:
@@ -316,6 +324,7 @@ def setup_entry(root, name, *, git) -> SetupEntry:
         variant=str(resolved["tracker.variant"]),
         board=resolved.board,
         max_pages=resolved["board.poll_pages"],
+        adopt_limit=resolved["board.add_per_pass"],
     )
 
 
@@ -330,22 +339,36 @@ def setup_tracker(entry, *, run=None, pacer=None) -> iface.Tracker:
     """
     if entry.variant == "board" and entry.board is None:
         return build_tracker(
-            variant="labels", board=None, max_pages=entry.max_pages, run=run, pacer=pacer
+            variant="labels",
+            board=None,
+            max_pages=entry.max_pages,
+            adopt_limit=entry.adopt_limit,
+            run=run,
+            pacer=pacer,
         )
     return build_tracker(
-        variant=entry.variant, board=entry.board, max_pages=entry.max_pages, run=run, pacer=pacer
+        variant=entry.variant,
+        board=entry.board,
+        max_pages=entry.max_pages,
+        adopt_limit=entry.adopt_limit,
+        run=run,
+        pacer=pacer,
     )
 
 
-def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.Tracker:
+def build_tracker(
+    *, variant, board, max_pages, adopt_limit=None, run=None, pacer=None
+) -> iface.Tracker:
     """One repo's tracker from validated settings data: the one factory.
 
     ``variant`` is ``resolved["tracker.variant"]``, ``board`` is the
     resolved ``[repo.board]`` table (or None), ``max_pages`` is the
-    resolved ``board.poll_pages``. A missing ``run`` wires the
-    production runners (paced REST for label mode, the raw runner for
-    board mode); tests pass a fake. Unknown variants and board mode
-    without a board table are refused, never run as label mode.
+    resolved ``board.poll_pages``, and ``adopt_limit`` the resolved
+    ``board.add_per_pass`` (None leaves the board step's adopt off). A
+    missing ``run`` wires the production runners (paced REST for label
+    mode, the raw runner for board mode); tests pass a fake. Unknown
+    variants and board mode without a board table are refused, never
+    run as label mode.
     """
     if variant == "labels":
         return GithubTracker(paced_run if run is None else run)
@@ -355,7 +378,11 @@ def build_tracker(*, variant, board, max_pages, run=None, pacer=None) -> iface.T
                 "tracker.variant is 'board' but no [board] table names the project board"
             )
         return BoardBackedTracker(
-            board, gh.run if run is None else run, pacer=pacer, max_pages=max_pages
+            board,
+            gh.run if run is None else run,
+            pacer=pacer,
+            max_pages=max_pages,
+            adopt_limit=adopt_limit,
         )
     want = ", ".join(repr(v) for v in sorted(VARIANTS))
     raise ValueError(f"unknown tracker variant {variant!r} (want one of {want})")
@@ -427,6 +454,7 @@ def production_trackers(
                 variant=variant,
                 board=resolved.board,
                 max_pages=resolved["board.poll_pages"],
+                adopt_limit=resolved["board.add_per_pass"],
             )
         except (ValueError, settings.SettingsError) as err:
             return {}, f"[[repo]] {name}: {err}"
