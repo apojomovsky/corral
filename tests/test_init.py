@@ -352,7 +352,7 @@ TAIL = """# Defaults: uncomment to override.
 # serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
 # serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
 # serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
-# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.port = 8420  # port to bind (default 8420, a fixed unprivileged port with no common clash; 0 picks a free port for a second or throwaway instance)
 # serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
 # serve.tail_max = 200  # maximum activity lines one tail read returns
 #
@@ -487,7 +487,7 @@ commits.conventional = false
 # serve.bind = "127.0.0.1"  # address to bind (default 127.0.0.1, loopback)
 # serve.max_streams = 20  # concurrent stream connections before the server sheds with 503
 # serve.origins = []  # dashboard origins allowed cross-origin (exact match, never *)
-# serve.port = 0  # port to bind (default 0, an ephemeral port)
+# serve.port = 8420  # port to bind (default 8420, a fixed unprivileged port with no common clash; 0 picks a free port for a second or throwaway instance)
 # serve.snapshot_ttl_s = 2  # seconds one built snapshot is shared between requests
 # serve.tail_max = 200  # maximum activity lines one tail read returns
 #
