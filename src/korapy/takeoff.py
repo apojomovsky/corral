@@ -23,13 +23,13 @@ with no commands to run starts nothing.
 
 Exit codes: 0 every check ok, skipped or planned, 1 a check failed, 3 the remote
 is unreachable or a lane scope could not be created, 4 usage or
-configuration, 75 a heavy command found no free lane slot in time.
-`--skip NAME` waives one policy check and records the
-skip; an unknown name or an identity check (`base`, `worktree`) is
-exit 4. `--plan` resolves every check without running the configured
-commands: each command is reported as `planned`, and neither `run_cmd`
-nor the lane runner is ever called. Exit codes mirror the
-resolved rows.
+configuration. Lane queue waits (exit 75) arrive with the queue ticket;
+this ticket runs listed commands without queueing. `--skip NAME`
+waives one policy check and records the skip; an unknown name or an
+identity check (`base`, `worktree`) is exit 4. `--plan` resolves every
+check without running the configured commands: each command is reported
+as `planned`, and neither `run_cmd` nor the lane runner is ever called.
+Exit codes mirror the resolved rows.
 """
 
 import functools

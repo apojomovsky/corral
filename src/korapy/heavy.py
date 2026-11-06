@@ -80,6 +80,10 @@ HOST_ID_FILE = "host-id"
 #: The unit name prefix for lane scopes.
 UNIT_PREFIX = "heavy-"
 
+#: A stored host label is 32 lowercase hex chars (a uuid4 hex): anything
+#: else in the label file is corruption or a hand edit, refused fail-closed.
+LABEL_RE = re.compile(r"[0-9a-f]{32}")
+
 
 class HeavyError(Exception):
     """The lane run failed: bad usage, bad config or a failed scope (exit 4)."""
@@ -383,10 +387,15 @@ def scope_argv(unit, command, workdir, env, *, memory_max=None, cpu_quota=None, 
 
 
 def default_run(argv, cwd, timeout):
-    """The production subprocess seam. A program that cannot run reads as a failure."""
+    """The production subprocess seam.
+
+    A program that cannot start raises OSError for the caller to bucket
+    (a missing scope program is a lane failure, never a command exit);
+    any other spawn failure reads as exit 127.
+    """
     try:
         return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    except (OSError, subprocess.SubprocessError) as exc:
+    except subprocess.SubprocessError as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
 
@@ -428,11 +437,24 @@ def stop_scope(unit, run=None):
         raise HeavyError(f"cannot stop scope {unit}: {tail}")
 
 
+def _check_label(label, path):
+    """A stored host label, or HeavyError when it is not fresh hex.
+
+    Only 32 lowercase hex chars stay a label, so a corrupt or hand-edited
+    `host-id` (a path escape, an absolute path, a truncation) fails closed
+    instead of redirecting ledger writes out of the lane directory.
+    """
+    if not isinstance(label, str) or LABEL_RE.fullmatch(label) is None:
+        raise HeavyError(f"the host label at {path} is not 32 lowercase hex chars")
+    return label
+
+
 def host_label(state_dir=None):
     """The opaque stable host label, created once under the lane dir.
 
     Random hex in `<state>/heavy/host-id`, never a hostname or address;
-    two hosts never share a ledger file. The one resolver for it.
+    two hosts never share a ledger file. The one resolver for it. A
+    present label that is not fresh hex is refused, never repaired here.
     """
     root = os.path.join(state_dir or paths.state_dir(), HEAVY_DIR)
     path = os.path.join(root, HOST_ID_FILE)
@@ -440,7 +462,7 @@ def host_label(state_dir=None):
         with open(path, encoding="utf-8") as handle:
             label = handle.read().strip()
         if label:
-            return label
+            return _check_label(label, path)
     except FileNotFoundError:
         pass
     except OSError as err:
@@ -455,6 +477,7 @@ def host_label(state_dir=None):
             label = handle.read().strip()
         if not label:
             raise HeavyError(f"the host label at {path} is empty") from None
+        return _check_label(label, path)
     except OSError as err:
         raise HeavyError(f"cannot write the host label at {path}: {err}") from None
     return label
@@ -464,11 +487,14 @@ def ledger_path(label=None, period=None, state_dir=None):
     """The raw run ledger file: `<state>/heavy/runs/<host>-<period>.jsonl`.
 
     One file per host per period, so two hosts never write the same
-    file. The one resolver for it.
+    file. The one resolver for it. An explicit label is validated like a
+    stored one, so a hostile value never becomes a path.
     """
     base = state_dir or paths.state_dir()
     if label is None:
         label = host_label(base)
+    else:
+        _check_label(label, os.path.join(base, HEAVY_DIR, HOST_ID_FILE))
     if period is None:
         period = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
     return os.path.join(base, HEAVY_DIR, RUNS_DIR, f"{label}-{period}.jsonl")
@@ -489,8 +515,10 @@ def append_ledger_row(path, row):
 def host_info(*, read=None, cpu_count=None, python_version=None):
     """The host descriptor for a ledger row: cores, memory and interpreter.
 
-    Unknown reads as None, never raising: a row with an unknown host
-    still records the run. The reader seam is injectable for tests.
+    A missing core count defaults to the live count, so production rows
+    carry cores from day one; unknown (undetermined, boolean, negative)
+    reads as None, never raising: a row with an unknown host still
+    records the run. The reader seam is injectable for tests.
     """
     reader = read or _read_text
     try:
@@ -507,9 +535,17 @@ def host_info(*, read=None, cpu_count=None, python_version=None):
                 except (ValueError, IndexError):
                     total_mb = None
                 break
-    cores = cpu_count if cpu_count is None else int(cpu_count)
-    if isinstance(cores, bool) or (cores is not None and cores < 0):
+    if cpu_count is None:
+        cpu_count = os.cpu_count()
+    if isinstance(cpu_count, bool):
         cores = None
+    else:
+        try:
+            cores = int(cpu_count) if cpu_count is not None else None
+        except (TypeError, ValueError):
+            cores = None
+        if cores is not None and cores < 0:
+            cores = None
     return {
         "cores": cores,
         "mem_mb": total_mb,
@@ -669,8 +705,10 @@ def run_heavy(
     the caller's failure rows, and the row keys. Raises
     subprocess.TimeoutExpired past `timeout` (no row: the run never
     completed), ScopeUnreachable when the manager cannot be reached,
-    and HeavyError on other lane failures. Teardown runs after the row
-    lands, so a failed release is loud without losing the measurement.
+    HeavyError naming the program when the scope spawn itself fails
+    (no row, no teardown: the scope never started), and HeavyError on
+    other lane failures. Teardown runs after the row lands, so a failed
+    release is loud without losing the measurement.
     """
     if not isinstance(role, str) or not role:
         raise HeavyError("the ledger role must be a non-empty name")
@@ -692,6 +730,8 @@ def run_heavy(
     scope = scope_argv(unit, list(argv), cwd, env, memory_max=memory_max, cpu_quota=cpu_quota)
     try:
         proc = run(scope, cwd, timeout)
+    except OSError as err:
+        raise HeavyError(f"cannot start scope {unit}: {scope[0]} could not run: {err}") from None
     except Exception:
         teardown(unit)
         raise

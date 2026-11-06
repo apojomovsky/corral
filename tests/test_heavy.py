@@ -402,11 +402,32 @@ class HostLabelCase(HeavyCase):
         self.assertEqual(heavy.host_label(), first)
 
     def test_ledger_path_names_host_and_period(self):
-        path = heavy.ledger_path(label="9c2e", period="2026-11")
+        label = "9c2e0123456789abcdef0123456789ab"
+        path = heavy.ledger_path(label=label, period="2026-11")
         self.assertEqual(
             path,
-            os.path.join(os.environ["KORAPY_STATE"], "heavy", "runs", "9c2e-2026-11.jsonl"),
+            os.path.join(os.environ["KORAPY_STATE"], "heavy", "runs", f"{label}-2026-11.jsonl"),
         )
+
+    def test_hostile_stored_label_is_refused(self):
+        root = os.path.join(os.environ["KORAPY_STATE"], "heavy")
+        os.makedirs(root, exist_ok=True)
+        for hostile in (
+            "../escape",
+            "/absolute",
+            "9c2e",
+            "9C2E0123456789ABCDEF0123456789AB",
+            "x" * 32,
+        ):
+            with self.subTest(label=hostile):
+                with open(os.path.join(root, "host-id"), "w", encoding="utf-8") as fh:
+                    fh.write(hostile + "\n")
+                with self.assertRaises(heavy.HeavyError):
+                    heavy.host_label()
+
+    def test_hostile_explicit_label_is_refused(self):
+        with self.assertRaises(heavy.HeavyError):
+            heavy.ledger_path(label="../escape", period="2026-11")
 
 
 class HostInfoCase(HeavyCase):
@@ -418,12 +439,25 @@ class HostInfoCase(HeavyCase):
         )
         self.assertEqual(info, {"cores": 8, "mem_mb": 16384.0, "python": "3.11"})
 
-    def test_missing_files_read_as_unknown(self):
+    def test_missing_core_count_defaults_to_the_live_count(self):
         def boom(path):
             raise OSError("gone")
 
-        info = heavy.host_info(read=boom, cpu_count=None, python_version="3.11")
-        self.assertEqual(info, {"cores": None, "mem_mb": None, "python": "3.11"})
+        info = heavy.host_info(read=boom, python_version="3.11")
+        self.assertIsInstance(info["cores"], int)
+        self.assertIsNone(info["mem_mb"])
+        self.assertEqual(info["python"], "3.11")
+
+    def test_bad_core_counts_read_as_unknown(self):
+        for bad in (True, False, -1):
+            with self.subTest(value=bad):
+                info = heavy.host_info(
+                    read=lambda path: "MemTotal:       16777216 kB\n",
+                    cpu_count=bad,
+                    python_version="3.11",
+                )
+                self.assertIsNone(info["cores"])
+                self.assertEqual(info["mem_mb"], 16384.0)
 
 
 class RunHeavyCase(HeavyCase):
@@ -630,6 +664,24 @@ class RunHeavyCase(HeavyCase):
         with self.assertRaises(heavy.HeavyError) as ctx:
             heavy.run_heavy(["make", "check"], self.tmp, {}, **self._run_kwargs(run))
         self.assertEqual(ctx.exception.exit_code, 4)
+
+    def test_missing_scope_program_is_a_usage_error_without_a_row(self):
+        def missing(argv, cwd, timeout):
+            raise FileNotFoundError("systemd-run")
+
+        teardown = mock.Mock()
+        with self.assertRaisesRegex(heavy.HeavyError, "systemd-run") as ctx:
+            heavy.run_heavy(
+                ["make", "check"], self.tmp, {}, **self._run_kwargs(missing, teardown=teardown)
+            )
+        self.assertEqual(ctx.exception.exit_code, 4)
+        teardown.assert_not_called()
+        runs = os.path.join(os.environ["KORAPY_STATE"], "heavy", "runs")
+        self.assertFalse(os.path.exists(runs))
+
+    def test_default_run_raises_when_the_program_is_missing(self):
+        with self.assertRaises(OSError):
+            heavy.default_run(["korapy-no-such-program", "--version"], self.tmp, 30)
 
     def test_manager_like_command_stderr_reads_as_a_lane_failure(self):
         # The twin the units start path accepts: a command whose own

@@ -3,7 +3,7 @@
 Exit codes: 0 every check ok, skipped or planned, 1 a check failed,
 3 the remote could not be read or a lane scope could not be created,
 4 usage or configuration error (including an unknown or identity
-`--skip` name), 75 a heavy command found no free lane slot in time
+`--skip` name). Lane queue waits (exit 75) arrive with the queue ticket
 (`--plan` never runs anything).
 """
 
@@ -89,8 +89,7 @@ def add_parser(sub, *, ls_remote=None, run_cmd=None, heavy_run=None) -> None:
         "the review record and the configured takeoff commands. Exit 0 when "
         "every check is ok, skipped or planned, 1 when one failed, 3 when "
         "the remote could not be read or a lane scope could not be created, "
-        "4 on usage or configuration error, "
-        "75 when a heavy command finds no free lane slot in time. "
+        "4 on usage or configuration error. "
         "A repeatable --skip NAME waives one policy check and records it; "
         "an unknown name or an identity check is exit 4.",
     )
