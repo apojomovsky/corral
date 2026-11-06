@@ -211,33 +211,75 @@ def _commit_rules():
     return module
 
 
-def _ticket_repo(ops_root, main_clone, short_map):
-    """`(ticket_repo, short, matched)` for the main clone.
+def _repo_state(ops_root, main_clone, git):
+    """`(short_map, ticket_repo, short, matched, resolved)`: one parse of the project file.
 
-    The covering `[[repo]]` entry names the ticket's repo: `short` is
-    that entry name, and `ticket_repo` is its spelling through the
-    once-built short-to-tracker map, so the match and the later
-    translation share one map instead of parsing the project file
-    twice. A matched entry the map cannot translate keeps its entry
+    Reads the ops root's `korapy.toml` (and the host config) exactly
+    once and derives the covering `[[repo]]` match and the
+    short-to-tracker map from that single parse, then resolves the
+    matched entry's settings from the same in-memory tables, so a
+    concurrent edit between reads cannot produce a mixed view. The map
+    is fail-soft like `syncli.short_to_tracker`: entries no tracker
+    spelling translates read as no entries, so short names keep
+    resolving. A matched entry the map cannot translate keeps its entry
     name. With no ops root or no covering entry the main clone's
     directory name is the fallback, so the gate still runs: the
     fallback derives the same name for writing and reading a record.
     Two entries covering the same clone are refused instead of picked
-    by name.
+    by name. A broken project file raises TakeoffError, like the
+    covering match did.
 
     `short` travels alongside the ticket spelling because the reverse
     lookup is lossy: when two shorts feed one tracker repo the first
-    entry wins, so the caller loads settings with `short` and reads
+    entry wins, so the caller resolves settings with `short` and reads
     the record through the translated spelling only.
     """
-    if ops_root is not None:
+    if ops_root is None:
         try:
-            name = settings.covering_repo(ops_root, main_clone)
+            resolved = settings.load(root=None)
         except settings.SettingsError as err:
             raise TakeoffError(str(err)) from None
-        if name is not None:
-            return short_map.get(name, name), name, True
-    return os.path.basename(main_clone), None, False
+        return {}, os.path.basename(main_clone), None, False, resolved
+    try:
+        table = settings.read_project(ops_root)
+        host = settings.read_host()
+    except settings.SettingsError as err:
+        raise TakeoffError(str(err)) from None
+    project_path = os.path.join(ops_root, settings.PROJECT_FILE)
+    try:
+        name = settings.match_covering(table, ops_root, main_clone, project_path)
+    except settings.SettingsError as err:
+        raise TakeoffError(str(err)) from None
+    # The match above validated this parse, so these are the validated
+    # entry names, without reading the file a second time.
+    names = [entry.get("name") for entry in table.get("repo", []) if isinstance(entry, dict)]
+    entries, problem = syncli.repo_operators(ops_root, names, git, project=table, host=host)
+    if problem is not None or entries is None:
+        short_map: dict = {}
+    else:
+        short_map = {entry: tracker for entry, (tracker, _) in entries.items()}
+    if name is not None:
+        ticket_repo, short, matched = short_map.get(name, name), name, True
+    else:
+        ticket_repo, short, matched = os.path.basename(main_clone), None, False
+    # The same joins `settings.load` uses; `resolve` only names them in errors.
+    host_name = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
+    try:
+        if matched:
+            resolved = settings.resolve(
+                host=host,
+                project=table,
+                repo=short,
+                host_name=host_name,
+                project_name=project_path,
+            )
+        else:
+            resolved = settings.resolve(
+                host=host, project=table, host_name=host_name, project_name=project_path
+            )
+    except settings.SettingsError as err:
+        raise TakeoffError(str(err)) from None
+    return short_map, ticket_repo, short, matched, resolved
 
 
 def _check_base(branch, cwd, ls_remote):
@@ -691,18 +733,10 @@ def run_takeoff(
     except (leakcli.CollectError, settings.SettingsError) as err:
         raise TakeoffError(str(err)) from None
     main_clone = os.path.realpath(gitenv.worktree_main_checkout(toplevel) or toplevel)
-    short_map = syncli.short_to_tracker(ops_root, _git)
-    ticket_repo, short, matched = _ticket_repo(ops_root, main_clone, short_map)
+    short_map, ticket_repo, short, matched, resolved = _repo_state(ops_root, main_clone, _git)
     try:
         record_repo = reviewrecord.local_repo(ticket_repo, short_map)
     except ValueError as err:
-        raise TakeoffError(str(err)) from None
-    try:
-        if matched:
-            resolved = settings.load(root=ops_root, repo=short)
-        else:
-            resolved = settings.load(root=ops_root)
-    except settings.SettingsError as err:
         raise TakeoffError(str(err)) from None
     if ops_root is None:
         default_branch = detect.default_branch(toplevel, _git) or resolved["clone.default_branch"]

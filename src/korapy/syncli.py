@@ -27,7 +27,7 @@ import subprocess
 import sys
 import time
 
-from korapy import board, settings, sync
+from korapy import board, paths, settings, sync
 from korapy import tracker as iface
 from korapy.gitenv import clean_env
 from korapy.github import forge as ghforge
@@ -88,18 +88,37 @@ def _tracker_repo(root, name, resolved, git):
     return repo, None
 
 
-def repo_operators(root, names, git):
+def repo_operators(root, names, git, *, project=None, host=None, env=None):
     """`{name: (tracker_repo, operators)}` for each named ``[[repo]]`` entry.
 
     The single resolver for per-repo operators: sync, mirror and the
     dispatch pass all build their tracker-repo mapping from it, so the
     three agree on which authors are internal. Returns (entries, None);
-    on a configuration error returns (None, problem).
+    on a configuration error returns (None, problem). When `project` is
+    given it is the pre-read project table (see `settings.read_project`,
+    with `host` the pre-read host table): every entry resolves from
+    that single parse instead of reading the file once per entry, so
+    one pass never mixes entries from a concurrent edit. `env` selects
+    the environment for both layers, defaulting as in `settings.load`.
     """
+    if project is not None and env is None:
+        env = os.environ
     entries = {}
     for name in names:
         try:
-            resolved = settings.load(root=root, repo=name)
+            if project is None:
+                resolved = settings.load(root=root, repo=name, env=env)
+            else:
+                resolved = settings.resolve(
+                    host=host if host is not None else {},
+                    project=project,
+                    repo=name,
+                    env=env,
+                    host_name=os.path.join(paths.config_dir(env), settings.HOST_CONFIG_NAME),
+                    project_name=os.path.join(root, settings.PROJECT_FILE)
+                    if root
+                    else settings.PROJECT_FILE,
+                )
         except settings.SettingsError as problem:
             return None, str(problem)
         tracker_repo, problem = _tracker_repo(root, name, resolved, git)
