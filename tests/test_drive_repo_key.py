@@ -185,6 +185,18 @@ class OneMapPerPassTest(RepoKeyCase):
     def test_the_pass_map_is_the_one_resolver_over_the_roots(self):
         self.assertEqual(drive.production_repo_map(self.registered, git=dead_git), {SHORT: TRACKER})
 
+    def test_two_roots_sharing_a_short_name_keep_the_first_tracker(self):
+        other = os.path.join(self.tmp.name, "ops2")
+        os.makedirs(other)
+        with open(os.path.join(other, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TOML.replace(TRACKER, "other/app"))
+        registered = list(self.registered) + [
+            projects_mod.Project(name="green", unit_prefix="green-agent-", root=other),
+        ]
+        self.assertEqual(
+            drive.production_repo_map(registered, git=dead_git), {SHORT: TRACKER}
+        )
+
     def test_the_admission_live_set_keys_on_the_tracker_repo(self):
         triples = {("blue", SHORT, NUMBER), ("blue", "other/repo", 9)}
         with mock.patch.object(drive.launch, "admission_state", return_value=triples):
