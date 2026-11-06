@@ -112,6 +112,42 @@ def repo_operators(root, names, git):
     return entries, None
 
 
+def root_short_map(root, git):
+    """`{short [[repo]] name: tracker repo}` for one ops root.
+
+    The one shared single-root projection of `repo_operators`: both
+    the dispatch pass (`drive.production_repo_map`, across registered
+    roots) and the fail-soft `short_to_tracker` below build from here,
+    so the two builders cannot drift. A configuration problem raises
+    `settings.SettingsError`, so strict callers refuse instead of
+    joining against a guess.
+    """
+    names = settings.repo_names(root)
+    entries, problem = repo_operators(root, names, git)
+    if problem is not None or entries is None:
+        raise settings.SettingsError(problem or f"{root}: cannot read the [[repo]] entries")
+    return {name: tracker for name, (tracker, _ops) in entries.items()}
+
+
+def short_to_tracker(root, git):
+    """`{short [[repo]] name: tracker repo}` for one ops root.
+
+    The single-root projection of the shared `repo_operators` map:
+    the review-record callers (record, show, takeoff, merge) resolve
+    their ticket repo through it, so one map feeds every spelling
+    decision. No root reads as no entries; a configuration problem
+    reads as no entries too, so short names (the on-disk truth every
+    writer uses) keep resolving: only a tracker spelling the map
+    cannot translate fails, loudly, at the caller.
+    """
+    if not root:
+        return {}
+    try:
+        return root_short_map(root, git)
+    except settings.SettingsError:
+        return {}
+
+
 def _has_board_reader(tracker) -> bool:
     """Whether ``tracker`` can run the board step, through the factory's
     predicate. A board-variant repo whose tracker lacks this is a
