@@ -108,7 +108,8 @@ summary:focus-visible {
 
 main {
   padding: 1rem;
-  max-width: 70rem;
+  margin: 0 auto;
+  max-width: 96rem;
 }
 
 main.stale #status-card,
@@ -204,10 +205,10 @@ main.stale #detail {
 }
 
 /* The overview cards: one responsive grid, the fleet strip across
-the whole row, the rest one or two columns by width. */
+the whole row, the rest up to three across on wide screens. */
 #cards {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(24rem, 100%), 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(22rem, 100%), 1fr));
   gap: 1rem;
   padding: 1rem;
 }
@@ -284,8 +285,8 @@ details.finished > summary {
   color: var(--muted);
 }
 
-/* Labelled fields: the label names the fact, the value states it,
-the help says what it means. */
+/* Labelled fields: the label names the fact, the value states it;
+per-field help rides as a tooltip on the row so the numbers lead. */
 dl.fields {
   margin: 0.5rem 0;
 }
@@ -307,24 +308,28 @@ dl.fields dd {
   overflow-wrap: break-word;
 }
 
-dl.fields dd.help {
-  grid-column: 1 / -1;
-  color: var(--muted);
-  font-size: 0.875rem;
-}
-
 /* Percentage meters: the bar carries the state color, the words
-beside it carry the state name, so nothing reads by color alone. */
+beside it carry the state name, so nothing reads by color alone.
+The bar fills the row; the percentage sits at the row end. */
 .meter {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 0.5rem;
+  width: 100%;
   font-variant-numeric: tabular-nums;
 }
 
 .meter svg {
   display: inline-block;
   vertical-align: middle;
+  flex: 1 1 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+.meter span:last-child {
+  margin-left: auto;
+  flex: none;
 }
 
 .meter.ok {
@@ -345,6 +350,36 @@ beside it carry the state name, so nothing reads by color alone. */
 
 .meter.unknown {
   color: var(--muted);
+}
+
+/* Quota providers: a stale provider looks stale at a glance, a
+muted group with a stale badge, not only in the reading line. */
+.provider {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+}
+
+.provider.stale {
+  border-color: var(--line);
+  background: var(--stale-bg);
+}
+
+.badge {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.badge.stale {
+  color: var(--stale);
+  border-color: currentColor;
 }
 
 /* Agents: one table per project group, finished behind a toggle. */

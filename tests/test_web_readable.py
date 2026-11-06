@@ -11,7 +11,7 @@ import copy
 import unittest
 from importlib import resources
 
-from korapy import snapshot
+from korapy import drive, snapshot
 from tests.test_serve import DRIVE, ServeCase
 from tests.test_snapshot import (
     HOST,
@@ -188,8 +188,12 @@ class DriveSection(unittest.TestCase):
         self.assertIn("finished cleanly", fmt)
 
     def test_pause_help_names_the_pause_file(self):
+        # The card renders the snapshot's pause_file, which the drive
+        # section reports from drive.PAUSE_NAME (pinned in
+        # test_web_polish.py), so the page never carries its own copy.
         views = web_text("views.js")
-        self.assertIn("drive.pause", views)
+        self.assertIn("pause_file", views)
+        self.assertTrue(drive.PAUSE_NAME)
 
 
 class SectionHelp(unittest.TestCase):

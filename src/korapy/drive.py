@@ -804,6 +804,7 @@ def drive_status(*, now, max_starts, journal_path, pause_path, day_path, lock_pa
         "lock_held": check_lock(lock_path),
         "paused": reason is not None,
         "pause_reason": reason,
+        "pause_file": PAUSE_NAME,
         "starts_today": used,
         "starts_remaining": max(0, max_starts - used),
         "max_starts_per_day": max_starts,
