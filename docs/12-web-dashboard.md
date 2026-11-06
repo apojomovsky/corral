@@ -463,10 +463,11 @@ today); in hub mode they follow the hub's own conventions (405
 for a wrong method on a known path, 404 beyond them). Browsers
 need no HEAD, and conditional GET covers revalidation.
 Everything else keeps today's behavior: unknown paths 404,
-error bodies stay minimal JSON. The `listening on HOST:PORT` stdout line is a machine
-contract (`05-dashboard-api.md` section 2) and does not change;
-the same address in a browser is the UI, and the tickets update
-`README.md` to say so. No new verb, no new port, no off switch in
+error bodies stay minimal JSON. The `korapy serve: dashboard at URL` stdout line is a machine
+contract (`05-dashboard-api.md` section 2); on the default port the
+same address in a browser is the UI at `http://127.0.0.1:8420/`,
+and the tickets update `README.md` to say so. No new verb, no new
+port beyond that fixed default, no off switch in
 version one: the assets are inert public files from a public
 repository, and a `serve.ui` setting would be a knob nobody has
 asked for (section 11).

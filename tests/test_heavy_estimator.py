@@ -83,6 +83,16 @@ class KeyCase(EstimatorCase):
     def test_key_pins_the_pipe_layout(self):
         self.assertEqual(heavy.estimate_key("r", "h", "o"), "r|h|o")
 
+    def test_key_rejects_pipe_segments(self):
+        for repo, digest, role in (
+            ("a|b", "h", "r"),
+            ("r", "h|h", "o"),
+            ("r", "h", "o|o"),
+        ):
+            with self.subTest(repo=repo, digest=digest, role=role):
+                with self.assertRaises(heavy.HeavyError):
+                    heavy.estimate_key(repo, digest, role)
+
 
 class ColdStartCase(EstimatorCase):
     def test_no_rows_means_no_estimates(self):
@@ -430,6 +440,13 @@ class NormalizeCase(EstimatorCase):
         normalized = heavy.normalize_row(row)
         assert normalized is not None
         self.assertEqual(normalized["at"], NOW)
+
+    def test_pipe_segments_skip_the_row(self):
+        for field in ("repo", "argv_hash", "role"):
+            with self.subTest(field=field):
+                row = _row()
+                row[field] = "a|b"
+                self.assertIsNone(heavy.normalize_row(row))
 
     def test_bad_epoch_timestamps_skip_the_row(self):
         for bad in (True, float("nan"), float("inf"), -1.0):

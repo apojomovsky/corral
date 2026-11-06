@@ -59,7 +59,9 @@ class TicketRow:
 
     `extra` carries the board concepts (priority, area, pool, blocked-by
     refs and the like); it defaults to None and reads as {} so label-only
-    rows are unchanged.
+    rows are unchanged. `pulls` carries the ticket's linked pull requests
+    from the tracker (None when that read failed, so readers fail closed);
+    it defaults to () for rows built without a tracker read, such as plans.
     """
 
     repo: str
@@ -71,7 +73,7 @@ class TicketRow:
     agent: str = ""
     status: str = ""
     external: bool = False
-    pulls: tuple = ()
+    pulls: tuple | None = ()
     extra: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
@@ -97,13 +99,15 @@ class StartRequest:
     weight: float = 0.0
 
 
-def row_from_item(item: board.Item) -> TicketRow:
-    """The policy view of one board store item. Pure."""
-    # pulls stays empty here: no provider-neutral link joins a store row
-    # to its pull requests, so only policies and tests set it. A linked
-    # pull the store cannot serve fails the drive hold gate closed.
-    # Board concepts ride along in extra, copied on read so no two rows
-    # share one dict; a missing value reads as carrying nothing.
+def row_from_item(item: board.Item, *, pulls: tuple | None = ()) -> TicketRow:
+    """The policy view of one board store item. Pure.
+
+    `pulls` is the ticket's linked pull requests from the tracker (None
+    when that read failed, so readers fail closed); the store carries
+    no pull rows, so callers pass what the pass read. Board concepts
+    ride along in extra, copied on read so no two rows share one dict;
+    a missing value reads as carrying nothing.
+    """
     return TicketRow(
         repo=item.repo,
         number=item.number,
@@ -114,14 +118,31 @@ def row_from_item(item: board.Item) -> TicketRow:
         agent=item.agent,
         status=item.status,
         external=item.external,
-        pulls=(),
+        pulls=pulls,
         extra=dict(item.extra) if isinstance(item.extra, dict) else {},
     )
 
 
-def rows_from_items(items: Sequence[board.Item]) -> list[TicketRow]:
-    """The policy view of every given item, in the given order. Pure."""
-    return [row_from_item(item) for item in items]
+def rows_from_items(
+    items: Sequence[board.Item],
+    *,
+    pulls_by_key: Mapping[tuple[str, int], tuple | None] | None = None,
+) -> list[TicketRow]:
+    """The policy view of every given item, in the given order. Pure.
+
+    `pulls_by_key` maps (repo, number) to the linked pulls the pass
+    read through the tracker (None marks an unreadable ticket); a
+    ticket missing from the map reads as carrying no pulls. With no
+    map every row reads empty, which is what plans build: they never
+    contact the tracker.
+    """
+    rows = []
+    for item in items:
+        pulls: tuple | None = ()
+        if pulls_by_key is not None:
+            pulls = pulls_by_key.get((item.repo, item.number), ())
+        rows.append(row_from_item(item, pulls=pulls))
+    return rows
 
 
 def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[..., Any]:
@@ -283,14 +304,25 @@ class Outcome(NamedTuple):
     skipped: str | None
 
 
-def for_project(project: Any, items: Sequence[board.Item], *, now: float) -> Outcome:
+def for_project(
+    project: Any,
+    items: Sequence[board.Item],
+    *,
+    now: float,
+    pulls_by_key: Mapping[tuple[str, int], tuple | None] | None = None,
+) -> Outcome:
     """One project's ordered requests over these store items.
 
-    Raises EligibilityError (exit 4, naming the project and the entry)
-    when the entry does not load or the answer is invalid. Blocks only
+    `pulls_by_key` maps (repo, number) to the linked pulls the pass
+    read through the tracker, so the policy and the gate read the
+    same row pulls; with none every row reads empty. Raises
+    EligibilityError (exit 4, naming the project and the entry) when
+    the entry does not load or the answer is invalid. Blocks only
     this project: the caller moves on to the next one.
     """
     if not project.eligibility:
         return Outcome([], f"project {project.name} has no eligibility entry: skipped")
     policy = load_policy(project.eligibility, project=project.name, base=project.root)
-    return Outcome(policy.eligible(rows_from_items(items), now=now), None)
+    return Outcome(
+        policy.eligible(rows_from_items(items, pulls_by_key=pulls_by_key), now=now), None
+    )
