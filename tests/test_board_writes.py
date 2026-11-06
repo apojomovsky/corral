@@ -236,6 +236,43 @@ class BoardWriteTest(unittest.TestCase):
             {"project": "PVT_1", "item": "PVTI_Issue-7", "field": "F_agent", "text": "agent-1"},
         )
 
+    def test_locate_rejects_malformed_mapped_values(self):
+        select_field_ref = {
+            "__typename": "ProjectV2SingleSelectField",
+            "id": "F_prio",
+            "name": "Priority",
+        }
+        text_field_ref = {"__typename": "ProjectV2Field", "id": "F_agent", "name": "Agent"}
+        bad_entries = [
+            {
+                "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                "optionId": 123,
+                "name": "P0",
+                "field": select_field_ref,
+            },
+            {
+                "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                "optionId": "opt-p0-id",
+                "name": 123,
+                "field": select_field_ref,
+            },
+            {
+                "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                "text": "P0",
+                "field": select_field_ref,
+            },
+            {"__typename": "ProjectV2ItemFieldTextValue", "field": text_field_ref},
+        ]
+        for entry in bad_entries:
+            with self.subTest(entry=entry):
+                run = BoardFakeRun()
+                script_schema(run, *full_schema_fields())
+                script_item(run, 7, [entry])
+                with self.assertRaises(tracker.TrackerError):
+                    write_tracker(run).write(REPO, 7, "agent", "agent-1")
+                self.assertEqual(mutations(run), [])
+                self.assertEqual(mutations(run, CLEAR_MARKER), [])
+
     def test_locate_honors_the_page_cap(self):
         run = BoardFakeRun()
         script_schema(run, *full_schema_fields())
