@@ -217,9 +217,9 @@ Exit codes: `0` success, `1` nothing to do or a gate said no, `2` race lost or a
 
 ```bash
 make test         # the unittest suite
-make check        # format check, type check, suite on Python 3.11 and 3.14
+make check        # format check, type check, suite on Python 3.11 and 3.14 in parallel (stamps the proof)
 make format       # ruff, through uv
-make pre-pr-check PR_BODY=<file> [TEST=1]   # takeoff before a PR
+make pre-pr-check PR_BODY=<file> [TEST=1]   # takeoff before a PR (TEST=1 reuses a fresh matrix proof)
 make help
 ```
 
