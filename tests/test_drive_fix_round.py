@@ -336,6 +336,39 @@ class MissingReviewRecordPassTest(unittest.TestCase):
         ]
         self.assertEqual(len(logged), 1)
 
+    def test_a_kept_claim_logs_no_missing_record_line(self):
+        store = self.reviewed_store()
+        code, out, err, launcher, _ = self.run_missing(store, None, live_units={("app", 7)})
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        self.assertIsNotNone(store.claim_of("app", 7))
+        self.assertNotIn("reviewer finished without a review record", out)
+        self.assertNotIn("review missing", out)
+
+    def test_a_plan_with_a_kept_claim_logs_no_missing_record_line(self):
+        store = self.reviewed_store()
+        out, err = io.StringIO(), io.StringIO()
+        launcher = FakeLauncher()
+        code = drive_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=True,
+            found=[("blue", [("app", 7, "start")])],
+            policy_dir=self.policies,
+            agent_states={REVIEWER_UNIT: (FINISHED, NOW - 5.0)},
+            agent_tickets={REVIEWER_UNIT: ("app", 7)},
+            finished_for={("app", 7): (REVIEWER_UNIT, "reviewer", "ok")},
+            review_reader=lambda repo, number: None,
+            live_units={("app", 7)},
+            now=NOW,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(launcher.calls, [])
+        self.assertNotIn("reviewer finished without a review record", out.getvalue())
+        self.assertNotIn("review missing", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
