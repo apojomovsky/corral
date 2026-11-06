@@ -118,6 +118,19 @@ class RowPullsTest(unittest.TestCase):
         )
         self.assertIsNone(rows[0].pulls)
 
+    def test_rows_from_items_carries_the_first_error_per_ticket(self):
+        rows = eligibility.rows_from_items(
+            [item(number=7), item(number=9)],
+            pulls_by_key={("app", 7): None},
+            pulls_errors={("app", 7): "tracker down"},
+        )
+        self.assertIsNone(rows[0].pulls)
+        self.assertEqual(rows[0].pulls_error, "tracker down")
+        self.assertEqual(rows[1].pulls_error, "")
+
+    def test_row_from_item_defaults_to_no_pull_error(self):
+        self.assertEqual(eligibility.row_from_item(item()).pulls_error, "")
+
     def test_ticket_row_defaults_extra_to_empty(self):
         self.assertEqual(eligibility.TicketRow(repo="app", number=7).extra, {})
         self.assertEqual(eligibility.TicketRow(repo="app", number=7, extra=None).extra, {})
