@@ -233,7 +233,7 @@ Because `--fix` cannot reach beyond the user and the clones, agents may run it.
   `korapy repo rename OLD NEW --plan` prints what would move, and
   `korapy repo rename OLD NEW` moves the store's keys (items, claims
   with agent and epoch, outbox, sync cursors) in one transaction,
-  refusing while a live agent or a live-held claim names the repo.
+  refusing while a live or stale agent entry or a live-held claim names the repo.
   Session directories and review records are keyed by the short
   repository name and are not touched by this verb (see #479).
   The verb leaves a timestamped backup beside the store (the newest
