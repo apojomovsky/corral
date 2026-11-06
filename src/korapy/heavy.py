@@ -1,11 +1,12 @@
-"""The heavy lane: weighted slots with limits, scope runs and the raw ledger.
+"""The heavy lane: weighted slots, the queue file, scope runs and the ledger.
 
-Ticket 1 of the heavy-lane design: the lane budget check, the transient
-scope argv on the ``units`` precedent, per-command routing for takeoff
-with role ``takeoff``, and one ledger row per run with the host
-descriptor. Weights still come from config; learned estimates arrive in
-a later ticket, which also adds the queue file, the status view and the
-pressure gate. There is no CLI verb here yet.
+Tickets 1 and 2 of the heavy-lane design: the lane budget check, the
+transient scope argv on the ``units`` precedent, per-command routing
+for takeoff with role ``takeoff``, one ledger row per run with the host
+descriptor, and the queue file with its lock sidecar. Weights still
+come from config; learned estimates, backfill with reaping, the
+pressure gate and the bypass arrive in later tickets. The ``heavy``
+verbs live in ``heavycli`` as thin parsers over this module.
 
 Config lives in the project's top-level ``[heavy]`` table, carried raw
 on the resolved settings (the ``[profiles]`` precedent) and validated
@@ -14,6 +15,7 @@ here, the one owner::
     [heavy]
     cpu_m = 4000
     memory_mb = 8192
+    wait_timeout_s = 1800
     [heavy.default_weight]
     cpu_m = 1000
     memory_mb = 1024
@@ -24,8 +26,10 @@ here, the one owner::
 ``commands`` names the commands that run through the lane; a listed
 command with an empty table queues at the default weight. The caps
 default per dimension to the host budget; a cap above the host budget
-is refused. ``starved_ratio`` and ``ledger_period`` default to 0.2 and
-``"month"``; only ``"month"`` periods are supported so far.
+is refused. ``wait_timeout_s`` caps one queue wait (an explicit
+``--timeout`` still overrides it per run). ``starved_ratio`` and
+``ledger_period`` default to 0.2 and ``"month"``; only ``"month"``
+periods are supported so far.
 
 Every subprocess goes through one injectable seam per operation.
 ``run_heavy`` takes ``run`` (start the scope and wait), ``teardown``
@@ -33,12 +37,19 @@ Every subprocess goes through one injectable seam per operation.
 all three are required, so a missed fake fails closed instead of
 leaking a scope. The file reader, clock, host and pressure readers
 default to the live ones; they only read. A vanished cgroup records a
-row with null measurements: unknown never blocks.
+row with null measurements: unknown never blocks. The queue uses the
+same shape: ``join_lane`` and friends take ``now``, ``asleep`` and
+``pid`` seams, and the lock retry reads the ``_flock``, ``_sleep`` and
+``_monotonic`` module seams the tests replace.
 """
 
+import contextlib
 import datetime
+import errno
+import fcntl
 import hashlib
 import json
+import math
 import os
 import platform
 import re
@@ -71,11 +82,27 @@ DEFAULT_STARVED_RATIO = 0.2
 #: The only ledger period so far: one file per host per calendar month.
 DEFAULT_LEDGER_PERIOD = "month"
 
-#: The lane state: host id, lock sidecar and queue file live directly
-#: under it in later tickets; the raw runs already do.
+#: The lane state: host id, lane file and lock sidecar live directly
+#: under it; the raw runs already do.
 HEAVY_DIR = "heavy"
 RUNS_DIR = "runs"
 HOST_ID_FILE = "host-id"
+LANE_FILE = "lane.json"
+LOCK_FILE = "lane.lock"
+
+#: One admit poll per second, on the suite-lock precedent: each poll is
+#: one small JSON read, so a few dozen agents polling stay trivial.
+HEAVY_POLL_S = 1.0
+
+#: A busy lane lock refuses the join with 75 instead of blocking
+#: forever, on the host-ledger precedent.
+HEAVY_LOCK_TIMEOUT_S = 5.0
+HEAVY_LOCK_POLL_S = 0.05
+
+#: The default cap on one queue wait: a run with no explicit --timeout
+#: leaves past the deadline with 75. The estimator ticket scales this
+#: per command; until then every wait uses the flat default.
+DEFAULT_WAIT_TIMEOUT_S = 1800
 
 #: The unit name prefix for lane scopes.
 UNIT_PREFIX = "heavy-"
@@ -99,6 +126,24 @@ class ScopeUnreachable(HeavyError):
     """The user manager could not be reached for the scope (exit 3)."""
 
     exit_code = 3
+
+
+class LaneLocked(HeavyError):
+    """The lane lock stayed busy past the retry deadline (exit 75)."""
+
+    exit_code = 75
+
+
+class LaneTimeout(HeavyError):
+    """The queue wait passed its deadline, or the waiter row is gone (exit 75)."""
+
+    exit_code = 75
+
+
+#: The module seams the queue lock reads: assigned fakes in tests.
+_flock = fcntl.flock
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 
 @dataclass(frozen=True)
@@ -125,10 +170,18 @@ class Config:
     commands: dict = field(default_factory=dict)
     starved_ratio: float = DEFAULT_STARVED_RATIO
     ledger_period: str = DEFAULT_LEDGER_PERIOD
+    wait_timeout_s: int = DEFAULT_WAIT_TIMEOUT_S
 
 
 class RunResult(NamedTuple):
-    """One finished lane run: the raw and mapped exits plus the row keys."""
+    """One finished lane run: the raw and mapped exits plus the row keys.
+
+    ``stdout`` and ``stderr`` carry the streams separately so the CLI
+    replays each onto its own; ``output`` stays their concatenation for
+    the takeoff failure rows. ``measured`` is the verdict's
+    per-cgroup measurement, None when the scope vanished before the
+    read; the ledger row stays the checkable truth behind it.
+    """
 
     command_exit: int
     exit_code: int
@@ -137,6 +190,16 @@ class RunResult(NamedTuple):
     wall_s: float
     unit: str
     argv_hash: str
+    stdout: str = ""
+    stderr: str = ""
+    measured: dict | None = None
+
+
+class LaneRun(NamedTuple):
+    """One queued lane run: the finished run plus its queue wait."""
+
+    result: RunResult
+    waited_s: float
 
 
 def _count(value, what, where):
@@ -189,6 +252,7 @@ def check_table(raw, where):
             "commands",
             "starved_ratio",
             "ledger_period",
+            "wait_timeout_s",
         ):
             raise settings.SettingsError(f"{where}: [heavy] has no key {key!r}")
     default = Weight()
@@ -223,6 +287,8 @@ def check_table(raw, where):
     for key in ("cpu_m", "memory_mb"):
         if key in raw:
             caps[key] = _count(raw[key], f"[heavy] {key}", where)
+    wait_timeout = raw.get("wait_timeout_s", DEFAULT_WAIT_TIMEOUT_S)
+    wait_timeout_s = _count(wait_timeout, "[heavy] wait_timeout_s", where)
     return Config(
         cpu_m=caps.get("cpu_m"),
         memory_mb=caps.get("memory_mb"),
@@ -230,6 +296,7 @@ def check_table(raw, where):
         commands=commands,
         starved_ratio=float(ratio),
         ledger_period=period,
+        wait_timeout_s=wait_timeout_s,
     )
 
 
@@ -716,6 +783,8 @@ def run_heavy(
     pressure=None,
     timeout,
     starved_ratio=DEFAULT_STARVED_RATIO,
+    waited_s=0.0,
+    unit=None,
 ):
     """Run one heavy command in a transient scope and record its ledger row.
 
@@ -728,11 +797,14 @@ def run_heavy(
     default. `read`, `clock`, `host` and `pressure` default to the live
     readers. `timeout` caps this run only and is required.
     `starved_ratio` decides the row's starved flag; the caller passes
-    the configured ratio.
+    the configured ratio. `waited_s` is the queue wait the lane
+    already spent (zero for a direct run); `unit` pins the scope unit
+    name when the queue admitted the run under it, else one is minted.
 
     Returns a RunResult: the raw command exit, the mapped exit (a
     public code passthrough, anything else 1), the combined output for
-    the caller's failure rows, and the row keys. Raises
+    the caller's failure rows, the split streams for the CLI replay,
+    the verdict measurement, and the row keys. Raises
     subprocess.TimeoutExpired past `timeout` (no row: the run never
     completed), ScopeUnreachable when the manager cannot be reached,
     HeavyError naming the program when the scope spawn itself fails
@@ -750,9 +822,19 @@ def run_heavy(
         raise HeavyError(f"budget must be a resource Usage, not {budget!r}")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
         raise HeavyError(f"timeout {timeout!r} must be a positive number of seconds")
+    if (
+        isinstance(waited_s, bool)
+        or not isinstance(waited_s, (int, float))
+        or waited_s != waited_s
+        or waited_s < 0
+    ):
+        raise HeavyError(f"waited_s {waited_s!r} must be a non-negative number of seconds")
+    if unit is None:
+        unit = UNIT_PREFIX + uuid.uuid4().hex
+    else:
+        _check_unit(unit)
     now = clock or time.time
     start = now()
-    unit = UNIT_PREFIX + uuid.uuid4().hex
     if budget is None:
         memory_max, cpu_quota = None, None
     else:
@@ -803,7 +885,7 @@ def run_heavy(
         "mem_pressure_us": measured["mem_pressure_us"],
         "starved": measured["starved"],
         "exit": code,
-        "waited_s": 0.0,
+        "waited_s": round(waited_s, 3),
         "weight": {"cpu_m": weight.cpu_m, "memory_mb": weight.memory_mb},
         "host_pressure": reading,
     }
@@ -820,4 +902,667 @@ def run_heavy(
         wall_s=wall_s,
         unit=unit,
         argv_hash=row["argv_hash"],
+        stdout=getattr(proc, "stdout", "") or "",
+        stderr=getattr(proc, "stderr", "") or "",
+        measured=_verdict_measured(measured),
     )
+
+
+def _verdict_measured(measured):
+    """The verdict's measurement, None when the scope vanished mid-read.
+
+    Average parallelism renders as millicores beside the megabyte
+    high-water mark; a vanished scope (every counter null) reads as
+    null, so unknown never blocks. The ledger row keeps the full
+    counters behind it.
+    """
+    keys = (
+        "cpu_s",
+        "peak_mb",
+        "pids_peak",
+        "avg_cores",
+        "throttled_us",
+        "cpu_pressure_us",
+        "mem_pressure_us",
+    )
+    if all(measured[key] is None for key in keys):
+        return None
+    avg = measured["avg_cores"]
+    return {
+        "cpu_m": round(avg * 1000) if avg is not None else None,
+        "memory_mb": measured["peak_mb"],
+    }
+
+
+def lane_path(state_dir=None):
+    """The queue file: ``<state>/heavy/lane.json``. The one resolver."""
+    return os.path.join(state_dir or paths.state_dir(), HEAVY_DIR, LANE_FILE)
+
+
+def lock_path(state_dir=None):
+    """The queue lock sidecar: ``<state>/heavy/lane.lock``. The one resolver."""
+    return os.path.join(state_dir or paths.state_dir(), HEAVY_DIR, LOCK_FILE)
+
+
+@contextlib.contextmanager
+def _locked_sidecar(lock, shared, timeout):
+    """Hold the lane lock sidecar, shared for readers, exclusive to write.
+
+    On the host-ledger precedent: non-blocking flock with a retry loop
+    against a monotonic deadline. Contention past the deadline refuses
+    with LaneLocked (exit 75); setup and unexpected lock failures raise
+    HeavyError. The kernel releases the lock when the holder dies.
+    """
+    directory = os.path.dirname(lock) or "."
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError as err:
+        raise HeavyError(f"cannot set up the lane lock at {lock}: {err}") from None
+    try:
+        handle = open(lock, "a+")
+    except OSError as err:
+        raise HeavyError(f"cannot open the lane lock at {lock}: {err}") from None
+    with handle:
+        flag = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        deadline = _monotonic() + timeout
+        while True:
+            try:
+                _flock(handle, flag | fcntl.LOCK_NB)
+                break
+            except OSError as err:
+                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                    raise HeavyError(f"cannot lock the lane at {lock}: {err}") from None
+            if _monotonic() >= deadline:
+                raise LaneLocked(
+                    f"lane at {lock} is locked by another process: waited {timeout}s, try later"
+                ) from None
+            _sleep(HEAVY_LOCK_POLL_S)
+        try:
+            yield
+        finally:
+            _flock(handle, fcntl.LOCK_UN)
+
+
+def _iso(moment):
+    """An epoch as a UTC ISO timestamp, readable by hand and `jq`."""
+    return datetime.datetime.fromtimestamp(moment, datetime.timezone.utc).isoformat()
+
+
+def _parse_moment(value, what, path):
+    """An ISO timestamp back to an epoch, else a refusal naming the file."""
+    if not isinstance(value, str):
+        raise HeavyError(f"lane file {path} is unparsable: {what} is not text")
+    try:
+        moment = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        raise HeavyError(f"lane file {path} is unparsable: {what} is not a timestamp") from None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.timestamp()
+
+
+def empty_lane():
+    """The lane with nothing in it: no cached budget, no rows."""
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "budget": None,
+        "holders": [],
+        "waiters": [],
+        "costs": {},
+        "recent": [],
+    }
+
+
+def _lane_millis(value, what, path):
+    """A non-negative resource amount from a lane row, else a refusal."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HeavyError(f"lane file {path} is unparsable: {what} is not an amount")
+    return value
+
+
+def _lane_weight(value, what, path):
+    """A ``{cpu_m, memory_mb}`` row weight, else a refusal naming the file."""
+    if not isinstance(value, Mapping) or set(value) != {"cpu_m", "memory_mb"}:
+        raise HeavyError(f"lane file {path} is unparsable: {what} is not a weight")
+    return {
+        "cpu_m": _lane_millis(value["cpu_m"], f"{what} cpu_m", path),
+        "memory_mb": _lane_millis(value["memory_mb"], f"{what} memory_mb", path),
+    }
+
+
+def _checked_waiter(row, path):
+    """A waiter row in canonical shape, else a refusal naming the file."""
+    if not isinstance(row, Mapping):
+        raise HeavyError(f"lane file {path} is unparsable: a waiter is not an object")
+    for key in ("id", "command", "argv_hash", "arrived_at", "deadline_at"):
+        if key not in row:
+            raise HeavyError(f"lane file {path} is unparsable: a waiter has no {key}")
+    if not isinstance(row["id"], str) or not row["id"]:
+        raise HeavyError(f"lane file {path} is unparsable: a waiter id is not text")
+    command = row["command"]
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(item, str) for item in command)
+    ):
+        raise HeavyError(f"lane file {path} is unparsable: a waiter command is not words")
+    arrived = _parse_moment(row["arrived_at"], "a waiter arrival", path)
+    deadline = _parse_moment(row["deadline_at"], "a waiter deadline", path)
+    skipped = row.get("skipped", 0)
+    if isinstance(skipped, bool) or not isinstance(skipped, int) or skipped < 0:
+        raise HeavyError(f"lane file {path} is unparsable: a waiter skip count is not a count")
+    pid = row.get("pid", 0)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
+        raise HeavyError(f"lane file {path} is unparsable: a waiter pid is not a pid")
+    return {
+        "id": row["id"],
+        "pid": pid,
+        "command": list(command),
+        "argv_hash": row["argv_hash"] if isinstance(row["argv_hash"], str) else "",
+        "weight": _lane_weight(row.get("weight"), "a waiter weight", path),
+        "arrived_at": _iso(arrived),
+        "deadline_at": _iso(deadline),
+        "skipped": skipped,
+    }
+
+
+def _checked_holder(row, path):
+    """A holder row in canonical shape, else a refusal naming the file."""
+    if not isinstance(row, Mapping):
+        raise HeavyError(f"lane file {path} is unparsable: a holder is not an object")
+    for key in ("id", "command", "weight", "since"):
+        if key not in row:
+            raise HeavyError(f"lane file {path} is unparsable: a holder has no {key}")
+    if not isinstance(row["id"], str) or not row["id"]:
+        raise HeavyError(f"lane file {path} is unparsable: a holder id is not text")
+    command = row["command"]
+    if (
+        not isinstance(command, list)
+        or not command
+        or any(not isinstance(item, str) for item in command)
+    ):
+        raise HeavyError(f"lane file {path} is unparsable: a holder command is not words")
+    since = _parse_moment(row["since"], "a holder start", path)
+    pid = row.get("pid", 0)
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid < 0:
+        raise HeavyError(f"lane file {path} is unparsable: a holder pid is not a pid")
+    unit = row.get("unit", "")
+    if not isinstance(unit, str):
+        raise HeavyError(f"lane file {path} is unparsable: a holder unit is not text")
+    return {
+        "id": row["id"],
+        "pid": pid,
+        "unit": unit,
+        "command": list(command),
+        "argv_hash": row.get("argv_hash") if isinstance(row.get("argv_hash"), str) else "",
+        "weight": _lane_weight(row.get("weight"), "a holder weight", path),
+        "since": _iso(since),
+    }
+
+
+def _check_lane(doc, path):
+    """A lane document in canonical shape.
+
+    A present-but-corrupt file refuses (exit 4, naming the file) and is
+    never reinitialized: the lane cannot prove an empty queue, so it
+    must not invent one. Unknown fields are ignored, so newer readers
+    stay readable to this one.
+    """
+    if not isinstance(doc, Mapping):
+        raise HeavyError(f"lane file {path} is unparsable: the top level is not an object")
+    if doc.get("schema_version") != SCHEMA_VERSION:
+        raise HeavyError(
+            f"lane file {path} is unparsable: needs schema_version {SCHEMA_VERSION}, "
+            f"not {doc.get('schema_version')!r}"
+        )
+    holders = doc.get("holders", [])
+    waiters = doc.get("waiters", [])
+    costs = doc.get("costs", {})
+    recent = doc.get("recent", [])
+    budget = doc.get("budget", None)
+    if not isinstance(holders, list) or not isinstance(waiters, list):
+        raise HeavyError(f"lane file {path} is unparsable: holders and waiters are lists")
+    if not isinstance(costs, dict) or not isinstance(recent, list):
+        raise HeavyError(f"lane file {path} is unparsable: costs is an object, recent a list")
+    if budget is not None:
+        budget = _lane_weight(budget, "the budget copy", path)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "budget": budget,
+        "holders": [_checked_holder(row, path) for row in holders],
+        "waiters": [_checked_waiter(row, path) for row in waiters],
+        "costs": dict(costs),
+        "recent": list(recent),
+    }
+
+
+def _read_locked(path):
+    """The lane file parsed and checked; a missing file reads as empty."""
+    try:
+        with open(path, encoding="utf-8") as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return empty_lane()
+    except OSError as err:
+        raise HeavyError(f"cannot read the lane file at {path}: {err}") from None
+    try:
+        doc = json.loads(text)
+    except ValueError as err:
+        raise HeavyError(f"lane file {path} is unparsable: {err}") from None
+    return _check_lane(doc, path)
+
+
+def read_lane(state_dir=None, *, lock_timeout=HEAVY_LOCK_TIMEOUT_S):
+    """The checked lane under the shared lock; missing reads as empty."""
+    path = lane_path(state_dir)
+    with _locked_sidecar(lock_path(state_dir), True, lock_timeout):
+        return _read_locked(path)
+
+
+def _store_locked(path, lane):
+    """The checked lane written atomically; the caller holds the lock."""
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        paths.atomic_write_text(path, json.dumps(_check_lane(lane, path), sort_keys=True))
+    except OSError as err:
+        raise HeavyError(f"cannot write the lane file at {path}: {err}") from None
+
+
+def _budget_copy(budget):
+    """The cached budget copy for the lane file: numbers, or null."""
+    if budget is None:
+        return None
+    if not isinstance(budget, resources.Usage):
+        raise HeavyError(f"budget must be a resource Usage, not {budget!r}")
+    return {"cpu_m": budget.cpu_m, "memory_mb": budget.memory_mb}
+
+
+def _check_timeout(timeout_s):
+    """A queue wait cap in seconds: zero times out at once, negative never waits."""
+    if isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float)):
+        raise HeavyError(f"timeout {timeout_s!r} must be a number of seconds")
+    if not math.isfinite(timeout_s) or timeout_s < 0:
+        raise HeavyError(f"timeout {timeout_s!r} must be a non-negative number of seconds")
+    return timeout_s
+
+
+def join_lane(
+    command,
+    weight,
+    budget,
+    *,
+    state_dir=None,
+    arrived=None,
+    pid=None,
+    timeout_s,
+    lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+):
+    """Append one waiter row under the exclusive lock and return it.
+
+    A missing file reads as an empty lane and is created on this first
+    join. `deadline_at` is `arrived` plus `timeout_s`; an explicit zero
+    stores a deadline equal to the arrival, so the waiter times out at
+    once when no slot is free. Repair stays manual: a corrupt file
+    refuses, and the operator archives it aside.
+    """
+    items = _check_command(command)
+    if not isinstance(weight, Weight):
+        raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
+    _check_timeout(timeout_s)
+    moment = time.time() if arrived is None else arrived
+    if isinstance(moment, bool) or not isinstance(moment, (int, float)):
+        raise HeavyError(f"arrival {moment!r} must be an epoch timestamp")
+    me = os.getpid() if pid is None else pid
+    if isinstance(me, bool) or not isinstance(me, int) or me < 0:
+        raise HeavyError(f"pid {me!r} must be a process id")
+    row = {
+        "id": uuid.uuid4().hex,
+        "pid": me,
+        "command": items,
+        "argv_hash": argv_hash(items),
+        "weight": {"cpu_m": weight.cpu_m, "memory_mb": weight.memory_mb},
+        "arrived_at": _iso(moment),
+        "deadline_at": _iso(moment + timeout_s),
+        "skipped": 0,
+    }
+    path = lane_path(state_dir)
+    lock = lock_path(state_dir)
+    with _locked_sidecar(lock, False, lock_timeout):
+        lane = _read_locked(path)
+        lane["waiters"].append(row)
+        lane["budget"] = _budget_copy(budget)
+        _store_locked(path, lane)
+    return row
+
+
+def holder_sum(lane):
+    """The held weight as a Usage: CPU and memory only, never pids."""
+    cpu_m = sum(holder["weight"]["cpu_m"] for holder in lane["holders"])
+    memory_mb = sum(holder["weight"]["memory_mb"] for holder in lane["holders"])
+    return resources.Usage(cpu_m=cpu_m, memory_mb=memory_mb, pids=0)
+
+
+def lane_fits(used, weight, budget):
+    """Whether `weight` still fits beside `used` under `budget`.
+
+    Pure, on the admission shape: no budget means order without numbers
+    and every request fits; otherwise both dimensions must hold.
+    """
+    if budget is None:
+        return True
+    if not isinstance(weight, Weight):
+        raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
+    return (
+        used.cpu_m + weight.cpu_m <= budget.cpu_m
+        and used.memory_mb + weight.memory_mb <= budget.memory_mb
+    )
+
+
+def plan_report(weight, lane, budget):
+    """The read-only verdict for one request weight: admit, position, reason.
+
+    Pure: the weight, the current lane and the live budget in, the
+    verdict out, without joining the queue. A planned admission that
+    would wait reports admitted false with the head reason and the
+    queue position (every current waiter stands ahead of a new
+    request); a planned admission with a free slot reports true.
+    """
+    if not isinstance(weight, Weight):
+        raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
+    mine = {"cpu_m": weight.cpu_m, "memory_mb": weight.memory_mb}
+    if budget is None:
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "admitted": True,
+            "position": 0,
+            "weight": mine,
+            "reason": "no lane budget: every request fits at once",
+        }
+    used = holder_sum(lane)
+    if lane["waiters"]:
+        head = lane["waiters"][0]
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "admitted": False,
+            "position": len(lane["waiters"]),
+            "weight": mine,
+            "reason": f"waiting behind {len(lane['waiters'])} waiter(s), head is {head['id'][:8]}",
+        }
+    if lane_fits(used, weight, budget):
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "admitted": True,
+            "position": 0,
+            "weight": mine,
+            "reason": (
+                f"slot free: holders use {used.cpu_m}m/{used.memory_mb}MB of "
+                f"{budget.cpu_m}m/{budget.memory_mb}MB"
+            ),
+        }
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "admitted": False,
+        "position": 0,
+        "weight": mine,
+        "reason": (
+            f"over budget: need {weight.cpu_m}m/{weight.memory_mb}MB with "
+            f"{used.cpu_m}m/{used.memory_mb}MB held of "
+            f"{budget.cpu_m}m/{budget.memory_mb}MB"
+        ),
+    }
+
+
+def status_report(lane, now=None):
+    """The read-only lane view: the cached budget, holders, waiters, costs.
+
+    Pure: the stored lane and one clock reading in, the status document
+    out. The budget is the cached copy the last writer saw; admission
+    resolves the live budget every pass and refreshes the cache on the
+    next write. Holder and waiter ETAs stay null until the estimator
+    ticket learns durations.
+    """
+    moment = time.time() if now is None else now
+    holders = [
+        {
+            "id": holder["id"],
+            "command": list(holder["command"]),
+            "weight": dict(holder["weight"]),
+            "since": holder["since"],
+            "eta_s": None,
+        }
+        for holder in lane["holders"]
+    ]
+    waiters = []
+    for waiter in lane["waiters"]:
+        arrived = _parse_moment(waiter["arrived_at"], "a waiter arrival", "<lane>")
+        waiters.append(
+            {
+                "id": waiter["id"],
+                "command": list(waiter["command"]),
+                "weight": dict(waiter["weight"]),
+                "waited_s": max(0.0, round(moment - arrived, 1)),
+                "skipped": waiter["skipped"],
+                "eta_s": None,
+            }
+        )
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "budget": lane["budget"],
+        "holders": holders,
+        "waiters": waiters,
+        "costs": dict(lane["costs"]),
+        "recent": list(lane["recent"]),
+    }
+
+
+def poll_once(
+    waiter_id, weight, budget, now, state_dir=None, *, unit="", lock_timeout=HEAVY_LOCK_TIMEOUT_S
+):
+    """One admit pass for `waiter_id`: promote, wait, or expire.
+
+    Under the exclusive lock, so two waiters never promote past the
+    cap together. The fitting head becomes the holder and its row is
+    returned; anyone else gets None and keeps waiting. Past the
+    deadline the waiter row goes and LaneTimeout (exit 75) reports it;
+    a gone row reads the same way. Head-first only: backfill arrives
+    in a later ticket. `unit` names the scope the run will take, so
+    the holder row carries it from admission.
+    """
+    if not isinstance(weight, Weight):
+        raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
+    if not isinstance(unit, str):
+        raise HeavyError(f"unit {unit!r} is not a scope unit name")
+    path = lane_path(state_dir)
+    lock = lock_path(state_dir)
+    with _locked_sidecar(lock, False, lock_timeout):
+        lane = _read_locked(path)
+        index = next(
+            (pos for pos, row in enumerate(lane["waiters"]) if row["id"] == waiter_id), None
+        )
+        if index is None:
+            raise LaneTimeout(f"waiter {waiter_id[:8]} is gone from the lane")
+        mine = lane["waiters"][index]
+        deadline = _parse_moment(mine["deadline_at"], "a waiter deadline", path)
+        if index == 0 and lane_fits(holder_sum(lane), weight, budget):
+            holder = {
+                "id": mine["id"],
+                "pid": mine["pid"],
+                "unit": unit,
+                "command": list(mine["command"]),
+                "argv_hash": mine["argv_hash"],
+                "weight": dict(mine["weight"]),
+                "since": _iso(now),
+            }
+            lane["waiters"].pop(index)
+            lane["holders"].append(holder)
+            lane["budget"] = _budget_copy(budget)
+            _store_locked(path, lane)
+            return holder
+        if now >= deadline:
+            lane["waiters"].pop(index)
+            lane["budget"] = _budget_copy(budget)
+            _store_locked(path, lane)
+            raise LaneTimeout(f"waiter {waiter_id[:8]} waited past its deadline with no free slot")
+        return None
+
+
+def wait_for_slot(
+    waiter_id,
+    weight,
+    budget,
+    *,
+    state_dir=None,
+    now=None,
+    asleep=None,
+    unit="",
+    lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+):
+    """Poll `poll_once` until the waiter is the fitting head or expires.
+
+    Past the deadline the waiter row is already gone and LaneTimeout
+    (exit 75) reports it. `now` defaults to the wall clock and `asleep`
+    to the module sleep seam; the tests script both. `unit` names the
+    scope the run will take and lands on the holder row at admission.
+    """
+    clock = now or time.time
+    rest = asleep or _sleep
+    while True:
+        holder = poll_once(
+            waiter_id, weight, budget, clock(), state_dir, unit=unit, lock_timeout=lock_timeout
+        )
+        if holder is not None:
+            return holder
+        rest(HEAVY_POLL_S)
+
+
+def release_lane(holder_id, budget, state_dir=None, *, lock_timeout=HEAVY_LOCK_TIMEOUT_S):
+    """Remove one holder row under the exclusive lock and refresh the cache.
+
+    Releasing an unknown holder is a no-op: the wait is already over
+    and there is nothing to free. The live budget is cached again, so
+    hand readers see what this writer saw.
+    """
+    path = lane_path(state_dir)
+    lock = lock_path(state_dir)
+    with _locked_sidecar(lock, False, lock_timeout):
+        lane = _read_locked(path)
+        lane["holders"] = [row for row in lane["holders"] if row["id"] != holder_id]
+        lane["budget"] = _budget_copy(budget)
+        _store_locked(path, lane)
+
+
+def hand_weight(cfg, name):
+    """The weight for a hand `heavy run`: the entry, else the default.
+
+    Resolves through ``weight_for`` (the one owner of the config
+    lookup) and falls back to the default weight only where it
+    refuses: a missing config reads as the conservative default, so a
+    project with no ``[heavy]`` table still queues safely; an unlisted
+    command in a configured project queues at that project's default.
+    """
+    try:
+        return weight_for(cfg, name)
+    except HeavyError:
+        return Weight() if cfg is None else cfg.default
+
+
+def command_name(argv):
+    """The lane command name for an argv: its words joined by spaces.
+
+    Listed ``[heavy.commands]`` keys are shell strings like
+    ``"make check"``; joining replays the same name for a hand run, so
+    both callers resolve one key and a changed command cold-starts.
+    """
+    return " ".join(_check_command(argv))
+
+
+def run_through_lane(
+    argv,
+    cwd,
+    env,
+    *,
+    role="hand",
+    weight,
+    budget,
+    timeout_s,
+    timeout,
+    run,
+    teardown,
+    scope_cgroup,
+    read=None,
+    now=None,
+    asleep=None,
+    host=None,
+    pressure=None,
+    starved_ratio=DEFAULT_STARVED_RATIO,
+    state_dir=None,
+    pid=None,
+    unit=None,
+    lock_timeout=HEAVY_LOCK_TIMEOUT_S,
+):
+    """Queue one command, run it in a transient scope, release the slot.
+
+    Joins the lane with the request's weight, waits for the fitting
+    head under the queue protocol (past the deadline the waiter is
+    already gone and LaneTimeout reports 75), runs through
+    ``run_heavy`` with the pinned scope unit, and releases the slot in
+    a finally, so a failed run never leaks a holder row. `run`,
+    `teardown` and `scope_cgroup` are required seams with no default.
+    `timeout_s` caps this queue wait; `timeout` caps the command run.
+    Returns a LaneRun: the finished run plus the seconds waited.
+    """
+    items = _check_command(argv)
+    if not isinstance(weight, Weight):
+        raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
+    _check_timeout(timeout_s)
+    clock = now or time.time
+    rest = asleep or _sleep
+    arrived = clock()
+    scope_unit = unit or UNIT_PREFIX + uuid.uuid4().hex
+    _check_unit(scope_unit)
+    me = os.getpid() if pid is None else pid
+    waiter = join_lane(
+        items,
+        weight,
+        budget,
+        state_dir=state_dir,
+        arrived=arrived,
+        pid=me,
+        timeout_s=timeout_s,
+        lock_timeout=lock_timeout,
+    )
+    wait_for_slot(
+        waiter["id"],
+        weight,
+        budget,
+        state_dir=state_dir,
+        now=clock,
+        asleep=rest,
+        unit=scope_unit,
+        lock_timeout=lock_timeout,
+    )
+    waited = round(clock() - arrived, 3)
+    try:
+        result = run_heavy(
+            items,
+            cwd,
+            env,
+            role=role,
+            repo=repo_key(cwd),
+            weight=weight,
+            budget=budget,
+            run=run,
+            teardown=teardown,
+            scope_cgroup=scope_cgroup,
+            read=read,
+            clock=clock,
+            host=host,
+            pressure=pressure,
+            timeout=timeout,
+            starved_ratio=starved_ratio,
+            waited_s=waited,
+            unit=scope_unit,
+        )
+    finally:
+        release_lane(waiter["id"], budget, state_dir=state_dir, lock_timeout=lock_timeout)
+    return LaneRun(result=result, waited_s=waited)
