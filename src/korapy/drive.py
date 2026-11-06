@@ -1050,14 +1050,17 @@ def install_timer(
     return service_path, timer_path
 
 
-def _default_live(registered):
+def _default_live(registered, *, mapping=None, git=None):
     """Live (project, repo, number) triples from units and the registry.
 
     Repos are store keys through the one short-to-tracker resolver, so
     the admission repo cap counts the same repo the gate request
     names. A short name no entry maps keeps itself, exactly as before.
+    `mapping` is the pass's one short-to-tracker map; with none, this
+    reads its own from the project roots through `git` (the origin
+    seam, defaulting to the real runner).
     """
-    mapping = _tracker_repo_map(registered, git=syncli._git)
+    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
     return {
         (project, *_tracker_key((repo, number), mapping))
         for project, repo, number in launch.admission_state(
@@ -1218,6 +1221,7 @@ def _read_inputs(
     read_labels,
     hold_label,
     pool,
+    repo_map=None,
 ):
     """Shared setup for both passes: rows, projects, live state, ledger, limits.
 
@@ -1225,7 +1229,9 @@ def _read_inputs(
     read_labels, ledger_data, quota_for, pool), None) on success, or
     (None, exit code) when the pass cannot proceed. A project whose
     policy or quota settings fail is not fatal here; that surfaces per
-    project in `_gate_all`.
+    project in `_gate_all`. `repo_map` is the pass's one
+    short-to-tracker map for the admission live set; with none, the
+    live set resolves its own.
     """
     try:
         items = store.items()
@@ -1241,7 +1247,7 @@ def _read_inputs(
         print(f"korapy drive: {problem}", file=err)
         return None, USAGE
     try:
-        live_set = set(live) if live is not None else _default_live(registered)
+        live_set = set(live) if live is not None else _default_live(registered, mapping=repo_map)
     except settings.SettingsError as problem:
         print(f"korapy drive: {problem}", file=err)
         return None, USAGE
@@ -1453,6 +1459,7 @@ def _pass(
     agent_roles=None,
     agent_tickets=None,
     live_units=None,
+    repo_map=None,
     review_reader=None,
     pulls_for=None,
 ) -> int:
@@ -1467,13 +1474,14 @@ def _pass(
     all are reads only. `live_units` filters the finished-reviewer
     simulation the same way the claiming pass filters its release, so
     a live unit's row gates as still claimed here too; without it every
-    finished reviewer row simulates as released. `review_reader`
-    feeds the gate's fix-round threshold from the session dirs (reads
-    only, like the registry); with none the threshold sees no records,
-    exactly as before. `pulls_for` feeds the gate's open-pull refusal;
-    with none the check is skipped, which is what `--plan` does: it
-    never contacts the tracker. The production CLI
-    supplies the host units.
+    finished reviewer row simulates as released. The production CLI
+    supplies the host units. `repo_map` is the pass's one
+    short-to-tracker map, threaded to the admission live set.
+    `review_reader` feeds the gate's fix-round threshold from the
+    session dirs (reads only, like the registry); with none the
+    threshold sees no records, exactly as before. `pulls_for` feeds
+    the gate's open-pull refusal; with none the check is skipped,
+    which is what `--plan` does: it never contacts the tracker.
     """
     ctx, fatal = _read_inputs(
         store,
@@ -1488,6 +1496,7 @@ def _pass(
         read_labels=read_labels,
         hold_label=hold_label,
         pool=pool,
+        repo_map=repo_map,
     )
     if fatal is not None:
         return fatal
@@ -2361,7 +2370,9 @@ def fix_message(repo, number) -> str:
     )
 
 
-def production_finished_for(registered, *, now, cfg=None, path=None, git=None) -> dict:
+def production_finished_for(
+    registered, *, now, cfg=None, path=None, git=None, mapping=None
+) -> dict:
     """{(repo, number): (agent id, role)} for the newest finished entry. Reads only.
 
     Built from the host registry: finished entries kept for RETAIN_S,
@@ -2370,11 +2381,14 @@ def production_finished_for(registered, *, now, cfg=None, path=None, git=None) -
     gate and the finished scans join them straight to claimed rows.
     `cfg` and `path` are the registry seams tests inject; production
     reads the host registry. `git` names the origin-lookup seam for
-    entries without an explicit tracker repo. The role is `""` for
-    entries that record none; the gate treats only a known reviewer
-    role as reviewed.
+    entries without an explicit tracker repo. `mapping` is the pass's
+    one short-to-tracker map (`production_repo_map`): every builder in
+    one pass gets the same one, so a config edit between them cannot
+    make two joins disagree; with none, the builder resolves its own.
+    The role is `""` for entries that record none; the gate treats only
+    a known reviewer role as reviewed.
     """
-    mapping = _tracker_repo_map(registered, git=syncli._git if git is None else git)
+    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
     found: dict = {}
     for entry, state in registry.visible(now, cfg, path):
         if state != registry.FINISHED:
@@ -2758,15 +2772,23 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         events.append({"event": "give_up", "at": now, "ticket": ref, "agent": claim.agent})
 
 
-def _tracker_repo_map(registered, *, git):
+def production_repo_map(registered, *, git=None):
     """`{short [[repo]] name: tracker repo}` across registered roots.
 
     The one resolver for the tracker repo behind a registry entry's
     short ticket repo: each root's entries resolve through the shared
     `repo_operators`, and the first project naming a short name wins.
     A configuration problem raises SettingsError, so the pass refuses
-    with exit 4 instead of joining against a guess.
+    with exit 4 instead of joining against a guess. The CLI builds it
+    once per pass and threads it into the admission live set, the
+    stuck, finished and orphan builders and `run_pass`, so a
+    `korapy.toml` edit between two of them cannot make two joins
+    disagree, and each repo lacking an explicit `tracker.repo` shells
+    git once per pass. `git` names the origin-lookup seam; None is the
+    real runner. A builder given no map builds its own, which is the
+    seam tests fake.
     """
+    git = syncli._git if git is None else git
     found = {}
     for project in registered:
         names = settings.repo_names(project.root)
@@ -2776,6 +2798,13 @@ def _tracker_repo_map(registered, *, git):
         for name, (tracker_repo, _operators) in entries.items():
             found.setdefault(name, tracker_repo)
     return found
+
+
+def _resolved_map(registered, mapping, git):
+    """The pass's map when given, else one built from `git`. The test seam."""
+    if mapping is not None:
+        return mapping
+    return production_repo_map(registered, git=git)
 
 
 def _tracker_key(ticket, mapping):
@@ -2791,7 +2820,7 @@ def _tracker_key(ticket, mapping):
     return (mapping.get(repo, repo), number)
 
 
-def production_stuck_inputs(registered, *, now, path=None, git=None):
+def production_stuck_inputs(registered, *, now, path=None, git=None, mapping=None):
     """`(agent_states, stale_s, agent_tickets)` from the registry for the stuck sweep.
 
     `agent_states` maps every visible agent id to (state, last_seen);
@@ -2803,11 +2832,12 @@ def production_stuck_inputs(registered, *, now, path=None, git=None):
     misses its tracker-repo claim. `path` is the registry dir seam
     tests inject; production reads the host registry. `git` names the
     origin-lookup seam for entries without an explicit tracker repo;
-    tests pass a fake, production the real runner. Raises
-    SettingsError for bad registry or project settings.
+    tests pass a fake, production the real runner. `mapping` is the
+    pass's one short-to-tracker map; with none, the builder resolves
+    its own. Raises SettingsError for bad registry or project settings.
     """
     cfg = registry.config()
-    mapping = _tracker_repo_map(registered, git=syncli._git if git is None else git)
+    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
     states = {}
     tickets = {}
     for entry, state in registry.visible(now, cfg, path):
@@ -3799,7 +3829,7 @@ def _worker_prompt(root, tgt, number, title):
     return render_prompt
 
 
-def production_orphan_inputs(registered, *, now, path=None, git=None):
+def production_orphan_inputs(registered, *, now, path=None, git=None, mapping=None):
     """`(present_agents, live_units, gone_s)` from the registry and units.
 
     `present_agents` is every agent id with a live or stale registry
@@ -3809,12 +3839,14 @@ def production_orphan_inputs(registered, *, now, path=None, git=None):
     them straight to claimed rows; `gone_s` is the registry setting
     of the same name, the single resolver for it. `path` is the
     registry dir seam tests inject; `git` names the origin-lookup
-    seam for entries without an explicit tracker repo. Raises the
-    settings error when the registry or project settings are bad, and
-    `units.Unreachable` when a unit listing fails.
+    seam for entries without an explicit tracker repo. `mapping` is
+    the pass's one short-to-tracker map; with none, the builder
+    resolves its own. Raises the settings error when the registry or
+    project settings are bad, and `units.Unreachable` when a unit
+    listing fails.
     """
     cfg = registry.config()
-    mapping = _tracker_repo_map(registered, git=syncli._git if git is None else git)
+    mapping = _resolved_map(registered, mapping, syncli._git if git is None else git)
     present = {
         entry["id"]
         for entry, state in registry.visible(now, cfg, path)
@@ -3994,6 +4026,7 @@ def _launching_pass(
     max_starts=None,
     hub_epoch_of=None,
     hub=None,
+    repo_map=None,
     review_reader=None,
     pulls_for=None,
 ) -> int:
@@ -4036,7 +4069,9 @@ def _launching_pass(
     (built CLI-side: `drive` never names the hub module); None means
     single-host, zero hub calls. A facade with an empty host id is
     refused with the usage error (exit 4): a host that cannot name
-    itself must never reconcile.
+    itself must never reconcile. `repo_map` is the pass's one
+    short-to-tracker map, threaded to the admission live set and to
+    orphan recovery.
     """
     events: list[dict] = []
     released = 0
@@ -4110,6 +4145,7 @@ def _launching_pass(
         read_labels=read_labels,
         hold_label=hold_label,
         pool=pool,
+        repo_map=repo_map,
     )
     if fatal is not None:
         return finish(fatal)
@@ -4141,7 +4177,9 @@ def _launching_pass(
     skip_orphans = False
     if gone_s is None:
         try:
-            present_agents, live_units, gone_s = production_orphan_inputs(registered, now=now)
+            present_agents, live_units, gone_s = production_orphan_inputs(
+                registered, now=now, mapping=repo_map
+            )
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=err)
             return finish(USAGE)
@@ -4432,6 +4470,7 @@ def run_pass(
     max_starts=None,
     hub_epoch_of=None,
     hub=None,
+    repo_map=None,
     review_reader=None,
     pulls_for=None,
 ) -> int:
@@ -4494,7 +4533,10 @@ def run_pass(
     does: it never contacts the tracker. `now` defaults to the wall
     clock; every other None means the host default, so tests inject
     plain data or fakes at those seams and
-    production reads the host. Returns the exit code.
+    production reads the host. `repo_map` is the pass's one
+    short-to-tracker map ({short [[repo]] name: tracker repo}), built
+    by `production_repo_map` once per production pass; with none, the
+    readers that need it resolve their own. Returns the exit code.
     """
     moment = time.time() if now is None else now
     if pause_path is not None:
@@ -4528,6 +4570,7 @@ def run_pass(
             agent_roles=agent_roles,
             agent_tickets=agent_tickets,
             live_units=live_units,
+            repo_map=repo_map,
             review_reader=review_reader,
             pulls_for=pulls_for,
             **args,
@@ -4560,6 +4603,7 @@ def run_pass(
                 max_starts=max_starts,
                 hub_epoch_of=hub_epoch_of,
                 hub=hub,
+                repo_map=repo_map,
                 review_reader=review_reader,
                 pulls_for=pulls_for,
                 **args,

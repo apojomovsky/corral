@@ -817,6 +817,37 @@ class ProductionHubGathering(unittest.TestCase):
                 self.assertEqual(probe.status, "unreachable")
                 self.assertIn("404", probe.detail)
 
+    def test_a_refused_probe_closes_the_error_response(self):
+        """An `HTTPError` owns a temp-file wrapper: leaking it warns at GC."""
+        import urllib.error
+        from email.message import Message
+
+        for code in (401, 404, 500):
+            with self.subTest(code=code):
+                fp = io.BytesIO(b"{}")
+                refused = urllib.error.HTTPError(
+                    HUB_URL + "/v1/version", code, "Not Found", Message(), fp
+                )
+                with mock.patch("urllib.request.urlopen", side_effect=refused):
+                    doctor.load_hub_probe(HUB_URL, None)
+                self.assertTrue(fp.closed, f"HTTP {code} response left open")
+
+    def test_a_probe_survives_an_error_that_cannot_close(self):
+        """A close failure stays report data, never a traceback."""
+        import urllib.error
+        from email.message import Message
+
+        refused = urllib.error.HTTPError(
+            HUB_URL + "/v1/version", 500, "Not Found", Message(), io.BytesIO(b"{}")
+        )
+        refused.close = mock.Mock(side_effect=OSError("no fd to close"))
+        with mock.patch("urllib.request.urlopen", side_effect=refused):
+            probe = doctor.load_hub_probe(HUB_URL, None)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.status, "unreachable")
+        self.assertIn("500", probe.detail)
+
     def test_probe_never_logs_the_token(self):
         import threading
 

@@ -1,14 +1,55 @@
 """The heavy lane: weighted slots, the queue file, scope runs, learned
 estimates and the rollup.
 
-Tickets 1, 2 and 4 of the heavy-lane design: the lane budget check, the
+Tickets 1 to 4 of the heavy-lane design: the lane budget check, the
 transient scope argv on the ``units`` precedent, per-command routing
 for takeoff with role ``takeoff``, one ledger row per run with the host
-descriptor, the queue file with its lock sidecar, and the section 6
-estimator (robust per-key statistics over the raw rows, the wait-deadline
-and ETA feeds, flaky detection) with the portable rollup document. Weights
-start from config and learn from measurement; the ``heavy`` verbs live in
-``heavycli`` as thin parsers over this module.
+descriptor, the queue file with its lock sidecar, fair order with
+bounded backfill plus reaping of dead holders and stale waiters, and
+the section 6 estimator (robust per-key statistics over the raw rows,
+the wait-deadline and ETA feeds, flaky detection) with the portable
+rollup document. Weights start from config and learn from measurement;
+the ``heavy`` verbs live in ``heavycli`` as thin parsers over this
+module.
+
+Config lives in the project's top-level ``[heavy]`` table, carried raw
+on the resolved settings (the ``[profiles]`` precedent) and validated
+here, the one owner::
+
+    [heavy]
+    cpu_m = 4000
+    memory_mb = 8192
+    wait_timeout_s = 1800
+    max_skips = 10
+    [heavy.default_weight]
+    cpu_m = 1000
+    memory_mb = 1024
+    [heavy.commands."make check"]
+    cpu_m = 3000
+    memory_mb = 6144
+
+``commands`` names the commands that run through the lane; a listed
+command with an empty table queues at the default weight. The caps
+default per dimension to the host budget; a cap above the host budget
+is refused. ``wait_timeout_s`` caps one queue wait (an explicit
+``--timeout`` still overrides it per run). ``max_skips`` bounds
+backfill: a waiter passed over by backfill gains one ``skipped``, and
+the lane stops backfilling past a waiter at the bound. ``starved_ratio``
+and ``ledger_period`` default to 0.2 and ``"month"``; only ``"month"``
+periods are supported so far.
+
+Every subprocess goes through one injectable seam per operation.
+``run_heavy`` takes ``run`` (start the scope and wait), ``teardown``
+(release the scope) and ``scope_cgroup`` (resolve the unit's cgroup);
+all three are required, so a missed fake fails closed instead of
+leaking a scope. The file reader, clock, host and pressure readers
+default to the live ones; they only read. A vanished cgroup records a
+row with null measurements: unknown never blocks. The queue uses the
+same shape: ``join_lane`` takes ``now`` and ``pid`` seams, the admit
+passes take ``scope_exists`` and ``is_alive`` liveness seams (None
+means assume live, so a caller without the seam never reaps), and the
+lock retry reads the ``_flock``, ``_sleep`` and ``_monotonic`` module
+seams the tests replace.
 """
 
 import contextlib
@@ -87,6 +128,26 @@ HEAVY_LOCK_POLL_S = 0.05
 #: per command; until then every wait uses the flat default.
 DEFAULT_WAIT_TIMEOUT_S = 1800
 
+#: The default bound on backfill: a waiter passed over this many times
+#: stops the lane from backfilling past it. Zero disables backfill, so
+#: the lane stays head-only.
+DEFAULT_MAX_SKIPS = 10
+
+#: A waiter outlives its owner when its pid is dead or its stored
+#: deadline plus this grace passed: a live waiter polls every
+#: HEAVY_POLL_S and removes itself past its deadline, so an older row
+#: belongs to a dead process.
+WAITER_GRACE_S = 60.0
+
+#: A holder younger than this is never reaped: the runner stores the
+#: holder row before the scope unit exists, and a reap inside that
+#: admit-to-start window would free weight for a live run.
+HOLDER_GRACE_S = 5.0
+
+#: The recent ring keeps this many outcomes; reaped rows are the only
+#: writers so far, and later tickets add the released and bypassed rows.
+RECENT_LIMIT = 50
+
 #: The unit name prefix for lane scopes.
 UNIT_PREFIX = "heavy-"
 
@@ -144,7 +205,8 @@ class Config:
     ``cpu_m`` and ``memory_mb`` are the lane caps, None per dimension
     when unset (that dimension defaults to the host budget).
     ``commands`` maps each listed command to its weight; an empty entry
-    queues at ``default``.
+    queues at ``default``. ``max_skips`` bounds backfill; zero keeps the
+    lane head-only.
     """
 
     cpu_m: int | None = None
@@ -155,6 +217,7 @@ class Config:
     ledger_period: str = DEFAULT_LEDGER_PERIOD
     wait_timeout_s: int = DEFAULT_WAIT_TIMEOUT_S
     wait_factor: float = DEFAULT_WAIT_FACTOR
+    max_skips: int = DEFAULT_MAX_SKIPS
 
 
 class RunResult(NamedTuple):
@@ -216,6 +279,19 @@ def _weight_table(value, what, where):
     )
 
 
+def _non_negative_count(value, what, where):
+    """A whole resource count of zero or more, else a SettingsError naming it."""
+    if isinstance(value, bool):
+        raise settings.SettingsError(f"{where}: {what} must be a whole number, not {value!r}")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise settings.SettingsError(f"{where}: {what} must be a whole number, not {value!r}")
+        value = int(value)
+    if not isinstance(value, int) or value < 0:
+        raise settings.SettingsError(f"{where}: {what} must be a whole number, not {value!r}")
+    return value
+
+
 def check_table(raw, where):
     """The validated ``[heavy]`` table, or None when the project sets none.
 
@@ -238,6 +314,7 @@ def check_table(raw, where):
             "ledger_period",
             "wait_timeout_s",
             "wait_factor",
+            "max_skips",
         ):
             raise settings.SettingsError(f"{where}: [heavy] has no key {key!r}")
     default = Weight()
@@ -284,6 +361,9 @@ def check_table(raw, where):
             caps[key] = _count(raw[key], f"[heavy] {key}", where)
     wait_timeout = raw.get("wait_timeout_s", DEFAULT_WAIT_TIMEOUT_S)
     wait_timeout_s = _count(wait_timeout, "[heavy] wait_timeout_s", where)
+    max_skips = _non_negative_count(
+        raw.get("max_skips", DEFAULT_MAX_SKIPS), "[heavy] max_skips", where
+    )
     return Config(
         cpu_m=caps.get("cpu_m"),
         memory_mb=caps.get("memory_mb"),
@@ -293,6 +373,7 @@ def check_table(raw, where):
         ledger_period=period,
         wait_timeout_s=wait_timeout_s,
         wait_factor=float(factor),
+        max_skips=max_skips,
     )
 
 
@@ -506,6 +587,50 @@ def show_cgroup(unit, run=None):
         if key.strip() == "ControlGroup" and value.strip():
             return value.strip()
     return None
+
+
+def pid_alive(pid):
+    """Whether a pid names a live process: a signal-zero probe, read-only.
+
+    A dead pid reads as gone; an unknown or non-positive pid reads as
+    gone too, so the caller treats it as no evidence of life. Permission
+    to signal is life: a process owned by another user still exists.
+    An unexpected probe failure reads as gone, so a missed probe never
+    keeps a stale row alive.
+    """
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def scope_exists(unit, run=None):
+    """Whether the scope unit still exists on the user manager.
+
+    Read-only: ``systemctl --user show`` for the unit's LoadState. Only
+    ``not-found`` reads as gone; a manager failure reads as present, so
+    a hiccup never reaps live rows. ``run`` is injectable for tests.
+    """
+    _check_unit(unit)
+    runner = run or default_run
+    try:
+        proc = runner(["systemctl", "--user", "show", unit, "-p", "LoadState"], None, 30)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    if proc is None or getattr(proc, "returncode", 1) != 0:
+        return True
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        key, _, value = line.partition("=")
+        if key.strip() == "LoadState":
+            return value.strip() != "not-found"
+    return True
 
 
 def stop_scope(unit, run):
@@ -1351,54 +1476,195 @@ def status_report(lane, now=None):
     }
 
 
+def _check_max_skips(value):
+    """A backfill bound of zero or more passes, else a HeavyError."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise HeavyError(f"max_skips {value!r} must be a non-negative number of passes")
+    return value
+
+
+def _waiter_stale(waiter, now, is_alive):
+    """Whether a waiter row outlived its owner: dead pid, or deadline plus grace."""
+    pid = waiter.get("pid", 0)
+    if is_alive is not None and pid > 0 and not is_alive(pid):
+        return True
+    deadline = _parse_moment(waiter["deadline_at"], "a waiter deadline", "<lane>")
+    return now > deadline + WAITER_GRACE_S
+
+
+def _reap_holders(lane, now, scope_exists):
+    """Drop holders whose scope is gone; record each in recent. True when changed.
+
+    A holder is dead when its scope unit is gone: kernel state is
+    authoritative, and the pid is never consulted, so pid reuse cannot
+    leak weight. Holders without a unit carry no proof either way and
+    stay, as do holders younger than the admit-to-start window (the
+    runner stores the row before the scope exists) and every holder
+    when no seam is given. No ledger row is appended for a reaped
+    holder: there is no measurement, only an absence.
+    """
+    if scope_exists is None:
+        return False
+    kept = []
+    changed = False
+    for holder in lane["holders"]:
+        unit = holder.get("unit", "")
+        if not unit:
+            kept.append(holder)
+            continue
+        age = now - _parse_moment(holder["since"], "a holder start", "<lane>")
+        if age >= HOLDER_GRACE_S and not scope_exists(unit):
+            lane["recent"].append(
+                {
+                    "at": _iso(now),
+                    "outcome": "reaped",
+                    "unit": unit,
+                    "id": holder["id"],
+                    "command": list(holder["command"]),
+                }
+            )
+            changed = True
+        else:
+            kept.append(holder)
+    if changed:
+        lane["holders"] = kept
+        lane["recent"] = lane["recent"][-RECENT_LIMIT:]
+    return changed
+
+
+def _reap_waiters(lane, now, is_alive):
+    """Drop stale waiters under the lock. True when the lane changed.
+
+    A waiter is stale when its pid is dead or its stored deadline plus
+    the grace bound passed; with no seam only the clock decides. A row
+    only ever blocks backfill, never admission of the fitting, so at
+    worst a reused pid keeps a dead row listed until the clock fires.
+    """
+    kept = []
+    changed = False
+    for waiter in lane["waiters"]:
+        if _waiter_stale(waiter, now, is_alive):
+            changed = True
+        else:
+            kept.append(waiter)
+    if changed:
+        lane["waiters"] = kept
+    return changed
+
+
+def _row_weight(row):
+    """A waiter row's stored weight as a Weight."""
+    return Weight(cpu_m=row["weight"]["cpu_m"], memory_mb=row["weight"]["memory_mb"])
+
+
+def _backfill_pick(lane, budget, max_skips):
+    """The backfill admission index: the first fitting later waiter, else None.
+
+    Pure. The head admits through the head-first path, never here: a
+    fitting head is the head's own promotion, and a head at the skip
+    bound stops backfill for everyone. Rows at the bound are skipped
+    over; with no budget every request fits at once, so the head path
+    owns admission and backfill stays out.
+    """
+    waiters = lane["waiters"]
+    if not waiters or budget is None:
+        return None
+    used = holder_sum(lane)
+    if lane_fits(used, _row_weight(waiters[0]), budget):
+        return None
+    if waiters[0]["skipped"] >= max_skips:
+        return None
+    for pos in range(1, len(waiters)):
+        row = waiters[pos]
+        if row["skipped"] >= max_skips:
+            continue
+        if lane_fits(used, _row_weight(row), budget):
+            return pos
+    return None
+
+
+def _promote(lane, path, pos, now, unit, budget):
+    """Move waiter `pos` to a holder row, store the lane, return the holder."""
+    mine = lane["waiters"].pop(pos)
+    holder = {
+        "id": mine["id"],
+        "pid": mine["pid"],
+        "unit": unit,
+        "command": list(mine["command"]),
+        "argv_hash": mine["argv_hash"],
+        "weight": dict(mine["weight"]),
+        "since": _iso(now),
+    }
+    lane["holders"].append(holder)
+    lane["budget"] = _budget_copy(budget)
+    _store_locked(path, lane)
+    return holder
+
+
 def poll_once(
-    waiter_id, weight, budget, now, state_dir=None, *, unit="", lock_timeout=HEAVY_LOCK_TIMEOUT_S
+    waiter_id,
+    weight,
+    budget,
+    now,
+    state_dir=None,
+    *,
+    unit="",
+    max_skips=DEFAULT_MAX_SKIPS,
+    scope_exists=None,
+    is_alive=None,
+    lock_timeout=HEAVY_LOCK_TIMEOUT_S,
 ):
-    """One admit pass for `waiter_id`: promote, wait, or expire.
+    """One admit pass for `waiter_id`: reap, promote, wait, or expire.
 
     Under the exclusive lock, so two waiters never promote past the
-    cap together. The fitting head becomes the holder and its row is
-    returned; anyone else gets None and keeps waiting. Past the
-    deadline the waiter row goes and LaneTimeout (exit 75) reports it;
-    a gone row reads the same way. Head-first only: backfill arrives
-    in a later ticket. `unit` names the scope the run will take, so
-    the holder row carries it from admission.
+    cap together. The pass first reaps dead holders (their scope unit
+    is gone, freeing the weight with a reaped row in recent and no
+    ledger row) and stale waiters (dead pid, or deadline plus grace),
+    then admits: the fitting head becomes the holder, else backfill
+    promotes the caller when it is the first fitting later waiter and
+    neither it nor the head reached the skip bound. Each waiter passed
+    over by a backfill admission gains one `skipped`. The fitting head
+    is the head's own promotion; anyone else unfitting gets None and
+    keeps waiting. Past the deadline the waiter row goes and LaneTimeout
+    (exit 75) reports it; a gone row reads the same way. `unit` names
+    the scope the run will take, so the holder row carries it from
+    admission. `scope_exists` and `is_alive` are the liveness seams;
+    None means assume live, so a caller without the seam never reaps.
     """
     if not isinstance(weight, Weight):
         raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
     if not isinstance(unit, str):
         raise HeavyError(f"unit {unit!r} is not a scope unit name")
+    _check_max_skips(max_skips)
     path = lane_path(state_dir)
     lock = lock_path(state_dir)
     with _locked_sidecar(lock, False, lock_timeout):
         lane = _read_locked(path)
+        changed = _reap_holders(lane, now, scope_exists)
+        changed |= _reap_waiters(lane, now, is_alive)
         index = next(
             (pos for pos, row in enumerate(lane["waiters"]) if row["id"] == waiter_id), None
         )
         if index is None:
+            if changed:
+                _store_locked(path, lane)
             raise LaneTimeout(f"waiter {waiter_id[:8]} is gone from the lane")
         mine = lane["waiters"][index]
         deadline = _parse_moment(mine["deadline_at"], "a waiter deadline", path)
         if index == 0 and lane_fits(holder_sum(lane), weight, budget):
-            holder = {
-                "id": mine["id"],
-                "pid": mine["pid"],
-                "unit": unit,
-                "command": list(mine["command"]),
-                "argv_hash": mine["argv_hash"],
-                "weight": dict(mine["weight"]),
-                "since": _iso(now),
-            }
-            lane["waiters"].pop(index)
-            lane["holders"].append(holder)
-            lane["budget"] = _budget_copy(budget)
-            _store_locked(path, lane)
-            return holder
+            return _promote(lane, path, index, now, unit, budget)
+        pick = _backfill_pick(lane, budget, max_skips)
+        if pick is not None and lane["waiters"][pick]["id"] == waiter_id:
+            for pos in range(pick):
+                lane["waiters"][pos]["skipped"] += 1
+            return _promote(lane, path, pick, now, unit, budget)
         if now >= deadline:
             lane["waiters"].pop(index)
             lane["budget"] = _budget_copy(budget)
             _store_locked(path, lane)
             raise LaneTimeout(f"waiter {waiter_id[:8]} waited past its deadline with no free slot")
+        if changed:
+            _store_locked(path, lane)
         return None
 
 
@@ -1411,20 +1677,34 @@ def wait_for_slot(
     now=None,
     asleep=None,
     unit="",
+    max_skips=DEFAULT_MAX_SKIPS,
+    scope_exists=None,
+    is_alive=None,
     lock_timeout=HEAVY_LOCK_TIMEOUT_S,
 ):
-    """Poll `poll_once` until the waiter is the fitting head or expires.
+    """Poll `poll_once` until the waiter is admitted or expires.
 
     Past the deadline the waiter row is already gone and LaneTimeout
     (exit 75) reports it. `now` defaults to the wall clock and `asleep`
     to the module sleep seam; the tests script both. `unit` names the
     scope the run will take and lands on the holder row at admission.
+    `max_skips` bounds backfill; `scope_exists` and `is_alive` are the
+    liveness seams, None meaning assume live.
     """
     clock = now or time.time
     rest = asleep or _sleep
     while True:
         holder = poll_once(
-            waiter_id, weight, budget, clock(), state_dir, unit=unit, lock_timeout=lock_timeout
+            waiter_id,
+            weight,
+            budget,
+            clock(),
+            state_dir,
+            unit=unit,
+            max_skips=max_skips,
+            scope_exists=scope_exists,
+            is_alive=is_alive,
+            lock_timeout=lock_timeout,
         )
         if holder is not None:
             return holder
@@ -1494,23 +1774,29 @@ def run_through_lane(
     state_dir=None,
     pid=None,
     unit=None,
+    max_skips=DEFAULT_MAX_SKIPS,
+    scope_exists=None,
+    is_alive=None,
     lock_timeout=HEAVY_LOCK_TIMEOUT_S,
 ):
     """Queue one command, run it in a transient scope, release the slot.
 
-    Joins the lane with the request's weight, waits for the fitting
-    head under the queue protocol (past the deadline the waiter is
-    already gone and LaneTimeout reports 75), runs through
-    ``run_heavy`` with the pinned scope unit, and releases the slot in
-    a finally, so a failed run never leaks a holder row. `run`,
-    `teardown` and `scope_cgroup` are required seams with no default.
-    `timeout_s` caps this queue wait; `timeout` caps the command run.
-    Returns a LaneRun: the finished run plus the seconds waited.
+    Joins the lane with the request's weight, waits for admission under
+    the queue protocol (past the deadline the waiter is already gone
+    and LaneTimeout reports 75), runs through ``run_heavy`` with the
+    pinned scope unit, and releases the slot in a finally, so a failed
+    run never leaks a holder row. `run`, `teardown` and `scope_cgroup`
+    are required seams with no default. `timeout_s` caps this queue
+    wait; `timeout` caps the command run. `max_skips` bounds backfill;
+    `scope_exists` and `is_alive` are the liveness seams, None meaning
+    assume live. Returns a LaneRun: the finished run plus the seconds
+    waited.
     """
     items = _check_command(argv)
     if not isinstance(weight, Weight):
         raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
     _check_timeout(timeout_s)
+    _check_max_skips(max_skips)
     clock = now or time.time
     rest = asleep or _sleep
     arrived = clock()
@@ -1535,6 +1821,9 @@ def run_through_lane(
         now=clock,
         asleep=rest,
         unit=scope_unit,
+        max_skips=max_skips,
+        scope_exists=scope_exists,
+        is_alive=is_alive,
         lock_timeout=lock_timeout,
     )
     waited = round(clock() - arrived, 3)
