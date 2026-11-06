@@ -30,6 +30,7 @@ from korapy import (
     deps,
     detect,
     drive,
+    heavy,
     host_ledger,
     hub,
     paths,
@@ -1231,6 +1232,62 @@ def _read_pressure(reader) -> tuple[float | None, float | None]:
     return (reading.load_per_cpu, reading.mem_available_pct)
 
 
+def _load_heavy_lane():
+    """(lane, error, path, size, mtime) for the heavy rows, never raising.
+
+    Best effort per aspect like every other reading here: a missing
+    file reads as no lane (the row renders an empty queue), a busy lock
+    reads as no lane (transient, gone by the next run), and only a
+    present-but-corrupt file lands in error with the documented
+    move-aside repair.
+    """
+    try:
+        path = heavy.lane_path()
+    except (paths.PathError, OSError):
+        return None, None, "", None, None
+    size = mtime = None
+    try:
+        probe = os.stat(path)
+        size, mtime = probe.st_size, probe.st_mtime
+    except OSError:
+        pass
+    try:
+        return heavy.read_lane(), None, path, size, mtime
+    except heavy.LaneLocked:
+        return None, None, path, size, mtime
+    except heavy.HeavyError as err:
+        return None, str(err), path, size, mtime
+    except (OSError, paths.PathError, ValueError) as err:
+        return None, f"cannot read the lane file at {path}: {err}", path, size, mtime
+
+
+def _load_heavy_estimates():
+    """The per-key ledger estimates for the stuck-holder row, never raising."""
+    try:
+        rows, _sources, _skipped = heavy.collect_ledger_rows()
+    except (heavy.HeavyError, OSError, paths.PathError):
+        return {}
+    try:
+        return heavy.estimates_for(rows)
+    except heavy.HeavyError:
+        return {}
+
+
+def _load_heavy_wait_factor(resolved):
+    """The configured wait multiplier for the stuck-holder row, never raising."""
+    try:
+        raw = resolved.heavy if resolved is not None else None
+    except AttributeError:
+        return heavy.DEFAULT_WAIT_FACTOR
+    try:
+        cfg = heavy.check_table(raw, "<settings>")
+    except (settings.SettingsError, heavy.HeavyError):
+        return heavy.DEFAULT_WAIT_FACTOR
+    if cfg is None:
+        return heavy.DEFAULT_WAIT_FACTOR
+    return cfg.wait_factor
+
+
 def load_resource_readings(
     resolved: settings.Resolved | None,
     *,
@@ -1336,6 +1393,7 @@ def load_resource_readings(
             pressure.DEFAULT_MAX_LOAD_PER_CPU,
             pressure.DEFAULT_MIN_MEM_AVAILABLE_PCT,
         )
+    heavy_lane, heavy_error, heavy_path, heavy_bytes, heavy_mtime = _load_heavy_lane()
     return resourcedoctor.ResourceReadings(
         host=limits.host if limits is not None else None,
         shares=dict(limits.projects) if limits is not None else {},
@@ -1360,6 +1418,14 @@ def load_resource_readings(
         pressure=pressure_values,
         pressure_caps=pressure_caps,
         foreign_ignored=foreign_ignored,
+        heavy_lane=heavy_lane,
+        heavy_error=heavy_error,
+        heavy_path=heavy_path,
+        heavy_bytes=heavy_bytes,
+        heavy_mtime=heavy_mtime,
+        heavy_now=moment,
+        heavy_estimates=_load_heavy_estimates(),
+        heavy_wait_factor=_load_heavy_wait_factor(resolved),
     )
 
 

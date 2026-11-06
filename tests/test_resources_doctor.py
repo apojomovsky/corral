@@ -92,6 +92,8 @@ class NoReadings(unittest.TestCase):
                 "resources-marker",
                 "resources-pressure",
                 "resources-foreign",
+                "heavy",
+                "heavy-stuck",
                 "resources-slices",
             ],
         )
