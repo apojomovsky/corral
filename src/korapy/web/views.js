@@ -243,12 +243,17 @@ function quotaWindow(id, window, info, nowMs) {
 
 // One provider: its state in words, its reading's age, then one row
 // per window. A stale provider keeps its last numbers on screen under
-// a stale meter, never a zero bar.
+// a stale meter, never a zero bar. The stale reason renders the
+// snapshot's stale_reason field as-is; the words come from the server.
 function quotaProvider(name, info, nowMs) {
   const group = document.createElement("div");
   group.appendChild(el("h3", String(name)));
   const line = document.createElement("p");
-  line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + formatQuotaRead(info, nowMs))));
+  let read = formatQuotaRead(info, nowMs);
+  if (info.stale && typeof info.stale_reason === "string" && info.stale_reason !== "") {
+    read += ": " + info.stale_reason;
+  }
+  line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + read)));
   group.appendChild(line);
   if (typeof info.error === "string" && info.error !== "") {
     group.appendChild(el("p", "reader error: " + info.error));

@@ -156,6 +156,7 @@ what it means. Do not edit this table by hand.
 | `prompts.triage` | `''` | override file for the triage prompt (relative to the ops root) |
 | `prompts.worker` | `''` | override file for the worker prompt (relative to the ops root) |
 | `quota.low_pct` | `90` | usage percent at which a provider reads low |
+| `quota.refresh_after_s` | `900` | seconds after a read before the drive pass refreshes it |
 | `quota.unknown_blocks` | `False` | an unknown provider blocks its roles instead of passing them |
 | `registry.count_toward_cap` | `True` | live registered ticket workers take cap slots |
 | `registry.gone_s` | `3600` | seconds without a heartbeat before an agent is dropped |

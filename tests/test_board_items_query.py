@@ -18,8 +18,11 @@ real ``gh``, the network, or a real board.
 import ast
 import json
 import pathlib
+import re
 import unittest
 
+from korapy import trackers
+from korapy.github import board as boardmod
 from korapy.github.board import GithubBoardProvisioner
 from tests.test_board_fields import FakePacer
 from tests.test_board_populate import (
@@ -151,6 +154,14 @@ class ReaderQueryIdentityTest(unittest.TestCase):
         for query in sent:
             self.assertIn("updatedAt", query)
             self.assertIn("fieldValues", query)
+
+
+class ReadKindsAgreementTest(unittest.TestCase):
+    def test_value_fragments_match_the_read_typenames(self):
+        pattern = re.compile(r"\.\.\. on (ProjectV2ItemField\w+)")
+        for query in (boardmod._ITEMS, trackers._ITEM):
+            with self.subTest(query=query.splitlines()[0]):
+                self.assertEqual(set(pattern.findall(query)), set(boardmod._READ_TYPENAMES))
 
 
 class ProvisionerQueryIdentityTest(unittest.TestCase):

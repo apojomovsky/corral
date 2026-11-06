@@ -79,7 +79,7 @@ The rules the design rests on:
    - it is covered by tests in the same PR.
 
    File everything else as an issue with `needs-triage` and a priority label. A deferral is an issue, not a paragraph in a PR body.
-4. **Takeoff:** `make pre-pr-check PR_BODY=<file>`, plus `TEST=1` for the full suite, and `make check`. Fix what they report.
+4. **Takeoff:** `make check`, then `make pre-pr-check PR_BODY=<file> TEST=1`. Fix what they report. When `make check` just passed on the same tree, `pre-pr-check` reuses that proof instead of running the suite again; with no fresh proof it runs the suite as before.
 5. **Open the PR** once, ready for review (never a draft). `Closes #N` comes first in the body (`Refs #N` for a partial win). The body says what changed and why, then `## Review`, which records:
    - the reviewer id;
    - the question asked;
