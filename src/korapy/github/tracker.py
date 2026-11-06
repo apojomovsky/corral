@@ -10,7 +10,7 @@ import json
 import re
 
 from korapy import tracker as iface
-from korapy.github.gh import is_rate_limited, retry_after_s
+from korapy.github.gh import body_linked_issue_refs, is_rate_limited, retry_after_s
 from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
 
 #: One page of the issues feed; the maximum the endpoint serves.
@@ -192,17 +192,20 @@ class GithubTracker:
         return self._forks[key]
 
     def _parse(self, repo, payload) -> iface.TrackerItem:
-        """One issues-endpoint object as a ``TrackerItem``.
+        """One issues- or pulls-endpoint object as a ``TrackerItem``.
 
         Anything short of the full shape is a ``TrackerError``, never a
         guess; a PR whose fork info cannot be read is ``from_fork``.
+        Pulls-endpoint objects carry ``head`` instead of the issues
+        endpoint's ``pull_request`` marker, which is how they read as
+        ``kind="pr"``.
         """
         if not isinstance(payload, dict):
             raise _fail(f"item is not an object: {payload!r}")
         number = payload.get("number")
         if isinstance(number, bool) or not isinstance(number, int) or number < 1:
             raise _fail(f"bad number {number!r}")
-        kind = "pr" if "pull_request" in payload else "issue"
+        kind = "pr" if ("pull_request" in payload or "head" in payload) else "issue"
         title = payload.get("title")
         if not isinstance(title, str):
             raise _fail(f"bad title {title!r}")
@@ -321,6 +324,30 @@ class GithubTracker:
         """Every item, oldest first, for a full resync."""
         for entry in self._feed(repo, None):
             yield self._parse(repo, entry)
+
+    def linked_pulls(self, repo: str, number: int) -> list:
+        """Every open pull request linked to ``repo#number``.
+
+        Lists the repo's open pull requests oldest first and keeps the
+        ones whose title or body links the ticket through
+        ``body_linked_issue_refs`` (close keywords and ``Refs`` lines,
+        outside fenced code). Pages until a short page ends the list,
+        like the feed; a missing or malformed page is a
+        ``TrackerError``, never a partial list.
+        """
+        peers = []
+        page = 1
+        while True:
+            base = f"repos/{repo}/pulls?state=open&sort=updated&direction=asc&per_page={PER_PAGE}"
+            entries = self._page(base if page == 1 else f"{base}&page={page}")
+            for entry in entries:
+                item = self._parse(repo, entry)
+                text = f"{item.title}\n{item.body}"
+                if (repo, int(number)) in body_linked_issue_refs(text, repo):
+                    peers.append(item)
+            if len(entries) < PER_PAGE:
+                return peers
+            page += 1
 
     def _write_error(self, err: Exception) -> iface.TrackerError:
         """One failed tracker call as the tracker's error. Rate-limit text
