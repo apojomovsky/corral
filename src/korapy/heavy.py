@@ -488,7 +488,7 @@ def _check_command(command):
     except TypeError:
         raise HeavyError(f"command {command!r} must be a list of argument strings") from None
     if not items or any(not isinstance(item, str) for item in items):
-        raise HeavyError(f"command {command[:1]!r} must be a list of argument strings")
+        raise HeavyError(f"command {items[:1]!r} must be a list of argument strings")
     if items[0].startswith("-"):
         raise HeavyError(f"command {items[:1]!r} must start with a program name")
     return items
@@ -717,7 +717,7 @@ def ledger_path(label=None, period=None, state_dir=None):
         _check_label(label, os.path.join(base, HEAVY_DIR, HOST_ID_FILE))
     if period is None:
         period = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
-    if PERIOD_RE.fullmatch(period) is None:
+    if not isinstance(period, str) or PERIOD_RE.fullmatch(period) is None:
         raise HeavyError(f"the ledger period {period!r} is not a calendar month (YYYY-MM)")
     return os.path.join(base, HEAVY_DIR, RUNS_DIR, f"{label}-{period}.jsonl")
 
