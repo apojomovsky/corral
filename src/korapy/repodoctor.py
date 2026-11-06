@@ -167,7 +167,7 @@ def _tracker_row(site: RepoSite) -> RepoRow | None:
     return RepoRow(
         name,
         "warn",
-        f"{site.name}: the tracker answers {site.tracker_repo} as"
+        f"{site.name}: configured as {site.tracker_repo} but the tracker answers"
         f" {site.canonical}: the repository was renamed",
         f"run `korapy repo rename {site.tracker_repo} {site.canonical}`,"
         " then point the entry at the new name and run `korapy doctor` again",

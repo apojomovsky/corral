@@ -171,7 +171,8 @@ def live_blockers(old, new, *, claims, entries, live_units, mapping, owners=None
             if live_number != number:
                 continue
             if short in mapping:
-                if mapping[short] == claim_repo:
+                tracker_repo, _ = drive._tracker_key((short, live_number), mapping)
+                if tracker_repo == claim_repo:
                     found.append(f"claim {claim_repo}#{number} by {agent} is held by a live unit")
                     break
             elif _unmapped_blocks(project=project, owners=owners, related=False):
