@@ -2652,6 +2652,325 @@ runtime = "muse"
         self.assertEqual(recorded.runtime, "muse")
         self.assertEqual(recorded.layer, 1)
 
+    def append_toml(self, text):
+        toml_path = os.path.join(self.root, settings.PROJECT_FILE)
+        with open(toml_path, encoding="utf-8") as handle:
+            before = handle.read()
+        with open(toml_path, "w", encoding="utf-8") as handle:
+            handle.write(before + text)
+
+    def test_launch_applies_muse_profile_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "low")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "low")
+
+    def test_launch_applies_omp_profile_options(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n[profiles.quiet.options]\nauto_approve = false\n'
+        )
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "options.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle), {"auto_approve": False})
+        self.assertNotIn("--auto-approve", self.system.started[-1])
+
+    def test_runtime_config_beats_muse_profile_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            "parallel_tool_calls = false\n"
+        )
+        config_path = os.path.join(self.tmp, "runtime.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"reasoning_effort": "medium"}, handle)
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            "--runtime-config",
+            config_path,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            config = json.load(handle)
+        self.assertEqual(config["reasoning_effort"], "medium")
+        self.assertIs(config["parallel_tool_calls"], False)
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "medium")
+        self.assertNotIn("--parallel-tool-calls", argv)
+
+    def test_runtime_config_beats_omp_profile_options(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n[profiles.quiet.options]\nauto_approve = false\n'
+        )
+        config_path = os.path.join(self.tmp, "runtime.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"auto_approve": True}, handle)
+        code, out, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            "--runtime-config",
+            config_path,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("--auto-approve", self.system.started[-1])
+
+    def test_resume_without_flags_reuses_the_recorded_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", tracker=FakeTracker([])
+        )
+        self.assertEqual((code, err), (0, ""))
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "low")
+
+    def test_resume_with_runtime_rebuilds_the_session_config(self):
+        self.write_tracker_repo()
+        code, out, _ = self.verb("launch", "lib", "5", "--role", "worker", "--title", "feat: go")
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        leaf = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(leaf, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+        with open(os.path.join(leaf, "options.json"), "w", encoding="utf-8") as handle:
+            json.dump({"auto_approve": False}, handle)
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--runtime",
+            "omp",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        self.assertFalse(os.path.exists(os.path.join(leaf, "options.json")))
+        self.assertIn("--auto-approve", self.system.started[-1])
+
+    def test_resume_with_profile_and_model_keeps_the_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "effort",
+            "--model",
+            "provider-a/model-1",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "low")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--model") + 1], "model-1")
+
+    def test_resume_onto_an_option_less_profile_sheds_the_old_keys(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            '[profiles.plain]\nruntime = "muse"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "plain",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertNotIn("reasoning_effort", json.load(handle))
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "high")
+
+    def test_resume_onto_another_runtime_without_its_handle_is_exit_4(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n'
+            "[profiles.quiet.options]\n"
+            "auto_approve = false\n"
+            '[profiles.fast]\nruntime = "muse"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, _, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("no muse session to resume", err)
+
+    def test_resume_with_profile_applies_the_new_options(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            '[profiles.calm]\nruntime = "muse"\n'
+            "[profiles.calm.options]\n"
+            'reasoning_effort = "medium"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "calm",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "medium")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "medium")
+
     def test_resume_without_flags_reuses_the_recorded_profile_after_expiry(self):
         toml_path = os.path.join(self.root, settings.PROJECT_FILE)
         with open(toml_path, encoding="utf-8") as handle:
@@ -2830,6 +3149,154 @@ runtime = "muse"
             "m",
         )
         self.assertEqual((code, err), (0, ""))
+
+    def test_launch_refining_an_omp_profile_to_muse_is_exit_4(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n[profiles.quiet.options]\nauto_approve = false\n'
+        )
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            "--runtime",
+            "muse",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("auto_approve", err)
+        self.assertIn("muse", err)
+
+    def test_launch_refining_a_muse_profile_to_omp_is_exit_4(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+        )
+        code, _, err = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            "--runtime",
+            "omp",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("reasoning_effort", err)
+        self.assertIn("omp", err)
+
+    def test_a_refused_flagged_resume_leaves_the_session_untouched(self):
+        self.append_toml(
+            '[profiles.quiet]\nruntime = "omp"\n'
+            "[profiles.quiet.options]\n"
+            "auto_approve = false\n"
+            '[profiles.fast]\nruntime = "muse"\n'
+        )
+        self.write_tracker_repo()
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "quiet",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "chat.jsonl"), "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"message": {"role": "assistant", "content": "work"}}) + "\n")
+
+        def snapshot():
+            found = {}
+            for name in ("overlay.yml", "options.json", "muse.json", "profile", "runtime"):
+                path = os.path.join(session, name)
+                try:
+                    with open(path, "rb") as handle:
+                        found[name] = handle.read()
+                except FileNotFoundError:
+                    found[name] = None
+            return found
+
+        before = snapshot()
+        code, _, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "fast",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 4)
+        self.assertIn("no muse session to resume", err)
+        self.assertEqual(snapshot(), before)
+        code, _, err = self.verb(
+            "resume", "lib", "5", "--message", "keep going", tracker=FakeTracker([])
+        )
+        self.assertEqual((code, err), (0, ""))
+
+    def test_flag_resume_reapplies_the_recorded_runtime_config(self):
+        self.append_toml(
+            '[profiles.effort]\nruntime = "muse"\n'
+            "[profiles.effort.options]\n"
+            'reasoning_effort = "low"\n'
+            '[profiles.calm]\nruntime = "muse"\n'
+            "[profiles.calm.options]\n"
+            'reasoning_effort = "high"\n'
+        )
+        self.write_tracker_repo()
+        config_path = os.path.join(self.tmp, "runtime.json")
+        with open(config_path, "w", encoding="utf-8") as handle:
+            json.dump({"reasoning_effort": "medium"}, handle)
+        code, out, _ = self.verb(
+            "launch",
+            "lib",
+            "5",
+            "--role",
+            "worker",
+            "--title",
+            "feat: go",
+            "--profile",
+            "effort",
+            "--runtime-config",
+            config_path,
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual(code, 0)
+        self.system.finish(out.split()[1])
+        code, out, err = self.verb(
+            "resume",
+            "lib",
+            "5",
+            "--message",
+            "keep going",
+            "--profile",
+            "calm",
+            tracker=FakeTracker([]),
+        )
+        self.assertEqual((code, err), (0, ""))
+        session = paths.newest_session("lib", 5, "worker")
+        with open(os.path.join(session, "muse.json"), encoding="utf-8") as handle:
+            self.assertEqual(json.load(handle)["reasoning_effort"], "medium")
+        argv = self.system.started[-1]
+        self.assertEqual(argv[argv.index("--reasoning-effort") + 1], "medium")
 
 
 class NoSliceStopgap(unittest.TestCase):

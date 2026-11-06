@@ -172,6 +172,8 @@ def write_config(session_dir, config):
 
     Profile options travel beside it in `options.json`, so `argv` can read
     them back; they never land in the overlay, which holds omp settings.
+    A rewrite without options removes a stale `options.json`, so a resume
+    onto a profile without options cannot inherit the old profile's.
     """
     options = {}
     rest = dict(config or {})
@@ -179,9 +181,15 @@ def write_config(session_dir, config):
         options["auto_approve"] = rest.pop("auto_approve")
     os.makedirs(session_dir, exist_ok=True)
     paths.atomic_write_text(os.path.join(session_dir, CONFIG_NAME), overlay_text(rest))
+    target = os.path.join(session_dir, OPTIONS_NAME)
     if options:
         text = json.dumps(options, indent=1) + "\n"
-        paths.atomic_write_text(os.path.join(session_dir, OPTIONS_NAME), text)
+        paths.atomic_write_text(target, text)
+    else:
+        try:
+            os.remove(target)
+        except FileNotFoundError:
+            pass
 
 
 def argv(

@@ -106,7 +106,21 @@ Relation to the existing pieces:
   `argv`, `env`, `write_config`, `resume_handle` and `activity_file`
   keep their shapes. The adapter gains one read-only declaration,
   `options_schema()`, and lays validated `options` over the per-launch
-  config the way it already lays chains.
+  config the way it already lays chains. Precedence inside the
+  per-launch config: the profile's options lay first, `--runtime-config`
+  wins on shared keys, and the live chains lay over both through
+  `with_models`. `--model` and `--runtime` refine the run on top (below)
+  and are recorded in provenance. A `--runtime` refinement re-validates
+  the profile's options against the effective adapter's schema: keys
+  from one runtime never land in another's config, and an unknown key
+  is a configuration error (exit 4) naming the key and the runtime. The
+  launch records the raw `--runtime-config` beside the session config;
+  a resume with `--profile` or `--runtime` rebuilds the session config
+  from the new profile the same way, re-applying the recorded
+  `--runtime-config` under the chains (still winning over the new
+  profile's options); any other resume keeps the recorded setup. The
+  new adapter's resume handle is checked before anything is rewritten,
+  so a refused flagged resume leaves the session untouched.
 - `korapy launch --model`: kept, narrowed in meaning. It overrides the
   head of the launched role's chain for that launch only (today it
   overrides the model the same way), and provenance records it as a
