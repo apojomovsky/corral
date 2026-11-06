@@ -119,6 +119,16 @@ def _check_chains(name: str, raw) -> dict[str, list[str]]:
     return chains
 
 
+def validate_options(name: str, runtime: str, options: dict) -> dict:
+    """`options` as validated against `runtime`'s schema: unknown keys fail exit 4.
+
+    `validate` already runs this against the profile's declared runtime;
+    the launch runs it again with the `--runtime` refinement, so options
+    from one runtime never land verbatim in another runtime's config.
+    """
+    return _check_options(name, runtime, options)
+
+
 def _check_options(name: str, runtime: str, raw) -> dict:
     """`raw` as validated options: flat scalars, every key in the schema."""
     if not isinstance(raw, dict):
