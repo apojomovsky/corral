@@ -2838,6 +2838,14 @@ class StartupLinesTest(unittest.TestCase):
             ["korapy serve: dashboard at http://127.0.0.1:4321/"],
         )
 
+    def test_bytes_host_decodes_to_the_same_url(self):
+        for host in (b"127.0.0.1", bytearray(b"127.0.0.1")):
+            with self.subTest(host=type(host).__name__):
+                self.assertEqual(
+                    serve.startup_lines(host, 4321),
+                    ["korapy serve: dashboard at http://127.0.0.1:4321/"],
+                )
+
     def test_ipv6_url_carries_brackets(self):
         self.assertEqual(
             serve.startup_lines("::1", 4321),
