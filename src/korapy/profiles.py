@@ -26,6 +26,7 @@ import os
 import re
 import tomllib
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from korapy import accounts, models, paths, runtimes, settings
@@ -209,6 +210,21 @@ def lookup(parsed: dict[str, Profile], name: str) -> Profile:
         hint = f"declared profiles: {', '.join(known)}" if known else "no profiles declared"
         raise ProfileError(f"unknown profile {name!r}: declare [profiles.{name}] ({hint})")
     return parsed[name]
+
+
+def declared_default(parsed: Mapping[str, Profile]) -> Profile | None:
+    """The declared `[profiles.default]`, or None when none is declared.
+
+    The one resolver for the profile named `default`: the declared table
+    wins, and only an undeclared name falls through to `BUILTIN_DEFAULT`
+    at layer 6. Every reader of the default goes through here, so the
+    resolver, `show` and the launch path agree with `list`.
+    """
+    if isinstance(parsed, dict):
+        found = parsed.get(DEFAULT_PROFILE_NAME)
+        if isinstance(found, Profile):
+            return found
+    return None
 
 
 #: Local selections live outside `settings.resolve` in their own file in
@@ -808,6 +824,8 @@ def explain(
         )
     elif defaults.default is not None:
         values.append((6, "default", "committed profile.default", defaults.default, "value"))
+    elif declared_default(parsed) is not None:
+        values.append((6, "default", "declared [profiles.default]", DEFAULT_PROFILE_NAME, "value"))
     else:
         values.append((6, "default", "built-in default", None, "builtin"))
     winner = next(
@@ -849,11 +867,12 @@ def resolve(
     Layer 1 is the `--profile` flag; 2 the ticket assignment (the tracker
     value, else the local pin); 3 the live temporary override; 4 and 5 the
     project and role selections (local beats committed); 6 the default
-    (local, else committed, else the built-in). Every reader goes through
-    here, so local always wins and provenance always names the layer and
-    source. A winning unknown name fails with ProfileError (exit 4); only
-    the winner is looked up, so a shadowed dangling selection waits for
-    the doctor instead of breaking unrelated launches.
+    (local, else committed, else the declared `[profiles.default]` table,
+    else the built-in). Every reader goes through here, so local always
+    wins and provenance always names the layer and source. A winning
+    unknown name fails with ProfileError (exit 4); only the winner is
+    looked up, so a shadowed dangling selection waits for the doctor
+    instead of breaking unrelated launches.
     """
     chain = explain(
         parsed,
