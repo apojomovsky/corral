@@ -111,6 +111,23 @@ def repo_operators(root, names, git):
     return entries, None
 
 
+def root_short_map(root, git):
+    """`{short [[repo]] name: tracker repo}` for one ops root.
+
+    The one shared single-root projection of `repo_operators`: both
+    the dispatch pass (`drive.production_repo_map`, across registered
+    roots) and the fail-soft `short_to_tracker` below build from here,
+    so the two builders cannot drift. A configuration problem raises
+    `settings.SettingsError`, so strict callers refuse instead of
+    joining against a guess.
+    """
+    names = settings.repo_names(root)
+    entries, problem = repo_operators(root, names, git)
+    if problem is not None or entries is None:
+        raise settings.SettingsError(problem or f"{root}: cannot read the [[repo]] entries")
+    return {name: tracker for name, (tracker, _ops) in entries.items()}
+
+
 def short_to_tracker(root, git):
     """`{short [[repo]] name: tracker repo}` for one ops root.
 
@@ -122,18 +139,12 @@ def short_to_tracker(root, git):
     writer uses) keep resolving: only a tracker spelling the map
     cannot translate fails, loudly, at the caller.
     """
-    from korapy import settings
-
     if not root:
         return {}
     try:
-        names = settings.repo_names(root)
+        return root_short_map(root, git)
     except settings.SettingsError:
         return {}
-    entries, problem = repo_operators(root, names, git)
-    if problem is not None or entries is None:
-        return {}
-    return {name: tracker for name, (tracker, _ops) in entries.items()}
 
 
 def _has_board_reader(tracker) -> bool:
