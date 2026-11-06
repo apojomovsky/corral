@@ -10,7 +10,7 @@ scope limits, and records the reason in the lane journal; a bare
 `--bypass` is exit 4, and `--bypass` with `--plan` is exit 4.
 `run --role NAME` names the ledger caller (`hand` by default;
 `takeoff` is reserved for the module call). `status` shows holders,
-waiters and learned costs. `rollup` regenerates the portable per-key cost summary from
+waiters, learned costs and the last few recent rows. `rollup` regenerates the portable per-key cost summary from
 the raw run ledger: stdout always carries the JSON document, and
 `--out PATH` additionally writes the same bytes for the operator to
 commit. Exit codes follow the public table: 0 ok, 1 nothing to do
@@ -25,12 +25,14 @@ import os
 import subprocess
 import sys
 
+from korapy import heavy
+
 OK, NO, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 3, 4, 75
 
 #: Roles the hand CLI never claims. Takeoff names its own ledger rows
 #: through the shared module call; a hand row under its name would
 #: pollute the role-keyed estimates that size takeoff's weights.
-RESERVED_ROLES = frozenset({"takeoff"})
+RESERVED_ROLES = frozenset({heavy.TAKEOFF_ROLE})
 
 
 def _err(text):
@@ -128,6 +130,17 @@ def cmd_status(args, *, state_dir=None, now=None):
             print(f"heavy: cost {key}: {json.dumps(report['costs'][key], sort_keys=True)}")
     else:
         print("heavy: costs: none yet")
+    shown = [row for row in report["recent"][-5:] if isinstance(row, dict)]
+    if shown:
+        for row in shown:
+            parts = [f"heavy: recent {row.get('outcome', '?')}"]
+            if row.get("reason"):
+                parts.append(str(row["reason"]))
+            if row.get("command"):
+                parts.append(" ".join(str(word) for word in row["command"]))
+            print(" ".join(parts))
+    else:
+        print("heavy: recent: none yet")
     return OK
 
 
@@ -464,7 +477,7 @@ def add_parser(sub) -> None:
     )
     status = verbs.add_parser(
         "status",
-        help="holders, waiters and learned costs",
+        help="holders, waiters, learned costs and recent rows",
     )
     status.add_argument("--json", action="store_true", help="machine-readable output")
     rollup = verbs.add_parser(

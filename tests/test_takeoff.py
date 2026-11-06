@@ -775,6 +775,16 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(call["timeout"], 1800)
         self.assertEqual(call["starved_ratio"], 0.2)
 
+    def test_heavy_role_is_in_the_cli_reserved_set(self):
+        from korapy import heavycli
+
+        self.write_heavy_ops(takeoff_cmd="make check")
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(self.heavy_calls), 1)
+        self.assertEqual(self.heavy_calls[0]["role"], heavy.TAKEOFF_ROLE)
+        self.assertIn(self.heavy_calls[0]["role"], heavycli.RESERVED_ROLES)
+
     def test_unlisted_command_still_uses_the_plain_seam(self):
         self.write_heavy_ops(takeoff_cmd="make lint")
         self.cmd_results["make lint"] = (0, "fine\n")

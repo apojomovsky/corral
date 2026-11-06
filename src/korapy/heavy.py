@@ -81,6 +81,12 @@ SCHEMA_VERSION = 1
 #: importing the CLI.
 PUBLIC_CODES = frozenset({0, 1, 2, 3, 4, 75})
 
+#: The ledger role takeoff's lane runs carry. The one place the name is
+#: defined: the human CLI reserves it, and takeoff's seam call uses it.
+#: A hand row under this name would pollute the role-keyed estimates
+#: that size takeoff's weights.
+TAKEOFF_ROLE = "takeoff"
+
 #: The conservative first-run weight: unknown jobs queue safely, and
 #: the first measurement corrects them.
 DEFAULT_WEIGHT_CPU_M = 1000
@@ -488,7 +494,7 @@ def _check_command(command):
     except TypeError:
         raise HeavyError(f"command {command!r} must be a list of argument strings") from None
     if not items or any(not isinstance(item, str) for item in items):
-        raise HeavyError(f"command {command[:1]!r} must be a list of argument strings")
+        raise HeavyError(f"command {items[:1]!r} must be a list of argument strings")
     if items[0].startswith("-"):
         raise HeavyError(f"command {items[:1]!r} must start with a program name")
     return items
@@ -717,7 +723,7 @@ def ledger_path(label=None, period=None, state_dir=None):
         _check_label(label, os.path.join(base, HEAVY_DIR, HOST_ID_FILE))
     if period is None:
         period = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
-    if PERIOD_RE.fullmatch(period) is None:
+    if not isinstance(period, str) or PERIOD_RE.fullmatch(period) is None:
         raise HeavyError(f"the ledger period {period!r} is not a calendar month (YYYY-MM)")
     return os.path.join(base, HEAVY_DIR, RUNS_DIR, f"{label}-{period}.jsonl")
 

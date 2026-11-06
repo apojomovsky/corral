@@ -615,7 +615,7 @@ def _check_commands(
                     ["/bin/sh", "-c", cmd],
                     toplevel,
                     env,
-                    role="takeoff",
+                    role=heavy.TAKEOFF_ROLE,
                     repo=repo_key,
                     weight=heavy.weight_for(heavy_cfg, cmd),
                     budget=budget,
