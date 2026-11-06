@@ -8,6 +8,7 @@ dirs, never the host's.
 """
 
 import argparse
+import errno
 import fcntl
 import inspect
 import io
@@ -184,6 +185,22 @@ class CoreTest(MergeCase):
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.merged)
         self.assertIn("held", self.row(result, "lock").detail)
+        self.assertEqual(fake.calls, [])
+
+    def test_plan_with_an_unreadable_lock_file_is_usage(self):
+        fake = self.fake()
+        path = merge.lock_path(FORGE_REPO)
+        real_open = os.open
+
+        def bad_open(p, *args, **kwargs):
+            if p == path:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_open(p, *args, **kwargs)
+
+        with mock.patch.object(merge.os, "open", side_effect=bad_open):
+            with self.assertRaises(merge.MergeError) as caught:
+                self.do_merge(fake, plan=True)
+        self.assertIn("cannot open the merge lock", str(caught.exception))
         self.assertEqual(fake.calls, [])
 
     def test_plan_reports_without_merging(self):
@@ -553,6 +570,20 @@ class CliTest(MergeCase):
         code, out, _ = self.call(self.args(plan=True), self.fake())
         self.assertEqual(code, 0)
         self.assertIn("not merged", out)
+
+    def test_plan_with_an_unreadable_lock_file_is_exit_4(self):
+        path = merge.lock_path(FORGE_REPO)
+        real_open = os.open
+
+        def bad_open(p, *args, **kwargs):
+            if p == path:
+                raise OSError(errno.EACCES, "Permission denied")
+            return real_open(p, *args, **kwargs)
+
+        with mock.patch.object(merge.os, "open", side_effect=bad_open):
+            code, _, err = self.call(self.args(plan=True), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("cannot open the merge lock", err)
 
     def test_method_flag_reaches_the_forge(self):
         fake = self.fake()
