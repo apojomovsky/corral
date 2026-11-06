@@ -34,6 +34,9 @@ EXPECTED_VERBS = frozenset(
         "agent list",
         "snapshot",
         "serve",
+        "heavy run",
+        "heavy status",
+        "heavy rollup",
     }
 )
 
