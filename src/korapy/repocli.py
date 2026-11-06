@@ -302,7 +302,7 @@ def _rename_body(
 
 
 def cmd_repo(args: argparse.Namespace) -> int:
-    from korapy import drive, projects, registry, settings, syncli, units
+    from korapy import drive, projects, registry, settings, units
 
     if args.repo_verb != "rename":
         print(f"korapy: unknown repo verb {args.repo_verb!r}", file=sys.stderr)
@@ -318,7 +318,7 @@ def cmd_repo(args: argparse.Namespace) -> int:
         return USAGE
     try:
         registered = projects.load_all()
-        mapping = drive._tracker_repo_map(registered, git=syncli._git)
+        mapping = drive.production_repo_map(registered)
         project_shorts = {project.name: settings.repo_names(project.root) for project in registered}
         cfg = registry.config()
     except (settings.SettingsError, projects.ProjectsError, board.StoreError) as problem:
