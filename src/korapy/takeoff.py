@@ -211,13 +211,18 @@ def _commit_rules():
     return module
 
 
-def _ticket_repo(ops_root, main_clone):
-    """`(repo, matched)`: the [[repo]] entry whose clone.path is the main clone.
+def _ticket_repo(ops_root, main_clone, short_map):
+    """`(repo, matched)`: the ticket's repo spelling for the main clone.
 
-    Falls back to the main clone's directory name when no ops root or no
-    entry covers it, so the gate still runs: the fallback derives the same
-    name for writing and reading a record. Two entries covering the same
-    clone are refused instead of picked by name.
+    The covering `[[repo]]` entry names the ticket's repo; the spelling
+    resolves through the once-built short-to-tracker map, so the match
+    and the later translation share one map instead of parsing the
+    project file twice. A matched entry the map cannot translate keeps
+    its entry name. With no ops root or no covering entry the main
+    clone's directory name is the fallback, so the gate still runs:
+    the fallback derives the same name for writing and reading a
+    record. Two entries covering the same clone are refused instead of
+    picked by name.
     """
     if ops_root is not None:
         try:
@@ -225,7 +230,7 @@ def _ticket_repo(ops_root, main_clone):
         except settings.SettingsError as err:
             raise TakeoffError(str(err)) from None
         if name is not None:
-            return name, True
+            return short_map.get(name, name), True
     return os.path.basename(main_clone), False
 
 
@@ -680,9 +685,10 @@ def run_takeoff(
     except (leakcli.CollectError, settings.SettingsError) as err:
         raise TakeoffError(str(err)) from None
     main_clone = os.path.realpath(gitenv.worktree_main_checkout(toplevel) or toplevel)
-    repo, matched = _ticket_repo(ops_root, main_clone)
+    short_map = syncli.short_to_tracker(ops_root, _git)
+    repo, matched = _ticket_repo(ops_root, main_clone, short_map)
     try:
-        repo = reviewrecord.local_repo(repo, syncli.short_to_tracker(ops_root, _git))
+        repo = reviewrecord.local_repo(repo, short_map)
     except ValueError as err:
         raise TakeoffError(str(err)) from None
     try:

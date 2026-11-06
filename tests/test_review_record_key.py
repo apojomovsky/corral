@@ -531,6 +531,71 @@ class MalformedConfigTest(unittest.TestCase):
         self.assertIn("acme/gone", err)
 
 
+class NoOpsRootTest(unittest.TestCase):
+    """`review record` with no ops root above the checkout.
+
+    A falsy root reads as no entries, so a short name (the on-disk
+    truth every writer uses) still records, while a tracker spelling
+    the empty map cannot translate fails naming the key.
+    """
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-no-root-key-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.clone = os.path.join(self.tmp, "clone")
+        os.makedirs(self.clone)
+        self.sessions = os.path.join(self.tmp, "sessions")
+        os.environ["KORAPY_SESSIONS"] = self.sessions
+        os.environ["KORAPY_STATE"] = os.path.join(self.tmp, "state")
+        os.environ["KORAPY_CONFIG"] = os.path.join(self.tmp, "config")
+        git_in(self.clone, "init", "-q", "-b", "master")
+        with open(os.path.join(self.clone, "a.txt"), "w", encoding="utf-8") as handle:
+            handle.write("one\n")
+        git_in(self.clone, "add", "-A")
+        git_in(self.clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "one")
+        self.commit = git_in(self.clone, "rev-parse", "HEAD")
+        here = os.getcwd()
+        os.chdir(self.clone)
+        self.addCleanup(os.chdir, here)
+
+    def record(self, repo):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = reviewcli.cmd_record(
+                argparse.Namespace(
+                    repo=repo,
+                    number=1,
+                    commit=self.commit,
+                    verdict="approve",
+                    finding=[],
+                    reviewer="reviewer-1",
+                    author="worker-1",
+                    question="",
+                    session="",
+                )
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_no_root_reads_as_no_entries(self):
+        self.assertEqual(syncli.short_to_tracker(None, dead_git), {})
+        self.assertEqual(syncli.short_to_tracker("", dead_git), {})
+
+    def test_a_short_name_records_with_no_ops_root(self):
+        code, _out, err = self.record(SHORT)
+        self.assertEqual((code, err), (0, ""))
+        record = reviewrecord.read_record(SHORT, 1, self.commit, sessions_root=self.sessions)
+        self.assertIsNotNone(record)
+
+    def test_a_tracker_spelling_fails_naming_the_key(self):
+        code, _, err = self.record(TRACKER)
+        self.assertEqual(code, 4)
+        self.assertIn(TRACKER, err)
+
+
 TWO_ENTRY_TOML = """\
 [[repo]]
 name = "app"
