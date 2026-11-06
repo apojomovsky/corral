@@ -79,10 +79,10 @@ korapy init          # in a project clone: writes korapy.toml and registers the 
 korapy doctor        # one row per check; every failure names its fix
 korapy drive --plan  # what one pass would start
                      # project NAME: project NAME has no eligibility entry: skipped
-                     # plan: 0 candidate(s), would start 0
+                     # plan: 0 candidate(s), would start 0, pulls calls 0
 korapy drive         # run the pass
                      # project NAME: project NAME has no eligibility entry: skipped
-                     # pass: 0 candidate(s), started 0
+                     # pass: 0 candidate(s), started 0, pulls calls 0
 korapy serve         # the dashboard, on loopback
                      # korapy serve: dashboard at http://127.0.0.1:8420/
 ```

@@ -425,7 +425,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             hub=hub,
             repo_map=repo_map,
             review_reader=review_reader,
-            pulls_for=drive.tracker_pulls_for(tracker_factory),
+            index_for=drive.pulls_index_for(tracker_factory),
             driven=driven,
             quota_refresh_after_s=quota_refresh_after_s,
         )
