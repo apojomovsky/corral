@@ -9,13 +9,14 @@ parses `drive.py` and `drivehub.py` and fails when a `.get(`, `in` or
 allow-list below. Additions need the one resolver or an explicit
 allow-list entry with a comment.
 
-The same files must never compare a registry ticket with a claim's
+The same files must never compare anything with a claim's
 `(repo, number)` outside the resolver either: registry tickets carry
 the short `[[repo]]` name while claims carry the tracker repo, so a
 raw `ticket != (claim.repo, claim.number)` can never match and
-mistakes every finished worker for a crash. Every `==`/`!=` between a
-ticket-shaped value and a `(claim.repo, claim.number)` tuple outside
-`entry_for_claim` fails.
+mistakes every finished worker for a crash. Every `==`/`!=` against a
+`(claim.repo, claim.number)` tuple outside `entry_for_claim` fails,
+whatever the other operand is called: a registry ticket held in a
+differently named variable is still a ticket.
 
 The same files must never compare a claim holder id with a registry
 entry id outside the resolver either: holders are opaque
@@ -114,27 +115,38 @@ def _raw_uses(path):
     return found
 
 
+#: The claim attributes that make a store key. Any other pair
+#: (`(claim.agent, claim.epoch)`) is an identity tuple, not a ticket key.
+CLAIM_KEY_ATTRS = {"repo", "number"}
+
+
 def _is_claim_key(node):
-    """Whether `node` is a `(claim.repo, claim.number)`-shaped tuple."""
-    return (
-        isinstance(node, ast.Tuple)
-        and len(node.elts) == 2
-        and all(
-            isinstance(elt, ast.Attribute)
-            and isinstance(elt.value, ast.Name)
-            and elt.value.id == "claim"
-            for elt in node.elts
-        )
-    )
+    """Whether `node` is a `(claim.repo, claim.number)`-shaped tuple.
 
-
-def _mentions_ticket(node):
-    """Whether `node` names a registry ticket value."""
-    return "ticket" in ast.unparse(node).replace(" ", "").lower()
+    Only those two attributes, in either order: a tuple of any other
+    two claim attributes is a different fact and must not trip the
+    ticket guard.
+    """
+    if not isinstance(node, ast.Tuple) or len(node.elts) != 2:
+        return False
+    if not all(
+        isinstance(elt, ast.Attribute)
+        and isinstance(elt.value, ast.Name)
+        and elt.value.id == "claim"
+        for elt in node.elts
+    ):
+        return False
+    return {elt.attr for elt in node.elts} == CLAIM_KEY_ATTRS
 
 
 def _ticket_comparisons_in(tree):
-    """`(function, lineno)` for every ticket-vs-claim-key `==`/`!=`."""
+    """`(function, lineno)` for every `==`/`!=` against a claim key.
+
+    The other operand's source text never matters: a registry ticket
+    held in a variable named anything at all still cannot match a
+    claim's tracker-repo key, so any equality against the tuple is
+    suspect outside `entry_for_claim`.
+    """
     enclosing = _enclosing_names(tree)
     found = []
     for node in ast.walk(tree):
@@ -143,9 +155,7 @@ def _ticket_comparisons_in(tree):
         if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
             continue
         parts = [node.left, *node.comparators]
-        if any(_is_claim_key(part) for part in parts) and any(
-            _mentions_ticket(part) for part in parts if not _is_claim_key(part)
-        ):
+        if any(_is_claim_key(part) for part in parts):
             found.append((enclosing[node], node.lineno))
     return found
 
@@ -237,6 +247,24 @@ class ResolverGuardTest(unittest.TestCase):
             "def somewhere_else(ticket, claim):\n    return ticket != (claim.repo, claim.number)\n"
         )
         self.assertEqual(_ticket_comparisons_in(tree), [("somewhere_else", 2)])
+
+    def test_a_differently_named_ticket_still_fails_the_guard(self):
+        tree = ast.parse(
+            "def somewhere_else(held, claim):\n    return held == (claim.repo, claim.number)\n"
+        )
+        self.assertEqual(_ticket_comparisons_in(tree), [("somewhere_else", 2)])
+
+    def test_a_claim_key_on_the_left_still_fails_the_guard(self):
+        tree = ast.parse(
+            "def somewhere_else(held, claim):\n    return (claim.repo, claim.number) != held\n"
+        )
+        self.assertEqual(_ticket_comparisons_in(tree), [("somewhere_else", 2)])
+
+    def test_another_pair_of_claim_attributes_is_not_a_ticket_key(self):
+        tree = ast.parse(
+            "def somewhere_else(claim):\n    return (claim.agent, claim.epoch) == prior\n"
+        )
+        self.assertEqual(_ticket_comparisons_in(tree), [])
 
     def test_the_resolver_comparison_itself_passes(self):
         tree = ast.parse(

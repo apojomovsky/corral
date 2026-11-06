@@ -887,6 +887,7 @@ class SealTest(unittest.TestCase):
                 ("units.py", "systemctl", "slice_start_argv"),
                 ("units.py", "systemd-run", "unit_argv"),
                 ("heavy.py", "systemctl", "show_cgroup"),
+                ("heavy.py", "systemctl", "scope_exists"),
                 ("heavy.py", "systemctl", "stop_scope"),
                 ("heavy.py", "systemd-run", "scope_argv"),
                 ("drive.py", "systemctl", "timer_state"),
