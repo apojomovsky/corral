@@ -956,6 +956,7 @@ def run_heavy(
     if (
         isinstance(waited_s, bool)
         or not isinstance(waited_s, (int, float))
+        or not math.isfinite(waited_s)
         or waited_s != waited_s
         or waited_s < 0
     ):
@@ -1341,7 +1342,11 @@ def join_lane(
         raise HeavyError(f"weight must be a lane Weight, not {weight!r}")
     _check_timeout(timeout_s)
     moment = time.time() if arrived is None else arrived
-    if isinstance(moment, bool) or not isinstance(moment, (int, float)):
+    if (
+        isinstance(moment, bool)
+        or not isinstance(moment, (int, float))
+        or not math.isfinite(moment)
+    ):
         raise HeavyError(f"arrival {moment!r} must be an epoch timestamp")
     me = os.getpid() if pid is None else pid
     if isinstance(me, bool) or not isinstance(me, int) or me < 0:
