@@ -11,8 +11,9 @@ scope limits, and records the reason in the lane journal; a bare
 `run --role NAME` names the ledger caller (`hand` by default;
 `takeoff` is reserved for the module call). `status` shows holders,
 waiters, learned costs and the last few recent rows. `rollup` regenerates the portable per-key cost summary from
-the raw run ledger: stdout always carries the JSON document, and
-`--out PATH` additionally writes the same bytes for the operator to
+the raw run ledger: stdout always carries the JSON document, the
+default file at `heavy.rollup_path()` is refreshed with the same
+bytes, and `--out PATH` additionally writes them for the operator to
 commit. Exit codes follow the public table: 0 ok, 1 nothing to do
 (or a wait that would block, for `--plan`), 3 the scope could not be
 created, 4 usage or configuration, 75 no slot.
@@ -394,7 +395,12 @@ def cmd_run(
 
 
 def cmd_rollup(args, *, state_dir=None, now=None):
-    """Run the verb. The ledger lives in the state dir; tests pass fakes."""
+    """Run the verb. The ledger lives in the state dir; tests pass fakes.
+
+    Standard output always carries the JSON document, and the default
+    file at ``heavy.rollup_path()`` is refreshed with the same bytes;
+    ``--out`` additionally writes them wherever the operator points it.
+    """
     from korapy import heavy, paths
 
     try:
@@ -407,6 +413,13 @@ def cmd_rollup(args, *, state_dir=None, now=None):
     sys.stdout.write(text)
     if skipped:
         print(f"korapy heavy: skipped {skipped} corrupt ledger rows", file=sys.stderr)
+    default = heavy.rollup_path(state_dir)
+    try:
+        os.makedirs(os.path.dirname(default), exist_ok=True)
+        paths.atomic_write_text(default, text)
+    except OSError as err:
+        _err(f"cannot write the rollup to {default}: {err}")
+        return USAGE
     if getattr(args, "out", None):
         try:
             paths.atomic_write_text(args.out, text)

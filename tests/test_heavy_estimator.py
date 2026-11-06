@@ -172,6 +172,20 @@ class StarvedCase(EstimatorCase):
         self.assertEqual(estimate.dur_s_p50, 200.0)
         self.assertEqual(estimate.memory_mb, 9000)
 
+    def test_starved_rows_leave_cpu_rates_alone(self):
+        healthy = [
+            _row(wall_s=100.0, cpu_s=cpu_s, peak_mb=1000.0, days_ago=float(9 - i))
+            for i, cpu_s in enumerate([200.0, 200.0, 300.0, 400.0, 500.0])
+        ]
+        starved = [
+            _row(wall_s=1000.0, cpu_s=100.0, peak_mb=9000.0, starved=True, days_ago=0.0)
+            for _ in range(5)
+        ]
+        (expected,) = heavy.estimates_for(healthy, now=NOW).values()
+        (actual,) = heavy.estimates_for(healthy + starved, now=NOW).values()
+        self.assertEqual(actual.cpu_m, expected.cpu_m)
+        self.assertEqual(actual.avg_cores, expected.avg_cores)
+
 
 class WindowCase(EstimatorCase):
     def test_rows_past_ninety_days_are_forgotten(self):

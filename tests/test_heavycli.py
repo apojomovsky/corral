@@ -179,6 +179,31 @@ class CmdRollupCase(RollupCliCase):
         with open(target, encoding="utf-8") as handle:
             self.assertEqual(handle.read(), out.getvalue())
 
+    def test_rollup_refreshes_the_default_file(self):
+        _write_row(self.tmp, _row())
+        _write_row(self.tmp, _row())
+        default = heavy.rollup_path(self.tmp)
+        self.assertFalse(os.path.exists(default))
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = heavycli.cmd_rollup(self._args(), state_dir=self.tmp)
+        self.assertEqual(code, 0)
+        with open(default, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), out.getvalue())
+
+    def test_default_refresh_failure_is_a_usage_error(self):
+        _write_row(self.tmp, _row())
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch("korapy.paths.atomic_write_text", side_effect=OSError("denied")),
+            redirect_stdout(out),
+            redirect_stderr(err),
+        ):
+            code = heavycli.cmd_rollup(self._args(), state_dir=self.tmp)
+        self.assertEqual(code, 4)
+        self.assertIn("cannot write", err.getvalue())
+        self.assertTrue(json.loads(out.getvalue())["keys"])
+
     def test_missing_out_parent_is_a_usage_error(self):
         _write_row(self.tmp, _row())
         target = os.path.join(self.tmp, "no-such-dir", "rollup.json")
