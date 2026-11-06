@@ -9,9 +9,10 @@ the keys: items, claims (agent and epoch kept), the outbox and the sync
 cursors, in a single transaction, with a backup left beside the store.
 
 Exit codes: 0 migrated (or a plan with changes), 1 nothing to do (an
-unknown old name, the same name twice, or a plan with no changes), 2 a
-live agent or a live-held claim blocks the move (named), 4 a bad name,
-a target that already holds rows, or an unreadable store or config.
+unknown old name, the same name twice, a second run, or a plan with no
+changes), 2 a live agent or a live-held claim blocks the move (named),
+4 a bad name, a target that already holds rows, or an unreadable store
+or config.
 """
 
 import argparse
@@ -67,6 +68,8 @@ def rename_root(
     registry_entries=(),
     live_units=frozenset(),
     mapping=None,
+    project_shorts=None,
+    owners=None,
     now,
     out,
     err,
@@ -75,9 +78,11 @@ def rename_root(
     """Migrate one tracker repo's store keys, or plan the move. All seams injected.
 
     ``registry_entries`` are ``(entry, state)`` registry rows,
-    ``live_units`` are ``(short repo, number)`` tickets with a live
-    unit, and ``mapping`` resolves short entry names to tracker repos.
-    Exit codes follow the module docstring.
+    ``live_units`` are ``(project, short repo, number)`` tickets with a
+    live unit, and ``mapping`` resolves short entry names to tracker
+    repos. ``project_shorts`` is ``{project: [shorts]}`` for the owners
+    fallback; ``owners`` names the projects owning the renamed repo
+    outright. Exit codes follow the module docstring.
     """
     mapping = dict(mapping or {})
     try:
@@ -88,6 +93,8 @@ def rename_root(
     if old == new:
         out.write(f"nothing to do: {old} is already {new}\n")
         return NO
+    if owners is None and project_shorts is not None:
+        owners = reponame.project_owners(project_shorts, mapping, {old, new})
     try:
         before = store.rename_counts(old)
         after = store.rename_counts(new)
@@ -112,6 +119,7 @@ def rename_root(
         entries=registry_entries,
         live_units=live_units,
         mapping=mapping,
+        owners=owners,
     )
     if blockers:
         _err("cannot migrate while live work holds these tickets:", err)
@@ -165,12 +173,16 @@ def cmd_repo(args: argparse.Namespace) -> int:
     try:
         registered = projects.load_all()
         mapping = drive._tracker_repo_map(registered, git=syncli._git)
+        project_shorts = {project.name: settings.repo_names(project.root) for project in registered}
         cfg = registry.config()
         listed = registry.visible(time.time(), cfg=cfg)
         live = set()
         for project in registered:
             rows = units.list_units(project.unit_prefix)
-            live.update(units.live_tickets(project.unit_prefix, rows))
+            live.update(
+                (project.name, repo, number)
+                for repo, number in units.live_tickets(project.unit_prefix, rows)
+            )
     except (settings.SettingsError, projects.ProjectsError, board.StoreError) as problem:
         print(f"korapy repo rename: {problem}", file=sys.stderr)
         return USAGE
@@ -189,6 +201,7 @@ def cmd_repo(args: argparse.Namespace) -> int:
             registry_entries=listed,
             live_units=live,
             mapping=mapping,
+            project_shorts=project_shorts,
             now=time.time(),
             out=sys.stdout,
             err=sys.stderr,

@@ -186,9 +186,64 @@ class BackupNameTest(unittest.TestCase):
         self.assertEqual(reponame.prune_backups(tmp.name), [])
         self.assertEqual(sorted(os.listdir(tmp.name)), sorted(foreign))
 
+    def test_suffixed_stamp_parses(self):
+        from korapy import reponame
 
-def entry(agent_id, repo=SHORT, number=1):
-    return {"id": agent_id, "ticket": {"project": "", "repo": repo, "number": number}}
+        self.assertEqual(
+            reponame._backup_stamp("board-backup-20240101T000000Z-2.sqlite"),
+            reponame._backup_stamp("board-backup-20240101T000000Z.sqlite"),
+        )
+        self.assertIsNotNone(reponame._backup_stamp("board-backup-20240101T000000Z-2.sqlite"))
+
+    def test_prune_ages_suffixed_backups_like_the_others(self):
+        from korapy import reponame
+
+        tmp = __import__("tempfile").TemporaryDirectory(prefix="korapy-rename-suffix-")
+        self.addCleanup(tmp.cleanup)
+        names = [reponame.backup_name(1000.0 + index) for index in range(5)]
+        names.append("board-backup-19700101T000015Z-2.sqlite")
+        for name in names:
+            with open(os.path.join(tmp.name, name), "w", encoding="utf-8") as handle:
+                handle.write("x")
+        removed = reponame.prune_backups(tmp.name)
+        self.assertEqual(removed, ["board-backup-19700101T000015Z-2.sqlite"])
+        self.assertEqual(len(os.listdir(tmp.name)), 5)
+
+
+class ProjectOwnersTest(unittest.TestCase):
+    def test_short_resolving_to_old_names_its_project(self):
+        from korapy import reponame
+
+        self.assertEqual(
+            reponame.project_owners({"demo": [SHORT], "other": ["aux"]}, {SHORT: OLD}, {OLD, NEW}),
+            {"demo"},
+        )
+
+    def test_short_resolving_to_new_names_its_project(self):
+        from korapy import reponame
+
+        self.assertEqual(
+            reponame.project_owners({"demo": [SHORT]}, {SHORT: NEW}, {OLD, NEW}),
+            {"demo"},
+        )
+
+    def test_unmapped_and_foreign_shorts_name_nobody(self):
+        from korapy import reponame
+
+        self.assertEqual(
+            reponame.project_owners({"demo": ["gone", "aux"]}, {"aux": "acme/other"}, {OLD, NEW}),
+            set(),
+        )
+
+    def test_empty_inputs_name_nobody(self):
+        from korapy import reponame
+
+        self.assertEqual(reponame.project_owners({}, {}, {OLD, NEW}), set())
+        self.assertEqual(reponame.project_owners(None, None, {OLD, NEW}), set())
+
+
+def entry(agent_id, repo=SHORT, number=1, project=""):
+    return {"id": agent_id, "ticket": {"project": project, "repo": repo, "number": number}}
 
 
 class LiveBlockersTest(unittest.TestCase):
@@ -233,7 +288,10 @@ class LiveBlockersTest(unittest.TestCase):
 
     def test_agent_for_another_repo_does_not_block(self):
         self.assertEqual(
-            self.blockers(entries=[(entry("agent-1", repo="other", number=3), registry.LIVE)]),
+            self.blockers(
+                entries=[(entry("agent-1", repo="other", number=3), registry.LIVE)],
+                mapping={SHORT: OLD, "other": "acme/other"},
+            ),
             [],
         )
 
@@ -279,6 +337,98 @@ class LiveBlockersTest(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIn(HOLDER, found[0])
         self.assertIn(f"{OLD}#1", found[0])
+
+    def test_unmapped_live_entry_blocks_naming_it(self):
+        found = self.blockers(
+            claims=[(OLD, 1, HOLDER)],
+            entries=[(entry("agent-1"), registry.LIVE)],
+            live_units=frozenset(),
+            mapping={},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_unmapped_stale_entry_blocks_naming_it(self):
+        found = self.blockers(
+            claims=[(OLD, 1, HOLDER)],
+            entries=[(entry("agent-1"), registry.STALE)],
+            live_units=frozenset(),
+            mapping={},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_unmapped_entry_without_claims_blocks(self):
+        found = self.blockers(
+            entries=[(entry("agent-1"), registry.LIVE)],
+            live_units=frozenset(),
+            mapping={},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_unmapped_entry_holding_a_claim_blocks_despite_its_project(self):
+        found = self.blockers(
+            claims=[(OLD, 1, "agent-1")],
+            entries=[(entry("agent-1", project="other"), registry.LIVE)],
+            live_units=frozenset(),
+            mapping={},
+            owners={"demo"},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_unmapped_entry_for_an_unrelated_project_does_not_block(self):
+        self.assertEqual(
+            self.blockers(
+                entries=[(entry("agent-1", repo="gone", number=9, project="other"), registry.LIVE)],
+                live_units=frozenset(),
+                mapping={},
+                owners={"demo"},
+            ),
+            [],
+        )
+
+    def test_unrelated_project_live_unit_does_not_block(self):
+        self.assertEqual(
+            self.blockers(
+                claims=[(OLD, 5, HOLDER)],
+                live_units=frozenset({("other", "gone", 5)}),
+                mapping={},
+                owners={"demo"},
+            ),
+            [],
+        )
+
+    def test_same_project_live_unit_blocks(self):
+        found = self.blockers(
+            claims=[(OLD, 5, HOLDER)],
+            live_units=frozenset({("demo", "gone", 5)}),
+            mapping={},
+            owners={"demo"},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn(HOLDER, found[0])
+
+    def test_unit_without_a_project_blocks(self):
+        found = self.blockers(
+            claims=[(OLD, 5, HOLDER)],
+            live_units=frozenset({("gone", 5)}),
+            mapping={},
+            owners={"demo"},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn(HOLDER, found[0])
+
+    def test_empty_owners_fail_closed(self):
+        found = self.blockers(
+            claims=[(OLD, 5, HOLDER)],
+            live_units=frozenset({("other", "gone", 5)}),
+            mapping={},
+            owners=set(),
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn(HOLDER, found[0])
 
     def test_unmapped_short_with_another_number_does_not_block(self):
         self.assertEqual(
@@ -370,6 +520,8 @@ class RenameRootCase(TempStoreTest):
             "registry_entries": [],
             "live_units": frozenset(),
             "mapping": {SHORT: OLD},
+            "project_shorts": None,
+            "owners": None,
             "now": NOW,
             "out": self.out,
             "err": self.err,
@@ -514,6 +666,27 @@ class RenameRootCase(TempStoreTest):
         self.assertEqual(code, 4)
         self.assertIn(NEW, self.err.getvalue())
         self.assertEqual(sorted(os.listdir(self.tmp.name)), before)
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+
+    def test_unrelated_project_live_unit_migrates(self):
+        self.setUpStore()
+        code = self.rename(
+            live_units=frozenset({("other", "gone", 1)}),
+            mapping={SHORT: OLD},
+            project_shorts={"demo": [SHORT], "other": ["gone"]},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.store.rename_counts(NEW)["items"], 2)
+
+    def test_same_project_live_unit_refuses(self):
+        self.setUpStore()
+        code = self.rename(
+            live_units=frozenset({("demo", "gone", 1)}),
+            mapping={SHORT: OLD},
+            project_shorts={"demo": [SHORT, "gone"]},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn(HOLDER, self.err.getvalue())
         self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
 
     def test_lost_race_refusal_keeps_every_earlier_backup(self):
