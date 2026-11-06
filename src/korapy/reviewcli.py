@@ -22,15 +22,12 @@ already reviewed, a bad `--forge-repo`).
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 
 OK, NO, UNREACHABLE, USAGE = 0, 1, 3, 4
 
 AGENT_ID_ENV = "KORAPY_AGENT_ID"
-
-_FULL_SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 
 
 def _err(text):
@@ -69,13 +66,13 @@ def _commit(raw, cwd):
     looks up, so only an id git resolves here, or a full SHA from a
     reviewer outside the reviewed checkout, is taken.
     """
-    from korapy import mergeup
+    from korapy import merge, mergeup
 
     raw = str(raw or "").strip()
     resolved = mergeup.resolve_commit(raw, cwd)
     if resolved:
         return resolved
-    if _FULL_SHA.fullmatch(raw):
+    if merge.FULL_SHA.fullmatch(raw):
         return raw.lower()
     return None
 

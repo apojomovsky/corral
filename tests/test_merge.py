@@ -20,7 +20,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 from unittest import mock
 
-from korapy import forge, merge, mergecli, paths, reviewrecord, settings
+from korapy import forge, merge, mergecli, paths, reviewcli, reviewrecord, settings
 from tests.test_forge import MERGE_SHA, FakeForge, make_pr
 from tests.test_reviewrecord import git_in
 
@@ -671,6 +671,137 @@ class CliTest(MergeCase):
         self.assertIn("merge method: fail", out)
         self.assertIn("merge.method", out)
         self.assertIn("not merged", out)
+
+
+def _no_flock(fd, op):
+    """A flock seam that fails the test when the probe takes any lock."""
+    raise AssertionError(f"plan probe took a lock: flock({fd}, {op})")
+
+
+class ShaAgreementTest(unittest.TestCase):
+    """`merge` and `review show` agree on what a full commit SHA is.
+
+    The pattern lives once, in `korapy.merge` (`FULL_SHA`); `reviewcli`
+    reuses it, so a loosened copy can never make `merge` accept a head
+    the forge pin then refuses.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-sha-")
+        self.addCleanup(tmp.cleanup)
+        self.dir = os.path.realpath(tmp.name)
+
+    def test_no_second_sha_copy_in_reviewcli(self):
+        self.assertFalse(hasattr(reviewcli, "_FULL_SHA"))
+        self.assertFalse(hasattr(reviewcli, "FULL_SHA"))
+
+    def test_full_shas_agree(self):
+        valid = [
+            "a" * 40,
+            "F" * 40,
+            "abCD" * 10,
+            "0" * 64,
+            "B" * 64,
+            "  abCD0123456789abcdef0123456789abcdef0123\n",
+        ]
+        for raw in valid:
+            with self.subTest(raw=raw):
+                self.assertTrue(merge.FULL_SHA.fullmatch(raw.strip()))
+                self.assertEqual(reviewcli._commit(raw, self.dir), raw.strip().lower())
+
+    def test_non_shas_agree(self):
+        invalid = [None, "", "short", "g" * 40, "a" * 39, "a" * 41, "a" * 63, "a" * 65]
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                text = "" if raw is None else raw
+                self.assertIsNone(merge.FULL_SHA.fullmatch(text))
+                self.assertIsNone(reviewcli._commit(raw, self.dir))
+
+
+class LockTableTest(unittest.TestCase):
+    """The lock-table parser: pure, fixture-driven, never touching `/proc`."""
+
+    KEY = "08:01:12345"
+
+    def table(self, *lines):
+        return "\n".join(lines) + "\n"
+
+    def test_write_lock_on_the_file_is_held(self):
+        text = self.table(f"64: FLOCK  ADVISORY  WRITE 999 {self.KEY} 0 EOF")
+        self.assertTrue(merge._lock_held(text, self.KEY))
+
+    def test_read_lock_on_the_file_is_held(self):
+        text = self.table(f"64: FLOCK  ADVISORY  READ 999 {self.KEY} 0 EOF")
+        self.assertTrue(merge._lock_held(text, self.KEY))
+
+    def test_lock_on_another_file_is_free(self):
+        text = self.table("64: FLOCK  ADVISORY  WRITE 999 08:01:99999 0 EOF")
+        self.assertFalse(merge._lock_held(text, self.KEY))
+
+    def test_posix_lock_on_the_file_is_free(self):
+        text = self.table(f"64: POSIX  ADVISORY  WRITE 999 {self.KEY} 0 EOF")
+        self.assertFalse(merge._lock_held(text, self.KEY))
+
+    def test_blocked_request_lines_never_match(self):
+        text = self.table(f"8: -> FLOCK  ADVISORY  WRITE 999 {self.KEY} 0 EOF")
+        self.assertFalse(merge._lock_held(text, self.KEY))
+
+    def test_partial_keys_never_match(self):
+        text = self.table("64: FLOCK  ADVISORY  WRITE 999 08:01:1234567 0 EOF")
+        self.assertFalse(merge._lock_held(text, "08:01:123"))
+
+    def test_empty_and_garbage_tables_are_free(self):
+        self.assertFalse(merge._lock_held("", self.KEY))
+        self.assertFalse(merge._lock_held("not a lock table\n", self.KEY))
+
+
+class PlanLockTest(MergeCase):
+    """`--plan` never writes and never takes the merge lock."""
+
+    def held_path(self):
+        path = merge.lock_path(FORGE_REPO)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        return path
+
+    def test_plan_creates_nothing_in_the_state_dir(self):
+        result = self.do_merge(self.fake(), plan=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(os.path.exists(os.environ["KORAPY_STATE"]))
+
+    def test_plan_probe_takes_no_lock(self):
+        self.hold_lock()
+        with mock.patch.object(merge, "_flock", _no_flock):
+            result = self.do_merge(self.fake(), plan=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.merged)
+        self.assertIn("held", self.row(result, "lock").detail)
+
+    def test_lock_free_without_a_lock_file_is_free_and_creates_nothing(self):
+        path = merge.lock_path(FORGE_REPO)
+        with mock.patch.object(merge, "_flock", _no_flock):
+            self.assertTrue(merge._lock_free(path))
+        self.assertFalse(os.path.exists(path))
+        self.assertFalse(os.path.exists(os.path.dirname(path)))
+
+    def test_lock_free_sees_a_live_lock_without_taking_it(self):
+        path = self.held_path()
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with mock.patch.object(merge, "_flock", _no_flock):
+                self.assertFalse(merge._lock_free(path))
+        finally:
+            os.close(fd)
+        with mock.patch.object(merge, "_flock", _no_flock):
+            self.assertTrue(merge._lock_free(path))
+
+    def test_lock_free_with_an_unreadable_table_is_usage(self):
+        path = self.held_path()
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        with mock.patch.object(merge, "_read_locks", side_effect=OSError("no proc")):
+            with self.assertRaises(merge.MergeError):
+                merge._lock_free(path)
 
 
 if __name__ == "__main__":
