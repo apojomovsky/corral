@@ -40,11 +40,13 @@ import os
 import sqlite3
 from dataclasses import dataclass, field
 
+from korapy import boardstatus
+
 from korapy import paths
 
 #: Schema version stamped as ``PRAGMA user_version``. A database with a
 #: newer or unknown version fails closed instead of migrating.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 #: The store file inside the state dir.
 DB_NAME = "board.sqlite"
@@ -89,7 +91,7 @@ class RenameRefused(Exception):
 
 
 #: Every table keyed by tracker repo: the rename verb moves all of them.
-RENAME_TABLES = ("items", "claims", "outbox", "cursors")
+RENAME_TABLES = ("items", "claims", "outbox", "cursors", "status_sets")
 
 
 @dataclass
@@ -186,6 +188,18 @@ _CURSORS_DDL = """
         PRIMARY KEY(repo, name))
 """
 
+#: The Status korapy last set per card: the option id written and the
+#: derived state behind the write. A card whose live Status differs
+#: from the recorded option id was moved by a person. Created by a
+#: fresh database and by the v2 to v3 migration alike: one definition.
+_STATUS_SETS_DDL = """
+    CREATE TABLE IF NOT EXISTS status_sets(
+        repo TEXT NOT NULL, number INTEGER NOT NULL,
+        option_id TEXT NOT NULL, derived TEXT NOT NULL,
+        set_at REAL NOT NULL,
+        PRIMARY KEY(repo, number))
+"""
+
 
 def _migrate(conn):
     """Create the schema forward from an empty database, in one place."""
@@ -224,12 +238,19 @@ def _migrate(conn):
         """
     )
     conn.execute(_CURSORS_DDL)
+    conn.execute(_STATUS_SETS_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
 def _migrate_1_to_2(conn):
     """Forward a version-1 database: add the tracker cursor table."""
     conn.execute(_CURSORS_DDL)
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+def _migrate_2_to_3(conn):
+    """Forward a version-2 database: add the last-set Status table."""
+    conn.execute(_STATUS_SETS_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -474,6 +495,35 @@ class Store:
     def clear_cursor(self, repo, name):
         """Drop the stored cursor for ``repo`` and ``name``, if any."""
         self._conn.execute("DELETE FROM cursors WHERE repo=? AND name=?", (repo, name))
+
+    def status_set_of(self, repo, number):
+        """The Status korapy last set on (``repo``, ``number``), or None.
+
+        Read-only: the recorded option id and derived state, so the
+        pass can tell a person's manual move from its own last write.
+        """
+        row = self._conn.execute(
+            "SELECT option_id, derived FROM status_sets WHERE repo=? AND number=?",
+            (repo, number),
+        ).fetchone()
+        if row is None:
+            return None
+        return boardstatus.StatusRecord(option_id=row[0], derived=row[1])
+
+    def record_status_set(self, repo, number, option_id, derived, *, now):
+        """Remember the Status just set on (``repo``, ``number``).
+
+        Overwrites any earlier record for the card: only the latest
+        write decides whether the live value is still korapy's.
+        """
+        self._conn.execute(
+            "INSERT INTO status_sets(repo, number, option_id, derived, set_at)"
+            " VALUES(?, ?, ?, ?, ?)"
+            " ON CONFLICT(repo, number) DO UPDATE SET"
+            " option_id=excluded.option_id, derived=excluded.derived,"
+            " set_at=excluded.set_at",
+            (repo, number, option_id, derived, now),
+        )
 
     def queued_writes(self, limit=None):
         """Queued outbox rows, oldest first, at most ``limit``."""
@@ -975,6 +1025,10 @@ def open_store(path=None):
         elif version == 1:
             with _txn(conn):
                 _migrate_1_to_2(conn)
+                _migrate_2_to_3(conn)
+        elif version == 2:
+            with _txn(conn):
+                _migrate_2_to_3(conn)
         elif version != SCHEMA_VERSION:
             raise StoreError(
                 f"board store {target} has schema version {version},"

@@ -469,7 +469,9 @@ board repo runs the feed step and then the board step. A complete
 board step also adds the tracker's missing open and recently closed
 issues to the board, up to `board.add_per_pass` per repo per pass; a failed add
 is logged with the issue number and retried on the next pass, and a
-rate limit stops the adopt with the rest left for the next pass. Exit 1 when
+rate limit stops the adopt with the rest left for the next pass. Every
+board step also sets the Status column from the derived state for a
+mapped project, up to `board.status_per_pass` per repo per pass. Exit 1 when
 nothing changed or the only failures are refused reads, 3 when the
 tracker is unreachable, 4 when stored rows are corrupt and nothing
 synced. `mirror` pushes queued writes oldest first; exit 0 when a

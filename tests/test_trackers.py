@@ -73,6 +73,55 @@ class BuildTrackerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "board"):
             trackers.build_tracker(variant="board", board=None, max_pages=5, run=lambda args: "{}")
 
+    def test_status_limit_reaches_the_backed_tracker(self):
+        from typing import cast
+
+        from tests.test_board_reader import config
+
+        built = trackers.build_tracker(
+            variant="board", board=config(), max_pages=5, run=lambda args: "{}"
+        )
+        self.assertIsInstance(built, trackers.BoardBackedTracker)
+        self.assertIsNone(cast(trackers.BoardBackedTracker, built).board_status_limit)
+        built = trackers.build_tracker(
+            variant="board",
+            board=config(),
+            max_pages=5,
+            run=lambda args: "{}",
+            status_limit=7,
+        )
+        self.assertIsInstance(built, trackers.BoardBackedTracker)
+        self.assertEqual(cast(trackers.BoardBackedTracker, built).board_status_limit, 7)
+
+    def test_status_ids_come_from_the_board_config(self):
+        from typing import cast
+
+        from tests.test_board_reader import config
+
+        built = trackers.build_tracker(
+            variant="board",
+            board=config(
+                status_available="opt-a",
+                status_claimed="opt-c",
+                status_review="opt-r",
+                status_done="opt-d",
+            ),
+            max_pages=5,
+            run=lambda args: "{}",
+        )
+        from korapy import boardstatus
+
+        self.assertIsInstance(built, trackers.BoardBackedTracker)
+        self.assertEqual(
+            cast(trackers.BoardBackedTracker, built).board_status_ids,
+            {
+                boardstatus.AVAILABLE: "opt-a",
+                boardstatus.CLAIMED: "opt-c",
+                boardstatus.REVIEW: "opt-r",
+                boardstatus.DONE: "opt-d",
+            },
+        )
+
 
 REPO = "example/demo"
 T1 = "2026-10-28T13:00:00Z"

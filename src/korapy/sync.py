@@ -14,7 +14,7 @@ a validation rejection is refused, not unreachable: it is reported in
 
 from typing import Iterator, NamedTuple
 
-from korapy import board, settings, tracker as iface
+from korapy import board, boardstatus, settings, tracker as iface
 
 settings.register(
     "tracker.repo", str, "", "tracker repository as owner/name (default: the clone's origin)"
@@ -34,6 +34,12 @@ settings.register(
     int,
     20,
     "missing board issues added per repo per pass (default: 20; 0 or less adopts nothing)",
+)
+settings.register(
+    "board.status_per_pass",
+    int,
+    20,
+    "board Status writes per repo per pass (default: 20; 0 or less syncs nothing)",
 )
 settings.register(
     "board.schema_max_age_s",
@@ -84,6 +90,15 @@ class SyncResult(NamedTuple):
     adopt_errors: tuple[
         str, ...
     ] = ()  # failed board adds, retried next pass, never counted toward an exit
+    status_errors: tuple[
+        str, ...
+    ] = ()  # failed Status writes, retried next pass, never counted toward an exit
+
+
+class StatusOutcome(NamedTuple):
+    written: tuple[str, ...]  # "repo#N" per card the pass set, in poll order
+    errors: tuple[str, ...]  # outage lines halting the step; "" never appears
+    status_errors: tuple[str, ...]  # per-card failure lines, retried next pass
 
 
 def _reading(item: iface.TrackerItem) -> board.Item:
@@ -188,6 +203,102 @@ def _adopt_after_poll(reader, schema, repo, found, *, page_after, resume, now):
     return tuple(adopted.refused), tuple(errors), ()
 
 
+def _option_names(options):
+    """The display name to option id map for one Status field's options.
+
+    Pure. A name two options share resolves to neither: the step reads
+    the card as unknown rather than picking a side, the same way the
+    doctor refuses the ambiguity instead of picking one.
+    """
+    by_name = {}
+    ambiguous = set()
+    for option_id, name in options.items():
+        if name in by_name:
+            ambiguous.add(name)
+        by_name[name] = option_id
+    for name in ambiguous:
+        del by_name[name]
+    return by_name
+
+
+def sync_board_status(store, reader, schema, repo, cards, *, now) -> StatusOutcome:
+    """Set the Status column from the derived state, up to the pass cap.
+
+    The derived state per card is closed means done, an open linked
+    pull request means in review, a live claim means claimed, otherwise
+    available. Only states the board config names an option id for are
+    synced; a project mapping none of them, a reader without a status
+    cap, or a schema without the Status column all read as unmapped
+    and change nothing. Pull-request cards are skipped like everywhere
+    else: only tickets carry a Status. A card a person moved (its live
+    Status differs from the recorded last set) rests until the derived
+    state changes, then writes again. Writes only land when the live
+    Status differs from the derived one, one write per changed card, at
+    most the reader's cap per pass; the rest carries to the next pass,
+    as does everything past a rate limit, which halts the step with an
+    outage line. A failed card is one status line and the step moves on.
+    """
+    limit = getattr(reader, "board_status_limit", None)
+    write = getattr(reader, "write_option", None)
+    ids = getattr(reader, "board_status_ids", None)
+    if limit is None or write is None or not ids:
+        return StatusOutcome((), (), ())
+    if limit <= 0:
+        return StatusOutcome((), (), ())
+    field = schema.fields.get("board_status")
+    if field is None:
+        return StatusOutcome((), (), ())
+    by_name = _option_names(field.options)
+    written: list[str] = []
+    errors: list[str] = []
+    status_errors: list[str] = []
+    for card in cards:
+        if getattr(card, "kind", "issue") != "issue":
+            continue
+        if card.state == "closed":
+            has_open_pull = False
+        else:
+            try:
+                has_open_pull = bool(reader.linked_pulls(card.repo, card.number))
+            except iface.TrackerRateLimited as err:
+                errors.append(
+                    f"{repo}: board status rate limited, retry after {err.retry_after:g}s"
+                    f" ({err}); the rest carries to the next pass"
+                )
+                return StatusOutcome(tuple(written), tuple(errors), tuple(status_errors))
+            except iface.TrackerError as err:
+                status_errors.append(f"{card.repo}#{card.number}: {err}")
+                continue
+        claimed = card.state != "closed" and (store.claim_of(card.repo, card.number) is not None)
+        derived = boardstatus.derive(card.state, has_open_pull, claimed)
+        extra = card.extra if isinstance(card.extra, dict) else {}
+        current_name = extra.get("board_status") or ""
+        current = by_name.get(current_name) if current_name else ""
+        record = store.status_set_of(card.repo, card.number)
+        action, payload = boardstatus.decide(current, record, derived, ids)
+        if action == "record":
+            store.record_status_set(
+                card.repo, card.number, payload.option_id, payload.derived, now=now
+            )
+        elif action == "write":
+            if len(written) >= limit:
+                continue
+            try:
+                write(card.repo, card.number, payload)
+            except iface.TrackerRateLimited as err:
+                errors.append(
+                    f"{repo}: board status rate limited, retry after {err.retry_after:g}s"
+                    f" ({err}); the rest carries to the next pass"
+                )
+                return StatusOutcome(tuple(written), tuple(errors), tuple(status_errors))
+            except iface.TrackerError as err:
+                status_errors.append(f"{card.repo}#{card.number}: {err}")
+                continue
+            store.record_status_set(card.repo, card.number, payload, derived, now=now)
+            written.append(f"{card.repo}#{card.number}")
+    return StatusOutcome(tuple(written), tuple(errors), tuple(status_errors))
+
+
 def sync_board_repo(
     store: board.Store,
     reader,
@@ -224,6 +335,12 @@ def sync_board_repo(
     board through the reader, up to its adopt cap; a truncated poll
     skips the adopt, since partial membership cannot prove anything
     missing. Failed adds are reported without failing the sync.
+
+    Every poll, complete or resumed, also syncs the Status column from
+    the derived state through the reader, up to its status cap: each
+    card's decision is independent, so a partial view still sets the
+    cards it holds. Failed writes are reported without failing the
+    sync.
     """
     old = store.get_cursor(repo, BOARD_CURSOR_NAME)
     page_after = store.get_cursor(repo, BOARD_PAGE_NAME)
@@ -246,6 +363,7 @@ def sync_board_repo(
     adopt_errors, adopt_outage, adopt_refused = _adopt_after_poll(
         reader, schema, repo, found, page_after=page_after, resume=resume, now=now
     )
+    status = sync_board_status(store, reader, schema, repo, found, now=now)
     if resume is None:
         store.clear_cursor(repo, BOARD_PAGE_NAME)
     else:
@@ -254,10 +372,11 @@ def sync_board_repo(
         return SyncResult(
             0,
             old,
-            tuple(adopt_outage),
+            tuple(adopt_outage) + tuple(status.errors),
             store_errors=tuple(store_errors),
             refused=tuple(adopt_refused),
             adopt_errors=tuple(adopt_errors),
+            status_errors=tuple(status.status_errors),
         )
     cursor = iface.format_cursor(max(item.updated_at for item in found))
     if before is not None and before > iface.parse_cursor(cursor):
@@ -266,10 +385,11 @@ def sync_board_repo(
     return SyncResult(
         seen,
         cursor,
-        tuple(adopt_outage),
+        tuple(adopt_outage) + tuple(status.errors),
         store_errors=tuple(store_errors),
         refused=tuple(adopt_refused),
         adopt_errors=tuple(adopt_errors),
+        status_errors=tuple(status.status_errors),
     )
 
 

@@ -131,6 +131,7 @@ what it means. Do not edit this table by hand.
 | `board.poll_pages` | `5` | board poll page cap per pass (default: small) |
 | `board.ready` | `'ready'` | label that makes an issue eligible |
 | `board.schema_max_age_s` | `3600` | seconds before the board step refreshes the cached board schema |
+| `board.status_per_pass` | `20` | board Status writes per repo per pass (default: 20; 0 or less syncs nothing) |
 | `checks.no_em_dash` | `True` | takeoff refuses added lines and bodies with an em-dash |
 | `checks.takeoff` | `[]` | takeoff gate commands, run in order in the worktree |
 | `checks.test` | `''` | the test command the agent and takeoff run |

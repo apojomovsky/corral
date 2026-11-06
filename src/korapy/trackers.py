@@ -10,6 +10,7 @@ too: paced REST for label mode, the raw ``gh`` runner for board mode
 
 from typing import NamedTuple
 
+from korapy import boardstatus
 from korapy import tracker as iface
 from korapy.github import gh
 from korapy.github.board import BoardReader, BoardSchema, BoardTracker, GithubBoardProvisioner
@@ -73,11 +74,14 @@ class BoardBackedTracker(BoardTracker):
     new instance, so nothing goes stale across passes.
     """
 
-    def __init__(self, board_config, run, pacer=None, *, max_pages, adopt_limit=None):
+    def __init__(
+        self, board_config, run, pacer=None, *, max_pages, adopt_limit=None, status_limit=None
+    ):
         super().__init__(board_config, run, pacer, max_pages=max_pages)
         self._project = None
         self._board_schema: BoardSchema | None = None
         self._adopt_limit = adopt_limit
+        self._status_limit = status_limit
 
     @property
     def board_poll_pages(self) -> int:
@@ -88,6 +92,24 @@ class BoardBackedTracker(BoardTracker):
     def board_adopt_limit(self) -> int | None:
         """The per-repo-per-pass adopt cap carried from settings, or None when unset."""
         return self._adopt_limit
+
+    @property
+    def board_status_limit(self) -> int | None:
+        """The per-repo-per-pass Status write cap carried from settings.
+
+        None when unset: the status step then stays read-only, the way
+        the adopt step does without its cap.
+        """
+        return self._status_limit
+
+    @property
+    def board_status_ids(self) -> dict:
+        """The derived key to Status option id map from the board config.
+
+        Only states with a non-empty id are synced; the step reads an
+        empty map as an unmapped project and changes nothing.
+        """
+        return boardstatus.status_ids(self._board)
 
     def _fetch_project_cached(self):
         """The live board project object, fetched once per instance.
@@ -357,18 +379,19 @@ def setup_tracker(entry, *, run=None, pacer=None) -> iface.Tracker:
 
 
 def build_tracker(
-    *, variant, board, max_pages, adopt_limit=None, run=None, pacer=None
+    *, variant, board, max_pages, adopt_limit=None, status_limit=None, run=None, pacer=None
 ) -> iface.Tracker:
     """One repo's tracker from validated settings data: the one factory.
 
     ``variant`` is ``resolved["tracker.variant"]``, ``board`` is the
     resolved ``[repo.board]`` table (or None), ``max_pages`` is the
-    resolved ``board.poll_pages``, and ``adopt_limit`` the resolved
-    ``board.add_per_pass`` (None leaves the board step's adopt off). A
-    missing ``run`` wires the production runners (paced REST for label
-    mode, the raw runner for board mode); tests pass a fake. Unknown
-    variants and board mode without a board table are refused, never
-    run as label mode.
+    resolved ``board.poll_pages``, ``adopt_limit`` the resolved
+    ``board.add_per_pass`` (None leaves the board step's adopt off),
+    and ``status_limit`` the resolved ``board.status_per_pass`` (None
+    leaves the board step's Status sync off). A missing ``run`` wires
+    the production runners (paced REST for label mode, the raw runner
+    for board mode); tests pass a fake. Unknown variants and board mode
+    without a board table are refused, never run as label mode.
     """
     if variant == "labels":
         return GithubTracker(paced_run if run is None else run)
@@ -383,6 +406,7 @@ def build_tracker(
             pacer=pacer,
             max_pages=max_pages,
             adopt_limit=adopt_limit,
+            status_limit=status_limit,
         )
     want = ", ".join(repr(v) for v in sorted(VARIANTS))
     raise ValueError(f"unknown tracker variant {variant!r} (want one of {want})")
@@ -455,6 +479,7 @@ def production_trackers(
                 board=resolved.board,
                 max_pages=resolved["board.poll_pages"],
                 adopt_limit=resolved["board.add_per_pass"],
+                status_limit=resolved["board.status_per_pass"],
             )
         except (ValueError, settings.SettingsError) as err:
             return {}, f"[[repo]] {name}: {err}"

@@ -24,6 +24,8 @@ from tests.test_board_reader import (
     rest_issue,
     schema_payload,
     select_field,
+    select_value,
+    text_field,
     text_value,
 )
 from tests.test_tracker import FakeTracker
@@ -33,6 +35,25 @@ T0 = 1_800_000_100.0
 
 WRITE_MARKER = "BoardWriteText"
 CLEAR_MARKER = "BoardClearField"
+SELECT_MARKER = "BoardWriteSelect"
+
+
+def script_status_schema(run):
+    """One live schema with a two-option Status column."""
+    return script_schema(
+        run,
+        text_field("F_agent", "Agent"),
+        select_field("F_wf", "Status", [("opt-a", "Available"), ("opt-c", "Claimed")]),
+    )
+
+
+def script_select_mutation(run):
+    """One Status option mutation answer."""
+    run.script(
+        SELECT_MARKER,
+        [{"updateProjectV2ItemFieldValue": {"projectV2Item": {"id": "PVTI-7"}}}],
+    )
+    return run
 
 
 def write_tracker(run, max_pages=5, **over):
@@ -370,6 +391,81 @@ class BoardWriteTest(unittest.TestCase):
             write_tracker(run).write(REPO, 7, "agent", "agent-1")
         self.assertNotIsInstance(caught.exception, tracker.TrackerRateLimited)
         self.assertEqual(caught.exception.exit_code, 3)
+
+
+class BoardStatusWriteTest(unittest.TestCase):
+    def test_status_option_write_sends_one_select_mutation(self):
+        run = BoardFakeRun()
+        script_status_schema(run)
+        script_item(run, 7, [select_value("F_wf", "Status", "opt-a", "Available")])
+        script_select_mutation(run)
+        write_tracker(run).write_option(REPO, 7, "opt-c")
+        found = mutations(run, SELECT_MARKER)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            found[0],
+            {"project": "PVT_1", "item": "PVTI_Issue-7", "field": "F_wf", "option": "opt-c"},
+        )
+        self.assertEqual(rest_paths(run), [])
+
+    def test_matching_status_option_sends_no_mutation(self):
+        run = BoardFakeRun()
+        script_status_schema(run)
+        script_item(run, 7, [select_value("F_wf", "Status", "opt-c", "Claimed")])
+        write_tracker(run).write_option(REPO, 7, "opt-c")
+        self.assertEqual(mutations(run, SELECT_MARKER), [])
+
+    def test_unset_status_writes_the_option(self):
+        run = BoardFakeRun()
+        script_status_schema(run)
+        script_item(run, 7)
+        script_select_mutation(run)
+        write_tracker(run).write_option(REPO, 7, "opt-c")
+        self.assertEqual(len(mutations(run, SELECT_MARKER)), 1)
+
+    def test_unmapped_status_column_is_unknown_option(self):
+        run = BoardFakeRun()
+        adapter = write_tracker(run, status_column="")
+        with self.assertRaises(tracker.UnknownOption):
+            adapter.write_option(REPO, 7, "opt-c")
+        self.assertEqual(run.calls, [])
+
+    def test_option_id_missing_from_the_board_is_a_tracker_error(self):
+        run = BoardFakeRun()
+        script_status_schema(run)
+        script_item(run, 7)
+        with self.assertRaises(tracker.TrackerError) as caught:
+            write_tracker(run).write_option(REPO, 7, "opt-gone")
+        self.assertNotIsInstance(caught.exception, tracker.UnknownOption)
+        self.assertEqual(mutations(run, SELECT_MARKER), [])
+
+    def test_text_status_column_is_a_tracker_error(self):
+        run = BoardFakeRun()
+        script_schema(run, text_field("F_wf", "Status"))
+        script_item(run, 7)
+        with self.assertRaises(tracker.TrackerError):
+            write_tracker(run).write_option(REPO, 7, "opt-c")
+        self.assertEqual(mutations(run, SELECT_MARKER), [])
+
+    def test_empty_option_id_is_a_tracker_error(self):
+        run = BoardFakeRun()
+        with self.assertRaises(tracker.TrackerError):
+            write_tracker(run).write_option(REPO, 7, "")
+        self.assertEqual(run.calls, [])
+
+    def test_rate_limit_select_maps_to_tracker_rate_limited(self):
+        run = BoardFakeRun()
+        script_status_schema(run)
+        script_item(run, 7)
+        pacer = FakePacer()
+        run.script(
+            SELECT_MARKER, [gh.GhError("unavailable", "API rate limit exceeded, retry after 45")]
+        )
+        adapter = boardmod.BoardTracker(config(), run, pacer=pacer, max_pages=5)
+        with self.assertRaises(tracker.TrackerRateLimited) as caught:
+            adapter.write_option(REPO, 7, "opt-c")
+        self.assertEqual(caught.exception.retry_after, 45.0)
+        self.assertEqual(len(pacer.cooldowns), 1)
 
 
 class FieldWriteTracker(FakeTracker):

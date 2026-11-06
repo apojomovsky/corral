@@ -141,7 +141,11 @@ class BoardConfig(NamedTuple):
     ``priority_map`` keys are opaque board option ids, never resolved
     against the registry; display names are comments only. Columns default
     to ``""`` (unmapped); at least the board address (the owner plus the
-    number or the node id) is always present."""
+    number or the node id) is always present. The four ``status_*``
+    attributes are the board's Status option ids per derived state
+    (available, claimed, in review, done): a state with no id is never
+    synced, so a project mapping none of them keeps the read-only
+    behavior."""
 
     project_owner: str
     project_number: int | None
@@ -154,6 +158,10 @@ class BoardConfig(NamedTuple):
     pool_column: str
     blocked_by_column: str
     priority_map: dict[str, str]
+    status_available: str = ""
+    status_claimed: str = ""
+    status_review: str = ""
+    status_done: str = ""
 
 
 @dataclass(frozen=True)
@@ -358,12 +366,22 @@ _BOARD_COLUMNS = (
     "blocked_by_column",
 )
 
+#: Concept keys holding a Status option id per derived state; all
+#: default to unmapped when the table omits them, and a state with no
+#: id is never synced.
+_BOARD_STATUS_IDS = (
+    "status_available",
+    "status_claimed",
+    "status_review",
+    "status_done",
+)
+
 #: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
 #: the ``[private]`` precedent: strict keys, so a typo fails here instead
 #: of silently running label mode. Derived from the
-#: address and column groups above (plus ``priority_map``), so a concept
-#: added to one group is never silently dropped by the other.
-_BOARD_KEYS = frozenset(_BOARD_ADDRESS + _BOARD_COLUMNS + ("priority_map",))
+#: address, column and status-id groups above (plus ``priority_map``),
+#: so a concept added to one group is never silently dropped by the other.
+_BOARD_KEYS = frozenset(_BOARD_ADDRESS + _BOARD_COLUMNS + ("priority_map",) + _BOARD_STATUS_IDS)
 
 
 def _split_board(raw, where):
@@ -411,7 +429,7 @@ def _check_board(raw, where):
     if (number is None) == (node is None):
         raise SettingsError(f"{where}: [board] needs exactly one of project_number or project_id")
     columns = {}
-    for key in _BOARD_COLUMNS:
+    for key in _BOARD_COLUMNS + _BOARD_STATUS_IDS:
         if key not in raw:
             columns[key] = ""
             continue
@@ -419,6 +437,10 @@ def _check_board(raw, where):
         if not isinstance(value, str) or not value:
             raise SettingsError(f"{where}: [board] {key} must be a non-empty string")
         columns[key] = value
+    if any(columns[key] for key in _BOARD_STATUS_IDS) and not columns["status_column"]:
+        raise SettingsError(
+            f"{where}: [board] status option ids need status_column to name the Status column"
+        )
     mapping = raw.get("priority_map", {})
     if not isinstance(mapping, dict):
         raise SettingsError(f"{where}: [board] priority_map must be a table of option ids")

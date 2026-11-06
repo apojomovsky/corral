@@ -1881,17 +1881,18 @@ def sync_all(store, tracker_factory, *, operators, now):
     ``tracker_factory`` maps a tracker repo to its tracker (labels or
     board, built by the one factory); board repos run the feed step then
     the board step, and a complete board poll also adopts the tracker's
-    missing issues onto the board through the same reader. Returns
-    (seen, errors, store_errors, refused, adopt_errors): the rows
-    applied, one line per tracker/outage failure, one line per corrupt
-    stored row, one line per refused read (a validation rejection the
-    tracker answered, toward exit 1, never 3), and one line per failed
-    board add (retried next pass, never counted toward an exit). A
-    failed repo keeps its rows and its cursor (that is `sync_repo`'s
-    contract) and the pass moves on to the next repo; a repo the
-    factory does not know is an error line, never a silent skip. With
-    no factory there is nothing to sync from: no rows move and no
-    errors are reported.
+    missing issues onto the board through the same reader, while every
+    poll also syncs the Status column from the derived state. Returns
+    (seen, errors, store_errors, refused, adopt_errors, status_errors):
+    the rows applied, one line per tracker/outage failure, one line per
+    corrupt stored row, one line per refused read (a validation rejection
+    the tracker answered, toward exit 1, never 3), one line per failed
+    board add and one per failed Status write (both retried next pass,
+    never counted toward an exit). A failed repo keeps its rows and its
+    cursor (that is `sync_repo`'s contract) and the pass moves on to the
+    next repo; a repo the factory does not know is an error line, never
+    a silent skip. With no factory there is nothing to sync from: no
+    rows move and no errors are reported.
 
     The repo list itself parses no row JSON (`Store.repos`), so one
     corrupt row cannot hide the healthy repos; each repo's rows are then
@@ -1903,12 +1904,13 @@ def sync_all(store, tracker_factory, *, operators, now):
     read setup aborts earlier with exit 4 on a corrupt row anyway.
     """
     if tracker_factory is None:
-        return 0, [], [], [], []
+        return 0, [], [], [], [], []
     seen = 0
     errors = []
     store_errors = []
     refused = []
     adopt_errors: list = []
+    status_errors: list = []
     try:
         repos = store.repos()
     except (board.StoreError, sqlite3.Error) as err:
@@ -1961,7 +1963,8 @@ def sync_all(store, tracker_factory, *, operators, now):
         refused.extend(board_result.refused)
         store_errors.extend(board_result.store_errors)
         adopt_errors.extend(board_result.adopt_errors)
-    return seen, errors, store_errors, refused, adopt_errors
+        status_errors.extend(board_result.status_errors)
+    return seen, errors, store_errors, refused, adopt_errors, status_errors
 
 
 def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_after):
@@ -4585,16 +4588,23 @@ def _launching_pass(
     if journal_path is not None:
         journal_write({"event": "pass_start", "at": now, "host": host or ""})
     try:
-        seen, sync_errors, sync_store_errors, sync_refused, sync_adopt_errors = sync_all(
-            store, tracker_factory, operators=operators, now=now
-        )
+        (
+            seen,
+            sync_errors,
+            sync_store_errors,
+            sync_refused,
+            sync_adopt_errors,
+            sync_status_errors,
+        ) = sync_all(store, tracker_factory, operators=operators, now=now)
     except board.StoreError as problem:
         print(f"korapy drive: {problem}", file=err)
         return finish(USAGE)
     except sqlite3.Error as problem:
         print(f"korapy drive: cannot read the store: {problem}", file=err)
         return finish(USAGE)
-    for line in sync_errors + sync_store_errors + sync_refused + sync_adopt_errors:
+    for line in (
+        sync_errors + sync_store_errors + sync_refused + sync_adopt_errors + sync_status_errors
+    ):
         print(f"korapy drive: {line}", file=err)
     if hub is not None:
         if not getattr(hub, "host_id", ""):
