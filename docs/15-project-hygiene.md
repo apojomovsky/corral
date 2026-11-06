@@ -124,10 +124,13 @@ misspelled selector must refuse, not clean the wrong set.
 PROPOSED. New module `hygiene.py` owns one resolver,
 `hygiene.declared_roots(rules)`, returning `{name: realpath}`
 for every rule with a directory root. It is the only function
-that joins a rule's `base` and `path`. `diskcli` builds its
-production roots through it; no second resolver is allowed, and
-a test asserts the copies agree wherever a value must be
-repeated (the AGENTS.md rule for repeated facts).
+that joins a rule's `base` and `path`. Validation
+(section 3.2) and the big-directory skip (section 5) take
+paths only from `declared_roots()` and never join `base`
+and `path` themselves. `diskcli` builds its production roots
+through it; no second resolver is allowed, and a test asserts
+no second `base` plus `path` join exists anywhere (the
+AGENTS.md one-fact-one-place rule).
 
 Bases come from a fixed vocabulary, each resolved by its
 existing helper: `cache` from `paths.cache_dir()`, `state`
@@ -190,7 +193,7 @@ kept sessions.
   ("modification time is unreadable", the `disk.py` precedent).
   Symlinks are never followed and never removed; an entry that
   resolves outside the declared roots is dropped with a note.
-- `count`: entries are ordered by mtime, ties broken by name;
+- `count`: entries are ordered by mtime, ties broken by ascending name;
   all but the newest `keep` are safe. The plan names the
   survivors, so a reviewer can see what stays. Apply re-sorts
   before deleting: a new entry between plan and apply shifts
@@ -208,7 +211,9 @@ and parses repository, tag, image ID and creation time; the
 container side runs `docker ps` and resolves each container to
 its image digest. An image is safe when no running container
 uses its ID and, when the rule sets `older_than_days`, its
-creation time is older than the floor. Kept images say why:
+creation time is older than the floor. The plan carries one
+row per image ID, listing all its tags, so several tags
+sharing one ID never plan twice. Kept images say why:
 "used by container `<name>`" or "built `<n>`d ago, floor is
 `<m>`d".
 
@@ -278,7 +283,8 @@ now"), the `disk.ApplyResult.kept` precedent.
   meaning, and hygiene inputs never change a reading. Hygiene
   rows only join the candidates, largest first, in the same
   ordering. Subdirs covered by a hygiene rule are skipped by
-  the `BIG_DIR_BYTES` sweep so one root is never reported
+  the `BIG_DIR_BYTES` sweep, which takes its managed paths only
+  from `declared_roots()`, so one root is never reported
   twice: hygiene owns them (one fact, one place).
 - The heavy-lane ledger and the review records are never
   candidates. The resolver excludes the heavy ledger dir, the
@@ -292,8 +298,8 @@ now"), the `disk.ApplyResult.kept` precedent.
 
 PROPOSED. The core stays pure; every read and every deletion
 goes through an injectable seam, following the `gc.git`,
-`disk.usage` / `disk.walk` and `diskcli.production_remove`
-precedents:
+`disk.plan` `usage` / `walk` parameters and
+`diskcli.production_remove` precedents:
 
 - `scan(root)` lists directory entries with mtime, size and
   symlink bits. Production reuses the `disk.measure` /
@@ -362,8 +368,8 @@ existing rows:
 ```text
 pressure: low
   /home/someone/state/korapy: 6.00 GB free (12%)
-  [safe] hygiene-image acme-dev:aa00001 (2.00 GB): rule acme-images; no container uses deadbee; built 8d ago, floor 3d
-  [keep] hygiene-image acme-dev:aa00002 (2.00 GB): kept: built 21h ago, floor is 3d
+  [safe] hygiene-image deadbee (tags acme-dev:aa00001, acme-dev:aa00002; 2.00 GB): rule acme-images; no container uses it; built 8d ago, floor 3d
+  [keep] hygiene-image facefeed (tags acme-dev:aa00003; 2.00 GB): kept: built 21h ago, floor is 3d
   [safe] hygiene-dir /home/someone/cache/acme/scratch/run-4 (1.50 GB): rule acme-scratch; untouched for 9d, a regular entry inside the cache dir
   [keep] hygiene-dir /home/someone/cache/acme/scratch/run-9 (5.00 MB): kept: touched 2d ago, rule keeps 7d
 ```
@@ -390,8 +396,10 @@ x86_64, Docker client and server 29.9.0), each read-only:
 - `docker system df -v` shows a per-image `CONTAINERS`
   count, a second unreferenced signal.
 
-UNVERIFIED, each with the safe read-only probe that settles
-it (run none of these with a mutating flag while learning):
+UNVERIFIED, each with the safe probe that settles
+it (probes 1-4 are read-only: run none of those with a
+mutating flag while learning; probe 5 mutates only scratch
+images on a scratch host):
 
 1. The exact `reference=` glob dialect across daemon
    versions (does `*` cross the `/` in `registry/repo`?).
@@ -414,6 +422,12 @@ it (run none of these with a mutating flag while learning):
    `docker images --format '{{.Repository}}:{{.Tag}}
    {{.ID}} {{.CreatedAt}}'` before and after retagging a
    scratch image.
+5. What `docker rmi <id>` does when several tags share one
+   image ID (whether the image goes away or only untags,
+   and which tag names remain). Probe, on a scratch host
+   only: build a scratch image, tag it twice, remove by ID,
+   and list the remaining tags; never run this against a
+   real project image. Settles before ticket 3.
 
 ## 9. Implementation ticket breakdown
 
@@ -425,14 +439,17 @@ real filesystem in tests.
    the exit 4 refusals (including image prefixes that do
    not start with the rule's repo and prefixes that
    overlap across rules), plus the resolver test that pins
-   one fact one place.
+   one fact one place by asserting no second `base` plus
+   `path` join exists.
 2. Directory planning: age, count and size selectors as pure
    code over injected scans, with adversarial fakes
    (symlink, unreadable mtime, escape, an mtime tie under
    `count` proving the documented name order).
 3. Image planning: prefix filtering and the unreferenced
-   proof over injected image and container listings,
-   including a tag that moves between plan and apply.
+   proof over injected image and container listings, one row
+   per image ID listing all its tags, including a tag that
+   moves between plan and apply; starts after the section 8
+   multi-tag `rmi` probe settles.
 4. Session planning: the `disk.py` proof reused, non-ticket
    names kept as unproven, `reviews/` never a candidate.
 5. Disk wiring: plan section, `--apply` with re-verification,
