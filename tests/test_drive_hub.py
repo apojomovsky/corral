@@ -658,6 +658,7 @@ class HubStuckWiringTest(unittest.TestCase):
             "stop_unit": FakeStop(),
             "restarter": FakeLauncher(),
             "stuck_project": lambda repo, number: "blue",
+            "driven": {"blue": frozenset({"app"})},
         }
         values.update(fields)
         code = drive_pass(
@@ -896,6 +897,32 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         self.assertEqual(seen.get("live_units"), frozenset())
         self.assertTrue(seen.get("plan"))
         self.assertIn("acme/app#7", logged)
+
+    def test_plan_hands_a_non_none_driven_to_run_pass(self):
+        seen = {}
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return 0
+
+        with mock.patch.object(drive, "run_pass", side_effect=spy):
+            code, _logged, _errors = self.run_plan()
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(seen.get("driven"))
+        self.assertEqual(seen["driven"], {"blue": frozenset({"acme/app"})})
+
+    def test_claiming_pass_hands_a_non_none_driven_to_run_pass(self):
+        seen = {}
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return 0
+
+        with mock.patch.object(drive, "run_pass", side_effect=spy):
+            code, _logged, _errors = self.run_non_plan()
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(seen.get("driven"))
+        self.assertEqual(seen["driven"], {"blue": frozenset({"acme/app"})})
 
     def test_non_plan_with_unusable_token_path_is_a_usage_error(self):
         with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
