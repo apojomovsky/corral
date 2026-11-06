@@ -523,7 +523,7 @@ done
 with CPU and memory limits, releasing the slot on exit; `--plan`
 reports the verdict without queueing or running. Everything after
 `--` is the queued command. `heavy status` is the rollup of the lane:
-holders, waiters and learned costs. An empty lane is an empty list,
+holders, waiters, learned costs and the last few recent rows. An empty lane is an empty list,
 not a failure.
 
 A renamed tracker repository keeps its issues, so plain reads keep
