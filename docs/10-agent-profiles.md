@@ -153,7 +153,7 @@ layer, and provenance always names both the layer and the source.
 | 3 | temp | temporary override with `until` (section 4) | local |
 | 4 | project | local per-project selection; else the repo's committed default | local wins, committed fallback |
 | 5 | role | local per-role selection; else the committed per-role default | local wins, committed fallback |
-| 6 | default | local `profile.default`; else the committed default; else the built-in `default` | local wins, committed fallback |
+| 6 | default | local `profile.default`; else the committed default; else the declared `[profiles.default]`; else the built-in `default` | local wins, committed fallback |
 
 Concretely:
 

@@ -230,10 +230,9 @@ def declared_default(parsed: Mapping[str, Profile]) -> Profile | None:
     at layer 6. Every reader of the default goes through here, so the
     resolver, `show` and the launch path agree with `list`.
     """
-    if isinstance(parsed, dict):
-        found = parsed.get(DEFAULT_PROFILE_NAME)
-        if isinstance(found, Profile):
-            return found
+    found = parsed.get(DEFAULT_PROFILE_NAME)
+    if isinstance(found, Profile):
+        return found
     return None
 
 
