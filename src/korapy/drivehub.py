@@ -281,20 +281,23 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 return drive.USAGE
             moment = time.time()
             try:
+                repo_map = drive.production_repo_map(registered)
                 planned_states, _, planned_tickets = drive.production_stuck_inputs(
-                    registered, now=moment, git=syncli._git
+                    registered, now=moment, mapping=repo_map
                 )
                 planned_finished = drive.production_finished_for(
-                    registered, now=moment, git=syncli._git
+                    registered, now=moment, mapping=repo_map
                 )
                 planned_roles = drive.production_agent_roles(now=moment)
-                planned_reviews = drive.production_review_reader(registered, git=syncli._git)
+                planned_reviews = drive.production_review_reader(
+                    registered, git=syncli._git, mapping=repo_map
+                )
             except settings.SettingsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
                 return drive.USAGE
             try:
                 _, planned_live, _ = drive.production_orphan_inputs(
-                    registered, now=moment, git=syncli._git
+                    registered, now=moment, mapping=repo_map
                 )
             except settings.SettingsError as problem:
                 print(f"korapy drive: {problem}", file=sys.stderr)
@@ -314,11 +317,13 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 err=sys.stderr,
                 hold_label=hold_label,
                 pause_path=drive.pause_path(),
+                projects_fn=lambda: registered,
                 agent_states=planned_states,
                 finished_for=planned_finished,
                 agent_roles=planned_roles,
                 agent_tickets=planned_tickets,
                 live_units=planned_live,
+                repo_map=repo_map,
                 review_reader=planned_reviews,
             )
         try:
@@ -349,12 +354,15 @@ def cmd_drive(args: argparse.Namespace) -> int:
 
         moment = time.time()
         try:
+            repo_map = drive.production_repo_map(registered)
             stuck_states, stuck_stale, stuck_tickets = drive.production_stuck_inputs(
-                registered, now=moment, git=syncli._git
+                registered, now=moment, mapping=repo_map
             )
-            finished_for = drive.production_finished_for(registered, now=moment, git=syncli._git)
+            finished_for = drive.production_finished_for(registered, now=moment, mapping=repo_map)
             agent_roles = drive.production_agent_roles(now=moment)
-            review_reader = drive.production_review_reader(registered, git=syncli._git)
+            review_reader = drive.production_review_reader(
+                registered, git=syncli._git, mapping=repo_map
+            )
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
@@ -382,6 +390,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             day_path=drive.day_path(),
             max_starts=max_starts,
             hub=hub,
+            repo_map=repo_map,
             review_reader=review_reader,
             pulls_for=drive.tracker_pulls_for(tracker_factory),
         )
