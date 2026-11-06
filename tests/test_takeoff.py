@@ -16,7 +16,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from korapy import heavy, leakcli, reviewrecord, settings, syncli, takeoff
+from korapy import heavy, leakcli, reviewrecord, settings, takeoff
 from korapy.gitenv import clean_env
 
 REPO = "myrepo"
@@ -676,12 +676,12 @@ class TakeoffCase(unittest.TestCase):
             'tracker.repo = "acme/myrepo"\n'
             'checks.test = "make test"\n'
         )
-        builds = []
-        real_map = syncli.short_to_tracker
+        reads = []
+        real_load = settings._load
 
-        def counting(root, git):
-            builds.append(root)
-            return real_map(root, git)
+        def counting(path):
+            reads.append(path)
+            return real_load(path)
 
         seen = []
         real_local = reviewrecord.local_repo
@@ -691,11 +691,15 @@ class TakeoffCase(unittest.TestCase):
             return real_local(repo, mapping)
 
         with (
-            mock.patch.object(syncli, "short_to_tracker", side_effect=counting),
+            mock.patch.object(settings, "_load", side_effect=counting),
             mock.patch.object(reviewrecord, "local_repo", side_effect=spying),
         ):
             result = self.gate()
-        self.assertEqual(len(builds), 1)
+        project_path = os.path.join(self.ops, "korapy.toml")
+        # One parse feeds the covering match, the tracker map and the
+        # resolved settings; the private terms read the file again
+        # through their own seam (see the leak tests).
+        self.assertEqual(reads.count(project_path), 2)
         self.assertEqual(seen, ["acme/myrepo"])
         self.assertEqual(self.status(result, "review"), "ok")
         self.assertEqual(result.exit_code, 0)
@@ -742,6 +746,86 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(self.cmd_calls, [("make second", self.work)])
         self.assertEqual(self.status(result, "review"), "ok")
         self.assertEqual(result.exit_code, 0)
+
+    def test_repo_state_parses_the_project_file_once(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'tracker.repo = "acme/myrepo"\n'
+            'checks.test = "make test"\n'
+        )
+        reads = []
+        real_load = settings._load
+
+        def counting(path):
+            reads.append(path)
+            return real_load(path)
+
+        def no_git(args, cwd):
+            raise AssertionError("the map must come from the single parse, not git")
+
+        with mock.patch.object(settings, "_load", side_effect=counting):
+            state = takeoff._repo_state(self.ops, self.main, no_git)
+        project_path = os.path.join(self.ops, "korapy.toml")
+        self.assertEqual(reads.count(project_path), 1)
+        short_map, ticket_repo, short, matched, resolved = state
+        self.assertEqual(short_map, {REPO: "acme/myrepo"})
+        self.assertEqual((ticket_repo, short, matched), ("acme/myrepo", REPO, True))
+        self.assertEqual(resolved["checks.test"], "make test")
+
+    def test_repo_state_map_is_fail_soft_when_no_tracker_spelling_resolves(self):
+        reads = []
+        real_load = settings._load
+
+        def counting(path):
+            reads.append(path)
+            return real_load(path)
+
+        def bad_git(args, cwd):
+            return _proc(args, 1, "")
+
+        with mock.patch.object(settings, "_load", side_effect=counting):
+            state = takeoff._repo_state(self.ops, self.main, bad_git)
+        project_path = os.path.join(self.ops, "korapy.toml")
+        self.assertEqual(reads.count(project_path), 1)
+        short_map, ticket_repo, short, matched, resolved = state
+        self.assertEqual(short_map, {})
+        self.assertEqual((ticket_repo, short, matched), (REPO, REPO, True))
+        self.assertEqual(resolved["checks.test"], "make test")
+
+    def test_repo_state_without_an_ops_root_falls_back_to_the_clone_name(self):
+        short_map, ticket_repo, short, matched, resolved = takeoff._repo_state(
+            None, self.main, self.run_cmd
+        )
+        self.assertEqual((short_map, ticket_repo, short, matched), ({}, "main", None, False))
+
+    def test_repo_state_matches_a_relative_clone_path_from_a_foreign_directory(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-takeoff-relative-")
+        self.addCleanup(tmp.cleanup)
+        root = os.path.realpath(tmp.name)
+        ops = os.path.join(root, "ops")
+        clone = os.path.join(root, "clone")
+        # Nested, so a relative clone.path resolved against the working
+        # directory lands somewhere else: only the ops root is correct.
+        foreign = os.path.join(root, "elsewhere", "deep")
+        os.makedirs(ops)
+        os.makedirs(clone)
+        os.makedirs(foreign)
+        with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\nclone.path = "../clone"\ntracker.repo = "acme/app"\n'
+            )
+        previous = os.getcwd()
+        os.chdir(foreign)
+        try:
+            state = takeoff._repo_state(ops, os.path.realpath(clone), self.run_cmd)
+        finally:
+            os.chdir(previous)
+        short_map, ticket_repo, short, matched, _resolved = state
+        self.assertEqual(short_map, {"app": "acme/app"})
+        self.assertEqual((ticket_repo, short, matched), ("acme/app", "app", True))
 
     def test_takeoff_commands_run_through_the_seam(self):
         self.write_ops(
@@ -1605,47 +1689,6 @@ class NoEmDashInCodeCase(unittest.TestCase):
 class TakeoffDocstringCase(unittest.TestCase):
     def test_exit_zero_line_names_planned_rows(self):
         self.assertIn("0 every check ok, skipped or planned", takeoff.__doc__ or "")
-
-
-class TicketRepoRelativePath(unittest.TestCase):
-    """`_ticket_repo` with a relative `clone.path`: the ops root wins from any cwd.
-
-    The triple carries the covering short alongside the ticket
-    spelling, so settings load under the matched entry even when the
-    reverse lookup would prefer another entry feeding the same
-    tracker repo.
-    """
-
-    def test_relative_clone_path_matches_from_a_foreign_working_directory(self):
-        tmp = tempfile.TemporaryDirectory(prefix="korapy-ticket-repo-")
-        self.addCleanup(tmp.cleanup)
-        root = os.path.realpath(tmp.name)
-        ops = os.path.join(root, "ops")
-        clone = os.path.join(root, "clone")
-        # Nested, so a relative clone.path resolved against the working
-        # directory lands somewhere else: only the ops root is correct.
-        foreign = os.path.join(root, "elsewhere", "deep")
-        os.makedirs(ops)
-        os.makedirs(clone)
-        os.makedirs(foreign)
-        with open(os.path.join(ops, "korapy.toml"), "w", encoding="utf-8") as handle:
-            handle.write('[[repo]]\nname = "app"\nclone.path = "../clone"\n')
-        previous = os.getcwd()
-        os.chdir(foreign)
-        try:
-            self.assertEqual(
-                takeoff._ticket_repo(ops, os.path.realpath(clone), {"app": "acme/app"}),
-                ("acme/app", "app", True),
-            )
-            self.assertEqual(
-                takeoff._ticket_repo(ops, os.path.realpath(clone), {}), ("app", "app", True)
-            )
-            self.assertEqual(
-                takeoff._ticket_repo(None, os.path.realpath(clone), {}),
-                ("clone", None, False),
-            )
-        finally:
-            os.chdir(previous)
 
 
 if __name__ == "__main__":
