@@ -379,9 +379,11 @@ def cmd_drive(args: argparse.Namespace) -> int:
             launcher=drive.production_launcher(registered, store=store, hold_label=hold_label),
             agent_states=stuck_states,
             stale_s=stuck_stale,
-            stop_unit=drive.production_stopper(registered),
+            stop_unit=drive.production_stopper(registered, mapping=repo_map),
             restarts_path=drive.restarts_path(),
-            stuck_project=lambda repo, number: drive.production_stuck_project(registered, repo),
+            stuck_project=lambda repo, number: drive.production_stuck_project(
+                registered, repo, mapping=repo_map
+            ),
             agent_roles=agent_roles,
             agent_tickets=stuck_tickets,
             finished_for=finished_for,
