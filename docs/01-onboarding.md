@@ -102,7 +102,8 @@ Everything a project might reasonably do differently is a named setting with a d
 | `checks.test` | detected (see 3) | the command the agent and takeoff run |
 | `checks.takeoff` | `[checks.test]` | any list of commands; each must exit 0 |
 | `checks.timeout_s` | `1800` | seconds before a takeoff command is killed |
-| `checks.suite_lock_timeout_s` | `3600` | seconds a second takeoff waits for the full-suite lock before giving up (exit 75) |
+| `[heavy]` `cpu_m`, `memory_mb` | the host budget | the lane caps; a cap above the host budget is refused (exit 4) |
+| `[heavy]` `commands`, `default_weight` | `1000` millicores, `1000` MB | the commands that run through the heavy lane and their weights; a listed command runs in a transient scope with lane limits and records one ledger row, an unlisted command runs as before |
 | `agents.cap` | 1 | this project's ceiling on the host |
 | `review.budget.base_minutes` | `15` | reviewer minutes before the diff size matters |
 | `review.budget.seconds_per_line` | `6` | reviewer seconds per changed line |

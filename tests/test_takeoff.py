@@ -5,7 +5,6 @@ and the remote read (`ls_remote`) and the check commands (`run_cmd`)
 are injected fakes. No `gh`, no network, no real state dirs.
 """
 
-import errno
 import io
 import json
 import os
@@ -17,7 +16,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from korapy import leakcli, reviewrecord, settings, takeoff
+from korapy import heavy, leakcli, reviewrecord, settings, takeoff
 from korapy.gitenv import clean_env
 
 REPO = "myrepo"
@@ -28,43 +27,6 @@ MAIN = "main"
 
 def _proc(cmd, code, out):
     return subprocess.CompletedProcess(args=cmd, returncode=code, stdout=out, stderr="")
-
-
-class _FakeClock:
-    """A monotonic clock a fake sleep advances: lock waits take no time."""
-
-    def __init__(self):
-        self.now = 1000.0
-        self.sleeps = []
-
-    def monotonic(self):
-        return self.now
-
-    def sleep(self, seconds):
-        self.sleeps.append(seconds)
-        self.now += seconds
-
-
-class _ContendedFlock:
-    """A `_flock` fake refusing the first `times` acquires, None for always.
-
-    Contention reads as EWOULDBLOCK, the way a held flock answers a
-    non-blocking try.
-    """
-
-    def __init__(self, times: int | None):
-        self.times = times
-        self.calls: list[int] = []
-
-    def __call__(self, fd: int, flags: int) -> None:
-        self.calls.append(flags)
-        if self.times is None or len(self.calls) <= self.times:
-            raise OSError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
-
-
-def _contended(times: int | None) -> _ContendedFlock:
-    """A `_ContendedFlock` refusing the first `times` acquires, None for always."""
-    return _ContendedFlock(times)
 
 
 class TakeoffCase(unittest.TestCase):
@@ -127,6 +89,17 @@ class TakeoffCase(unittest.TestCase):
         self.ls_calls = []
         self.cmd_results = {}
         self.cmd_calls = []
+        self.heavy_calls = []
+        self.heavy_error = None
+        self.heavy_result = heavy.RunResult(
+            command_exit=0,
+            exit_code=0,
+            output="heavy ok\n",
+            weight=heavy.Weight(cpu_m=3000, memory_mb=6144),
+            wall_s=1.0,
+            unit="heavy-test",
+            argv_hash="aa",
+        )
         self.write_record(self.head, verdict="approve")
 
     def git(self, *args, cwd, target=None):
@@ -183,6 +156,37 @@ class TakeoffCase(unittest.TestCase):
         code, out = self.cmd_results.get(cmd, (0, "ok\n"))
         return _proc(cmd, code, out)
 
+    def heavy_run(
+        self,
+        argv,
+        cwd,
+        env,
+        *,
+        role,
+        repo,
+        weight,
+        budget,
+        timeout,
+        host=None,
+        pressure=None,
+        starved_ratio=0.2,
+    ):
+        self.heavy_calls.append(
+            {
+                "argv": list(argv),
+                "cwd": cwd,
+                "role": role,
+                "repo": repo,
+                "weight": weight,
+                "budget": budget,
+                "timeout": timeout,
+                "starved_ratio": starved_ratio,
+            }
+        )
+        if self.heavy_error is not None:
+            raise self.heavy_error
+        return self.heavy_result
+
     def gate(self, **kwargs):
         params = {
             "body_file": self.body,
@@ -190,25 +194,42 @@ class TakeoffCase(unittest.TestCase):
             "ops_dir": self.ops,
             "ls_remote": self.ls_remote,
             "run_cmd": self.run_cmd,
+            "heavy_run": self.heavy_run,
         }
         params.update(kwargs)
         return takeoff.run_takeoff(self.work, **params)
+
+    def write_heavy_ops(self, takeoff_cmd="make test", caps=True, host=True):
+        lines = [
+            "[[repo]]",
+            f'name = "{REPO}"',
+            f'clone.path = "{self.main}"',
+            f'clone.default_branch = "{MAIN}"',
+            f'checks.test = "{takeoff_cmd}"',
+            "[heavy]",
+        ]
+        if caps:
+            lines += ["cpu_m = 4000", "memory_mb = 8192"]
+        lines += [
+            "[heavy.default_weight]",
+            "cpu_m = 1000",
+            "memory_mb = 1024",
+            '[heavy.commands."make check"]',
+            "cpu_m = 3000",
+            "memory_mb = 6144",
+        ]
+        self.write_ops("\n".join(lines) + "\n")
+        if host:
+            config = os.path.join(os.environ["KORAPY_CONFIG"], "config.toml")
+            os.makedirs(os.path.dirname(config), exist_ok=True)
+            with open(config, "w", encoding="utf-8") as handle:
+                handle.write("[resources.host]\ncpu_m = 8000\nmemory_mb = 16384\npids = 200\n")
 
     def status(self, result, name):
         for check in result.checks:
             if check.name == name:
                 return check.status
         self.fail(f"no check named {name!r}")
-
-    def patch_lock_seams(self, flock, clock):
-        for name, value in (
-            ("_flock", flock),
-            ("_monotonic", clock.monotonic),
-            ("_sleep", clock.sleep),
-        ):
-            patcher = mock.patch.object(takeoff, name, value)
-            patcher.start()
-            self.addCleanup(patcher.stop)
 
     def test_all_ok(self):
         result = self.gate()
@@ -249,6 +270,7 @@ class TakeoffCase(unittest.TestCase):
             ops_dir=self.ops,
             ls_remote=self.ls_remote,
             run_cmd=self.run_cmd,
+            heavy_run=self.heavy_run,
         )
         self.assertEqual(result.exit_code, 1)
         self.assertEqual(self.status(result, "worktree"), "fail")
@@ -661,6 +683,130 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(self.cmd_calls, [("make test", self.work)])
         self.assertEqual(result.exit_code, 0)
 
+    def test_heavy_command_routes_with_the_takeoff_role(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.status(result, "checks"), "ok")
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(len(self.heavy_calls), 1)
+        call = self.heavy_calls[0]
+        self.assertEqual(call["argv"], ["/bin/sh", "-c", "make check"])
+        self.assertEqual(call["cwd"], self.work)
+        self.assertEqual(call["role"], "takeoff")
+        self.assertEqual(call["repo"], heavy.repo_key(self.work))
+        self.assertEqual(call["weight"], heavy.Weight(cpu_m=3000, memory_mb=6144))
+        self.assertEqual(call["timeout"], 1800)
+        self.assertEqual(call["starved_ratio"], 0.2)
+
+    def test_unlisted_command_still_uses_the_plain_seam(self):
+        self.write_heavy_ops(takeoff_cmd="make lint")
+        self.cmd_results["make lint"] = (0, "fine\n")
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.heavy_calls, [])
+        self.assertEqual(self.cmd_calls, [("make lint", self.work)])
+
+    def test_heavy_command_without_an_entry_uses_the_default_weight(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make build"\n'
+            "[heavy]\n"
+            "[heavy.default_weight]\n"
+            "cpu_m = 1000\n"
+            "memory_mb = 1024\n"
+            '[heavy.commands."make build"]\n'
+        )
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(self.heavy_calls), 1)
+        self.assertEqual(self.heavy_calls[0]["weight"], heavy.Weight(cpu_m=1000, memory_mb=1024))
+
+    def test_heavy_command_failure_fails_the_checks_row(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        self.heavy_result = heavy.RunResult(
+            command_exit=2,
+            exit_code=2,
+            output="broken\n",
+            weight=heavy.Weight(cpu_m=3000, memory_mb=6144),
+            wall_s=3.0,
+            unit="heavy-test",
+            argv_hash="aa",
+        )
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 1)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "fail")
+        self.assertIn("make check", found.detail)
+        self.assertIn("exited 2", found.detail)
+        self.assertEqual(self.cmd_calls, [])
+
+    def test_heavy_timeout_fails_like_a_plain_timeout(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        self.heavy_error = subprocess.TimeoutExpired(["systemd-run"], 1800)
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 1)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "fail")
+        self.assertIn("exceeded checks.timeout_s", found.detail)
+
+    def test_unreachable_scope_exits_3_with_a_fail_row(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        self.heavy_error = heavy.ScopeUnreachable("cannot start scope: no bus")
+        result = self.gate(body_file=None)
+        self.assertEqual(result.exit_code, 3)
+        found = [c for c in result.checks if c.name == "checks"][0]
+        self.assertEqual(found.status, "fail")
+        self.assertEqual(self.cmd_calls, [])
+
+    def test_heavy_usage_error_is_exit_4(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        self.heavy_error = heavy.HeavyError("cannot stop scope")
+        with self.assertRaises(takeoff.TakeoffError):
+            self.gate(body_file=None)
+
+    def test_lane_cap_above_the_host_budget_is_exit_4(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make check"\n'
+            "[heavy]\n"
+            "cpu_m = 9000\n"
+            "memory_mb = 8192\n"
+            '[heavy.commands."make check"]\n'
+            "cpu_m = 3000\n"
+            "memory_mb = 6144\n"
+        )
+        with self.assertRaisesRegex(takeoff.TakeoffError, "9000"):
+            self.gate(body_file=None)
+
+    def test_old_suite_lock_setting_is_exit_4(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "checks.suite_lock_timeout_s = 3600\n"
+        )
+        with self.assertRaisesRegex(takeoff.TakeoffError, "unknown setting"):
+            self.gate(body_file=None)
+
+    def test_plan_lists_heavy_commands_without_running(self):
+        self.write_heavy_ops(takeoff_cmd="make check")
+        result = self.gate(body_file=None, plan=True)
+        planned = [c for c in result.checks if c.name == "checks"]
+        self.assertEqual([(c.status, c.detail) for c in planned], [("planned", "`make check`")])
+        self.assertEqual(self.heavy_calls, [])
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(result.exit_code, 0)
+
     def test_a_failing_command_shows_the_tail(self):
         lines = "".join(f"line{i:02d}\n" for i in range(1, 26))
         self.write_ops(
@@ -715,121 +861,6 @@ class TakeoffCase(unittest.TestCase):
                     f"checks.timeout_s = {bad}\n"
                 )
                 with self.assertRaises(takeoff.TakeoffError):
-                    self.gate()
-
-    def test_suite_lock_path_is_under_the_state_dir(self):
-        self.assertEqual(
-            takeoff.suite_lock_path(),
-            os.path.join(os.path.normpath(os.environ["KORAPY_STATE"]), takeoff.SUITE_LOCK_NAME),
-        )
-
-    def test_second_takeoff_waits_for_the_lock_then_runs(self):
-        clock = _FakeClock()
-        flock = _contended(2)
-        self.patch_lock_seams(flock, clock)
-        self.cmd_results["make test"] = (0, "green\n")
-        result = self.gate(body_file=None)
-        self.assertEqual(result.exit_code, 0)
-        self.assertEqual(self.status(result, "checks"), "ok")
-        self.assertEqual(self.cmd_calls, [("make test", self.work)])
-        self.assertEqual(len(flock.calls), 3)
-        self.assertEqual(len(clock.sleeps), 2)
-
-    def test_lock_held_past_the_timeout_exits_75_without_running(self):
-        clock = _FakeClock()
-        self.patch_lock_seams(_contended(None), clock)
-        result = self.gate(body_file=None)
-        self.assertEqual(result.exit_code, 75)
-        found = [c for c in result.checks if c.name == "checks"][0]
-        self.assertEqual(found.status, "fail")
-        self.assertIn("run takeoff again", found.fix)
-        self.assertEqual(self.cmd_calls, [])
-        self.assertTrue(clock.sleeps)
-
-    def test_no_suite_takes_no_lock(self):
-        self.write_ops(
-            "[[repo]]\n"
-            f'name = "{REPO}"\n'
-            f'clone.path = "{self.main}"\n'
-            f'clone.default_branch = "{MAIN}"\n'
-        )
-
-        def exploding(fd, flags):
-            raise AssertionError("the lock must not be taken without suite commands")
-
-        self.patch_lock_seams(exploding, _FakeClock())
-        result = self.gate(body_file=None)
-        self.assertEqual(result.exit_code, 0)
-        self.assertEqual(self.status(result, "checks"), "ok")
-
-    def test_lock_file_is_created_in_the_state_dir(self):
-        path = takeoff.suite_lock_path()
-        if os.path.exists(path):
-            os.unlink(path)
-        result = self.gate(body_file=None)
-        self.assertEqual(result.exit_code, 0)
-        self.assertTrue(os.path.isfile(path))
-
-    def test_non_contention_flock_error_is_a_usage_error(self):
-        def bad_flock(fd, flags):
-            raise OSError(errno.EINVAL, "Invalid argument")
-
-        clock = _FakeClock()
-        self.patch_lock_seams(bad_flock, clock)
-        with self.assertRaises(takeoff.TakeoffError):
-            with takeoff.suite_lock(takeoff.suite_lock_path(), 10):
-                pass
-        self.assertEqual(clock.sleeps, [])
-
-    def test_lock_open_failure_is_a_usage_error(self):
-        path = takeoff.suite_lock_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.isfile(path):
-            os.unlink(path)
-        os.makedirs(path, exist_ok=True)
-        with self.assertRaisesRegex(takeoff.TakeoffError, "cannot open the suite lock"):
-            with takeoff.suite_lock(path, 10):
-                pass
-
-    def test_a_dead_holder_releases_the_lock(self):
-        path = takeoff.suite_lock_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        child = (
-            "import fcntl, os, sys, time; "
-            f"fd = os.open({path!r}, os.O_CREAT | os.O_RDWR, 0o600); "
-            "fcntl.flock(fd, fcntl.LOCK_EX); "
-            "sys.stdout.write('ready\\n'); sys.stdout.flush(); "
-            "time.sleep(60)"
-        )
-        proc = subprocess.Popen(
-            [sys.executable, "-c", child],
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        self.addCleanup(proc.kill)
-        if proc.stdout is None:
-            self.fail("the holder child has no stdout pipe")
-        self.assertEqual(proc.stdout.readline().strip(), "ready")
-        proc.kill()
-        proc.wait(timeout=30)
-        proc.stdout.close()
-        with takeoff.suite_lock(path, 10):
-            pass
-
-    def test_an_invalid_lock_timeout_setting_is_a_usage_error(self):
-        for bad in ("0", "-5", "true", '"soon"'):
-            with self.subTest(value=bad):
-                self.write_ops(
-                    "[[repo]]\n"
-                    f'name = "{REPO}"\n'
-                    f'clone.path = "{self.main}"\n'
-                    f'clone.default_branch = "{MAIN}"\n'
-                    'checks.test = "make test"\n'
-                    f"checks.suite_lock_timeout_s = {bad}\n"
-                )
-                with self.assertRaisesRegex(
-                    takeoff.TakeoffError, "positive number|must be int, not"
-                ):
                     self.gate()
 
     def test_a_detached_head_fails_the_worktree_check(self):
@@ -923,6 +954,7 @@ class TakeoffCase(unittest.TestCase):
                 ops_dir=self.ops,
                 ls_remote=self.ls_remote,
                 run_cmd=self.run_cmd,
+                heavy_run=self.heavy_run,
             )
 
     def test_seams_have_no_default(self):
@@ -935,7 +967,7 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(settings.REGISTRY["checks.no_em_dash"].default, True)
         self.assertEqual(settings.REGISTRY["review.required"].default, True)
         self.assertEqual(settings.REGISTRY["checks.timeout_s"].default, 1800)
-        self.assertEqual(settings.REGISTRY["checks.suite_lock_timeout_s"].default, 3600)
+        self.assertNotIn("checks.suite_lock_timeout_s", settings.REGISTRY)
         self.assertIn("korapy.takeoff", settings.PROVIDERS)
 
     def test_each_policy_check_names_its_flag_skip(self):
@@ -1108,15 +1140,13 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual([c.status for c in planned], ["planned"])
         self.assertEqual(self.cmd_calls, [])
 
-    def test_plan_takes_no_lock(self):
-        clock = _FakeClock()
-        self.patch_lock_seams(_contended(None), clock)
+    def test_plan_runs_nothing(self):
         result = self.gate(body_file=None, plan=True)
         self.assertEqual(result.exit_code, 0)
         planned = [c for c in result.checks if c.name == "checks"][0]
         self.assertEqual(planned.status, "planned")
-        self.assertEqual(clock.sleeps, [])
         self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(self.heavy_calls, [])
 
     def test_plan_with_a_skip_reports_the_skip(self):
         self.write_ops(
@@ -1135,22 +1165,19 @@ class TakeoffCase(unittest.TestCase):
         self.assertEqual(self.cmd_calls, [])
         self.assertEqual(result.exit_code, 0)
 
-    def test_plan_with_no_commands_is_ok_and_takes_no_lock(self):
+    def test_plan_with_no_commands_is_ok_and_runs_nothing(self):
         self.write_ops(
             "[[repo]]\n"
             f'name = "{REPO}"\n'
             f'clone.path = "{self.main}"\n'
             f'clone.default_branch = "{MAIN}"\n'
         )
-
-        def exploding(fd, flags):
-            raise AssertionError("the lock must not be taken without suite commands")
-
-        self.patch_lock_seams(exploding, _FakeClock())
         result = self.gate(body_file=None, plan=True)
         found = [c for c in result.checks if c.name == "checks"][0]
         self.assertEqual(found.status, "ok")
         self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.cmd_calls, [])
+        self.assertEqual(self.heavy_calls, [])
 
     def test_plan_with_test_flag_plans_the_test_command(self):
         result = self.gate(body_file=None, with_test=True, plan=True)
@@ -1255,41 +1282,48 @@ class TakeoffCliCase(unittest.TestCase):
             code = args.func(args)
         self.assertEqual(code, 3)
 
-    def test_cli_suite_busy_exits_75(self):
+    def test_cli_scope_unreachable_exits_3(self):
         from korapy import takeoffcli
         import argparse
 
-        clock = _FakeClock()
-        self.case.patch_lock_seams(_contended(None), clock)
+        self.case.write_heavy_ops(takeoff_cmd="make check")
+        self.case.heavy_error = heavy.ScopeUnreachable("cannot start scope: no bus")
         parser = argparse.ArgumentParser(prog="korapy")
         sub = parser.add_subparsers(dest="command", required=True)
-        takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
+        takeoffcli.add_parser(
+            sub,
+            ls_remote=self.case.ls_remote,
+            run_cmd=self.case.run_cmd,
+            heavy_run=self.case.heavy_run,
+        )
         args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
             code = args.func(args)
-        self.assertEqual(code, 75)
+        self.assertEqual(code, 3)
         self.assertIn("takeoff checks: FAIL", out.getvalue())
         self.assertEqual(self.case.cmd_calls, [])
 
-    def test_cli_lock_setup_failure_exits_4(self):
+    def test_cli_heavy_command_routes_through_the_lane(self):
         from korapy import takeoffcli
         import argparse
 
-        blocker = os.path.join(self.case.tmp, "blocker")
-        with open(blocker, "w", encoding="utf-8") as handle:
-            handle.write("not a directory\n")
-        bad = os.path.join(blocker, takeoff.SUITE_LOCK_NAME)
-        with mock.patch.object(takeoff, "suite_lock_path", return_value=bad):
-            parser = argparse.ArgumentParser(prog="korapy")
-            sub = parser.add_subparsers(dest="command", required=True)
-            takeoffcli.add_parser(sub, ls_remote=self.case.ls_remote, run_cmd=self.case.run_cmd)
-            args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
-            out, err = io.StringIO(), io.StringIO()
-            with redirect_stdout(out), redirect_stderr(err):
-                code = args.func(args)
-        self.assertEqual(code, 4)
-        self.assertIn("cannot set up the suite lock", err.getvalue())
+        self.case.write_heavy_ops(takeoff_cmd="make check")
+        self.case.cmd_results["make check"] = (0, "checked\n")
+        parser = argparse.ArgumentParser(prog="korapy")
+        sub = parser.add_subparsers(dest="command", required=True)
+        takeoffcli.add_parser(
+            sub,
+            ls_remote=self.case.ls_remote,
+            run_cmd=self.case.run_cmd,
+            heavy_run=self.case.heavy_run,
+        )
+        args = parser.parse_args(["takeoff", "--ops", self.case.ops, self.case.work])
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = args.func(args)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.case.heavy_calls), 1)
         self.assertEqual(self.case.cmd_calls, [])
 
     def test_verb_is_on_the_korapy_parser(self):
