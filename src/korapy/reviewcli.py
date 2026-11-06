@@ -77,9 +77,31 @@ def _commit(raw, cwd):
     return None
 
 
+def _session_repo(verb, repo):
+    """`repo` through the one short-name resolver, or None with a loud line.
+
+    The ticket positionals take the short `[[repo]]` entry name or the
+    store's tracker repo; records live under the short name either
+    way. An unresolvable repository names its key on stderr.
+    """
+    from korapy import reviewrecord, settings, syncli
+
+    try:
+        resolved = reviewrecord.local_repo(
+            repo, syncli.short_to_tracker(settings.find_root(os.getcwd()), _git)
+        )
+    except ValueError as err:
+        _err(f"review {verb}: {err}")
+        return None
+    return resolved
+
+
 def cmd_record(args: argparse.Namespace) -> int:
     from korapy import reviewrecord
 
+    repo = _session_repo("record", args.repo)
+    if repo is None:
+        return USAGE
     reviewer = args.reviewer or os.environ.get(AGENT_ID_ENV, "")
     if not reviewer:
         _err(f"review record needs --reviewer (or {AGENT_ID_ENV})")
@@ -100,7 +122,7 @@ def cmd_record(args: argparse.Namespace) -> int:
         findings.append({"severity": severity.strip() or "note", "text": text.strip()})
     try:
         path = reviewrecord.write_record(
-            args.repo,
+            repo,
             args.number,
             commit,
             reviewer=reviewer,
@@ -124,6 +146,9 @@ def cmd_show(args: argparse.Namespace, forge=None) -> int:
     if args.pr is None:
         _err("review show needs --pr N: the base is the PR's base_sha from the forge")
         return NO
+    repo = _session_repo("show", args.repo)
+    if repo is None:
+        return USAGE
     forge_repo = args.forge_repo or ghforge.origin_repo(os.getcwd(), _git)
     if forge_repo is None:
         _err("review show needs --forge-repo owner/name: no forge repo in the origin remote")
@@ -153,15 +178,13 @@ def cmd_show(args: argparse.Namespace, forge=None) -> int:
         _err(f"PR base {pr.base_sha} is not present in this clone")
         return NO
     record, found = mergeup.find_record(
-        lambda c: reviewrecord.read_record(args.repo, args.number, c),
+        lambda c: reviewrecord.read_record(repo, args.number, c),
         commit,
         pr.base_sha,
         cwd,
     )
     if record is None:
-        _err(
-            f"no review record for {args.repo} {args.number} commit {reviewrecord.commit_id(commit)}"
-        )
+        _err(f"no review record for {repo} {args.number} commit {reviewrecord.commit_id(commit)}")
         return NO
     if args.json:
         print(

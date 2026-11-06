@@ -25,6 +25,7 @@ from tests.test_board_reader import (
     text_value,
 )
 from tests.test_board_fields import FakePacer
+from tests.test_reponame import RecordingLock
 from tests.test_tracker import FakeTracker, item_payload, reading
 
 APP = "acme/app"
@@ -127,6 +128,8 @@ class WiringCase(unittest.TestCase):
             "out": self.out,
             "err": self.err,
             "tracker_factory": factory,
+            "lock": RecordingLock(),
+            "lock_path": "/state/drive.lock",
         }
         params.update(over)
         return syncli.sync_root(self.root, list(names), **params)
@@ -142,6 +145,8 @@ class WiringCase(unittest.TestCase):
             "out": self.out,
             "err": self.err,
             "tracker_factory": factory,
+            "lock": RecordingLock(),
+            "lock_path": "/state/drive.lock",
         }
         params.update(over)
         return mirrorcli.mirror_root(self.root, list(names), **params)
