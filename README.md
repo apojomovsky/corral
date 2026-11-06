@@ -118,6 +118,8 @@ Each `reader_path` entry is an absolute directory (after `~` and environment exp
 | `korapy quota refresh [provider]` | run the readers, record readings or failures; exit 3 when every reader failed |
 | `korapy quota mark PROVIDER [--until T] [--reason R]` | block a provider until T (default: now plus the cooldown); exit 1 when a further mark stands |
 | `korapy quota unmark PROVIDER [--reason R]` | release a provider's mark early; exit 1 when none is stored |
+| `korapy heavy run [--timeout SECS] [--plan] [--json] -- CMD [ARGS...]` | queue one heavy command in the lane and run it in a transient scope with CPU and memory limits, releasing the slot on exit; `--plan` reports the verdict without queueing or running; exit 75 past the wait deadline, 3 when a scope cannot be created |
+| `korapy heavy status [--json]` | the lane's holders, waiters and learned costs; an empty lane is an empty list, not a failure |
 | `korapy heavy rollup [--out PATH]` | regenerate the portable per-key cost summary from the raw run ledger; stdout always carries the JSON document, `--out` writes the same bytes for the operator to commit; exit 0 with an empty key set when nothing was learned yet |
 | `korapy snapshot [--json]` | one read-only view of the host: agents, quota, capacity, resources, disks and the drive section; `--json` prints the stable document |
 | `korapy serve [--bind ADDR] [--port N] [--allow-remote] [--allow-origin ORIGIN] [--new-token]` | run the read-only dashboard API on loopback (a wider bind needs `--allow-remote` and a token file); the same address in a browser is the dashboard; prints the listening address; exit 2 when the port is held, 3 when the state dir cannot be read |

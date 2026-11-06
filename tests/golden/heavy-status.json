@@ -1,0 +1,40 @@
+{
+  "budget": {
+    "cpu_m": 4000,
+    "memory_mb": 8192
+  },
+  "costs": {},
+  "holders": [
+    {
+      "command": [
+        "make",
+        "check"
+      ],
+      "eta_s": null,
+      "id": "11111111111111111111111111111111",
+      "since": "2023-11-14T22:13:20+00:00",
+      "weight": {
+        "cpu_m": 3000,
+        "memory_mb": 6144
+      }
+    }
+  ],
+  "recent": [],
+  "schema_version": 1,
+  "waiters": [
+    {
+      "command": [
+        "make",
+        "build"
+      ],
+      "eta_s": null,
+      "id": "22222222222222222222222222222222",
+      "skipped": 0,
+      "waited_s": 12.0,
+      "weight": {
+        "cpu_m": 1000,
+        "memory_mb": 1024
+      }
+    }
+  ]
+}
