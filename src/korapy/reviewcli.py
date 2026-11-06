@@ -184,13 +184,24 @@ def cmd_show(args: argparse.Namespace, forge=None) -> int:
     return OK if reviewrecord.approves(record) else NO
 
 
+def ticket_parser() -> argparse.ArgumentParser:
+    """The shared ticket positionals: `REPO NUMBER`.
+
+    One parser for every verb that takes the ticket explicitly (`review`
+    and `merge`), so the two spell the ticket the same way. No second
+    copy: `merge` reuses this one.
+    """
+    ticket = argparse.ArgumentParser(add_help=False)
+    ticket.add_argument("repo", help="the ticket's repository name")
+    ticket.add_argument("number", type=int, help="the ticket number")
+    return ticket
+
+
 def add_parser(sub) -> None:
     """Register `review` and its verbs on the top-level subparsers."""
     from korapy import reviewrecord
 
-    ticket = argparse.ArgumentParser(add_help=False)
-    ticket.add_argument("repo", help="the ticket's repository name")
-    ticket.add_argument("number", type=int, help="the ticket number")
+    ticket = ticket_parser()
     review = sub.add_parser("review", help="review records: proof a separate reviewer looked")
     verbs = review.add_subparsers(dest="review_verb", required=True)
     p = verbs.add_parser("record", parents=[ticket], help="state a verdict on one commit")
