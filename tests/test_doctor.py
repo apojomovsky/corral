@@ -832,6 +832,22 @@ class ProductionHubGathering(unittest.TestCase):
                     doctor.load_hub_probe(HUB_URL, None)
                 self.assertTrue(fp.closed, f"HTTP {code} response left open")
 
+    def test_a_probe_survives_an_error_that_cannot_close(self):
+        """A close failure stays report data, never a traceback."""
+        import urllib.error
+        from email.message import Message
+
+        refused = urllib.error.HTTPError(
+            HUB_URL + "/v1/version", 500, "Not Found", Message(), io.BytesIO(b"{}")
+        )
+        refused.close = mock.Mock(side_effect=OSError("no fd to close"))
+        with mock.patch("urllib.request.urlopen", side_effect=refused):
+            probe = doctor.load_hub_probe(HUB_URL, None)
+        self.assertIsNotNone(probe)
+        assert probe is not None
+        self.assertEqual(probe.status, "unreachable")
+        self.assertIn("500", probe.detail)
+
     def test_probe_never_logs_the_token(self):
         import threading
 

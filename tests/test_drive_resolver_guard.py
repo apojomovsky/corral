@@ -115,18 +115,28 @@ def _raw_uses(path):
     return found
 
 
+#: The claim attributes that make a store key. Any other pair
+#: (`(claim.agent, claim.epoch)`) is an identity tuple, not a ticket key.
+CLAIM_KEY_ATTRS = {"repo", "number"}
+
+
 def _is_claim_key(node):
-    """Whether `node` is a `(claim.repo, claim.number)`-shaped tuple."""
-    return (
-        isinstance(node, ast.Tuple)
-        and len(node.elts) == 2
-        and all(
-            isinstance(elt, ast.Attribute)
-            and isinstance(elt.value, ast.Name)
-            and elt.value.id == "claim"
-            for elt in node.elts
-        )
-    )
+    """Whether `node` is a `(claim.repo, claim.number)`-shaped tuple.
+
+    Only those two attributes, in either order: a tuple of any other
+    two claim attributes is a different fact and must not trip the
+    ticket guard.
+    """
+    if not isinstance(node, ast.Tuple) or len(node.elts) != 2:
+        return False
+    if not all(
+        isinstance(elt, ast.Attribute)
+        and isinstance(elt.value, ast.Name)
+        and elt.value.id == "claim"
+        for elt in node.elts
+    ):
+        return False
+    return {elt.attr for elt in node.elts} == CLAIM_KEY_ATTRS
 
 
 def _ticket_comparisons_in(tree):
@@ -249,6 +259,12 @@ class ResolverGuardTest(unittest.TestCase):
             "def somewhere_else(held, claim):\n    return (claim.repo, claim.number) != held\n"
         )
         self.assertEqual(_ticket_comparisons_in(tree), [("somewhere_else", 2)])
+
+    def test_another_pair_of_claim_attributes_is_not_a_ticket_key(self):
+        tree = ast.parse(
+            "def somewhere_else(claim):\n    return (claim.agent, claim.epoch) == prior\n"
+        )
+        self.assertEqual(_ticket_comparisons_in(tree), [])
 
     def test_the_resolver_comparison_itself_passes(self):
         tree = ast.parse(

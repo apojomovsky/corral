@@ -2641,7 +2641,7 @@ def give_up(store, claim, tracker, *, observed, restarts, now, out, events=None)
         events.append({"event": "give_up", "at": now, "ticket": ref, "agent": claim.agent})
 
 
-def production_repo_map(registered, *, git):
+def production_repo_map(registered, *, git=None):
     """`{short [[repo]] name: tracker repo}` across registered roots.
 
     The one resolver for the tracker repo behind a registry entry's
@@ -2653,9 +2653,11 @@ def production_repo_map(registered, *, git):
     stuck, finished and orphan builders and `run_pass`, so a
     `korapy.toml` edit between two of them cannot make two joins
     disagree, and each repo lacking an explicit `tracker.repo` shells
-    git once per pass. A builder given no map builds its own, which is
-    the seam tests fake.
+    git once per pass. `git` names the origin-lookup seam; None is the
+    real runner. A builder given no map builds its own, which is the
+    seam tests fake.
     """
+    git = syncli._git if git is None else git
     found = {}
     for project in registered:
         names = settings.repo_names(project.root)
