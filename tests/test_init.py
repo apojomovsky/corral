@@ -294,7 +294,6 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
-# checks.suite_lock_timeout_s = 3600  # seconds a second takeoff waits for the full-suite lock before giving up (exit 75)
 # checks.takeoff = []  # takeoff gate commands, run in order in the worktree
 # checks.timeout_s = 1800  # seconds before a takeoff command is killed
 #
@@ -430,7 +429,6 @@ commits.conventional = false
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
-# checks.suite_lock_timeout_s = 3600  # seconds a second takeoff waits for the full-suite lock before giving up (exit 75)
 # checks.takeoff = []  # takeoff gate commands, run in order in the worktree
 # checks.timeout_s = 1800  # seconds before a takeoff command is killed
 #
