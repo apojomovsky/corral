@@ -15,8 +15,9 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from unittest import mock
 
-from korapy import board, drive, registry
+from korapy import board, drive, registry, reviewrecord
 from korapy import tracker as iface
 from korapy import projects as projects_mod
 from korapy.tracker import NEEDS_DECISION
@@ -1281,6 +1282,125 @@ class ProductionStuckProjectTest(unittest.TestCase):
             name="blue", unit_prefix="blue-agent-", root=self.root, eligibility=None
         )
         self.assertIsNone(drive.production_stuck_project([blue], "other/repo"))
+
+
+def dead_git(args, cwd):
+    """A git seam that must never fire: the fixtures name their tracker repos."""
+    raise AssertionError(f"unexpected git call: {args!r} in {cwd!r}")
+
+
+class StopPathAgreementTest(unittest.TestCase):
+    """The stop path resolves through the pass map's one spelling.
+
+    `reviewrecord.local_repo` is the one store-key to short-name
+    resolver; the stop path (`production_stuck_project`,
+    `production_stopper`) resolves its spelling through it over the
+    pass map, then names the first registered project whose root feeds
+    that spelling. A short or otherwise unmapped input names no
+    project: where `local_repo` passes a short name through, the stop
+    path refuses it, so a guessed spelling never stops a stranger's
+    units. Real `korapy.toml` fixtures in temporary directories; a git
+    seam that must never fire; the launch target and stop seams are
+    recording fakes. No `gh`, no systemd, no network, no real state
+    dir.
+    """
+
+    TRACKER = "acme/app"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-stop-agreement-")
+        self.addCleanup(self.tmp.cleanup)
+        self.blue_root = os.path.join(self.tmp.name, "blue-ops")
+        self.green_root = os.path.join(self.tmp.name, "green-ops")
+        os.makedirs(self.blue_root)
+        os.makedirs(self.green_root)
+        with open(os.path.join(self.blue_root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n')
+        with open(os.path.join(self.green_root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "second"\ntracker.repo = "acme/app"\n')
+        self.registered = [
+            projects_mod.Project(name="blue", unit_prefix="blue-agent-", root=self.blue_root),
+            projects_mod.Project(name="green", unit_prefix="green-agent-", root=self.green_root),
+        ]
+
+    def pass_map(self):
+        return drive.production_repo_map(self.registered, git=dead_git)
+
+    def owner(self, repo, mapping):
+        return drive.production_stuck_project(self.registered, repo, mapping=mapping, git=dead_git)
+
+    def test_the_first_short_name_wins_for_a_shared_tracker_repo(self):
+        mapping = self.pass_map()
+        self.assertEqual(mapping, {"app": self.TRACKER, "second": self.TRACKER})
+        self.assertEqual(reviewrecord.local_repo(self.TRACKER, mapping), "app")
+        self.assertEqual(self.owner(self.TRACKER, mapping), "blue")
+
+    def test_the_stop_path_takes_the_pass_map_without_resolving_its_own(self):
+        mapping = self.pass_map()
+        with mock.patch.object(
+            drive,
+            "production_repo_map",
+            side_effect=AssertionError("the stop path must take the pass map"),
+        ):
+            self.assertEqual(self.owner(self.TRACKER, mapping), "blue")
+            stop = drive.production_stopper(self.registered, mapping=mapping, git=dead_git)
+            with (
+                mock.patch.object(drive.launch, "target", return_value="tgt"),
+                mock.patch.object(drive.launch, "stop", return_value=["u"]) as stop_fn,
+            ):
+                self.assertEqual(stop(self.TRACKER, 7), ["u"])
+        self.assertEqual(stop_fn.call_args[0][:2], ("tgt", 7))
+
+    def test_the_stopper_stops_through_the_owning_root_and_short(self):
+        seen = []
+
+        def fake_target(root, repo):
+            seen.append((root, repo))
+            return ("tgt", root, repo)
+
+        with (
+            mock.patch.object(drive.launch, "target", side_effect=fake_target),
+            mock.patch.object(drive.launch, "stop", return_value=["u"]) as stop_fn,
+        ):
+            stop = drive.production_stopper(self.registered, mapping=self.pass_map(), git=dead_git)
+            stop(self.TRACKER, 7)
+        self.assertEqual(seen, [(self.blue_root, "app")])
+        self.assertEqual(stop_fn.call_args[0][:2], (("tgt", self.blue_root, "app"), 7))
+
+    def test_a_short_name_input_names_no_project_where_local_repo_passes_it_through(self):
+        mapping = self.pass_map()
+        self.assertEqual(reviewrecord.local_repo("app", mapping), "app")
+        self.assertIsNone(self.owner("app", mapping))
+        stop = drive.production_stopper(self.registered, mapping=mapping, git=dead_git)
+        with self.assertRaises(drive.units.UnitsError) as caught:
+            stop("app", 7)
+        self.assertIn("app", str(caught.exception))
+
+    def test_an_unknown_tracker_is_refused_by_both(self):
+        mapping = self.pass_map()
+        with self.assertRaises(ValueError) as caught:
+            reviewrecord.local_repo("acme/gone", mapping)
+        self.assertIn("acme/gone", str(caught.exception))
+        self.assertIsNone(self.owner("acme/gone", mapping))
+
+    def test_an_unmapped_plain_name_names_no_project_where_local_repo_passes_it_through(self):
+        mapping = self.pass_map()
+        self.assertEqual(reviewrecord.local_repo("legacy", mapping), "legacy")
+        self.assertIsNone(self.owner("legacy", mapping))
+
+    def test_a_tracker_only_a_later_root_feeds_reads_as_no_project(self):
+        other = os.path.join(self.tmp.name, "other-ops")
+        os.makedirs(other)
+        with open(os.path.join(other, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "other/app"\n')
+        registered = list(self.registered) + [
+            projects_mod.Project(name="teal", unit_prefix="teal-agent-", root=other),
+        ]
+        mapping = drive.production_repo_map(registered, git=dead_git)
+        self.assertEqual(mapping["app"], self.TRACKER)
+        self.assertIsNone(
+            drive.production_stuck_project(registered, "other/app", mapping=mapping, git=dead_git)
+        )
 
 
 class ProductionStuckInputsTest(unittest.TestCase):
