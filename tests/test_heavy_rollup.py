@@ -258,9 +258,49 @@ class RollupPathCase(RollupCase):
         )
 
 
+class RunsDirCase(RollupCase):
+    def test_default_dir_lives_under_the_lane_dir(self):
+        self.assertEqual(
+            heavy.runs_dir(),
+            os.path.join(os.environ["KORAPY_STATE"], "heavy", "runs"),
+        )
+
+    def test_explicit_state_dir_wins(self):
+        self.assertEqual(
+            heavy.runs_dir(self.tmp),
+            os.path.join(self.tmp, "heavy", "runs"),
+        )
+
+    def test_ledger_path_lives_in_the_runs_dir(self):
+        self.assertEqual(
+            heavy.ledger_path(label=LABEL, period="2026-11"),
+            os.path.join(heavy.runs_dir(), f"{LABEL}-2026-11.jsonl"),
+        )
+        self.assertEqual(
+            heavy.ledger_path(label=LABEL, period="2026-11", state_dir=self.tmp),
+            os.path.join(heavy.runs_dir(self.tmp), f"{LABEL}-2026-11.jsonl"),
+        )
+
+
 class CollectCase(RollupCase):
     def test_missing_runs_dir_reads_as_empty(self):
         self.assertEqual(heavy.collect_ledger_rows(self.tmp), ([], [], 0))
+
+    def test_collect_returns_rows_oldest_first_across_files(self):
+        old = json.dumps(_raw(argv_hash="ha", days_ago=5.0), sort_keys=True)
+        new = json.dumps(_raw(argv_hash="hb", days_ago=0.0), sort_keys=True)
+        _write_runs(
+            self.tmp,
+            {
+                "a-host-2026-11.jsonl": [new],
+                "b-host-2026-10.jsonl": [old],
+            },
+        )
+        rows, sources, skipped = heavy.collect_ledger_rows(self.tmp)
+        self.assertEqual(sources, ["a-host-2026-11.jsonl", "b-host-2026-10.jsonl"])
+        self.assertEqual(skipped, 0)
+        self.assertEqual([row["argv_hash"] for row in rows], ["ha", "hb"])
+        self.assertLess(rows[0]["at"], rows[1]["at"])
 
     def test_collect_reads_every_file_and_counts_the_corrupt(self):
         _write_runs(self.tmp, _fixture())
