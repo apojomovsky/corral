@@ -1,4 +1,4 @@
-"""`korapy merge`: the serialized, verified squash-merge verb.
+"""`korapy merge`: the serialized, verified merge verb.
 
 The forge-side half of landing (`push` is the worktree-side half). The
 verb merges one pull request after proving it is mergeable, one merger
@@ -32,13 +32,60 @@ import re
 from collections.abc import Callable
 from typing import NamedTuple
 
-from korapy import forge as iface, mergeup, paths, reviewrecord
+from korapy import forge as iface, mergeup, paths, reviewrecord, settings
 
 #: The version stamped on every `--json` document.
 SCHEMA_VERSION = 1
 
 #: Exit codes: a subset of the public interface (AGENTS.md).
 OK, NO, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
+
+#: The merge methods the verb knows: a squash, or a merge commit that
+#: keeps the branch commits. Anything else (including rebase) is
+#: refused: rebase support waits until a project asks for it.
+METHODS = ("squash", "merge")
+
+#: The default method: a squash.
+DEFAULT_METHOD = "squash"
+
+#: The setting naming the project's merge method. One fact, one place:
+#: `resolve_method` below is the only reader of the resolved value.
+METHOD_SETTING = "merge.method"
+
+
+def _check_method(value):
+    """The `merge.method` range check: squash or merge, else a rule."""
+    if value not in METHODS:
+        raise ValueError(f"must be one of {list(METHODS)}")
+    return value
+
+
+settings.register(
+    METHOD_SETTING,
+    str,
+    DEFAULT_METHOD,
+    "how korapy merge lands a PR: a squash, or a merge commit",
+    check=_check_method,
+)
+
+
+def resolve_method(*, flag=None, resolved=None):
+    """The effective merge method: the one place that decides it.
+
+    The `--method` flag wins when given, else the resolved
+    `merge.method` setting, else the default squash. Anything outside
+    `METHODS` is a MergeError naming the setting (exit 4).
+    """
+    if flag is not None:
+        method = flag
+    elif resolved is not None:
+        method = resolved[METHOD_SETTING]
+    else:
+        method = DEFAULT_METHOD
+    if method not in METHODS:
+        raise MergeError(f"{METHOD_SETTING} {method!r} must be one of {list(METHODS)}")
+    return method
+
 
 #: The precondition rows, in gate order.
 CHECK_NAMES = ("lock", "open", "head", "review", "checks", "fork")
@@ -277,7 +324,7 @@ def run_merge(
     number: int,
     *,
     head_sha: str,
-    method: str = "squash",
+    method: str | None = None,
     skips=(),
     plan: bool = False,
     forge,
@@ -287,16 +334,25 @@ def run_merge(
 
     `forge` reads the PR and performs the merge: it is required, so no
     default may silently answer for the remote or merge. `head_sha` is
-    the exact head the caller approved; `method` takes one value today,
-    `squash`. `skips` names waived checks (`checks` alone may be
-    waived). With `plan` every row is reported without taking the lock
-    and without merging. Usage problems raise MergeError (exit 4);
-    forge outages raise `korapy.forge.ForgeError` (exit 3).
+    the exact head the caller approved; `method` is a squash or a merge
+    commit, absent for the default squash (anything else is a MergeError
+    naming `merge.method`).
+    `skips` names waived checks (`checks` alone may be waived). With
+    `plan` every row is reported without taking the lock and without
+    merging. Usage problems raise MergeError (exit 4); forge outages
+    raise `korapy.forge.ForgeError` (exit 3).
+
+    The post-merge verify ties the reported merge SHA to the pinned
+    head: state `merged` with the merge SHA the forge reports. For a
+    merge commit the forge seam's merge call additionally requires the
+    merge commit's parents to include the pinned head. A merge-time
+    refusal with every row still green is the method the forge or the
+    repository settings do not allow: a `method` row fails naming
+    `merge.method`, and the row appears in no other case.
     """
     if forge is None:
         raise TypeError("run_merge needs a forge seam")
-    if method != "squash":
-        raise MergeError(f"unsupported merge method {method!r}: only squash merges today")
+    method = resolve_method(flag=method)
     skip_set = _resolve_skips(skips)
     if not paths.plain_repo_name(ticket_repo):
         raise MergeError(f"ticket repo {ticket_repo!r} is not a plain repository name")
@@ -329,13 +385,26 @@ def run_merge(
                 return Result(checks, sorted(skip_set), False, None, NO)
             try:
                 reported = forge.merge(repo, number, head_sha=head, method=method)
-            except iface.ForgeRefused:
+            except iface.ForgeRefused as refused:
                 # The head moved under the lock: re-read, so the
-                # document names the failing row.
+                # document names the failing row. A re-read with every
+                # row still green is the method the forge or the
+                # repository settings do not allow: the `method` row
+                # names the setting, and appears in no other case.
                 pr = forge.pull_request(repo, number)
                 checks = _evaluate(
                     ticket_repo, ticket_number, pr, head, skip_set, cwd, "the merge lock is free"
                 )
+                if not _failed(checks):
+                    checks.append(
+                        Check(
+                            "method",
+                            FAIL,
+                            f"the forge refused {METHOD_SETTING} {method!r}: {refused}; "
+                            f"allow the method in the repository settings "
+                            f"or choose another {METHOD_SETTING}",
+                        )
+                    )
                 return Result(checks, sorted(skip_set), False, None, NO)
             verified = forge.pull_request(repo, number)
             if verified.state != iface.MERGED or verified.merge_sha != reported:
