@@ -314,6 +314,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
                 err=sys.stderr,
                 hold_label=hold_label,
                 pause_path=drive.pause_path(),
+                projects_fn=lambda: registered,
                 agent_states=planned_states,
                 finished_for=planned_finished,
                 agent_roles=planned_roles,

@@ -238,6 +238,46 @@ class OneMapPerPassTest(RepoKeyCase):
         self.assertEqual(code, 0, err.getvalue())
         self.assertEqual(err.getvalue(), "")
 
+    def test_a_claiming_pass_threads_its_map_into_orphan_recovery(self):
+        store = self.claimed_tracker_store()
+        seen = {}
+
+        def fake_orphan(registered, *, now, path=None, git=None, mapping=None):
+            seen.update(registered=registered, mapping=mapping)
+            return frozenset(), frozenset(), GONE_S
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive, "production_orphan_inputs", side_effect=fake_orphan),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=AssertionError("the pass must build the map once"),
+            ),
+        ):
+            code = drive.run_pass(
+                plan=False,
+                store=store,
+                lock_path=os.path.join(self.tmp.name, "drive.lock"),
+                out=out,
+                err=err,
+                now=NOW,
+                projects_fn=lambda: list(self.registered),
+                live=frozenset(),
+                limits=drive.admission.Limits(total=4),
+                quotas={},
+                ledger={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                present_agents=None,
+                live_units=None,
+                gone_s=None,
+                repo_map={SHORT: TRACKER},
+            )
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(seen.get("mapping"), {SHORT: TRACKER})
+        self.assertIsNotNone(seen.get("registered"))
+
 
 class BrokenConfigTest(unittest.TestCase):
     """A project root whose korapy.toml cannot resolve refuses, never guesses."""
