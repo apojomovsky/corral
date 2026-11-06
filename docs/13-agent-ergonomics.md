@@ -255,12 +255,12 @@ Purpose: merge one pull request after proving it is mergeable,
 serially, with every precondition reported as data. The forge-side
 half of landing; `push` stays the worktree-side half.
 
-Arguments: `REPO PR --head SHA [--method squash] [--skip CHECK]
+Arguments: `REPO PR --head SHA [--method squash|merge] [--skip CHECK]
 [--json] [--plan]`. `REPO` is `owner/name`; `PR` the pull request
 number. `--head` is required: the exact head SHA the caller
-approved. `--method` takes one value today, `squash`; anything
-else is exit 4, so the flag exists for later extension without
-breaking callers. `--skip` names only `checks`, with the same
+approved. `--method` is `squash` or `merge` and defaults to the
+`merge.method` project setting (`squash`); anything else is
+exit 4. `--skip` names only `checks`, with the same
 recording rule as the gate (section 6); the default is no skips.
 Naming `lock`, `open`, `head`, `review` or `fork` is exit 4:
 those checks establish what is being merged, and skipping
@@ -463,13 +463,21 @@ PRs to the same repo never merge concurrently.
    exit 1; a maintainer merges those by hand (AGENTS.md: external
    contributions are for maintainers).
 
-After the merge call, the verb verifies: re-read the PR and
-require state `merged` plus the merge commit SHA the forge
+After the merge call, the verb verifies per method: re-read the
+PR and require state `merged` plus the merge commit SHA the forge
 reports tied to the pinned head (section 8). A mismatch fails
 closed with exit 1 (the merge happened but is unverified; the
-row says so). A parent check on the merge commit is reserved for
-a future non-squash method; squash produces a single-parent
-commit, so no parent check applies here.
+row says so). For a merge commit the forge seam's merge call
+additionally requires the merge commit's parents to include the
+pinned head: the provider proves it kept the approved commits.
+A squash produces a single-parent commit, so no parent check
+applies there.
+
+The method is `--method` when given, else the `merge.method`
+project setting (`squash` by default, or `merge`). A merge-time
+refusal with every row still green is a method the forge or the
+repository settings do not allow: a `method` row fails exit 1
+naming `merge.method`, and the row appears in no other case.
 
 ### 7.3 How it refuses, and what it never does
 
@@ -512,12 +520,13 @@ state, head, checks and merge SHA consistent.
 
 ```python
 def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
-    """Squash-merge PR `number` and return the merge commit SHA.
+    """Merge PR `number` with `method` and return the merge commit SHA.
 
-    Refuses unless the PR is open at `head_sha`. Raises
-    `ForgeError` when the forge is unreachable or answers
-    something unusable. Only the adapters call `gh` or know
-    provider shapes.
+    `method` is `squash` or `merge`, resolved from the project's
+    `merge.method` setting. Refuses unless the PR is open at
+    `head_sha`. Raises `ForgeError` when the forge is unreachable
+    or answers something unusable. Only the adapters call `gh` or
+    know provider shapes.
     """
 ```
 

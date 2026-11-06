@@ -124,12 +124,16 @@ class Forge(Protocol):
         ...
 
     def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
-        """Squash-merge PR ``number`` and return the merge commit SHA.
+        """Merge PR ``number`` and return the merge commit SHA.
 
-        Refuses with ``ForgeRefused`` unless the PR is open at
-        ``head_sha``. Raises ``ForgeError`` when the forge is unreachable
-        or answers something unusable. Only the adapters call ``gh`` or
-        know provider shapes. ``method`` takes one value today,
-        ``"squash"``.
+        ``method`` is ``"squash"`` or ``"merge"``: the verb resolves it
+        from the project's ``merge.method`` setting and carries it here.
+        Anything else is ``ForgeError``. Refuses with ``ForgeRefused``
+        unless the PR is open at ``head_sha``. Raises ``ForgeError``
+        when the forge is unreachable or answers something unusable.
+        Only the adapters call ``gh`` or know provider shapes. For a
+        merge commit the adapter verifies the merge commit's parents
+        include ``head_sha``; anything else is unverified
+        (``ForgeError``), never returned.
         """
         ...
