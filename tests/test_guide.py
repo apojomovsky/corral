@@ -202,6 +202,21 @@ class GuideTest(unittest.TestCase):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, self.text)
 
+    def test_the_rename_backup_sentence_names_successful_migrations(self):
+        self.assertNotIn("Every run leaves a timestamped backup", self.text)
+        self.assertIn(
+            "Every successful migration leaves a timestamped backup",
+            self.text,
+        )
+
+    def test_the_rename_refusal_names_stale_entries_and_their_clearing(self):
+        for snippet in (
+            "live or stale agent",
+            "korapy agent done",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, self.text)
+
 
 if __name__ == "__main__":
     unittest.main()
