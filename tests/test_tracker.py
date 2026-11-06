@@ -93,6 +93,8 @@ class FakeTracker:
         self.labels_error = labels_error
         self.canonical = dict(canonical or {})
         self.canonical_error = canonical_error
+        self.linked = {}
+        self.linked_errors = {}
         self.calls = []
 
     def add(self, item):
@@ -132,6 +134,13 @@ class FakeTracker:
             if self.items_break_after is not None and index >= self.items_break_after:
                 raise tracker.TrackerError(f"page error at index {index}")
             yield item
+
+    def linked_pulls(self, repo, number):
+        """Programmed open pull requests linked to the ticket."""
+        self.calls.append(("linked_pulls", repo, number))
+        if (repo, number) in self.linked_errors:
+            raise tracker.TrackerError(self.linked_errors[(repo, number)])
+        return list(self.linked.get((repo, number), ()))
 
     def write(self, repo, number, field, value):
         """Record one korapy-owned field write; programmed errors raise."""
@@ -816,6 +825,105 @@ class DecisionAdapterTest(unittest.TestCase):
             self.adapter.add_label("acme/app", 7, "needs-decision")
         self.assertNotIsInstance(ctx.exception, tracker.TrackerRateLimited)
         self.assertEqual(ctx.exception.exit_code, 3)
+
+
+def pr_payload(number, body, fork=False, **over):
+    """One pulls-endpoint payload; override any field."""
+    payload = item_payload(number, body=body, **over)
+    payload.pop("pull_request", None)
+    payload["head"] = {"ref": f"topic-{number}", "repo": {"fork": fork}}
+    return payload
+
+
+class LinkedPullsTest(unittest.TestCase):
+    """The open pull requests linked to a ticket. Fakes only; no network."""
+
+    def setUp(self):
+        self.gh = FakeRun()
+        self.adapter = ghtracker.GithubTracker(self.gh)
+
+    def listing(self, pulls):
+        self.gh.add(
+            "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100",
+            pulls,
+        )
+        for entry in pulls:
+            self.gh.add(
+                f"repos/acme/app/pulls/{entry['number']}",
+                pull_payload(entry["number"], fork=False),
+            )
+
+    def test_an_open_pr_closing_the_ticket_is_linked(self):
+        self.listing([pr_payload(9, "Fixes things.\n\nCloses #7")])
+        found = self.adapter.linked_pulls("acme/app", 7)
+        self.assertEqual(
+            [(item.number, item.kind, item.state) for item in found], [(9, "pr", "open")]
+        )
+
+    def test_unrelated_and_other_ticket_prs_are_not_linked(self):
+        self.listing(
+            [
+                pr_payload(9, "No ticket here"),
+                pr_payload(10, "Closes #8"),
+            ]
+        )
+        self.assertEqual(self.adapter.linked_pulls("acme/app", 7), [])
+
+    def test_a_refs_pr_links_too(self):
+        self.listing([pr_payload(9, "Partial win.\n\nRefs #7")])
+        self.assertEqual([item.number for item in self.adapter.linked_pulls("acme/app", 7)], [9])
+
+    def test_a_close_keyword_in_the_title_links(self):
+        self.listing([pr_payload(9, "unrelated body", title="Fixes #7 on retry")])
+        self.assertEqual([item.number for item in self.adapter.linked_pulls("acme/app", 7)], [9])
+
+    def test_a_bare_title_mention_links_nothing(self):
+        self.listing([pr_payload(9, "unrelated body", title="Follow-up for #7")])
+        self.assertEqual(self.adapter.linked_pulls("acme/app", 7), [])
+
+    def test_a_close_keyword_in_a_fence_links_nothing(self):
+        self.listing([pr_payload(9, "```\nCloses #7\n```")])
+        self.assertEqual(self.adapter.linked_pulls("acme/app", 7), [])
+
+    def test_a_cross_repo_close_does_not_link_this_repo(self):
+        self.listing([pr_payload(9, "Closes other/repo#7")])
+        self.assertEqual(self.adapter.linked_pulls("acme/app", 7), [])
+
+    def test_a_qualified_close_of_this_repo_links(self):
+        self.listing([pr_payload(9, "Closes acme/app#7")])
+        self.assertEqual([item.number for item in self.adapter.linked_pulls("acme/app", 7)], [9])
+
+    def test_a_fork_pr_still_links(self):
+        self.gh.add(
+            "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100",
+            [pr_payload(9, "Closes #7")],
+        )
+        self.gh.add("repos/acme/app/pulls/9", pull_payload(9, fork=True))
+        found = self.adapter.linked_pulls("acme/app", 7)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].from_fork)
+
+    def test_a_listing_failure_is_a_tracker_error(self):
+        self.gh.fail("repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100")
+        with self.assertRaises(tracker.TrackerError) as ctx:
+            self.adapter.linked_pulls("acme/app", 7)
+        self.assertEqual(ctx.exception.exit_code, 3)
+
+    def test_pages_combine(self):
+        first = [pr_payload(n, f"Closes #{700 + n}") for n in range(100, 200)]
+        self.gh.routes[
+            "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100"
+        ] = json.dumps(first)
+        self.gh.routes[
+            "repos/acme/app/pulls?state=open&sort=updated&direction=asc&per_page=100&page=2"
+        ] = json.dumps([pr_payload(9, "Closes #7")])
+        for entry in first + [pr_payload(9, "Closes #7")]:
+            self.gh.add(
+                f"repos/acme/app/pulls/{entry['number']}",
+                pull_payload(entry["number"], fork=False),
+            )
+        found = self.adapter.linked_pulls("acme/app", 7)
+        self.assertEqual([item.number for item in found], [9])
 
 
 if __name__ == "__main__":

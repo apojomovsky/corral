@@ -534,6 +534,7 @@ class ProtocolShapeTests(unittest.TestCase):
                 "item",
                 "changes",
                 "items",
+                "linked_pulls",
                 "write",
                 "comment",
                 "add_label",

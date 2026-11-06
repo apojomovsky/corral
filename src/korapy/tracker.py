@@ -155,6 +155,19 @@ class Tracker(Protocol):
         """Every item, for a full resync."""
         ...
 
+    def linked_pulls(self, repo: str, number: int) -> list[TrackerItem]:
+        """Every open pull request linked to the ticket.
+
+        A pull request links to a ticket when it references it the way
+        the adapter reads as closing or relating it (on GitHub: a
+        close keyword or `Refs` line naming the ticket in the title or
+        body, outside fenced code). Only open pull requests are
+        returned, oldest first. A failed call raises `TrackerError`; a
+        rate-limit answer raises `TrackerRateLimited` with the seconds
+        to wait.
+        """
+        ...
+
     def write(self, repo: str, number: int, field: str, value: str) -> None:
         """Set one korapy-owned field (``agent`` or ``status``) on an item.
 
