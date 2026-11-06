@@ -7,9 +7,10 @@ keeping the public meaning (no free slot, try later). `run --plan`
 reports the verdict without queueing or running anything.
 `run --bypass REASON` runs now, skipping the queue inside the same
 scope limits, and records the reason in the lane journal; a bare
-`--bypass` is exit 4. `run --role NAME` names the ledger caller
-(`hand` by default). `status` shows holders, waiters and learned
-costs. `rollup` regenerates the portable per-key cost summary from
+`--bypass` is exit 4, and `--bypass` with `--plan` is exit 4.
+`run --role NAME` names the ledger caller (`hand` by default;
+`takeoff` is reserved for the module call). `status` shows holders,
+waiters and learned costs. `rollup` regenerates the portable per-key cost summary from
 the raw run ledger: stdout always carries the JSON document, and
 `--out PATH` additionally writes the same bytes for the operator to
 commit. Exit codes follow the public table: 0 ok, 1 nothing to do
@@ -25,6 +26,11 @@ import subprocess
 import sys
 
 OK, NO, UNREACHABLE, USAGE, NO_SLOT = 0, 1, 3, 4, 75
+
+#: Roles the hand CLI never claims. Takeoff names its own ledger rows
+#: through the shared module call; a hand row under its name would
+#: pollute the role-keyed estimates that size takeoff's weights.
+RESERVED_ROLES = frozenset({"takeoff"})
 
 
 def _err(text):
@@ -247,6 +253,9 @@ def cmd_run(
     if not isinstance(role, str) or not role:
         _err("--role needs a name for the ledger row")
         return USAGE
+    if role in RESERVED_ROLES:
+        _err(f"--role {role!r} is reserved: takeoff names its own ledger rows")
+        return USAGE
     raw_timeout = args.timeout
     if raw_timeout is None:
         wait_s = float(cfg.wait_timeout_s if cfg is not None else heavy.DEFAULT_WAIT_TIMEOUT_S)
@@ -261,7 +270,10 @@ def cmd_run(
             return USAGE
     caps = pressure_caps if pressure_caps is not None else _pressure_caps(resolved)
     bypass = getattr(args, "bypass", None)
-    if bypass is not None and not args.plan:
+    if bypass is not None and args.plan:
+        _err("--bypass and --plan do not combine: drop --plan to run now, or drop --bypass to plan")
+        return USAGE
+    if bypass is not None:
         if not bypass:
             _err("a bypass needs a reason: korapy heavy run --bypass REASON -- CMD [ARGS...]")
             return USAGE
@@ -424,7 +436,7 @@ def add_parser(sub) -> None:
     run.add_argument(
         "--role",
         default="hand",
-        help="ledger role naming the caller (default hand; takeoff uses its own name)",
+        help="ledger role naming the caller (default hand; takeoff is reserved)",
     )
     run.add_argument(
         "--bypass",

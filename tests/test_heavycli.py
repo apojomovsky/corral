@@ -731,6 +731,33 @@ class BypassCase(HeavyCliCase):
         )
         self.assertEqual(code, 4)
 
+    def test_bypass_with_plan_is_exit_4_without_running(self):
+        from korapy import heavycli
+
+        self._project()
+        calls = []
+
+        def fake_lane(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _lane_run()
+
+        def fake_bypass(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _bypass_result()
+
+        code, _, err = self._read_stdout(
+            heavycli.cmd_run,
+            _run_args(["make", "check"], bypass="hotfix", plan=True),
+            root=self.tmp,
+            run_lane=fake_lane,
+            run_bypass=fake_bypass,
+            pressure=_cool(),
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(calls, [])
+        self.assertIn("--bypass", err)
+        self.assertIn("--plan", err)
+
 
 class RoleCase(HeavyCliCase):
     """Ticket 6: `heavy run --role NAME` names the ledger caller; empty is 4."""
@@ -747,12 +774,60 @@ class RoleCase(HeavyCliCase):
 
         code, _, _ = self._read_stdout(
             heavycli.cmd_run,
-            _run_args(["make", "check"], role="takeoff"),
+            _run_args(["make", "check"], role="nightly"),
             root=self.tmp,
             run_lane=fake_lane,
         )
         self.assertEqual(code, 0)
-        self.assertEqual(seen["role"], "takeoff")
+        self.assertEqual(seen["role"], "nightly")
+
+    def test_takeoff_role_is_exit_4_without_running(self):
+        from korapy import heavycli
+
+        self._project()
+        calls = []
+
+        def fake_lane(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _lane_run()
+
+        def fake_bypass(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _bypass_result()
+
+        code, _, err = self._read_stdout(
+            heavycli.cmd_run,
+            _run_args(["make", "check"], role="takeoff"),
+            root=self.tmp,
+            run_lane=fake_lane,
+            run_bypass=fake_bypass,
+            pressure=_cool(),
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(calls, [])
+        self.assertIn("--role", err)
+        self.assertIn("takeoff", err)
+
+    def test_takeoff_role_is_exit_4_on_the_bypass_path(self):
+        from korapy import heavycli
+
+        self._project()
+        calls = []
+
+        def fake_bypass(*args, **kwargs):
+            calls.append((args, kwargs))
+            return _bypass_result()
+
+        code, _, err = self._read_stdout(
+            heavycli.cmd_run,
+            _run_args(["make", "check"], bypass="hotfix", role="takeoff"),
+            root=self.tmp,
+            run_bypass=fake_bypass,
+            pressure=_cool(),
+        )
+        self.assertEqual(code, 4)
+        self.assertEqual(calls, [])
+        self.assertIn("--role", err)
 
     def test_default_role_is_hand(self):
         from korapy import heavycli

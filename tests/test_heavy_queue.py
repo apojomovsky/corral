@@ -11,7 +11,9 @@ file locks); no test touches systemd, `/proc`, the network or real
 state dirs.
 """
 
+import contextlib
 import fcntl
+import io
 import json
 import os
 import subprocess
@@ -794,6 +796,52 @@ class BypassCase(QueueCase):
         with self.assertRaises(heavy.HeavyError):
             self._bypass(missing)
         self.assertEqual(heavy.read_lane()["recent"], [])
+
+    def test_bypass_record_lock_busy_warns_and_returns_the_run(self):
+        run = _FakeRunner(code=0, stdout="green\n", stderr="")
+        warnings = []
+        path = heavy.lock_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        held = open(path, "a+")
+        self.addCleanup(held.close)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = self._bypass(run, warn=warnings.append, lock_timeout=0.1)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("bypass", warnings[0])
+        self.assertIn("locked by another process", warnings[0])
+        (row,) = self._ledger_rows()
+        self.assertEqual(row["exit"], 0)
+        fcntl.flock(held, fcntl.LOCK_UN)
+        self.assertEqual(heavy.read_lane()["recent"], [])
+
+    def test_bypass_record_corrupt_lane_warns_and_returns_the_run(self):
+        run = _FakeRunner(code=0, stdout="green\n", stderr="")
+        warnings = []
+        path = heavy.lane_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        result = self._bypass(run, warn=warnings.append)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("bypass", warnings[0])
+        self.assertIn("unparsable", warnings[0])
+        (row,) = self._ledger_rows()
+        self.assertEqual(row["exit"], 0)
+
+    def test_bypass_record_failure_warns_on_stderr_by_default(self):
+        run = _FakeRunner(code=0, stdout="green\n", stderr="")
+        path = heavy.lane_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("{not json")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            result = self._bypass(run)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("bypass", err.getvalue())
+        self.assertIn("unparsable", err.getvalue())
 
     def test_record_bypass_names_the_reason_in_the_ring(self):
         heavy.record_bypass(["make", "check"], "hotfix", now=ARRIVED)

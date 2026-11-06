@@ -64,6 +64,7 @@ import os
 import platform
 import re
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Mapping
@@ -2022,6 +2023,11 @@ def record_bypass(command, reason, *, state_dir=None, now=None, lock_timeout=HEA
         _store_locked(path, lane)
 
 
+def _warn_stderr(text):
+    """The live bypass warning writer: one stderr line naming the failure."""
+    print(f"korapy heavy: {text}", file=sys.stderr)
+
+
 def run_bypass(
     argv,
     cwd,
@@ -2044,6 +2050,8 @@ def run_bypass(
     state_dir=None,
     unit=None,
     now=None,
+    warn=None,
+    lock_timeout=HEAVY_LOCK_TIMEOUT_S,
 ):
     """Run one heavy command now, skipping the queue, and record the bypass.
 
@@ -2058,10 +2066,16 @@ def run_bypass(
     default; `timeout` caps this run only and is required. `now` is an
     epoch timestamp for the journal row (live when None); `clock` is
     the run's injectable clock, on the `run_heavy` precedent.
+    `lock_timeout` caps the journal write's lock wait. A journal
+    failure (a lock busy past the timeout, a corrupt lane file) warns
+    through `warn` (stderr live, faked in tests) naming the failure
+    and still returns the run result: the bypass is visible, not
+    prevented, and the ledger row keeps it measurable.
     """
     if not isinstance(reason, str) or not reason:
         raise HeavyError("a bypass needs a reason: pass --bypass REASON")
     moment = time.time() if now is None else _check_now(now)
+    tell = warn or _warn_stderr
     result = run_heavy(
         argv,
         cwd,
@@ -2082,7 +2096,12 @@ def run_bypass(
         waited_s=0.0,
         unit=unit,
     )
-    record_bypass(list(argv), reason, state_dir=state_dir, now=moment)
+    try:
+        record_bypass(
+            list(argv), reason, state_dir=state_dir, now=moment, lock_timeout=lock_timeout
+        )
+    except HeavyError as err:
+        tell(f"bypass ran but the journal row was lost: {err}")
     return result
 
 
