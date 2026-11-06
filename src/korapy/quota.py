@@ -16,6 +16,7 @@ UNKNOWN = "unknown"
 
 DEFAULT_LOW_PCT = 90
 DEFAULT_UNKNOWN_BLOCKS = False
+DEFAULT_REFRESH_AFTER_S = 900
 
 settings.register(
     "quota.low_pct", int, DEFAULT_LOW_PCT, "usage percent at which a provider reads low"
@@ -25,6 +26,12 @@ settings.register(
     bool,
     DEFAULT_UNKNOWN_BLOCKS,
     "an unknown provider blocks its roles instead of passing them",
+)
+settings.register(
+    "quota.refresh_after_s",
+    int,
+    DEFAULT_REFRESH_AFTER_S,
+    "seconds after a read before the drive pass refreshes it",
 )
 
 

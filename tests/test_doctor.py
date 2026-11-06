@@ -890,5 +890,76 @@ class ProductionHubGathering(unittest.TestCase):
             self.assertNotIn(token, probe.detail)
 
 
+class QuotaFreshness(unittest.TestCase):
+    T0 = 1_800_000_000.0
+
+    def view(self, providers):
+        return {"now": self.T0, "providers": providers}
+
+    def entry(self, **fields):
+        values = {
+            "state": "ok",
+            "windows": {"weekly": {"used_pct": 10.0, "resets_at": None}},
+            "read_at": self.T0,
+            "stale": False,
+            "stale_reason": None,
+            "mark": None,
+            "reader": "fake:provider-a",
+            "error": None,
+        }
+        values.update(fields)
+        return values
+
+    def test_no_quota_view_means_no_quota_rows(self):
+        checks = doctor.run_checks(env())
+        self.assertEqual([check.name for check in checks if check.name.startswith("quota:")], [])
+
+    def test_a_fresh_reading_is_an_ok_row_with_its_age(self):
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": self.entry()})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "ok")
+        self.assertIn("just now", rows[0].detail)
+
+    def test_a_too_old_reading_warns_with_its_reason(self):
+        entry = self.entry(
+            state="unknown", stale=True, stale_reason="too old", read_at=self.T0 - 10
+        )
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": entry})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("too old", rows[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_missing_reading_warns_that_it_never_ran(self):
+        entry = self.entry(state="unknown", stale=True, stale_reason="never ran", read_at=None)
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": entry})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("never ran", rows[0].detail)
+
+    def test_a_failed_reading_warns_with_the_error(self):
+        entry = self.entry(
+            state="unknown",
+            stale=True,
+            stale_reason="reader failed",
+            read_at=self.T0 - 60,
+            error="boom",
+        )
+        checks = doctor.run_checks(env(quota_view=self.view({"provider-a": entry})))
+        rows = [check for check in checks if check.name == "quota:provider-a"]
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("reader failed", rows[0].detail)
+        self.assertIn("boom", rows[0].detail)
+
+    def test_an_unreadable_ledger_is_one_warn_row(self):
+        checks = doctor.run_checks(env(quota_view=ValueError("ledger gone")))
+        rows = [check for check in checks if check.name == "quota"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].status, "warn")
+        self.assertIn("ledger gone", rows[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

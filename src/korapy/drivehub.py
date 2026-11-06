@@ -263,6 +263,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             max_starts = host_settings["drive.max_starts_per_day"]
             hold_label = host_settings["board.hold_label"]
             hub_url = host_settings["hub.url"]
+            quota_refresh_after_s = host_settings["quota.refresh_after_s"]
         except settings.SettingsError as problem:
             print(f"korapy drive: {problem}", file=sys.stderr)
             return drive.USAGE
@@ -426,6 +427,7 @@ def cmd_drive(args: argparse.Namespace) -> int:
             review_reader=review_reader,
             pulls_for=drive.tracker_pulls_for(tracker_factory),
             driven=driven,
+            quota_refresh_after_s=quota_refresh_after_s,
         )
 
 
