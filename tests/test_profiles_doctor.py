@@ -223,6 +223,22 @@ class BuiltinFallback(unittest.TestCase):
         checks = check(state(parsed=fast, selections=selections), [dep("omp")])
         self.assertNotIn("profile-default", by_name(checks))
 
+    def test_a_committed_default_carries_no_fallback_note(self):
+        fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
+        checks = check(
+            state(
+                parsed=fast,
+                committed={"default": "fast", "repos": {}, "roles": {}},
+            ),
+            [dep("omp")],
+        )
+        self.assertNotIn("profile-default", by_name(checks))
+
+    def test_no_selections_reading_with_declarations_carries_no_fallback_note(self):
+        fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
+        checks = check(state(parsed=fast, selections=None), [dep("omp")])
+        self.assertNotIn("profile-default", by_name(checks))
+
     def test_no_declarations_carry_no_fallback_note(self):
         checks = check(state(), [dep("muse"), dep("omp")])
         self.assertNotIn("profile-default", by_name(checks))

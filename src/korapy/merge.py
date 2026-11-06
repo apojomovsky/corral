@@ -100,7 +100,10 @@ IDENTITY = ("lock", "open", "head", "review", "fork")
 OK_S, FAIL, SKIPPED = "ok", "fail", "skipped"
 
 #: A pinned head: a full 40- or 64-digit hex SHA, nothing shorter.
-_FULL_SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
+#:
+#: The one definition; `review show` reuses it, so a loosened copy can
+#: never make `merge` accept a head the forge pin then refuses.
+FULL_SHA = re.compile(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}")
 
 
 class MergeError(Exception):
@@ -214,16 +217,60 @@ def _locked(path: str):
         os.close(fd)
 
 
+#: The kernel's live lock table: the source of the lockless probe.
+LOCKS_PATH = "/proc/locks"
+
+
+def _read_locks(path: str) -> str:
+    """The lock table text: the probe's seam, so tests inject fixtures."""
+    with open(path, encoding="utf-8") as handle:
+        return handle.read()
+
+
+def _lock_key(fd: int) -> str:
+    """The `/proc/locks` device key for an open file: `major:minor:inode`."""
+    stat = os.fstat(fd)
+    return f"{os.major(stat.st_dev):02x}:{os.minor(stat.st_dev):02x}:{stat.st_ino}"
+
+
+def _lock_held(text: str, key: str) -> bool:
+    """Whether the lock table shows an `FLOCK` lock on the `key` file.
+
+    Pure: only `FLOCK` rows for this device and inode count (`POSIX`
+    locks live in another lock space and never block `flock`), and
+    unknown rows never match, so a stranger table reads as free.
+    """
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != "FLOCK":
+            continue
+        if fields[5] == key:
+            return True
+    return False
+
+
 def _lock_free(path: str) -> bool:
-    """Whether the merge lock is free: a probe that never holds it."""
-    fd = _open_lock(path)
+    """Whether the merge lock is free: a probe that never holds it.
+
+    Nothing is created (a missing lock file reads as free) and no lock
+    is taken: the open is read-only and the state comes from the
+    kernel's lock table, so a real merger's non-blocking attempt never
+    lands inside a probe window.
+    """
     try:
-        _acquire(fd, path)
-    except MergeBusy:
-        return False
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return True
+    except OSError as err:
+        raise MergeError(f"cannot open the merge lock {path}: {err}") from None
+    try:
+        text = _read_locks(LOCKS_PATH)
+        held = _lock_held(text, _lock_key(fd))
+    except OSError as err:
+        raise MergeError(f"cannot probe the merge lock {path}: {err}") from None
     finally:
         os.close(fd)
-    return True
+    return not held
 
 
 def _check_review(ticket_repo: str, ticket_number: int, head: str, base: str, cwd: str) -> Check:
@@ -361,7 +408,7 @@ def run_merge(
     if isinstance(number, bool) or not isinstance(number, int) or number < 1:
         raise MergeError(f"PR number {number!r} must be a positive integer")
     head = str(head_sha or "").strip()
-    if not _FULL_SHA.fullmatch(head):
+    if not FULL_SHA.fullmatch(head):
         raise MergeError("--head must be the full head SHA the caller approved")
     head = head.lower()
     cwd = cwd or os.getcwd()
