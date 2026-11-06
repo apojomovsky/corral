@@ -782,7 +782,9 @@ def launch(
 
     `profile` is the `--profile` flag: the layer-1 profile name. `model`
     and `runtime` are one-shot refinements of the resolved profile for
-    this launch only. The profile resolves before anything is made (no
+    this launch only. The profile's `options` lay under `--runtime-config`
+    in the per-launch config (the flag file wins shared keys), through
+    `_session_config`. The profile resolves before anything is made (no
     worktree, no unit on a bad profile); with no `[profiles.*]`
     declaration and no flag, the layers fall through to the built-in
     default. Every launch records the resolved profile next to the
@@ -889,7 +891,14 @@ def launch(
         except paths.PathError as err:
             raise LaunchError(str(err)) from None
         session_id = _write_session(
-            session, adapter, session_runtime, prompt, runtime_config, chains, role
+            session,
+            adapter,
+            session_runtime,
+            prompt,
+            runtime_config,
+            chains,
+            role,
+            options=selection.profile.options,
         )
         try:
             profiles.record_profile(
@@ -997,14 +1006,33 @@ def _recorded_role(session):
     return role
 
 
-def _write_session(session, adapter, runtime, prompt, runtime_config, chains=None, role=None):
+def _session_config(adapter, options, runtime_config, chains):
+    """The per-launch config: profile options under `--runtime-config`, chains on top.
+
+    The resolved profile's `options` lay first; the command line's
+    `--runtime-config` wins on every shared key, and the live chains lay
+    over both through the adapter's `with_models`, the way chains
+    already did. One helper owns the order, so a launch and a resume
+    with flags build the same config.
+    """
+    config = {**(options or {}), **(runtime_config or {})}
+    if chains:
+        config = adapter.with_models(config, chains)
+    return config
+
+
+def _write_session(
+    session, adapter, runtime, prompt, runtime_config, chains=None, role=None, options=None
+):
     """The prompt, the runtime and role records and the per-launch config.
 
     Writes into a fresh role generation dir, so no record is ever
-    inherited from another role's session. Returns the fresh muse
-    session id for a muse launch, else None. The id is generated here,
-    recorded here and passed to `argv` by the caller, so the recorded
-    id and the run's id cannot differ.
+    inherited from another role's session. The per-launch config lays
+    the profile's `options` under `--runtime-config` (see
+    `_session_config`). Returns the fresh muse session id for a muse
+    launch, else None. The id is generated here, recorded here and
+    passed to `argv` by the caller, so the recorded id and the run's
+    id cannot differ.
     """
     try:
         os.makedirs(session, exist_ok=True)
@@ -1012,9 +1040,7 @@ def _write_session(session, adapter, runtime, prompt, runtime_config, chains=Non
         runtimes.record(session, runtime)
         if role is not None:
             paths.atomic_write_text(os.path.join(session, ROLE_FILE), role + "\n")
-        config = runtime_config or {}
-        if chains:
-            config = adapter.with_models(config, chains)
+        config = _session_config(adapter, options, runtime_config, chains)
         adapter.write_config(session, config)
         if adapter.name == muse.NAME:
             session_id = muse.new_session_id()
@@ -1065,7 +1091,10 @@ def resume(
     before profiles were recorded falls back to its recorded runtime.
     With `--profile` (or `--model`/`--runtime`) the flag layer decides
     for the resumed run instead, the same way it does at launch, and the
-    new profile is recorded over the old one. A lone `--runtime` without
+    new profile is recorded over the old one. A resume with `--profile`
+    or `--runtime` also rebuilds the session config from the new
+    profile's options and chains through `_session_config`; any other
+    resume keeps the recorded setup. A lone `--runtime` without
     any declared profile still switches the run to that runtime.
     The reviewer mode is the one the launch ran with: a resumed reviewer
     stays read-only.
@@ -1167,6 +1196,14 @@ def resume(
             raise _no_session(tgt, number, role, "session to resume")
         if selection is not None:
             adapter = _adapter(selection.runtime)
+            if profile is not None or runtime is not None:
+                try:
+                    adapter.write_config(
+                        session,
+                        _session_config(adapter, selection.profile.options, None, selection.chains),
+                    )
+                except (ValueError, TypeError, OSError) as err:
+                    raise LaunchError(f"cannot write the agent's session: {err}") from None
             try:
                 profiles.record_profile(
                     session,
