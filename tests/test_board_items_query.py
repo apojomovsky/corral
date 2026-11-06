@@ -49,93 +49,92 @@ PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
 def top_level_bindings(tree):
     """Every module-scope ``(name, lineno, is_plain_import)`` binding of one module.
 
-    The walk descends into the suites of ``if``, ``while``, ``for``,
-    ``with``, ``try`` and ``match`` statements, which all run in the
-    module scope, and records the names those statements bind themselves
-    (loop targets, ``with`` items, ``except ... as`` names, ``match``
-    captures) plus walrus targets in their conditions, iterables and
-    assigned values. Function and class bodies open a new scope, so
-    only the ``def`` or ``class`` name itself is recorded, never the
-    names inside. An augmented assignment never binds on its own, so
+    One generic walk visits every node evaluated where the module body
+    runs and records each name that binds there: stored names
+    (assignment, ``for`` and ``with ... as`` targets), walrus targets
+    (a walrus binds its enclosing scope, even in a comprehension, a
+    decorator or a default), ``except ... as`` names, ``match``
+    captures, import aliases, and each ``def`` or ``class`` name.
+    Function, lambda and class bodies open a new scope, so only the
+    names around them are visited: decorators, defaults, annotations,
+    bases and keywords. Comprehension loop targets stay out for the
+    same reason. An augmented assignment never binds on its own, so
     ``X += 1`` after ``X = 1`` is not a second binding.
     """
     found = []
 
-    def collect_target(target, lineno):
-        found.extend(
-            (name.id, lineno, False)
-            for name in ast.walk(target)
-            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
-        )
+    def bind(name, lineno, plain=False):
+        found.append((name, lineno, plain))
 
-    def collect_walrus(expr):
-        for node in ast.walk(expr):
-            if isinstance(node, ast.NamedExpr):
-                collect_target(node.target, node.lineno)
-
-    def collect_pattern(pattern):
-        for node in ast.walk(pattern):
-            if isinstance(node, (ast.MatchAs, ast.MatchStar)):
-                if node.name:
-                    found.append((node.name, node.lineno, False))
-            elif isinstance(node, ast.MatchMapping):
-                if node.rest:
-                    found.append((node.rest, node.lineno, False))
-
-    def visit(node):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            found.append((node.name, node.lineno, False))
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                collect_target(target, node.lineno)
-            collect_walrus(node.value)
-        elif isinstance(node, ast.AnnAssign):
+    def visit(node, in_comprehension=False):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store) and not in_comprehension:
+                bind(node.id, node.lineno)
+            return
+        if isinstance(node, ast.NamedExpr):
             if isinstance(node.target, ast.Name):
-                found.append((node.target.id, node.lineno, False))
-            if node.value is not None:
-                collect_walrus(node.value)
+                bind(node.target.id, node.lineno)
+            visit(node.value, in_comprehension)
+            return
+        if isinstance(node, ast.ExceptHandler):
+            if node.name:
+                bind(node.name, node.lineno)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                bind(node.name, node.lineno)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                bind(node.rest, node.lineno)
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                bound = alias.asname or alias.name.split(".")[0]
-                found.append((bound, node.lineno, True))
+                bind(alias.asname or alias.name.split(".")[0], node.lineno, plain=True)
+            return
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 if alias.name != "*":
-                    found.append((alias.asname or alias.name, node.lineno, False))
-        elif isinstance(node, (ast.If, ast.While)):
-            collect_walrus(node.test)
-            for child in (*node.body, *node.orelse):
-                visit(child)
-        elif isinstance(node, (ast.For, ast.AsyncFor)):
-            collect_target(node.target, node.lineno)
-            collect_walrus(node.iter)
-            for child in (*node.body, *node.orelse):
-                visit(child)
-        elif isinstance(node, (ast.With, ast.AsyncWith)):
-            for item in node.items:
-                collect_walrus(item.context_expr)
-                if item.optional_vars is not None:
-                    collect_target(item.optional_vars, node.lineno)
-            for child in node.body:
-                visit(child)
-        elif isinstance(node, (ast.Try, ast.TryStar)):
-            for child in node.body:
-                visit(child)
-            for handler in node.handlers:
-                visit(handler)
-            for child in (*node.orelse, *node.finalbody):
-                visit(child)
-        elif isinstance(node, ast.ExceptHandler):
-            if node.name:
-                found.append((node.name, node.lineno, False))
-            for child in node.body:
-                visit(child)
-        elif isinstance(node, ast.Match):
-            collect_walrus(node.subject)
-            for case in node.cases:
-                collect_pattern(case.pattern)
-                for child in case.body:
-                    visit(child)
+                    bind(alias.asname or alias.name, node.lineno)
+            return
+        elif isinstance(node, ast.AugAssign):
+            visit(node.value, in_comprehension)
+            return
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(node.name, node.lineno)
+            for decorator in node.decorator_list:
+                visit(decorator, in_comprehension)
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    visit(default, in_comprehension)
+            params = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            if node.args.vararg is not None:
+                params += (node.args.vararg,)
+            if node.args.kwarg is not None:
+                params += (node.args.kwarg,)
+            for param in params:
+                if param.annotation is not None:
+                    visit(param.annotation, in_comprehension)
+            if node.returns is not None:
+                visit(node.returns, in_comprehension)
+            return
+        elif isinstance(node, ast.ClassDef):
+            bind(node.name, node.lineno)
+            for decorator in node.decorator_list:
+                visit(decorator, in_comprehension)
+            for base in node.bases:
+                visit(base, in_comprehension)
+            for keyword in node.keywords:
+                visit(keyword.value, in_comprehension)
+            return
+        elif isinstance(node, ast.Lambda):
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    visit(default, in_comprehension)
+            return
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            for child in ast.iter_child_nodes(node):
+                visit(child, True)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, in_comprehension)
 
     for node in tree.body:
         visit(node)
@@ -215,9 +214,13 @@ class WrappedBindingGuardTest(unittest.TestCase):
     """Duplicates hidden inside a compound statement still bind at module scope.
 
     ``if``, ``try``, ``for``, ``with`` and ``match`` suites run in the
-    module scope, so a second binding there replaces the first at import
-    time exactly like a second direct statement. Function and class
-    bodies open a new scope and stay out of the walk.
+    module scope, as do guards, decorators, defaults, bases and bare
+    expressions, so a second binding there replaces the first at import
+    time exactly like a second direct statement. Function, lambda and
+    class bodies open a new scope and stay out of the walk, as do
+    comprehension targets (a walrus inside one still binds outside).
+    Each new bypass gets a CASES entry, never a new branch: the walk is
+    generic, so one entry is the whole proof.
     """
 
     CASES = [
@@ -244,12 +247,31 @@ class WrappedBindingGuardTest(unittest.TestCase):
         ("except as", "try:\n    pass\nexcept OSError as _DUP:\n    pass\n_DUP = None\n"),
         ("walrus in condition", "if (_DUP := load()):\n    pass\n_DUP = None\n"),
         ("walrus in iterable", "for item in (_DUP := load()):\n    pass\n_DUP = None\n"),
+        (
+            "match-case guard",
+            "match cmd:\n    case _ if (_DUP := check()):\n        pass\n_DUP = None\n",
+        ),
+        ("bare walrus", "(_DUP := load())\n_DUP = None\n"),
+        ("assert walrus", "assert (_DUP := check())\n_DUP = None\n"),
+        ("augmented value", "_TOTAL = 0\n_TOTAL += (_DUP := 1)\n_DUP = 2\n"),
+        ("decorator", "@(_DUP := deco)\ndef handle():\n    pass\n_DUP = None\n"),
+        ("default", "def handle(arg=(_DUP := load())):\n    pass\n_DUP = None\n"),
+        ("class base", "class Thing((_DUP := Base)):\n    pass\n_DUP = None\n"),
+        (
+            "walrus in comprehension",
+            "[(_DUP := render(item)) for item in items]\n_DUP = None\n",
+        ),
     ]
 
     CLEAN_CASES = [
         ("except as bound once", "try:\n    pass\nexcept OSError as _DUP:\n    print(_DUP)\n"),
         ("walrus bound once", "if (_DUP := load()):\n    print(_DUP)\n"),
         ("augassign is not a rebinding", "_TOTAL = 0\nif cond:\n    _TOTAL += 2\n"),
+        ("comprehension target stays out", "[_DUP for _DUP in items]\n"),
+        (
+            "lambda default walrus bound once",
+            "apply(lambda arg=(_DUP := load()): arg)\n",
+        ),
     ]
 
     def test_each_wrapper_reports_both_bindings(self):
