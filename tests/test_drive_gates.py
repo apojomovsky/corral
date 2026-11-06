@@ -1062,10 +1062,12 @@ class PullsIndexMapTest(unittest.TestCase):
 class PullsCheckNeededTest(unittest.TestCase):
     """Only tickets a check could still start trigger a listing."""
 
-    def check(self, item, live=(), hold_label="hold"):
+    def check(self, item, live=(), hold_label="hold", kind="start"):
         rows = eligibility.rows_from_items([item])
         live_keys = {(repo, number) for _, repo, number in live}
-        return drive.pulls_check_needed(rows[0], live_keys=live_keys, hold_label=hold_label)
+        return drive.pulls_check_needed(
+            rows[0], live_keys=live_keys, hold_label=hold_label, kind=kind
+        )
 
     def test_an_open_unclaimed_ticket_needs_the_check(self):
         self.assertTrue(self.check(board_item()))
@@ -1086,6 +1088,20 @@ class PullsCheckNeededTest(unittest.TestCase):
     def test_a_ticket_claimed_by_a_live_agent_needs_no_check(self):
         item = board_item(agent="drive-host-1-abc-7")
         self.assertFalse(self.check(item, live=[("blue", "app", 7)]))
+
+    def test_a_live_claim_needs_no_check_for_start_or_review(self):
+        item = board_item(agent="drive-host-1-abc-7")
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="start"))
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="review"))
+
+    def test_a_live_managed_claim_needs_the_check_for_fix_and_resume(self):
+        item = board_item(agent="drive-host-1-abc-7")
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="fix"))
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="resume"))
+
+    def test_a_live_foreign_claim_needs_no_check_for_fix(self):
+        item = board_item(agent="human-1")
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="fix"))
 
     def test_a_managed_claim_without_a_live_agent_still_needs_the_check(self):
         self.assertTrue(self.check(board_item(agent="drive-host-1-abc-7")))

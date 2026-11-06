@@ -144,8 +144,9 @@ ticket's repository once through the tracker (`Tracker.pulls_index`,
 implemented once by each adapter: one paged open-pulls listing per
 repository, filed by linked ticket) and the rows a policy sees arrive
 with `pulls` populated: only tickets some project wants and the gate
-could still start trigger a listing (open, unheld, not live-claimed,
-and in a repository the pass drives; anything else never fetches, and
+could still decide trigger a listing (open, unheld, and in a
+repository the pass drives, with live-claimed tickets fetched only
+for `fix` and `resume`; anything else never fetches, and
 with none to check the tracker is never contacted). `basic`'s own pull filter refuses a
 ticket with an open linked pull, and the shared gate reads the same row
 pulls (section 3), so the two never disagree and no second lookup runs.
@@ -215,7 +216,7 @@ Per-candidate gate order, cheapest first:
    - Claimed row plus `review`: skip while the worker still holds
      the claim. The review is scheduled on a later pass, after the
      worker finishes and the takeover above schedules it.
-3. Review threshold and linked pulls, both on unclaimed rows only.
+3. Review threshold (unclaimed rows) and linked pulls.
    The pass reads the ticket's latest review record once per pass
    from the session dirs and grades it here: an approving verdict
    (`approve` or `approve-with-findings`) whose findings all sit
@@ -243,7 +244,10 @@ Per-candidate gate order, cheapest first:
    repository; an unreadable read fails closed (skip, record
    "unreadable"), and so does a repository past the
    `drive.pulls_max_calls` cap (skip, record "pulls lookup limited").
-   `--plan` builds rows with no pulls and skips this check: it never
+   A `fix` or `resume` on a claimed row reads the same row pulls:
+   unreadable pulls refuse it with the cause named, and a hold label
+   on a linked pull hold-skips it. `--plan` builds rows with no pulls
+   and skips this check: it never
    contacts the tracker. The summary line counts the listing calls
    (`pulls calls`), so a regression is visible at once.
 4. Hold: `hold.reason` over the ticket and linked PR labels.

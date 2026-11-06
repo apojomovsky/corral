@@ -1399,16 +1399,18 @@ def pulls_index_for(tracker_factory):
     return index_for
 
 
-def pulls_check_needed(row, *, live_keys, hold_label) -> bool:
+def pulls_check_needed(row, *, live_keys, hold_label, kind="start") -> bool:
     """Whether the pass must list pulls before deciding this row. Pure.
 
-    Only tickets the gate could still start need the listing: an open,
-    internally owned ticket no live agent holds and no human holds.
-    Anything else skips before the gate ever reads row pulls (closed,
-    external, held, waiting on a human, foreign-claimed, or claimed
-    by a live agent), so listing for it would spend GitHub calls no
-    verdict uses. `live_keys` holds the (repo, number) pairs with a
-    live agent.
+    Only tickets the gate could still decide need the listing: an open,
+    internally owned ticket no human holds. Anything else skips before
+    the gate ever reads row pulls (closed, external, held, waiting on
+    a human, foreign-claimed), so listing for it would spend GitHub
+    calls no verdict uses. A live-claimed ticket needs the listing
+    only for `fix` and `resume`: those are the only kinds that reach
+    the pulls reads with a holder, while `start` and `review` skip on
+    the claim first. `live_keys` holds the (repo, number) pairs with a
+    live agent, and `kind` is the wanted request kind.
     """
     if row is None or row.state != "open" or row.external:
         return False
@@ -1421,7 +1423,7 @@ def pulls_check_needed(row, *, live_keys, hold_label) -> bool:
     if not holder:
         return True
     if (row.repo, row.number) in live_keys:
-        return False
+        return kind in ("fix", "resume") and is_managed_agent(holder)
     return is_managed_agent(holder)
 
 
@@ -1673,8 +1675,9 @@ def _gate_all(
     `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
     setting) caps the listing calls for the pass. The map is built
     lazily: a pulls-less eligibility run first finds which tickets any
-    project wants, then only the fetchable ones (open, unheld, not
-    live-claimed, and in a repository the pass drives) trigger one
+    project wants, then only the fetchable ones (open, unheld, and in
+    a repository the pass drives, with live-claimed tickets fetched
+    only for `fix` and `resume`) trigger one
     listing per repository; with none to check the tracker is never
     contacted. A pass that hits the cap
     prints "pulls lookup limited" and refuses the unchecked starts,
@@ -1708,7 +1711,7 @@ def _gate_all(
         for repos in driven.values():
             union |= set(repos)
     if index_for is not None:
-        wanted: set = set()
+        wanted: dict = {}
         for project in registered:
             try:
                 outcome = eligibility.for_project(project, items, now=now)
@@ -1716,14 +1719,22 @@ def _gate_all(
                 continue
             if outcome.skipped is None:
                 for request in outcome.requests:
-                    wanted.add((request.repo, request.number))
+                    wanted.setdefault((request.repo, request.number), set()).add(request.kind)
         pre_by_key = _released_rows(items, released)
         live_keys = {(repo, number) for _, repo, number in live_set}
         fetch_keys = {
             key
-            for key in wanted
+            for key, kinds in wanted.items()
             if (union is None or key[0] in union)
-            and pulls_check_needed(pre_by_key.get(key), live_keys=live_keys, hold_label=hold_label)
+            and any(
+                pulls_check_needed(
+                    pre_by_key.get(key),
+                    live_keys=live_keys,
+                    hold_label=hold_label,
+                    kind=kind,
+                )
+                for kind in kinds
+            )
         }
         if fetch_keys:
             if pulls_max_calls is None:

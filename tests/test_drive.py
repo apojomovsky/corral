@@ -342,6 +342,114 @@ class PullsLookupPassTest(unittest.TestCase):
         self.assertIn("linked pulls unreadable, start refused (pulls lookup limited", out)
         self.assertIn("pulls lookup limited", out.splitlines()[-1])
 
+    def test_fix_on_a_live_claimed_row_with_unreadable_pulls_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "fix")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("linked pulls unreadable, fix refused", out)
+        self.assertIn("tracker down", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_resume_on_a_live_claimed_row_with_unreadable_pulls_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "resume")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("linked pulls unreadable, resume refused", out)
+        self.assertIn("tracker down", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_fix_on_a_live_claimed_row_with_a_held_pull_is_hold_skipped(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 12, kind="pr", state="open")]}
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "fix")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            read_labels=lambda kind, repo, number: ["hold"] if kind == "pr" else [],
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#12", out)
+        self.assertIn("pulls calls 1", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_a_bad_pulls_setting_is_recorded_and_the_pass_caps_at_the_default(self):
+        from korapy import eligibility
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        items = store.items()
+        project = project_named("blue", entry="dummy:eligible")
+        outcome = eligibility.Outcome([eligibility.StartRequest("app", 7, "start")], None)
+        fake = FakeTracker()
+        out = io.StringIO()
+        with (
+            mock.patch.object(eligibility, "for_project", return_value=outcome),
+            mock.patch.object(
+                drive.settings,
+                "load",
+                side_effect=settings.SettingsError("bad pulls budget"),
+            ),
+        ):
+            gated, problems, _, pulls_calls, pulls_limited = drive._gate_all(
+                items,
+                [project],
+                out,
+                now=2000.0,
+                live_set=frozenset(),
+                limits=admission.Limits(total=4),
+                quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+                pool=None,
+                ledger_data={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                fix_threshold="high",
+                index_for=drive.pulls_index_for(lambda repo: fake),
+                pulls_max_calls=None,
+            )
+        self.assertEqual(len(problems), 1)
+        self.assertIn("bad pulls budget", problems[0])
+        self.assertEqual(
+            [call for call in fake.calls if call[0] == "pulls_index"],
+            [("pulls_index", "app", drive.DEFAULT_PULLS_MAX_CALLS)],
+        )
+        self.assertEqual(pulls_calls, 1)
+        self.assertFalse(pulls_limited)
+        self.assertEqual(len(gated), 1)
+
 
 class PlanTest(unittest.TestCase):
     def setUp(self):
