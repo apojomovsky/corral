@@ -37,6 +37,9 @@ Five rules bind every verb:
 | `korapy merge REPO NUMBER --pr N --head SHA [--forge-repo OWNER/NAME] [--method METHOD] [--skip CHECK] [--plan] [--json]` | Merge one PR after proving it mergeable, one merger per repo. `--head` pins the approved head; only `checks` can be skipped. | `--plan`: reports every row and the lock state without taking the lock or merging. |
 | `korapy drive [--plan]` | Run one dispatch pass over the board store. | `--plan`: prints the candidate table and changes nothing. |
 | `korapy push [BRANCH] [--remote REMOTE]` | Push the branch, verify the remote ref, retry once on a dead connection. | None: pushing is the worktree-side half of landing. |
+| `korapy heavy run [--timeout SECS] [--role NAME] [--bypass REASON] [--plan] [--json] CMD` | Queue one heavy command in the lane and run it in a transient scope with CPU and memory limits, releasing the slot on exit. `--bypass REASON` runs now, skipping the queue inside the same scope limits, and records the reason in the lane journal. Past the wait deadline the waiter leaves with 75. | `--plan`: reports the verdict without queueing or running. |
+| `korapy heavy status [--json]` | The lane's holders, waiters and learned costs; an empty lane is an empty list. | Itself: it writes nothing. |
+| `korapy heavy rollup [--out PATH]` | Regenerate the portable per-key cost summary from the raw run ledger; `--out` writes the same bytes for the operator to commit. | Without `--out` it writes nothing. |
 | `korapy agent list [--json]` | Agents on this host that are not gone. | Itself: it writes nothing. |
 | `korapy snapshot [--json]` | One read-only view of the host: agents, quota, capacity, resources, disks, the drive section. | Itself: it writes nothing. |
 | `korapy serve [--bind ADDR] [--port N]` | Run the read-only dashboard API on loopback; the stream is `/v1/stream` over the snapshot. | Itself: the API only reads. |
@@ -54,7 +57,7 @@ lists `acquire`, `status`, `heartbeat`, `release`, `takeover`, `log`,
 | 2 | Race lost or already running: the lease is held, another merger holds the per-repo lock, another pass holds the drive lock. Retry later. |
 | 3 | Unreachable: the forge, the tracker, or the state dir cannot be read. |
 | 4 | Usage or configuration error: a bad flag value, a missing project, `--skip` naming an unknown or identity check. |
-| 75 | No free slot (try later): the daily start cap or the suite lock stopped the run. |
+| 75 | No free slot (try later): the daily start cap or a lane wait past its deadline stopped the run. |
 
 An empty event queue is not a failure: `coord events` prints an empty
 list and exits 0. Scripts that need an exit code use `coord wait` in a
