@@ -401,14 +401,7 @@ def check_quota(view: Mapping[str, object] | Exception | None) -> list[Check]:
             )
         except TypeError:
             age = quotacli.format_age(None)
-        reason = info.get("stale_reason")
-        if not reason and info.get("stale"):
-            if info.get("error") is not None:
-                reason = quotacli.READER_FAILED
-            elif read_at is not None:
-                reason = quotacli.TOO_OLD
-            else:
-                reason = quotacli.NEVER_RAN
+        reason = quotacli.stale_reason(info)
         if reason is None:
             rows.append(Check(f"quota:{name}", "ok", f"{state}, read {age}", ""))
             continue

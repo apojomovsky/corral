@@ -78,6 +78,30 @@ def format_age(age_s) -> str:
     return f"{hours // 24}d ago"
 
 
+def stale_reason(entry) -> str | None:
+    """Why `entry` reads stale: its stored reason, or derived from its shape.
+
+    `entry` is a provider view as `snapshot` returns it (or any mapping
+    with `stale`, `stale_reason`, `error` and `read_at`). A stored
+    reason passes through; a fresh entry reads None; otherwise the
+    shape decides: a recorded error means the reader failed, a read
+    timestamp means the reading is too old, and neither means the
+    reader never ran. One helper, so the dashboard and the doctor
+    never disagree on the words.
+    """
+    info = entry if isinstance(entry, dict) else {}
+    reason = info.get("stale_reason")
+    if reason:
+        return reason
+    if not info.get("stale"):
+        return None
+    if info.get("error") is not None:
+        return READER_FAILED
+    if info.get("read_at") is not None:
+        return TOO_OLD
+    return NEVER_RAN
+
+
 def snapshot(pool, ledger, now, *, low_pct):
     """Status view: ``{"now": now, "providers": {name: {...}}}``.
 

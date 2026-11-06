@@ -196,6 +196,25 @@ class StaleReason(unittest.TestCase):
         self.assertEqual(entry["error"], "boom")
 
 
+class StaleReasonHelper(unittest.TestCase):
+    def test_a_fresh_entry_has_no_reason(self):
+        self.assertIsNone(quotacli.stale_reason({"stale": False, "stale_reason": None}))
+
+    def test_a_stored_reason_passes_through(self):
+        entry = {"stale": True, "stale_reason": "too old", "error": None, "read_at": 10.0}
+        self.assertEqual(quotacli.stale_reason(entry), "too old")
+
+    def test_a_stale_entry_without_a_reason_derives_one_from_the_error(self):
+        entry = {"stale": True, "error": "boom", "read_at": 10.0}
+        self.assertEqual(quotacli.stale_reason(entry), quotacli.READER_FAILED)
+
+    def test_a_stale_entry_with_a_read_at_is_too_old(self):
+        self.assertEqual(quotacli.stale_reason({"stale": True, "read_at": 10.0}), quotacli.TOO_OLD)
+
+    def test_a_stale_entry_that_never_ran_says_so(self):
+        self.assertEqual(quotacli.stale_reason({"stale": True}), quotacli.NEVER_RAN)
+
+
 class FormatAge(unittest.TestCase):
     def test_never_without_a_stamp(self):
         self.assertEqual(quotacli.format_age(None), "never")

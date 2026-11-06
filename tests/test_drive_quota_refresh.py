@@ -9,7 +9,7 @@ import os
 import tempfile
 import unittest
 
-from korapy import accounts, admission, drive, projects
+from korapy import accounts, admission, drive, projects, quota_ledger
 from tests.test_drive import policy_source, stored
 
 
@@ -213,6 +213,32 @@ class FailureRecordingTest(unittest.TestCase):
         self.assertIn("does not import", fresh["readings"]["provider-a"]["error"])
         self.assertEqual(results["provider-a"][0], False)
 
+    def test_garbage_windows_are_recorded_never_raised(self):
+        class GarbageReader:
+            def __init__(self):
+                self.calls = 0
+
+            def read(self, now):
+                self.calls += 1
+                return {"windows": {"weekly": {"used_pct": "high", "resets_at": None}}}
+
+            def parse_limit_error(self, text, now):
+                return None
+
+        reader = GarbageReader()
+        fresh, results = drive.refresh_stale(
+            [provider()],
+            {"readings": {}, "marks": {}},
+            T0,
+            refresh_after_s=AGE,
+            load_reader=loader_for(reader),
+        )
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(results["provider-a"][0], False)
+        entry = fresh["readings"]["provider-a"]
+        self.assertIn("error", entry)
+        self.assertEqual(entry["at"], T0)
+
     def test_a_failed_refresh_keeps_todays_admission_behavior(self):
         from korapy import quota
 
@@ -386,6 +412,129 @@ class PassRefreshTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(reader.calls, 0)
         self.assertEqual(err, "")
+
+
+class PassRefreshLockBranchTest(unittest.TestCase):
+    """The production branch persists through the ledger lock and gates fresh.
+
+    Production never injects `ledger`, so the pass loads it from the
+    state dir and persists through `quota_ledger.update`. These tests
+    point `KORAPY_STATE` at a temp dir and omit `ledger`, covering the
+    branch every injected-ledger test skips: if the branch persisted
+    the fresh reading yet gated on the stale one, the first test here
+    would fail.
+    """
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-quota-lock-"))
+        self.db = os.path.join(self.tmp, "board.sqlite")
+        self.lock = os.path.join(self.tmp, "drive.lock")
+        self.policies = os.path.join(self.tmp, "policies")
+        os.makedirs(self.policies)
+        self.state = os.path.join(self.tmp, "state")
+        os.makedirs(self.state)
+        old = os.environ.get("KORAPY_STATE")
+        os.environ["KORAPY_STATE"] = self.state
+        self.addCleanup(self._restore_state, old)
+
+    def _restore_state(self, old):
+        if old is None:
+            os.environ.pop("KORAPY_STATE", None)
+        else:
+            os.environ["KORAPY_STATE"] = old
+
+    def write_policy(self, name, wants):
+        path = os.path.join(self.policies, name + ".py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(policy_source(wants))
+        return path + ":eligible"
+
+    def project(self, name, entry):
+        return projects.Project(
+            name=name,
+            unit_prefix=name + "-agent-",
+            root=os.path.join(self.tmp, "ops", name),
+            eligibility=entry,
+        )
+
+    def quotas(self, **fields):
+        values = {"stale_after": AGE, "low_pct": 90, "unknown_blocks": True}
+        values.update(fields)
+        return {"blue": drive.QuotaSource(chains={"worker": ["provider-a/model"]}, **values)}
+
+    def run_pass(self, store, found, **fields):
+        out, err = io.StringIO(), io.StringIO()
+        values = {
+            "plan": False,
+            "store": store,
+            "lock_path": self.lock,
+            "out": out,
+            "err": err,
+            "now": T0,
+            "projects_fn": lambda: found,
+            "live": frozenset(),
+            "limits": admission.Limits(
+                total=4, projects={p.name: {"floor": 0, "ceiling": None} for p in found}
+            ),
+            "read_labels": lambda kind, repo, number: [],
+            "hold_label": "hold",
+            "present_agents": frozenset(),
+            "live_units": frozenset(),
+            "gone_s": 3600.0,
+        }
+        values.update(fields)
+        code = drive.run_pass(**values)
+        return code, out.getvalue(), err.getvalue()
+
+    def ledger_file(self):
+        return os.path.join(self.state, quota_ledger.LEDGER_NAME)
+
+    def test_a_stale_disk_reading_is_rewritten_and_gates_fresh(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        old = {
+            "windows": {"weekly": {"used_pct": 10.0, "resets_at": None}},
+            "read_at": T0 - 6 * 86400,
+        }
+        quota_ledger.save({"readings": {"provider-a": old}, "marks": {}})
+        reader = CountingReader()
+        code, out, err = self.run_pass(
+            store,
+            [self.project("blue", entry)],
+            quotas=self.quotas(),
+            pool=[provider()],
+            quota_refresh_after_s=AGE,
+            quota_load_reader=loader_for(reader),
+        )
+        self.assertEqual(reader.calls, 1)
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: start", out)
+        self.assertNotIn("quota", err)
+        reread = quota_ledger.load()
+        self.assertEqual(reread["readings"]["provider-a"]["read_at"], T0)
+
+    def test_a_fresh_disk_reading_leaves_the_file_alone(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        entry = self.write_policy("blue_policy", [("app", 7, "start")])
+        quota_ledger.save({"readings": {"provider-a": fresh_entry(at=T0)}, "marks": {}})
+        with open(self.ledger_file(), encoding="utf-8") as handle:
+            before = handle.read()
+        reader = CountingReader()
+        code, out, _ = self.run_pass(
+            store,
+            [self.project("blue", entry)],
+            quotas=self.quotas(),
+            pool=[provider()],
+            quota_refresh_after_s=AGE,
+            quota_load_reader=loader_for(reader),
+        )
+        self.assertEqual(reader.calls, 0)
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: start", out)
+        with open(self.ledger_file(), encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
 
 
 if __name__ == "__main__":

@@ -441,14 +441,7 @@ def _show(doc):
                     notes.append(f"read {quotacli.format_age(now - read_at)}")
                 except TypeError:
                     pass
-            reason = info.get("stale_reason")
-            if reason is None and info.get("stale"):
-                if info.get("error") is not None:
-                    reason = quotacli.READER_FAILED
-                elif read_at is not None:
-                    reason = quotacli.TOO_OLD
-                else:
-                    reason = quotacli.NEVER_RAN
+            reason = quotacli.stale_reason(info)
             if reason is not None:
                 notes.append(f"stale: {reason}")
             if notes:
