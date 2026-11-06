@@ -76,7 +76,11 @@ def cmd_merge(args: argparse.Namespace, forge=None) -> int:
         _err(f"korapy merge needs --forge-repo as owner/name, got {want!r}")
         return USAGE
     try:
-        resolved = settings.load(root=settings.find_root(os.getcwd()))
+        root = settings.find_root(os.getcwd())
+        if root is not None and args.repo in settings.repo_names(root):
+            resolved = settings.load(root=root, repo=args.repo)
+        else:
+            resolved = settings.load(root=root)
     except settings.SettingsError as err:
         _err(f"korapy merge: {err}")
         return USAGE

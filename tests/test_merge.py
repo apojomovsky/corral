@@ -9,6 +9,7 @@ dirs, never the host's.
 
 import argparse
 import fcntl
+import inspect
 import io
 import json
 import os
@@ -385,6 +386,15 @@ class ResolveMethodTest(unittest.TestCase):
 
 
 class MergeMethodTest(MergeCase):
+    def test_absent_method_leaves_the_default_to_the_resolver(self):
+        params = inspect.signature(merge.run_merge).parameters
+        self.assertIsNone(params["method"].default)
+        fake = self.fake()
+        result = self.do_merge(fake)
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.merged)
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, merge.DEFAULT_METHOD)])
+
     def test_merge_commit_merges_and_verifies(self):
         fake = self.fake()
         result = self.do_merge(fake, method="merge")
@@ -576,6 +586,41 @@ class CliTest(MergeCase):
         code, _, _ = self.call(self.args(method="squash"), fake)
         self.assertEqual(code, 0)
         self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "squash")])
+
+    def test_per_repo_method_wins_over_project_level(self):
+        self.write(
+            "korapy.toml",
+            '[merge]\nmethod = "squash"\n'
+            '\n[[repo]]\nname = "lib"\n'
+            '\n[repo.merge]\nmethod = "merge"\n',
+        )
+        fake = self.fake()
+        code, out, _ = self.call(self.args(method=None, json=True), fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["method"], "merge")
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "merge")])
+
+    def test_unmatched_repo_name_falls_back_to_project_level(self):
+        self.write(
+            "korapy.toml",
+            '[merge]\nmethod = "merge"\n'
+            '\n[[repo]]\nname = "lib"\n'
+            '\n[repo.merge]\nmethod = "squash"\n',
+        )
+        reviewrecord.write_record(
+            "other",
+            TICKET,
+            self.head,
+            reviewer="reviewer-1",
+            author="author-1",
+            verdict="approve",
+            sessions_root=os.environ["KORAPY_SESSIONS"],
+        )
+        fake = self.fake()
+        code, out, _ = self.call(self.args(method=None, repo="other", json=True), fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["method"], "merge")
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "merge")])
 
     def test_bad_method_flag_is_usage(self):
         code, _, err = self.call(self.args(method="rebase"), self.fake())

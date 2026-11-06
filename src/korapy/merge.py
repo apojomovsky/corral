@@ -324,7 +324,7 @@ def run_merge(
     number: int,
     *,
     head_sha: str,
-    method: str = "squash",
+    method: str | None = None,
     skips=(),
     plan: bool = False,
     forge,
@@ -335,7 +335,8 @@ def run_merge(
     `forge` reads the PR and performs the merge: it is required, so no
     default may silently answer for the remote or merge. `head_sha` is
     the exact head the caller approved; `method` is a squash or a merge
-    commit (anything else is a MergeError naming `merge.method`).
+    commit, absent for the default squash (anything else is a MergeError
+    naming `merge.method`).
     `skips` names waived checks (`checks` alone may be waived). With
     `plan` every row is reported without taking the lock and without
     merging. Usage problems raise MergeError (exit 4); forge outages
