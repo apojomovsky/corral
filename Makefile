@@ -27,9 +27,24 @@ setup-hooks: ## Point git at .githooks (commit-msg, pre-commit, pre-push)
 test: ## Run the unittest suite on the pinned Python
 	uv run --locked $(UNITTEST) -v
 
-test-matrix: ## Run the suite on every supported Python (PYTHONS="3.11 3.14")
-	@for v in $(PYTHONS); do echo "== Python $$v"; \
-	  uv run --locked --isolated --python $$v $(UNITTEST) || exit 1; done
+test-matrix: ## Run the suite on every supported Python in parallel (PYTHONS="3.11 3.14")
+	@cache=$$(uv run --locked korapy paths cache --mkdir) && \
+	logdir="$$cache/check-logs" && mkdir -p "$$logdir" && rm -f "$$logdir"/python-*.status && \
+	for v in $(PYTHONS); do \
+	  (uv run --locked --isolated --python $$v $(UNITTEST) >"$$logdir/python-$$v.log" 2>&1; echo $$? >"$$logdir/python-$$v.status") & \
+	done; wait; \
+	fail=0; for v in $(PYTHONS); do \
+	  code=$$(cat "$$logdir/python-$$v.status" 2>/dev/null); \
+	  if [ "$$code" != "0" ]; then echo "test-matrix: Python $$v failed (see $$logdir/python-$$v.log)"; fail=1; fi; \
+	done; \
+	if [ $$fail != 0 ]; then exit 1; fi; \
+	if [ -z "$$(git status --porcelain)" ]; then \
+	  tree=$$(git rev-parse 'HEAD^{tree}') && now=$$(date +%s) && \
+	  printf '%s %s %s\n' "$$tree" "$(PYTHONS)" "$$now" >"$$cache/korapy-check-stamp" && \
+	  echo "test-matrix: suite passed on $(PYTHONS) (proof in $$cache/korapy-check-stamp)"; \
+	else \
+	  echo "test-matrix: suite passed on $(PYTHONS) (tree is dirty, no proof stamped)"; \
+	fi
 
 format: ## Format the code (ruff, through uv)
 	uv format --preview-features format-command
@@ -46,7 +61,7 @@ audit: ## Check the locked dependencies for known vulnerabilities
 check: lint typecheck test-matrix ## Everything CI runs
 
 pre-pr-check: ## Takeoff ritual: PR_BODY=<file> required, TEST=1 also runs the suite
-	@uv run --script scripts/pre_pr_check.py --body "$(PR_BODY)" $(if $(filter 1,$(TEST)),--test,)
+	@uv run --script scripts/pre_pr_check.py --body "$(PR_BODY)" --pythons "$(PYTHONS)" $(if $(filter 1,$(TEST)),--test,)
 
 install: ## Install the korapy CLI for your user from this checkout (uv tool)
 	uv tool install --reinstall .

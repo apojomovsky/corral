@@ -5,9 +5,13 @@ import io
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
+
+from korapy import checkstamp
 
 from .test_hooks import clean_env
 
@@ -54,8 +58,11 @@ class Template(unittest.TestCase):
         self.assertEqual(check.check_body(body, "docs/81-release-readiness"), [])
 
 
-class Tree(unittest.TestCase):
-    """A main clone with origin/master and a ticket worktree under .worktrees/."""
+class TicketWorktree(unittest.TestCase):
+    """A main clone with origin/master and a ticket worktree under .worktrees/.
+
+    Helpers only, no tests of its own, so the suite runs each gate once.
+    """
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -112,6 +119,10 @@ class Tree(unittest.TestCase):
             code = check.main(["--body", str(self.body), "--cwd", str(cwd or self.tree)])
         return code, err.getvalue()
 
+
+class Tree(TicketWorktree):
+    """The takeoff gates on a ticket worktree (no --test)."""
+
     def test_a_clean_ticket_worktree_passes(self):
         self.commit(self.tree, "feat(x): add the thing", name="g")
         self.assertEqual(self.takeoff(), (0, ""))
@@ -151,6 +162,96 @@ class Tree(unittest.TestCase):
     def test_a_missing_body_is_a_usage_error(self):
         self.body.unlink()
         self.assertEqual(self.takeoff()[0], 4)
+
+
+class StampReuse(TicketWorktree):
+    """--test reuses a fresh matrix stamp instead of running the suite again."""
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.cache = Path(tmp.name)
+        cache_patch = mock.patch.dict(os.environ, {"KORAPY_CACHE": str(self.cache)})
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
+        self.suite_calls = []
+        suite_patch = mock.patch.object(check, "run_suite", self.fake_suite)
+        suite_patch.start()
+        self.addCleanup(suite_patch.stop)
+
+    def fake_suite(self, cwd):
+        self.suite_calls.append(str(cwd))
+        return self.suite_result
+
+    suite_result = 0
+
+    def tree_hash(self):
+        return self.run_git(self.tree, "rev-parse", "HEAD^{tree}").stdout.strip()
+
+    def write_stamp(self, tree=None, pythons="3.11 3.14", now=None):
+        text = checkstamp.format_stamp(
+            tree or self.tree_hash(), pythons, now if now is not None else time.time()
+        )
+        path = Path(checkstamp.stamp_path())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def takeoff_test(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = check.main(
+                [
+                    "--body",
+                    str(self.body),
+                    "--cwd",
+                    str(self.tree),
+                    "--test",
+                    "--pythons",
+                    "3.11 3.14",
+                ]
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_fresh_stamp_skips_the_suite(self):
+        self.commit(self.tree, "feat(x): add the thing", name="g")
+        self.write_stamp()
+        code, out, err = self.takeoff_test()
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.suite_calls, [])
+        self.assertIn("reusing the green check", out)
+
+    def test_a_missing_stamp_runs_the_suite(self):
+        self.commit(self.tree, "feat(x): add the thing", name="g")
+        code, out, err = self.takeoff_test()
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.suite_calls, [str(self.tree)])
+
+    def test_a_stale_stamp_runs_the_suite(self):
+        self.commit(self.tree, "feat(x): add the thing", name="g")
+        self.write_stamp(now=time.time() - checkstamp.STAMP_MAX_AGE_S - 1)
+        self.takeoff_test()
+        self.assertEqual(self.suite_calls, [str(self.tree)])
+
+    def test_a_stamp_for_another_tree_runs_the_suite(self):
+        self.commit(self.tree, "feat(x): add the thing", name="g")
+        self.write_stamp()
+        self.commit(self.tree, "feat(x): add more", name="h")
+        self.takeoff_test()
+        self.assertEqual(self.suite_calls, [str(self.tree)])
+
+    def test_a_stamp_for_other_interpreters_runs_the_suite(self):
+        self.commit(self.tree, "feat(x): add the thing", name="g")
+        self.write_stamp(pythons="3.11")
+        self.takeoff_test()
+        self.assertEqual(self.suite_calls, [str(self.tree)])
+
+    def test_a_failing_suite_still_fails(self):
+        self.commit(self.tree, "feat(x): add the thing", name="g")
+        self.suite_result = 1
+        code, out, err = self.takeoff_test()
+        self.assertEqual(code, 1)
+        self.assertIn("the test suite failed", err)
 
 
 if __name__ == "__main__":

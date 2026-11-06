@@ -12,7 +12,8 @@ Blocking checks (exit 1, with a fix line each):
   - no added line carries an em-dash
   - the PR body has real newlines, links the branch's ticket with
     `Closes #N` or `Refs #N`, and has a non-empty `## Review` section
-  - with --test, the suite passes
+  - with --test, the suite passes, or a fresh `make check` stamp proves
+  the same tree so the suite is not run again
 
 Exit 4 on a usage error (no body file).
 """
@@ -24,8 +25,12 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(ROOT, "src"))
+from korapy import checkstamp
+
 # korapy's own takeoff gates against its own master, whatever base a
 # caller's $BASE_REF names for the diff tools: a PR here always targets it.
 BASE = "origin/master"
@@ -107,10 +112,61 @@ def check_body(text, branch):
     return found
 
 
+def tree_hash(cwd):
+    proc = git(["rev-parse", "HEAD^{tree}"], cwd)
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
+
+def run_suite(cwd):
+    """Run the suite the way the ritual always has; tests fake this seam."""
+    proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--locked",
+            "python",
+            "-m",
+            "unittest",
+            "discover",
+            "-t",
+            ".",
+            "-s",
+            "tests",
+        ],
+        cwd=cwd,
+    )
+    return proc.returncode
+
+
+def suite_proof(cwd, pythons):
+    """(True, detail) when a fresh matrix stamp proves this tree.
+
+    Every False carries the miss reason; the caller runs the suite again.
+    """
+    verdict = checkstamp.stamp_status(checkstamp.read_stamp(), tree_hash(cwd), pythons, time.time())
+    if verdict == "fresh":
+        return True, "the check matrix already passed for this tree"
+    reasons = {
+        "missing": "no check stamp",
+        "corrupt": "the check stamp is corrupt",
+        "different-tree": "the check stamp is for another tree",
+        "different-pythons": "the check stamp covers other interpreters",
+        "stale": "the check stamp is stale",
+    }
+    return False, reasons.get(verdict, "no usable check stamp")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--body", required=True, help="the PR body file")
     parser.add_argument("--test", action="store_true", help="also run the suite")
+    parser.add_argument(
+        "--pythons",
+        default=None,
+        help="interpreters a reused stamp must cover, e.g. '3.11 3.14'",
+    )
     parser.add_argument("--cwd", default=os.getcwd())
     args = parser.parse_args(argv)
     try:
@@ -125,23 +181,10 @@ def main(argv=None):
     found += check_commits(args.cwd, commit_rules())
     found += check_body(body, branch)
     if args.test and not found:
-        proc = subprocess.run(
-            [
-                "uv",
-                "run",
-                "--locked",
-                "python",
-                "-m",
-                "unittest",
-                "discover",
-                "-t",
-                ".",
-                "-s",
-                "tests",
-            ],
-            cwd=args.cwd,
-        )
-        if proc.returncode != 0:
+        reused, detail = suite_proof(args.cwd, args.pythons)
+        if reused:
+            print(f"pre-pr-check: reusing the green check ({detail}), skipping the suite")
+        elif run_suite(args.cwd) != 0:
             found.append("the test suite failed (make test)")
     for problem in found:
         print(f"pre-pr-check: {problem}", file=sys.stderr)
