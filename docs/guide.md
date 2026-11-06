@@ -472,6 +472,13 @@ or a rate limit stopped the pass with nothing sent.
 resources, disks and the drive section. `--json` prints the stable
 document the dashboard serves.
 
+`serve` runs the read-only dashboard API on loopback, default port
+8420, so `http://127.0.0.1:8420/` in a browser is the dashboard.
+Startup prints that URL; `--port N` overrides `serve.port` for one
+run, and `--port 0` picks a free port for a second or throwaway
+instance. A wider bind needs `--allow-remote` and a token file, and
+a held port exits 2 with the `--port` fix in the message.
+
 `coord events` lists what is open (`--all` includes resolved rows);
 `coord wait` blocks until an unresolved event exists (or the timeout,
 default forever) and prints the batch. `wait` and `events` only read.
