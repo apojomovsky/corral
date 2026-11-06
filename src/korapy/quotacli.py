@@ -45,13 +45,49 @@ def _number(value):
     return float(value)
 
 
+#: Why a provider's reading reads stale: it never ran, its reader
+#: failed, or its last read is older than the provider's bound. Fresh
+#: readings carry None. The dashboard and the doctor print these words.
+NEVER_RAN = "never ran"
+READER_FAILED = "reader failed"
+TOO_OLD = "too old"
+
+
+def format_age(age_s) -> str:
+    """`age_s` seconds as a short age: "just now", "45s ago", "3m ago". Pure.
+
+    None reads as "never": the reading never ran. Negative ages clamp
+    to "just now": a skewed clock must not print a negative age.
+    """
+    if age_s is None:
+        return "never"
+    try:
+        secs = max(0, int(age_s))
+    except (TypeError, ValueError):
+        return "never"
+    if secs < 5:
+        return "just now"
+    if secs < 60:
+        return f"{secs}s ago"
+    mins = secs // 60
+    if mins < 60:
+        return f"{mins}m ago"
+    hours = mins // 60
+    if hours < 48:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 def snapshot(pool, ledger, now, *, low_pct):
     """Status view: ``{"now": now, "providers": {name: {...}}}``.
 
     Each provider carries its state, plain windows (or None), `read_at`
-    (or None), `stale`, the stored mark (or None), its reader entry and
-    the recorded failure text (or None). The `--json` verb prints this
-    dict as-is: its field names are the stable schema.
+    (the last attempt, success or recorded failure, or None when the
+    reader never ran), `stale`, `stale_reason` (None when fresh, else
+    "never ran", "reader failed" or "too old"), the stored mark (or
+    None), its reader entry and the recorded failure text (or None).
+    The `--json` verb prints this dict as-is: its field names are the
+    stable schema.
     """
     readings = (ledger or {}).get("readings", {}) or {}
     marks = (ledger or {}).get("marks", {}) or {}
@@ -63,6 +99,7 @@ def snapshot(pool, ledger, now, *, low_pct):
         windows = None
         read_at = None
         error = None
+        stale, reason = True, NEVER_RAN
         if isinstance(reading, dict):
             if isinstance(reading.get("windows"), dict):
                 windows = {}
@@ -75,15 +112,21 @@ def snapshot(pool, ledger, now, *, low_pct):
                     else:
                         windows[window_id] = None
                 read_at = _number(reading.get("read_at"))
+                if windows is not None and read_at is not None and now - read_at <= bound:
+                    stale, reason = False, None
+                else:
+                    stale, reason = True, TOO_OLD
             elif "error" in reading:
                 error = reading.get("error")
-        stale = windows is not None and read_at is not None and now - read_at > bound
+                read_at = _number(reading.get("at"))
+                stale, reason = True, READER_FAILED
         mark = marks.get(name)
         providers[name] = {
             "state": quota.provider_state(reading, mark, now, stale_after=bound, low_pct=low_pct),
             "windows": windows,
             "read_at": read_at,
             "stale": stale,
+            "stale_reason": reason,
             "mark": dict(mark) if isinstance(mark, dict) else None,
             "reader": getattr(provider, "reader", "") or "",
             "error": error if isinstance(error, str) else None,
@@ -197,6 +240,7 @@ def _show(view) -> None:
     if not view["providers"]:
         print("no providers")
         return
+    now = view.get("now")
     for name, entry in view["providers"].items():
         line = f"{name}: {entry['state']}"
         if entry["windows"]:
@@ -207,12 +251,16 @@ def _show(view) -> None:
             )
             if windows:
                 line += f" ({windows})"
+        read_at = entry.get("read_at")
+        if read_at is not None and now is not None:
+            line += f" (read {format_age(now - read_at)})"
         if entry["stale"]:
-            line += " (stale)"
+            detail = entry.get("stale_reason") or "stale"
+            if detail == READER_FAILED and entry.get("error") is not None:
+                detail += f": {entry['error']}"
+            line += f" (stale: {detail})"
         if entry["mark"] is not None:
             line += f" (mark until {entry['mark'].get('until')})"
-        if entry["error"] is not None:
-            line += f" (reader failed: {entry['error']})"
         print(line)
 
 

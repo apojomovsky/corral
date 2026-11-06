@@ -184,7 +184,11 @@ function quotaCard(quota, nowMs) {
     const bits = [String(info.state)];
     bits.push("read " + age(info.read_at, nowMs));
     if (info.stale) {
-      bits.push("stale");
+      bits.push(
+        typeof info.stale_reason === "string" && info.stale_reason !== ""
+          ? "stale: " + info.stale_reason
+          : "stale",
+      );
     }
     if (typeof info.error === "string" && info.error !== "") {
       bits.push(info.error);

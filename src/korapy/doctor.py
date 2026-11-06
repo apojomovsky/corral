@@ -38,6 +38,9 @@ from korapy import (
     profiles,
     projects,
     prompts,
+    quota,
+    quota_ledger,
+    quotacli,
     registry,
     repodoctor,
     resourcedoctor,
@@ -176,6 +179,10 @@ class Env(NamedTuple):
     #: The profile readings. None means the caller has no reading, and
     #: then the report carries no profile row.
     profile_state: ProfileState | None = None
+    #: The quota freshness view: the dict `quotacli.snapshot` returns,
+    #: or the exception reading it raised. None means the caller has no
+    #: reading, and then the report carries no quota row.
+    quota_view: Mapping[str, object] | Exception | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -354,6 +361,69 @@ def _check_readers(errors: Sequence[tuple[str, str, str]]) -> list[Check]:
             )
         )
     return named
+
+
+def check_quota(view: Mapping[str, object] | Exception | None) -> list[Check]:
+    """Per-provider quota freshness rows, pure over a snapshot view.
+
+    None means the caller has no reading: no rows. An exception is
+    one warn row: the pool or ledger could not be read. A fresh
+    provider reads ok with its age; a stale one warns with the reason
+    ("never ran", "reader failed", "too old"), so a dead reader never
+    fails the report: admission already treats it as unknown, and the
+    fix names the refresh that would heal it.
+    """
+    if view is None:
+        return []
+    if isinstance(view, Exception):
+        return [
+            Check(
+                "quota",
+                "warn",
+                f"quota ledger unreadable: {view}",
+                "make the state dir usable, then run `korapy doctor` again",
+            )
+        ]
+    providers = view.get("providers", {}) if isinstance(view, dict) else {}
+    if not isinstance(providers, dict):
+        providers = {}
+    now = view.get("now") if isinstance(view, dict) else None
+    rows = []
+    for name in sorted(providers):
+        info = providers[name] if isinstance(providers[name], dict) else {}
+        state = info.get("state", "unknown")
+        read_at = info.get("read_at")
+        try:
+            age = (
+                quotacli.format_age(now - read_at)
+                if read_at is not None and now is not None
+                else quotacli.format_age(None)
+            )
+        except TypeError:
+            age = quotacli.format_age(None)
+        reason = info.get("stale_reason")
+        if not reason and info.get("stale"):
+            if info.get("error") is not None:
+                reason = quotacli.READER_FAILED
+            elif read_at is not None:
+                reason = quotacli.TOO_OLD
+            else:
+                reason = quotacli.NEVER_RAN
+        if reason is None:
+            rows.append(Check(f"quota:{name}", "ok", f"{state}, read {age}", ""))
+            continue
+        detail = f"{state}, stale: {reason}, read {age}"
+        if reason == quotacli.READER_FAILED and info.get("error") is not None:
+            detail += f": {info['error']}"
+        rows.append(
+            Check(
+                f"quota:{name}",
+                "warn",
+                detail,
+                f"run `korapy quota refresh {name}`, then run `korapy doctor` again",
+            )
+        )
+    return rows
 
 
 def _check_registry(rows: Sequence[tuple[Mapping, str]], error: str | None = None) -> Check:
@@ -795,6 +865,7 @@ def run_checks(env: Env) -> list[Check]:
         *_check_drive_timer(env.timer_state),
         *_check_drive_projects(env.project_problems),
         *_check_readers(env.reader_errors),
+        *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
         _check_prompts(env.prompts_invalid, env.prompts_stale, env.prompts_error),
         *_check_boards(env),
@@ -921,6 +992,35 @@ def load_dep_results() -> tuple[list[deps.Result], str | None]:
         re.error,
     ) as err:
         return [], str(err)
+
+
+def load_quota_view(resolved: settings.Resolved | None):
+    """The quota freshness view, or the exception reading it raised.
+
+    Only production builds it; tests inject the view into `Env`
+    directly. A missing accounts file is an empty pool, never an
+    error; an unreadable pool or ledger is the exception the one
+    `quota` row warns about. Reading never runs a reader.
+    """
+    if resolved is None:
+        low_pct = quota.DEFAULT_LOW_PCT
+    else:
+        try:
+            low_pct = resolved["quota.low_pct"]
+        except KeyError:
+            low_pct = quota.DEFAULT_LOW_PCT
+    try:
+        pool = accounts.providers()
+    except (paths.PathError, accounts.AccountsError) as err:
+        return err
+    try:
+        ledger = quota_ledger.load()
+    except (paths.PathError, quota_ledger.LedgerError) as err:
+        return err
+    try:
+        return quotacli.snapshot(pool, ledger, time.time(), low_pct=low_pct)
+    except Exception as err:  # noqa: BLE001 - a broken view is report data, never a traceback
+        return err
 
 
 def load_readers(config_dir: str | None = None) -> list[tuple[str, str, str]]:
@@ -1761,6 +1861,7 @@ def production_env() -> Env:
         hub_auth=hub_auth,
         hub_probe=hub_probe,
         profile_state=profile_state,
+        quota_view=load_quota_view(resolved),
     )
 
 

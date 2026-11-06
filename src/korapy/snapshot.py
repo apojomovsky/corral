@@ -428,9 +428,32 @@ def _show(doc):
         print(f"host: {header['host']}  now: {header['now']}")
     quota = doc.get("quota")
     if isinstance(quota, dict) and "providers" in quota:
-        states = [
-            f"{name}={info.get('state')}" for name, info in sorted(quota["providers"].items())
-        ]
+        from korapy import quotacli
+
+        now = quota.get("now")
+        states = []
+        for name, info in sorted(quota["providers"].items()):
+            bit = f"{name}={info.get('state')}"
+            notes = []
+            read_at = info.get("read_at")
+            if read_at is not None and now is not None:
+                try:
+                    notes.append(f"read {quotacli.format_age(now - read_at)}")
+                except TypeError:
+                    pass
+            reason = info.get("stale_reason")
+            if reason is None and info.get("stale"):
+                if info.get("error") is not None:
+                    reason = quotacli.READER_FAILED
+                elif read_at is not None:
+                    reason = quotacli.TOO_OLD
+                else:
+                    reason = quotacli.NEVER_RAN
+            if reason is not None:
+                notes.append(f"stale: {reason}")
+            if notes:
+                bit += f" ({', '.join(notes)})"
+            states.append(bit)
         print(f"quota: {', '.join(states) if states else 'no providers'}")
     else:
         _err(

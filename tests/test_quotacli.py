@@ -157,9 +157,94 @@ class SnapshotView(unittest.TestCase):
         self.assertEqual(set(view), {"now", "providers"})
         self.assertEqual(
             set(view["providers"]["provider-a"]),
-            {"state", "windows", "read_at", "stale", "mark", "reader", "error"},
+            {"state", "windows", "read_at", "stale", "stale_reason", "mark", "reader", "error"},
         )
         json.dumps(view)
+
+
+class StaleReason(unittest.TestCase):
+    def view(self, seen, now=T0, **kw):
+        kw.setdefault("low_pct", 90)
+        return quotacli.snapshot(pool("provider-a"), seen, now, **kw)
+
+    def test_a_reading_that_never_ran_is_stale(self):
+        entry = self.view(ledger())["providers"]["provider-a"]
+        self.assertTrue(entry["stale"])
+        self.assertEqual(entry["stale_reason"], "never ran")
+        self.assertIsNone(entry["read_at"])
+        self.assertEqual(entry["state"], "unknown")
+
+    def test_a_fresh_reading_has_no_reason(self):
+        entry = self.view(ledger(**{"provider-a": ("reading", reading({"w": win(10)}))}))[
+            "providers"
+        ]["provider-a"]
+        self.assertFalse(entry["stale"])
+        self.assertIsNone(entry["stale_reason"])
+
+    def test_a_too_old_reading_names_its_age(self):
+        seen = ledger(**{"provider-a": ("reading", reading({"w": win(10)}, at=T0 - 2000))})
+        entry = self.view(seen)["providers"]["provider-a"]
+        self.assertTrue(entry["stale"])
+        self.assertEqual(entry["stale_reason"], "too old")
+
+    def test_a_recorded_failure_is_stale_with_its_age(self):
+        seen = quota_ledger.record_failure(ledger(), "provider-a", "boom", T0 - 60)
+        entry = self.view(seen)["providers"]["provider-a"]
+        self.assertTrue(entry["stale"])
+        self.assertEqual(entry["stale_reason"], "reader failed")
+        self.assertEqual(entry["read_at"], T0 - 60)
+        self.assertEqual(entry["error"], "boom")
+
+
+class FormatAge(unittest.TestCase):
+    def test_never_without_a_stamp(self):
+        self.assertEqual(quotacli.format_age(None), "never")
+
+    def test_just_now(self):
+        self.assertEqual(quotacli.format_age(0), "just now")
+        self.assertEqual(quotacli.format_age(4), "just now")
+
+    def test_seconds(self):
+        self.assertEqual(quotacli.format_age(45), "45s ago")
+
+    def test_minutes(self):
+        self.assertEqual(quotacli.format_age(180), "3m ago")
+
+    def test_hours(self):
+        self.assertEqual(quotacli.format_age(7200), "2h ago")
+
+    def test_days(self):
+        self.assertEqual(quotacli.format_age(6 * 86400), "6d ago")
+
+
+class ShowAges(unittest.TestCase):
+    def show(self, seen, now=T0):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            quotacli._show(quotacli.snapshot(pool("provider-a"), seen, now, low_pct=90))
+        return out.getvalue()
+
+    def test_a_fresh_reading_shows_its_age(self):
+        out = self.show(ledger(**{"provider-a": ("reading", reading({"w": win(10)}))}))
+        self.assertIn("provider-a: ok", out)
+        self.assertIn("just now", out)
+
+    def test_a_stale_reading_shows_why_and_its_age(self):
+        seen = ledger(**{"provider-a": ("reading", reading({"w": win(10)}, at=T0 - 6 * 86400))})
+        out = self.show(seen)
+        self.assertIn("stale: too old", out)
+        self.assertIn("6d ago", out)
+
+    def test_a_failed_reading_shows_the_error_and_its_age(self):
+        seen = quota_ledger.record_failure(ledger(), "provider-a", "boom", T0 - 120)
+        out = self.show(seen)
+        self.assertIn("stale: reader failed", out)
+        self.assertIn("boom", out)
+        self.assertIn("2m ago", out)
+
+    def test_a_missing_reading_says_it_never_ran(self):
+        out = self.show(ledger())
+        self.assertIn("stale: never ran", out)
 
 
 class Refresh(unittest.TestCase):
@@ -332,7 +417,7 @@ class QuotaVerbs(OpsCase):
         self.assertEqual(set(view), {"now", "providers"})
         self.assertEqual(
             set(view["providers"]["provider-a"]),
-            {"state", "windows", "read_at", "stale", "mark", "reader", "error"},
+            {"state", "windows", "read_at", "stale", "stale_reason", "mark", "reader", "error"},
         )
 
     def test_refresh_records_readings(self):
