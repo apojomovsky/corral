@@ -570,16 +570,11 @@ the verb, point the clone's origin remote at the new URL and set
 `tracker.repo` to the new name, then remove the pause file and
 re-run `korapy doctor`.
 
-Exit codes are a public interface; scripts branch on them:
-
-| Code | Meaning |
-| --- | --- |
-| 0 | Success (under `--plan`: the plan holds) |
-| 1 | Nothing to do, or a gate said no |
-| 2 | Race lost or already running: retry later |
-| 3 | GitHub, systemd or a host unreachable |
-| 4 | Configuration or usage error |
-| 75 | No free slot (try later) |
+Exit codes are a public interface; scripts branch on them. The full
+table lives in [`commands.md`](commands.md): 0 is success (under
+`--plan`: the plan holds), 1 means nothing to do or a gate said no, 2
+means a lost race, 3 an unreachable host, 4 a usage error, and 75
+means no free slot, so try later.
 
 An empty event queue is not a failure: `coord events` prints an empty
 list and exits 0. Scripts that need an exit code use `coord wait` in a

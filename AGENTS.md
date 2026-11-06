@@ -95,7 +95,7 @@ The rules the design rests on:
 
 `priority:urgent` is the maintainers' alone.
 
-**README freshness.** When a change alters user-visible surface (CLI verbs or flags, install steps, config files, exit codes, `system-deps.toml`), update `README.md` in the same PR. If no README change is needed, say why in `## Review`. The README is the front door: what it is, install, a quickstart, links. Details go in `docs/`.
+**Docs freshness.** When a change alters user-visible surface (CLI verbs or flags, install steps, config files, exit codes, `system-deps.toml`), update the reference in the same PR: `docs/commands.md` for verbs, flags and exit codes, `docs/configuration.md` for settings, the install section of `docs/guide.md` for install steps and host programs. The README changes only when the pitch, the install or the quickstart changes; if none of those needs it, say why in `## Review`. The README is the front door: what it is, install, a quickstart, links. Details go in `docs/`.
 
 ## Approval gates
 
