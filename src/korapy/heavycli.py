@@ -149,6 +149,9 @@ def cmd_run(args, *, run_lane=None, root=None, now=None):
         run=heavy.default_run,
         teardown=functools.partial(heavy.stop_scope, run=heavy.default_run),
         scope_cgroup=heavy.show_cgroup,
+        max_skips=cfg.max_skips if cfg is not None else heavy.DEFAULT_MAX_SKIPS,
+        scope_exists=heavy.scope_exists,
+        is_alive=heavy.pid_alive,
     )
     try:
         lane_run = runner(
