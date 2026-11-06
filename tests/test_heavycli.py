@@ -458,7 +458,7 @@ class PlanCase(HeavyCliCase):
         from korapy import heavycli
 
         self._project()
-        for bad in ("soon", -5):
+        for bad in ("soon", -5, "inf", float("inf")):
             with self.subTest(timeout=bad):
                 code, _, _ = self._read_stdout(
                     heavycli.cmd_run,
