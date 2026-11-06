@@ -526,9 +526,12 @@ class SeverityThresholdTest(unittest.TestCase):
 class DefaultThresholdAgreementTest(unittest.TestCase):
     """Every fix-round threshold default is the one shared constant.
 
-    The settings default, the gate default and the reviewrecord
+    The settings default, the gate fallback and the reviewrecord
     defaults all grade findings the same way; a drift in any one of
-    them reopens lows-only fix rounds or skips deserved ones.
+    them reopens lows-only fix rounds or skips deserved ones. The
+    gate takes a None sentinel so its default follows the constant
+    past import time; equality alone would still pass with a
+    reintroduced literal, so a source scan pins every site too.
     """
 
     def test_the_default_threshold_is_normal(self):
@@ -539,8 +542,28 @@ class DefaultThresholdAgreementTest(unittest.TestCase):
         for func in (reviewrecord.meets_threshold, reviewrecord.fix_wanted):
             with self.subTest(func=func.__name__):
                 self.assertEqual(inspect.signature(func).parameters["threshold"].default, want)
-        self.assertEqual(inspect.signature(drive.gate).parameters["fix_threshold"].default, want)
         self.assertEqual(settings.REGISTRY["drive.fix_round_threshold"].default, want)
+
+    def test_the_gate_default_is_a_sentinel_following_the_constant(self):
+        self.assertIsNone(inspect.signature(drive.gate).parameters["fix_threshold"].default)
+
+    def test_no_threshold_site_reintroduces_the_literal(self):
+        sites = (
+            (drive, "fix_threshold"),
+            (reviewrecord, "threshold"),
+        )
+        for module, needle in sites:
+            with self.subTest(module=module.__name__):
+                path = module.__file__
+                assert isinstance(path, str)
+                with open(path, encoding="utf-8") as handle:
+                    lines = handle.read().splitlines()
+                bad = [
+                    number
+                    for number, line in enumerate(lines, 1)
+                    if needle in line and '"normal"' in line
+                ]
+                self.assertEqual(bad, [])
 
 
 if __name__ == "__main__":

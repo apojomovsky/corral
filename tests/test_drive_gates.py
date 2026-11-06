@@ -6,15 +6,18 @@ to a temporary directory, and injected plain-data inputs for every
 host read, so nothing reaches the network, subprocesses or real dirs.
 """
 
+import inspect
 import io
 import os
 import tempfile
 import unittest
 from unittest import mock
 
-from korapy import accounts, admission, board, drive, projects, registry
+from korapy import accounts, admission, board, drive, eligibility, policies, projects, registry
 from korapy.eligibility import LinkedPull, StartRequest, TicketRow
 from tests.test_drive import policy_source, stored
+from tests.test_eligibility import item as board_item
+from tests.test_tracker import FakeTracker, reading
 
 
 def request(repo="app", number=7, kind="start", weight=0.0):
@@ -29,6 +32,7 @@ def row(
     priority="",
     labels=(),
     external=False,
+    pulls=(),
 ):
     return TicketRow(
         repo=repo,
@@ -38,7 +42,12 @@ def row(
         priority=priority,
         labels=labels,
         external=external,
+        pulls=pulls,
     )
+
+
+def open_pull(number):
+    return LinkedPull(number=number, state="open")
 
 
 def requests_of(items):
@@ -859,11 +868,6 @@ class PassWiringTest(unittest.TestCase):
         self.assertIn("app#7: start", out.getvalue())
 
 
-def linked(*numbers, state="open"):
-    """A pulls_for seam returning the given linked pull numbers."""
-    return lambda repo, number: tuple(LinkedPull(number=n, state=state) for n in numbers)
-
-
 def lows_record():
     return {"verdict": "approve-with-findings", "findings": [{"severity": "low", "text": "t"}]}
 
@@ -873,60 +877,139 @@ def normal_record():
 
 
 class OpenPullGateTest(unittest.TestCase):
+    """The gate reads linked pulls from the row, never live.
+
+    Rows arrive with pulls populated from the tracker; the gate has no
+    pull seam of its own, so policies and the gate cannot disagree.
+    """
+
     def test_a_fresh_start_with_an_open_linked_pull_skips(self):
-        gated = gate(entry(), pulls_for=linked(9))
+        gated = gate(entry(row_=row(pulls=(open_pull(9),))))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
         self.assertIn("not a fresh start", gated.reason)
 
     def test_an_unclaimed_fix_with_an_open_linked_pull_skips(self):
-        gated = gate(entry(kind="fix"), pulls_for=linked(9))
+        gated = gate(entry(kind="fix", row_=row(pulls=(open_pull(9),))))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("skip", "start", "row"))
         self.assertIn("pull #9 is open", gated.reason)
 
     def test_an_unclaimed_resume_with_an_open_linked_pull_skips(self):
-        gated = gate(entry(kind="resume"), pulls_for=linked(9))
+        gated = gate(entry(kind="resume", row_=row(pulls=(open_pull(9),))))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
 
     def test_a_fix_on_a_claimed_row_proceeds_despite_an_open_pull(self):
-        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x")), pulls_for=linked(9))
+        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x", pulls=(open_pull(9),))))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("fix", "fix", ""))
         self.assertNotIn("pull #", gated.reason)
 
     def test_a_review_proceeds_despite_an_open_pull(self):
         gated = gate(
-            entry(kind="review"),
+            entry(kind="review", row_=row(pulls=(open_pull(9),))),
             finished={("app", 7): ("drive-w-1", "worker")},
-            pulls_for=linked(9),
         )
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("review", "review", ""))
 
     def test_a_closed_linked_pull_does_not_block_a_start(self):
-        gated = gate(entry(), pulls_for=linked(9, state="closed"))
+        gated = gate(entry(row_=row(pulls=(LinkedPull(number=9, state="closed"),))))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
     def test_two_open_linked_pulls_name_the_first(self):
-        pulls = lambda repo, number: (
-            LinkedPull(number=9, state="open"),
-            LinkedPull(number=4, state="open"),
-        )
-        gated = gate(entry(), pulls_for=pulls)
+        gated = gate(entry(row_=row(pulls=(open_pull(9), open_pull(4)))))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
         self.assertNotIn("#4", gated.reason)
 
     def test_an_unreadable_pull_lookup_refuses_the_start(self):
-        def broken(repo, number):
-            raise ValueError("tracker down")
-
-        gated = gate(entry(), pulls_for=broken)
+        gated = gate(entry(row_=row(pulls=None)))
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("unreadable", gated.reason)
 
-    def test_no_pull_seam_means_no_pull_check(self):
-        gated = gate(entry(), pulls_for=None)
+    def test_no_linked_pulls_means_a_fresh_start(self):
+        gated = gate(entry(row_=row(pulls=())))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
+
+
+class LinkedPullsMapTest(unittest.TestCase):
+    """One tracker read per ticket feeds every row in the pass."""
+
+    def test_each_ticket_reads_once_through_the_tracker(self):
+        fake = FakeTracker()
+        fake.linked[("app", 7)] = [reading("app", 9, kind="pr", state="open")]
+        fake.linked[("app", 8)] = []
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        found = drive.linked_pulls_map([board_item(number=7), board_item(number=8)], pulls_for)
+        self.assertEqual([pull.number for pull in found[("app", 7)]], [9])
+        self.assertEqual([pull.state for pull in found[("app", 7)]], ["open"])
+        self.assertEqual(found[("app", 8)], ())
+        self.assertEqual(
+            fake.calls,
+            [("linked_pulls", "app", 7), ("linked_pulls", "app", 8)],
+        )
+
+    def test_an_unreadable_ticket_maps_to_none(self):
+        fake = FakeTracker()
+        fake.linked_errors[("app", 7)] = "tracker down"
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        found = drive.linked_pulls_map([board_item()], pulls_for)
+        self.assertIsNone(found[("app", 7)])
+
+    def test_non_pull_links_never_reach_the_row(self):
+        fake = FakeTracker()
+        fake.linked[("app", 7)] = [reading("app", 9, kind="issue", state="open")]
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        found = drive.linked_pulls_map([board_item()], pulls_for)
+        self.assertEqual(found[("app", 7)], ())
+
+
+class LinkedPullAgreementTest(unittest.TestCase):
+    """Policy and gate read the one tracker-sourced row pulls.
+
+    A ticket with an open linked pull is startable by neither: the
+    policy selects nothing and the gate skips naming the pull.
+    """
+
+    def tracked_rows(self, state="open"):
+        fake = FakeTracker()
+        fake.linked[("app", 7)] = [reading("app", 9, kind="pr", state=state)]
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        items = [board_item()]
+        rows = eligibility.rows_from_items(
+            items, pulls_by_key=drive.linked_pulls_map(items, pulls_for)
+        )
+        return fake, rows
+
+    def test_an_open_linked_pull_is_not_startable_by_policy_or_gate(self):
+        _, rows = self.tracked_rows()
+        self.assertEqual(policies.basic(rows, now=1000.0), [])
+        gated = gate(entry(row_=rows[0]))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("pull #9 is open", gated.reason)
+
+    def test_policy_and_gate_share_a_single_tracker_read(self):
+        fake, rows = self.tracked_rows()
+        policies.basic(rows, now=1000.0)
+        gate(entry(row_=rows[0]))
+        self.assertEqual(fake.calls, [("linked_pulls", "app", 7)])
+
+    def test_the_gate_takes_no_pull_seam(self):
+        self.assertNotIn("pulls_for", inspect.signature(drive.gate).parameters)
+
+    def test_a_hold_label_on_a_linked_pull_names_the_pull(self):
+        fake = FakeTracker()
+        fake.linked[("app", 7)] = [reading("app", 12, kind="pr", state="closed")]
+        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        items = [board_item()]
+        (built,) = eligibility.rows_from_items(
+            items, pulls_by_key=drive.linked_pulls_map(items, pulls_for)
+        )
+        gated = gate(
+            entry(row_=built),
+            read_labels=labels_for({("issue", "app", 7): [], ("pr", "app", 12): ["hold"]}),
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "hold"))
+        self.assertIn("app#12", gated.reason)
 
 
 class ReviewThresholdGateTest(unittest.TestCase):
@@ -994,6 +1077,16 @@ class ReviewThresholdGateTest(unittest.TestCase):
             finished=self.reviewed(),
             reviews={("app", 7): lows_record()},
             fix_threshold="",
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("merge-ready", gated.reason)
+
+    def test_an_unset_threshold_grades_against_the_default(self):
+        gated = gate(
+            entry(kind="fix"),
+            finished=self.reviewed(),
+            reviews={("app", 7): lows_record()},
+            fix_threshold=None,
         )
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("merge-ready", gated.reason)
