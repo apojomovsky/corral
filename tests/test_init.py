@@ -304,6 +304,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 #
@@ -439,6 +440,7 @@ commits.conventional = false
 #
 # [drive]
 # drive.agent_host = ""  # display name for the host segment of minted agent ids (empty hashes the hostname)
+# drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
 #
