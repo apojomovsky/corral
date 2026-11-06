@@ -347,8 +347,8 @@ def gate(
             request.kind in ("start", "review")
             and is_managed_agent(holder)
             and newest is not None
-            and newest[0] == holder
-            and newest[1] != "reviewer"
+            and _finished_agent(newest) == holder
+            and _finished_role(newest) != "reviewer"
         )
         if takes_over:
             kind = "review"
@@ -374,21 +374,14 @@ def gate(
                 f"{ref}: foreign claim by `{holder}`, never touched",
             )
 
-    if not holder:
-        newest = (finished or {}).get((row.repo, row.number))
-        if (
-            newest is not None
-            and newest[1] == "reviewer"
-            and _finished_outcome(newest) == "ok"
-            and reviews is not None
-            and (row.repo, row.number) not in reviews
-        ):
-            return _skip(
-                candidate,
-                kind,
-                "review-missing",
-                f"{ref}: reviewer finished without a review record, review missing, skipped",
-            )
+    newest = (finished or {}).get((row.repo, row.number))
+    if _review_missing(holder, newest, reviews, (row.repo, row.number)):
+        return _skip(
+            candidate,
+            kind,
+            "review-missing",
+            f"{ref}: reviewer finished without a review record, review missing, skipped",
+        )
 
     if not holder and request.kind in ("review", "fix", "resume"):
         newest = (finished or {}).get((row.repo, row.number))
@@ -400,14 +393,14 @@ def gate(
                     "row",
                     f"{ref}: no finished worker, nothing to review, skipped",
                 )
-            if newest[1] == "reviewer":
+            if _finished_role(newest) == "reviewer":
                 return _skip(
                     candidate,
                     kind,
                     "row",
                     f"{ref}: already reviewed since the last work, merge-ready, skipped",
                 )
-        elif newest is not None and newest[1] == "worker":
+        elif newest is not None and _finished_role(newest) == "worker":
             return _skip(
                 candidate,
                 kind,
@@ -417,7 +410,7 @@ def gate(
 
     if not holder and request.kind in ("start", "review", "fix", "resume"):
         newest = (finished or {}).get((row.repo, row.number))
-        if newest is None or newest[1] == "reviewer":
+        if newest is None or _finished_role(newest) == "reviewer":
             record = (reviews or {}).get((row.repo, row.number))
             if (
                 record is not None
@@ -1198,39 +1191,61 @@ def production_review_reader(registered, *, git, mapping=None):
     return reviewrecord.store_reader(mapping)
 
 
-def missing_review_records(finished, reviews) -> list:
+def _review_missing(holder, newest, reviews, key) -> bool:
+    """Whether the gate skips this ticket as `review-missing`. Pure.
+
+    The gate's skip and `missing_review_records` share this check, so
+    the skip verdicts and the once-per-pass log line agree: the row is
+    unheld, the newest finished entry names a reviewer with outcome
+    `ok`, the review map exists, and the ticket has no record. Short
+    entries read as unreviewed, never as missing.
+    """
+    return (
+        not holder
+        and newest is not None
+        and _finished_role(newest) == "reviewer"
+        and _finished_outcome(newest) == "ok"
+        and reviews is not None
+        and key not in reviews
+    )
+
+
+def missing_review_records(finished, reviews, rows) -> list:
     """[(repo, number, agent)] finished reviewers (outcome ok) with no record. Pure.
 
     `finished` is the newest finished entry per ticket, `reviews` the
-    latest record per ticket. With no review map (`reviews` None) the
-    check cannot run and nothing is missing: the gate reads the same
-    guard, so the log line and the skip verdicts never disagree. A
-    non-`ok` outcome is not a protocol failure and never lists. Sorted
-    for a stable once-per-pass log line.
+    latest record per ticket, `rows` the {(repo, number): row} map with
+    the pass's releases applied. Only rows the gate could have skipped
+    as `review-missing` list: the row must be known, open, internally
+    owned and unheld, so a kept claim (a live unit, a failed release
+    write), a non-open or externally owned row, and a ticket with no
+    row never log. With no review map (`reviews` None) the check cannot
+    run and nothing is missing. A non-`ok` outcome is not a protocol
+    failure and never lists. Sorted for a stable once-per-pass log line.
     """
     if finished is None or reviews is None:
         return []
     found = []
     for (repo, number), newest in finished.items():
-        if newest[1] != "reviewer":
+        row = (rows or {}).get((repo, number))
+        if row is None or row.state != "open" or row.external:
             continue
-        if _finished_outcome(newest) != "ok":
+        if not _review_missing(row.agent or "", newest, reviews, (repo, number)):
             continue
-        if (repo, number) in reviews:
-            continue
-        found.append((repo, number, newest[0]))
+        found.append((repo, number, _finished_agent(newest)))
     return sorted(found)
 
 
-def log_missing_reviews(out, finished, reviews) -> int:
+def log_missing_reviews(out, finished, reviews, rows) -> int:
     """Print the once-per-pass missing-record lines. Returns the count.
 
     One line per ticket from `missing_review_records`, naming the
     ticket and the finished reviewer id. Both passes call this after
-    gating, so the line and the `review-missing` skip verdicts agree.
+    gating with the pass's released rows, so the line and the
+    `review-missing` skip verdicts agree.
     """
     count = 0
-    for repo, number, agent in missing_review_records(finished, reviews):
+    for repo, number, agent in missing_review_records(finished, reviews, rows):
         print(
             f"{repo}#{number}: reviewer finished without a review record (`{agent}`), "
             "review missing, skipped",
@@ -1379,6 +1394,21 @@ def _read_inputs(
     ), None
 
 
+def _released_rows(items, released):
+    """{(repo, number): row} with this pass's releases applied. Pure.
+
+    The gate and the missing-record log read the same map, so a freed
+    row gates and logs as unheld while a kept claim gates and logs as
+    held. One builder keeps the two from disagreeing on the holder.
+    """
+    by_key = {(row.repo, row.number): row for row in eligibility.rows_from_items(items)}
+    for key in released or ():
+        prior = by_key.get(key)
+        if prior is not None:
+            by_key[key] = replace(prior, agent="")
+    return by_key
+
+
 def _gate_all(
     items,
     registered,
@@ -1431,12 +1461,7 @@ def _gate_all(
             problems = []
     else:
         problems = []
-    rows = eligibility.rows_from_items(items)
-    by_key = {(row.repo, row.number): row for row in rows}
-    for key in released or ():
-        prior = by_key.get(key)
-        if prior is not None:
-            by_key[key] = replace(prior, agent="")
+    by_key = _released_rows(items, released)
     waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     candidates = []
     for project in registered:
@@ -1568,8 +1593,9 @@ def _pass(
     `review_reader` feeds the gate's fix-round threshold from the
     session dirs (reads only, like the registry); with none the
     threshold sees no records, exactly as before. Both passes also
-    log each finished reviewer (outcome `ok`) with no record once,
-    naming the ticket and the reviewer, before the table. `pulls_for`
+    log each unheld finished reviewer (outcome `ok`) with no record
+    once, naming the ticket and the reviewer, before the table, so a
+    kept claim never logs a line the gate did not skip on. `pulls_for`
     feeds the gate's open-pull refusal; with none the check is
     skipped, which is what `--plan` does: it never contacts the
     tracker.
@@ -1614,6 +1640,7 @@ def _pass(
         if review_reader is not None
         else None
     )
+    released = reviewed_claims(authors, finished, live_units=plan_live)
     gated_rows, problems, _ = _gate_all(
         items,
         registered,
@@ -1626,7 +1653,7 @@ def _pass(
         ledger_data=ledger_data,
         read_labels=read_labels,
         hold_label=hold_label,
-        released=reviewed_claims(authors, finished, live_units=plan_live),
+        released=released,
         finished=finished,
         agent_roles=agent_roles,
         agent_states=agent_states,
@@ -1634,7 +1661,7 @@ def _pass(
         reviews=reviews,
         pulls_for=pulls_for,
     )
-    log_missing_reviews(out, finished, reviews)
+    log_missing_reviews(out, finished, reviews, _released_rows(items, released))
     table = [
         Candidate(
             project=gated.project,
@@ -2393,6 +2420,25 @@ def _finished_outcome(value) -> str | None:
     return value[2]
 
 
+def _finished_role(value) -> str | None:
+    """The role of one finished entry value, or None when unrecorded. Pure.
+
+    Production values are (agent id, role, outcome) triples; an older
+    injected (agent id, role) pair still carries its role, while a
+    shorter value reads as no role, which never takes a role branch.
+    """
+    if value is None or len(value) < 2:
+        return None
+    return value[1]
+
+
+def _finished_agent(value) -> str | None:
+    """The agent id of one finished entry value, or None when unrecorded. Pure."""
+    if value is None or len(value) < 1:
+        return None
+    return value[0]
+
+
 def resolve_finished(finished_for, released, *, agent_states=None, agent_tickets=None) -> dict:
     """{(repo, number): (agent id, role, outcome)} newest finished entry. Pure.
 
@@ -2982,37 +3028,66 @@ def production_agent_roles(*, now):
     }
 
 
-def production_stuck_project(registered, repo):
+def production_stuck_project(registered, repo, *, mapping=None, git=None):
     """The registered project name owning tracker repo `repo`, or None.
 
-    The first project whose ops root maps the repo wins; entries that
-    do not map it are skipped. Pure settings reads, no subprocess when
-    the entry names its tracker repo explicitly.
+    The spelling resolves once through `reviewrecord.local_repo` over
+    the pass map (the same map the stuck, orphan and finished builders
+    join against), so the stop path and the joins never disagree; the
+    owner is then the first project whose root feeds that spelling.
+    The pass map cannot name the owning root, so the stop path keeps
+    its own per-root owner lookup: only an exact tracker-repo feed
+    names a project, and a short or otherwise unmapped spelling names
+    none, instead of stopping a stranger's units under a guessed
+    spelling. A key the map cannot translate falls back to the
+    per-root scan, so a tracker repo shadowed out of the pass map by
+    an earlier project sharing its short name still stops under its
+    unambiguous owner. `mapping` is the pass's one short-to-tracker
+    map; with none, the builder resolves its own. `git` names the
+    origin-lookup seam for entries without an explicit tracker repo;
+    None is the real runner. Pure settings reads, no subprocess when
+    every entry names its tracker repo explicitly.
     """
+    runner = syncli._git if git is None else git
+    mapping = _resolved_map(registered, mapping, runner)
+    try:
+        short = reviewrecord.local_repo(repo, mapping)
+    except ValueError:
+        for project in registered:
+            try:
+                _local_repo(project.root, repo, git=runner)
+            except launch.LaunchError:
+                continue
+            return project.name
+        return None
     for project in registered:
         try:
-            _local_repo(project.root, repo)
-        except launch.LaunchError:
+            root_map = syncli.root_short_map(project.root, runner)
+        except settings.SettingsError:
             continue
-        return project.name
+        if root_map.get(short) == repo:
+            return project.name
     return None
 
 
-def production_stopper(registered):
+def production_stopper(registered, *, mapping=None, git=None):
     """The stuck step's stop seam over `launch.stop` with production I/O.
 
-    Resolves the owning project per ticket, then stops the ticket's
-    logged live units. Every argument the stop path needs is fixed here;
-    tests inject a fake instead.
+    Resolves the owning project per ticket over the pass map, then
+    stops the ticket's logged live units. Every argument the stop path
+    needs is fixed here; tests inject a fake instead. `mapping` is the
+    pass's one short-to-tracker map; with none, each stop resolves its
+    own. `git` names the origin-lookup seam; None is the real runner.
     """
+    runner = syncli._git if git is None else git
     listings = lambda prefix: units.list_units(prefix, run=units.default_run)
 
     def stop_unit(repo, number):
-        name = production_stuck_project(registered, repo)
+        name = production_stuck_project(registered, repo, mapping=mapping, git=runner)
         if name is None:
             raise units.UnitsError(f"no registered project feeds tracker repo {repo!r}")
         entry = next(item for item in registered if item.name == name)
-        local = _local_repo(entry.root, repo)
+        local = _local_repo(entry.root, repo, git=runner)
         tgt = launch.target(entry.root, local)
         return launch.stop(tgt, number, list_fn=listings, stop_fn=units.systemctl_stop)
 
@@ -3886,7 +3961,7 @@ def _claim_and_launch(
     return rows, started, blocked, launched
 
 
-def _local_repo(root, repo):
+def _local_repo(root, repo, *, git=None):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
     The reverse of the one short-to-tracker resolver: the spelling
@@ -3896,10 +3971,12 @@ def _local_repo(root, repo):
     tracker repo names it wins, an entry name that merely equals
     `repo` is not a mapping, and a reported problem is surfaced,
     never masked. Anything else is a `LaunchError` naming the root
-    and the repo.
+    and the repo. `git` names the origin-lookup seam for entries
+    without an explicit tracker repo; None is the real runner.
     """
+    runner = worktrees.git if git is None else git
     try:
-        mapping = syncli.root_short_map(root, worktrees.git)
+        mapping = syncli.root_short_map(root, runner)
     except settings.SettingsError as problem:
         raise launch.LaunchError(str(problem)) from None
     try:
@@ -4391,7 +4468,7 @@ def _launching_pass(
         reviews=reviews,
         pulls_for=pulls_for,
     )
-    log_missing_reviews(out, finished, reviews)
+    log_missing_reviews(out, finished, reviews, _released_rows(_items, freed))
     if host is None:
         try:
             configured = settings.load(root=None)["drive.agent_host"]
