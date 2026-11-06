@@ -708,13 +708,18 @@ def host_label(state_dir=None):
     return label
 
 
+def runs_dir(state_dir=None):
+    """The raw run ledger dir: ``<state>/heavy/runs``. The one resolver."""
+    return os.path.join(state_dir or paths.state_dir(), HEAVY_DIR, RUNS_DIR)
+
+
 def ledger_path(label=None, period=None, state_dir=None):
     """The raw run ledger file: `<state>/heavy/runs/<host>-<period>.jsonl`.
 
     One file per host per period, so two hosts never write the same
-    file. The one resolver for it. An explicit label is validated like a
-    stored one and the period must be a calendar month, so a hostile
-    value never becomes a path.
+    file. The one resolver for the file; the dir comes from ``runs_dir``.
+    An explicit label is validated like a stored one and the period
+    must be a calendar month, so a hostile value never becomes a path.
     """
     base = state_dir or paths.state_dir()
     if label is None:
@@ -725,7 +730,7 @@ def ledger_path(label=None, period=None, state_dir=None):
         period = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m")
     if not isinstance(period, str) or PERIOD_RE.fullmatch(period) is None:
         raise HeavyError(f"the ledger period {period!r} is not a calendar month (YYYY-MM)")
-    return os.path.join(base, HEAVY_DIR, RUNS_DIR, f"{label}-{period}.jsonl")
+    return os.path.join(runs_dir(base), f"{label}-{period}.jsonl")
 
 
 def append_ledger_row(path, row):
@@ -2665,12 +2670,17 @@ def collect_ledger_rows(state_dir=None):
 
     Returns ``(rows, sources, skipped)``: the normalized rows oldest
     first across every ``*.jsonl`` run file, the absorbed basenames in
-    sort order, and the count of lines that failed validation. A missing
-    runs dir reads as empty (nothing learned yet, not a failure); an
-    unreadable dir or file refuses, naming it. Corrupt lines never block
-    the rollup: they count, and the verb names the count on stderr.
+    sort order, and the count of lines that failed validation. Rows
+    sort by their ``at`` timestamp (file order breaks ties), so monthly
+    files from two hosts still read in time order. A missing runs dir
+    reads as empty (nothing learned yet, not a failure); an unreadable
+    dir or file refuses, naming it. Corrupt lines never block the
+    rollup: they count, and the verb names the count on stderr. The
+    read pass takes no lock, so a concurrent append can tear the final
+    line: that line counts as skipped for one run and heals itself on
+    the next rollup, once the writer finishes it.
     """
-    runs = os.path.join(state_dir or paths.state_dir(), HEAVY_DIR, RUNS_DIR)
+    runs = runs_dir(state_dir)
     rows, sources, skipped = [], [], 0
     try:
         names = sorted(os.listdir(runs))
@@ -2702,6 +2712,10 @@ def collect_ledger_rows(state_dir=None):
                 skipped += 1
                 continue
             rows.append(normalized)
+    # Time order, oldest first: files read in name order, so monthly
+    # files from two hosts would otherwise interleave. The sort is
+    # stable, so equal timestamps keep file order.
+    rows.sort(key=lambda row: row["at"])
     return rows, sources, skipped
 
 
