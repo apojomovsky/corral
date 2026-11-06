@@ -9,6 +9,15 @@ the stamp is ever read, so the tree alone identifies the tested
 content. The stamp proves only the identical tree, the identical
 interpreter set, and an age within `STAMP_MAX_AGE_S`.
 
+This is not the pre-push stamp (`src/korapy/push.py`, `.githooks/pre-push`):
+that one proves the hook's own single-interpreter suite at push time, so it
+is keyed on the hook digest (`<tree> <hook-digest>`), lives under the git
+dir, and never expires. This one proves the multi-interpreter matrix at
+check time, so it is keyed on the interpreter set, lives under the cache
+dir, and expires after a day. The two gates differ in key, place and
+lifetime on purpose; a pre-push-shaped line reads as corrupt here, never
+as proof. `tests/test_checkstamp.py::TwoStamps` pins that difference.
+
 Pure core, thin seams: `stamp_status` decides over plain data (the file
 text, the tree, the interpreters, now); the file read, the git calls
 and the clock stay at the edges, in the Makefile and the takeoff

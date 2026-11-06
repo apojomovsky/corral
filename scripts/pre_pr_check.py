@@ -12,7 +12,7 @@ Blocking checks (exit 1, with a fix line each):
   - no added line carries an em-dash
   - the PR body has real newlines, links the branch's ticket with
     `Closes #N` or `Refs #N`, and has a non-empty `## Review` section
-  - with --test, the suite passes, or a fresh `make check` stamp proves
+  - with --test, the suite passes, or a fresh matrix stamp proves
   the same tree so the suite is not run again
 
 Exit 4 on a usage error (no body file).
@@ -119,24 +119,16 @@ def tree_hash(cwd):
     return proc.stdout.strip()
 
 
+# The suite command, kept in step with the Makefile's UNITTEST definition
+# (`UNITTEST = python -m unittest discover -t . -s tests`; the matrix legs
+# wrap it with `--isolated --python <v>`, `make test` with `-v`). The
+# agreement test in tests/test_checkstamp.py fails when the two drift apart.
+SUITE_ARGV = ("python", "-m", "unittest", "discover", "-t", ".", "-s", "tests")
+
+
 def run_suite(cwd):
     """Run the suite the way the ritual always has; tests fake this seam."""
-    proc = subprocess.run(
-        [
-            "uv",
-            "run",
-            "--locked",
-            "python",
-            "-m",
-            "unittest",
-            "discover",
-            "-t",
-            ".",
-            "-s",
-            "tests",
-        ],
-        cwd=cwd,
-    )
+    proc = subprocess.run(["uv", "run", "--locked", *SUITE_ARGV], cwd=cwd)
     return proc.returncode
 
 
@@ -183,7 +175,7 @@ def main(argv=None):
     if args.test and not found:
         reused, detail = suite_proof(args.cwd, args.pythons)
         if reused:
-            print(f"pre-pr-check: reusing the green check ({detail}), skipping the suite")
+            print(f"pre-pr-check: reusing the green matrix ({detail}), skipping the suite")
         elif run_suite(args.cwd) != 0:
             found.append("the test suite failed (make test)")
     for problem in found:

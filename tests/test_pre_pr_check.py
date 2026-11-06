@@ -219,7 +219,7 @@ class StampReuse(TicketWorktree):
         code, out, err = self.takeoff_test()
         self.assertEqual((code, err), (0, ""))
         self.assertEqual(self.suite_calls, [])
-        self.assertIn("reusing the green check", out)
+        self.assertIn("reusing the green matrix", out)
 
     def test_a_missing_stamp_runs_the_suite(self):
         self.commit(self.tree, "feat(x): add the thing", name="g")

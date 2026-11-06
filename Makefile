@@ -29,7 +29,8 @@ test: ## Run the unittest suite on the pinned Python
 
 test-matrix: ## Run the suite on every supported Python in parallel (PYTHONS="3.11 3.14")
 	@cache=$$(uv run --locked korapy paths cache --mkdir) && \
-	logdir="$$cache/check-logs" && mkdir -p "$$logdir" && rm -f "$$logdir"/python-*.status && \
+	tree_before=$$(git rev-parse 'HEAD^{tree}') && \
+	logdir=$$(mktemp -d "$$cache/check-logs.XXXXXX") && \
 	for v in $(PYTHONS); do \
 	  (uv run --locked --isolated --python $$v $(UNITTEST) >"$$logdir/python-$$v.log" 2>&1; echo $$? >"$$logdir/python-$$v.status") & \
 	done; wait; \
@@ -37,11 +38,15 @@ test-matrix: ## Run the suite on every supported Python in parallel (PYTHONS="3.
 	  code=$$(cat "$$logdir/python-$$v.status" 2>/dev/null); \
 	  if [ "$$code" != "0" ]; then echo "test-matrix: Python $$v failed (see $$logdir/python-$$v.log)"; fail=1; fi; \
 	done; \
-	if [ $$fail != 0 ]; then exit 1; fi; \
-	if [ -z "$$(git status --porcelain)" ]; then \
-	  tree=$$(git rev-parse 'HEAD^{tree}') && now=$$(date +%s) && \
-	  printf '%s %s %s\n' "$$tree" "$(PYTHONS)" "$$now" >"$$cache/korapy-check-stamp" && \
-	  echo "test-matrix: suite passed on $(PYTHONS) (proof in $$cache/korapy-check-stamp)"; \
+	if [ $$fail != 0 ]; then echo "test-matrix: logs kept in $$logdir"; exit 1; fi; \
+	rm -rf "$$logdir" && \
+	tree_after=$$(git rev-parse 'HEAD^{tree}') && \
+	if [ "$$tree_before" != "$$tree_after" ]; then \
+	  echo "test-matrix: suite passed on $(PYTHONS) (tree changed mid-run, no proof stamped)"; \
+	elif [ -z "$$(git status --porcelain)" ]; then \
+	  now=$$(date +%s) && \
+	  printf '%s %s %s\n' "$$tree_before" "$(PYTHONS)" "$$now" >"$$cache/korapy-check-stamp" && \
+	  echo "test-matrix: the green matrix passed on $(PYTHONS) (proof in $$cache/korapy-check-stamp)"; \
 	else \
 	  echo "test-matrix: suite passed on $(PYTHONS) (tree is dirty, no proof stamped)"; \
 	fi
