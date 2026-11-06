@@ -9,8 +9,13 @@ Checks, in gate order: `lock` (the per-repo lock is free), `open`
 pinned `--head`), `review` (the same `mergeup.find_record` reader
 takeoff uses, so both gates agree, including inheritance across a
 clean merge-up), `checks` (the forge check statuses are green; the
-only waivable row), `fork` (the PR is not from a fork; a maintainer
-merges those by hand).
+only waivable row: `pending` while they are still running, with a
+wait message and no fix advice), `fork` (the PR is not from a fork;
+a maintainer merges those by hand).
+
+`--wait` polls the forge (never the lock) until the `checks` row
+leaves `pending`, any row fails, or `--timeout` (default ten
+minutes) lands; a timeout still reports `pending` with exit 1.
 
 The verb acquires the per-repo lock, re-reads the PR live, merges,
 verifies, and releases. `--plan` reports every row and the lock state
@@ -27,8 +32,10 @@ there is no default that could merge when a caller passes nothing.
 import contextlib
 import errno
 import fcntl
+import math
 import os
 import re
+import time
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -96,8 +103,16 @@ SKIPPABLE = ("checks",)
 #: The identity checks no flag may waive: they establish what is merged.
 IDENTITY = ("lock", "open", "head", "review", "fork")
 
-#: Row statuses: a precondition holds, refuses, or was waived by name.
-OK_S, FAIL, SKIPPED = "ok", "fail", "skipped"
+#: Row statuses: a precondition holds, is not yet met, refuses, or
+#: was waived by name. `pending` is a wait, not a failure: the detail
+#: names the wait and carries no fix advice.
+OK_S, PENDING, FAIL, SKIPPED = "ok", "pending", "fail", "skipped"
+
+#: Seconds `--wait` polls a pending forge before giving up: ten minutes.
+DEFAULT_WAIT_TIMEOUT_S = 600
+
+#: The `--wait` poll interval: a gentle forge read cadence, not a spin.
+WAIT_POLL_S = 30.0
 
 #: A pinned head: a full 40- or 64-digit hex SHA, nothing shorter.
 #:
@@ -147,6 +162,11 @@ def lock_path(repo: str) -> str:
 
 #: The lock seam: production locks with fcntl; tests assign fakes.
 _flock: Callable[[int, int], None] = fcntl.flock
+
+#: The wait-loop seams: the monotonic clock and the sleep. Tests assign
+#: fakes (or pass `now_fn`/`sleep_fn`); production waits on the wall.
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 
 def _resolve_skips(skips) -> frozenset[str]:
@@ -338,7 +358,7 @@ def _evaluate(
     elif pr.checks_state == "passing":
         checks.append(Check("checks", OK_S, "the checks are passing"))
     elif pr.checks_state == "pending":
-        checks.append(Check("checks", FAIL, "the checks are pending: wait for them to finish"))
+        checks.append(Check("checks", PENDING, "the checks are pending: wait for them to finish"))
     else:
         checks.append(
             Check(
@@ -364,6 +384,84 @@ def _failed(checks: list[Check]) -> bool:
     return any(check.status == FAIL for check in checks)
 
 
+def _blocked(checks: list[Check]) -> bool:
+    """Whether the evaluation stops the merge: any refusal or any wait.
+
+    A `pending` row blocks like a `fail` (exit 1, nothing merged) but
+    stays `pending` in the document, so a caller branching on the row
+    waits instead of fixing the branch.
+    """
+    return any(check.status in (FAIL, PENDING) for check in checks)
+
+
+def _status(checks: list[Check], name: str) -> str:
+    """The status of one precondition row; `_evaluate` always emits it."""
+    for check in checks:
+        if check.name == name:
+            return check.status
+    raise AssertionError(f"no check named {name!r}")
+
+
+def _resolve_timeout(timeout) -> float:
+    """Seconds `--wait` polls a pending forge: the default or a validated value.
+
+    `None` is the default ten minutes. Anything else must be a finite
+    number of seconds, zero or more; anything unusable is a MergeError
+    naming `--timeout` (exit 4 through the CLI).
+    """
+    if timeout is None:
+        return float(DEFAULT_WAIT_TIMEOUT_S)
+    if isinstance(timeout, bool):
+        raise MergeError("--timeout needs seconds")
+    try:
+        seconds = float(timeout)
+    except (TypeError, ValueError):
+        raise MergeError("--timeout needs seconds") from None
+    if not math.isfinite(seconds) or seconds < 0:
+        raise MergeError("--timeout needs seconds")
+    return seconds
+
+
+def _poll_until_settled(
+    ticket_repo: str,
+    ticket_number: int,
+    repo: str,
+    number: int,
+    head: str,
+    skip_set: frozenset[str],
+    path: str,
+    held_detail: str,
+    cwd: str,
+    *,
+    timeout: float,
+    poll_s: float,
+    clock,
+    sleep,
+    forge,
+) -> list[Check]:
+    """Poll the forge until the checks row leaves pending, a row fails, or time lands.
+
+    No lock is taken and nothing merges: the caller merges (or reports
+    `--plan`) from the returned evaluation. A `fail` anywhere wins at
+    once, even beside a pending checks row; a timeout returns the
+    pending evaluation. Forge outages raise through the seam, never
+    swallowed into a verdict.
+    """
+    start = clock()
+    while True:
+        if _lock_free(path):
+            lock_detail = "the merge lock is free"
+        else:
+            lock_detail = held_detail
+        pr = forge.pull_request(repo, number)
+        checks = _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail)
+        if _status(checks, "checks") != PENDING or _failed(checks):
+            return checks
+        if clock() - start >= timeout:
+            return checks
+        sleep(poll_s)
+
+
 def run_merge(
     ticket_repo: str,
     ticket_number: int,
@@ -374,6 +472,11 @@ def run_merge(
     method: str | None = None,
     skips=(),
     plan: bool = False,
+    wait: bool = False,
+    timeout=None,
+    poll_s: float = WAIT_POLL_S,
+    now_fn=None,
+    sleep_fn=None,
     forge,
     cwd: str | None = None,
 ) -> Result:
@@ -386,8 +489,14 @@ def run_merge(
     naming `merge.method`).
     `skips` names waived checks (`checks` alone may be waived). With
     `plan` every row is reported without taking the lock and without
-    merging. Usage problems raise MergeError (exit 4); forge outages
-    raise `korapy.forge.ForgeError` (exit 3).
+    merging. With `wait` a pending `checks` row polls the forge until it
+    leaves pending, any row fails, or `timeout` seconds land (`None` is
+    the default ten minutes; a `timeout` without `wait` is a MergeError
+    naming `--timeout`). `poll_s` is the poll cadence; `now_fn` and
+    `sleep_fn` inject the clock and the sleep for tests. The wait never
+    holds the merge lock: a real merge re-reads under the lock after
+    the wait settles. Usage problems raise MergeError (exit 4); forge
+    outages raise `korapy.forge.ForgeError` (exit 3).
 
     The post-merge verify ties the reported merge SHA to the pinned
     head: state `merged` with the merge SHA the forge reports. For a
@@ -413,22 +522,63 @@ def run_merge(
     head = head.lower()
     cwd = cwd or os.getcwd()
     path = lock_path(repo)
+    if timeout is not None and not wait:
+        raise MergeError("--timeout needs --wait: it bounds how long --wait polls")
+    timeout_s = _resolve_timeout(timeout) if wait else 0.0
     if plan:
-        free = _lock_free(path)
-        pr = forge.pull_request(repo, number)
-        if free:
-            lock_detail = "the merge lock is free"
+        if wait:
+            checks = _poll_until_settled(
+                ticket_repo,
+                ticket_number,
+                repo,
+                number,
+                head,
+                skip_set,
+                path,
+                "the merge lock is held by another merger "
+                "(informational: --plan never takes the lock)",
+                cwd,
+                timeout=timeout_s,
+                poll_s=poll_s,
+                clock=now_fn or _monotonic,
+                sleep=sleep_fn or _sleep,
+                forge=forge,
+            )
         else:
-            lock_detail = "the merge lock is held by another merger (informational: --plan never takes the lock)"
-        checks = _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail)
-        return Result(checks, sorted(skip_set), False, None, OK if not _failed(checks) else NO)
+            free = _lock_free(path)
+            pr = forge.pull_request(repo, number)
+            if free:
+                lock_detail = "the merge lock is free"
+            else:
+                lock_detail = "the merge lock is held by another merger (informational: --plan never takes the lock)"
+            checks = _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail)
+        return Result(checks, sorted(skip_set), False, None, OK if not _blocked(checks) else NO)
+    if wait:
+        checks = _poll_until_settled(
+            ticket_repo,
+            ticket_number,
+            repo,
+            number,
+            head,
+            skip_set,
+            path,
+            "the merge lock is held by another merger",
+            cwd,
+            timeout=timeout_s,
+            poll_s=poll_s,
+            clock=now_fn or _monotonic,
+            sleep=sleep_fn or _sleep,
+            forge=forge,
+        )
+        if _blocked(checks):
+            return Result(checks, sorted(skip_set), False, None, NO)
     try:
         with _locked(path):
             pr = forge.pull_request(repo, number)
             checks = _evaluate(
                 ticket_repo, ticket_number, pr, head, skip_set, cwd, "the merge lock is free"
             )
-            if _failed(checks):
+            if _blocked(checks):
                 return Result(checks, sorted(skip_set), False, None, NO)
             try:
                 reported = forge.merge(repo, number, head_sha=head, method=method)
@@ -442,7 +592,7 @@ def run_merge(
                 checks = _evaluate(
                     ticket_repo, ticket_number, pr, head, skip_set, cwd, "the merge lock is free"
                 )
-                if not _failed(checks):
+                if not _blocked(checks):
                     checks.append(
                         Check(
                             "method",

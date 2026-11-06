@@ -58,6 +58,44 @@ class MethodRefusedForge(FakeForge):
         )
 
 
+class SequenceForge(FakeForge):
+    """A forge serving a scripted PR per `pull_request` read, then holding.
+
+    `reads` lists the `PullRequest` objects successive reads return; once
+    one remains, every later read returns it. `merge` stamps that last
+    read merged with `MERGE_SHA`, like `FakeForge.merge`, so the
+    post-merge verify sees the merge. Tests drive `--wait` polling
+    without any clock or network.
+    """
+
+    def __init__(self, reads):
+        self.reads = list(reads)
+        self.requested = []
+        self.calls = []
+
+    def pull_request(self, repo, number):
+        self.requested.append((repo, number))
+        if len(self.reads) > 1:
+            return self.reads.pop(0)
+        return self.reads[0]
+
+    def merge(self, repo, number, *, head_sha, method):
+        from korapy.github import forge as ghforge
+
+        self.calls.append(("merge", repo, number, head_sha, method))
+        if method not in ("squash", "merge"):
+            raise forge.ForgeError(f"unsupported merge method {method!r}")
+        if not ghforge.is_repo_name(repo):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        pr = self.reads[0]
+        if pr.state != forge.OPEN:
+            raise forge.ForgeRefused(f"PR {number} is {pr.state}, nothing to merge")
+        if pr.head_sha != head_sha:
+            raise forge.ForgeRefused(f"PR {number} head moved: want {head_sha}")
+        self.reads[0] = pr._replace(state=forge.MERGED, merge_sha=MERGE_SHA)
+        return MERGE_SHA
+
+
 class MergeCase(unittest.TestCase):
     def setUp(self):
         env = mock.patch.dict(os.environ)
@@ -281,11 +319,11 @@ class CoreTest(MergeCase):
         self.assertTrue(result.merged)
 
     def test_pending_and_failing_checks_refuse(self):
-        for state in ("pending", "failing"):
+        for state, status in (("pending", "pending"), ("failing", "fail")):
             with self.subTest(state=state):
                 result = self.do_merge(self.fake(checks_state=state))
                 self.assertEqual(result.exit_code, 1)
-                self.assertEqual(self.row(result, "checks").status, "fail")
+                self.assertEqual(self.row(result, "checks").status, status)
                 self.assertFalse(result.merged)
 
     def test_skip_checks_waives_a_failing_row(self):
@@ -469,6 +507,161 @@ class MergeMethodTest(MergeCase):
                 self.assertIn("merge.method", str(ctx.exception))
 
 
+class PendingWaitTest(MergeCase):
+    """Pending checks are a wait, not a failure; `--wait` polls the forge."""
+
+    def pr(self, checks_state):
+        return make_pr(
+            repo=FORGE_REPO,
+            number=PR,
+            base_sha=self.base,
+            head_sha=self.head,
+            checks_state=checks_state,
+        )
+
+    def clock(self):
+        now = [1000.0]
+        sleeps = []
+
+        def now_fn():
+            return now[0]
+
+        def sleep_fn(secs):
+            sleeps.append(secs)
+            now[0] += secs
+
+        return now_fn, sleep_fn, sleeps
+
+    def test_pending_checks_report_pending_with_wait_advice(self):
+        result = self.do_merge(self.fake(checks_state="pending"), plan=True)
+        self.assertEqual(result.exit_code, 1)
+        row = self.row(result, "checks")
+        self.assertEqual(row.status, "pending")
+        self.assertIn("wait", row.detail)
+        self.assertNotIn("fix the branch", row.detail)
+        self.assertFalse(result.merged)
+
+    def test_pending_checks_block_the_merge_without_merging(self):
+        result = self.do_merge(self.fake(checks_state="pending"))
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "checks").status, "pending")
+        self.assertFalse(result.merged)
+        self.assertIsNone(result.merge_sha)
+
+    def test_failing_checks_still_fail_with_fix_advice(self):
+        result = self.do_merge(self.fake(checks_state="failing"), plan=True)
+        self.assertEqual(result.exit_code, 1)
+        row = self.row(result, "checks")
+        self.assertEqual(row.status, "fail")
+        self.assertIn("fix the branch", row.detail)
+
+    def test_mixed_pending_checks_and_failing_review_failing_wins(self):
+        self.write("more.txt", "more\n")
+        self.commit("more work")
+        head = self.rev("HEAD")
+        self.approve(head, verdict="block")
+        fake = SequenceForge([self.pr("pending")._replace(head_sha=head)])
+        now_fn, sleep_fn, sleeps = self.clock()
+        result = merge.run_merge(
+            REPO,
+            TICKET,
+            FORGE_REPO,
+            PR,
+            head_sha=head,
+            forge=fake,
+            cwd=self.dir,
+            wait=True,
+            timeout=100,
+            poll_s=10,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "review").status, "fail")
+        self.assertEqual(self.row(result, "checks").status, "pending")
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(fake.requested), 1)
+
+    def test_wait_polls_until_passing_then_merges(self):
+        fake = SequenceForge([self.pr("pending"), self.pr("pending"), self.pr("passing")])
+        now_fn, sleep_fn, sleeps = self.clock()
+        result = merge.run_merge(
+            REPO,
+            TICKET,
+            FORGE_REPO,
+            PR,
+            head_sha=self.head,
+            forge=fake,
+            cwd=self.dir,
+            wait=True,
+            timeout=100,
+            poll_s=10,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.merged)
+        self.assertEqual(result.merge_sha, MERGE_SHA)
+        self.assertEqual(sleeps, [10, 10])
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_wait_stops_on_a_failing_check(self):
+        fake = SequenceForge([self.pr("pending"), self.pr("failing")])
+        now_fn, sleep_fn, sleeps = self.clock()
+        result = merge.run_merge(
+            REPO,
+            TICKET,
+            FORGE_REPO,
+            PR,
+            head_sha=self.head,
+            forge=fake,
+            cwd=self.dir,
+            wait=True,
+            timeout=100,
+            poll_s=10,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "checks").status, "fail")
+        self.assertIn("fix the branch", self.row(result, "checks").detail)
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(sleeps, [10])
+
+    def test_wait_times_out_with_pending(self):
+        fake = SequenceForge([self.pr("pending")])
+        now_fn, sleep_fn, sleeps = self.clock()
+        result = merge.run_merge(
+            REPO,
+            TICKET,
+            FORGE_REPO,
+            PR,
+            head_sha=self.head,
+            forge=fake,
+            cwd=self.dir,
+            wait=True,
+            timeout=100,
+            poll_s=10,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "checks").status, "pending")
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(len(sleeps), 10)
+
+    def test_wait_default_timeout_is_ten_minutes(self):
+        self.assertEqual(merge.DEFAULT_WAIT_TIMEOUT_S, 600)
+
+    def test_bad_timeout_is_usage(self):
+        for timeout in ("soon", -1, float("nan"), float("inf")):
+            with self.subTest(timeout=timeout):
+                with self.assertRaises(merge.MergeError):
+                    self.do_merge(self.fake(), wait=True, timeout=timeout)
+
+
 class CliTest(MergeCase):
     def args(self, **overrides):
         base = {
@@ -481,6 +674,8 @@ class CliTest(MergeCase):
             "skip": [],
             "json": False,
             "plan": False,
+            "wait": False,
+            "timeout": None,
         }
         base.update(overrides)
         return argparse.Namespace(**base)
@@ -674,6 +869,69 @@ class CliTest(MergeCase):
         self.assertIn("merge method: fail", out)
         self.assertIn("merge.method", out)
         self.assertIn("not merged", out)
+
+    def test_pending_text_names_the_wait(self):
+        code, out, _ = self.call(self.args(plan=True), self.fake(checks_state="pending"))
+        self.assertEqual(code, 1)
+        self.assertIn("merge checks: pending", out)
+        self.assertIn("wait", out)
+        self.assertIn("not merged", out)
+
+    def test_timeout_without_wait_is_usage(self):
+        code, _, err = self.call(self.args(timeout="60"), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("--wait", err)
+
+    def test_bad_timeout_is_usage(self):
+        for timeout in ("soon", "-1"):
+            with self.subTest(timeout=timeout):
+                code, _, err = self.call(self.args(wait=True, timeout=timeout), self.fake())
+                self.assertEqual(code, 4)
+                self.assertIn("--timeout", err)
+
+    def test_wait_merges_once_the_checks_pass(self):
+        base = make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)
+        fake = SequenceForge(
+            [
+                base._replace(checks_state="pending"),
+                base._replace(checks_state="passing"),
+            ]
+        )
+        now = [1000.0]
+        with (
+            mock.patch.object(merge, "_monotonic", side_effect=lambda: now[0]),
+            mock.patch.object(
+                merge, "_sleep", side_effect=lambda secs: now.__setitem__(0, now[0] + secs)
+            ),
+        ):
+            code, out, _ = self.call(self.args(wait=True, timeout="100"), fake)
+        self.assertEqual(code, 0)
+        self.assertIn(f"merged {MERGE_SHA}", out)
+        self.assertEqual(len(fake.calls), 1)
+
+    def test_wait_flags_parse(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers()
+        mergecli.add_parser(sub)
+        ns = parser.parse_args(
+            [
+                "merge",
+                REPO,
+                str(TICKET),
+                "--pr",
+                str(PR),
+                "--head",
+                self.head,
+                "--wait",
+                "--timeout",
+                "60",
+            ]
+        )
+        self.assertTrue(ns.wait)
+        self.assertEqual(ns.timeout, "60")
+        ns = parser.parse_args(["merge", REPO, str(TICKET), "--pr", str(PR), "--head", self.head])
+        self.assertFalse(ns.wait)
+        self.assertIsNone(ns.timeout)
 
 
 def _no_flock(fd, op):
