@@ -89,6 +89,7 @@ PROVIDERS = (
     "korapy.hold",
     "korapy.hub",
     "korapy.launch",
+    "korapy.merge",
     "korapy.prompts",
     "korapy.quota",
     "korapy.registry",

@@ -18,7 +18,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from typing import Any
 from unittest import mock
 
-from korapy import forge, merge, mergecli, paths, reviewrecord
+from korapy import forge, merge, mergecli, paths, reviewrecord, settings
 from tests.test_forge import MERGE_SHA, FakeForge, make_pr
 from tests.test_reviewrecord import git_in
 
@@ -46,6 +46,16 @@ class RacedForge(FakeForge):
         raise forge.ForgeRefused(f"PR {number} is closed: nothing to merge")
 
 
+class MethodRefusedForge(FakeForge):
+    """The forge disallows the method; the PR stays open at the head."""
+
+    def merge(self, repo, number, *, head_sha, method):
+        self.calls.append(("merge", repo, number, head_sha, method))
+        raise forge.ForgeRefused(
+            f"PR {number} merge refused: the repository settings allow squash only (HTTP 405)"
+        )
+
+
 class MergeCase(unittest.TestCase):
     def setUp(self):
         env = mock.patch.dict(os.environ)
@@ -58,6 +68,7 @@ class MergeCase(unittest.TestCase):
         self.tmp = os.path.realpath(tmp.name)
         os.environ["KORAPY_STATE"] = os.path.join(self.tmp, "state")
         os.environ["KORAPY_SESSIONS"] = os.path.join(self.tmp, "sessions")
+        os.environ["KORAPY_CONFIG"] = os.path.join(self.tmp, "config")
         self.dir = os.path.join(self.tmp, "clone")
         os.makedirs(self.dir)
         self.git("init", "-q", "-b", "master")
@@ -312,6 +323,124 @@ class CoreTest(MergeCase):
         self.assertEqual(len(fake.calls), 1)
 
 
+class MethodSettingTest(unittest.TestCase):
+    def resolve(self, **kw):
+        kw.setdefault("env", {})
+        return settings.resolve(**kw)
+
+    def test_provider_is_registered(self):
+        self.assertIn("korapy.merge", settings.PROVIDERS)
+        self.assertEqual(settings.REGISTRY["merge.method"].default, "squash")
+
+    def test_default_is_squash(self):
+        resolved = self.resolve()
+        self.assertEqual(resolved["merge.method"], "squash")
+        self.assertEqual(resolved.values["merge.method"].origin, settings.DEFAULT)
+
+    def test_project_file_selects_merge(self):
+        resolved = self.resolve(project={"merge": {"method": "merge"}})
+        self.assertEqual(resolved["merge.method"], "merge")
+        self.assertEqual(resolved.values["merge.method"].origin, settings.PROJECT)
+
+    def test_env_selects_merge(self):
+        resolved = self.resolve(env={"KORAPY_MERGE_METHOD": "merge"})
+        self.assertEqual(resolved["merge.method"], "merge")
+
+    def test_anything_but_squash_or_merge_is_rejected(self):
+        for where in (
+            {"project": {"merge": {"method": "rebase"}}},
+            {"project": {"merge": {"method": "bogus"}}},
+            {"project": {"merge": {"method": 7}}},
+            {"host": {"merge": {"method": "rebase"}}},
+            {"env": {"KORAPY_MERGE_METHOD": "rebase"}},
+        ):
+            with self.subTest(where=where):
+                with self.assertRaises(settings.SettingsError) as ctx:
+                    self.resolve(**where)
+                self.assertIn("merge.method", str(ctx.exception))
+
+
+class ResolveMethodTest(unittest.TestCase):
+    def configured(self, method):
+        return settings.resolve(project={"merge": {"method": method}}, env={})
+
+    def test_flag_wins_over_config(self):
+        resolved = self.configured("merge")
+        self.assertEqual(merge.resolve_method(flag="squash", resolved=resolved), "squash")
+
+    def test_config_applies_without_a_flag(self):
+        self.assertEqual(merge.resolve_method(resolved=self.configured("merge")), "merge")
+
+    def test_default_is_squash(self):
+        self.assertEqual(merge.resolve_method(), "squash")
+        self.assertEqual(merge.resolve_method(resolved=settings.resolve(env={})), "squash")
+
+    def test_unknown_flag_or_value_names_the_setting(self):
+        bad = settings.Resolved(values={"merge.method": settings.Value("rebase", settings.PROJECT)})
+        for kw in ({"flag": "rebase"}, {"flag": "bogus"}, {"resolved": bad}):
+            with self.subTest(kw=kw):
+                with self.assertRaises(merge.MergeError) as ctx:
+                    merge.resolve_method(**kw)
+                self.assertIn("merge.method", str(ctx.exception))
+
+
+class MergeMethodTest(MergeCase):
+    def test_merge_commit_merges_and_verifies(self):
+        fake = self.fake()
+        result = self.do_merge(fake, method="merge")
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(result.merged)
+        self.assertEqual(result.merge_sha, MERGE_SHA)
+        for check in result.checks:
+            self.assertEqual(check.status, "ok", check.name)
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "merge")])
+
+    def test_plan_with_merge_method_reports_without_merging(self):
+        fake = self.fake()
+        result = self.do_merge(fake, plan=True, method="merge")
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.merged)
+        self.assertEqual(fake.calls, [])
+
+    def test_refused_method_is_exit_1_naming_the_setting(self):
+        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+        fake = MethodRefusedForge(pulls=pulls)
+        result = self.do_merge(fake, method="merge")
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(result.merged)
+        self.assertIsNone(result.merge_sha)
+        row = self.row(result, "method")
+        self.assertEqual(row.status, "fail")
+        self.assertIn("merge.method", row.detail)
+        for check in result.checks:
+            if check.name != "method":
+                self.assertEqual(check.status, "ok", check.name)
+
+    def test_race_refusal_still_names_the_row_not_the_method(self):
+        fake = RacedForge(
+            pulls=[make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+        )
+        result = self.do_merge(fake, method="merge")
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "open").status, "fail")
+        self.assertNotIn("method", [check.name for check in result.checks])
+
+    def test_verify_mismatch_for_merge_method_fails_closed(self):
+        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+        fake = UnverifiedForge(pulls=pulls)
+        result = self.do_merge(fake, method="merge")
+        self.assertEqual(result.exit_code, 1)
+        self.assertFalse(result.merged)
+        self.assertEqual(self.row(result, "verify").status, "fail")
+
+    def test_rebase_and_unknown_methods_are_usage(self):
+        for method in ("rebase", "bogus", ""):
+            with self.subTest(method=method):
+                with self.assertRaises(merge.MergeError) as ctx:
+                    self.do_merge(self.fake(), method=method)
+                self.assertIn("merge.method", str(ctx.exception))
+
+
 class CliTest(MergeCase):
     def args(self, **overrides):
         base = {
@@ -413,6 +542,58 @@ class CliTest(MergeCase):
     def test_plan_passes_through(self):
         code, out, _ = self.call(self.args(plan=True), self.fake())
         self.assertEqual(code, 0)
+        self.assertIn("not merged", out)
+
+    def test_method_flag_reaches_the_forge(self):
+        fake = self.fake()
+        code, out, _ = self.call(self.args(method="merge"), fake)
+        self.assertEqual(code, 0)
+        self.assertIn(f"merged {MERGE_SHA}", out)
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "merge")])
+
+    def test_no_flag_defaults_to_squash(self):
+        fake = self.fake()
+        code, out, _ = self.call(self.args(method=None), fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "squash")])
+
+    def test_no_flag_json_reports_squash(self):
+        code, out, _ = self.call(self.args(method=None, json=True), self.fake())
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["method"], "squash")
+
+    def test_project_config_selects_the_method(self):
+        self.write("korapy.toml", '[merge]\nmethod = "merge"\n')
+        fake = self.fake()
+        code, out, _ = self.call(self.args(method=None, json=True), fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["method"], "merge")
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "merge")])
+
+    def test_method_flag_wins_over_project_config(self):
+        self.write("korapy.toml", '[merge]\nmethod = "merge"\n')
+        fake = self.fake()
+        code, _, _ = self.call(self.args(method="squash"), fake)
+        self.assertEqual(code, 0)
+        self.assertEqual(fake.calls, [("merge", FORGE_REPO, PR, self.head, "squash")])
+
+    def test_bad_method_flag_is_usage(self):
+        code, _, err = self.call(self.args(method="rebase"), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("merge.method", err)
+
+    def test_bad_configured_method_is_usage(self):
+        self.write("korapy.toml", '[merge]\nmethod = "rebase"\n')
+        code, _, err = self.call(self.args(method=None), self.fake())
+        self.assertEqual(code, 4)
+        self.assertIn("merge.method", err)
+
+    def test_refused_method_text_names_the_setting(self):
+        pulls = [make_pr(repo=FORGE_REPO, number=PR, base_sha=self.base, head_sha=self.head)]
+        code, out, _ = self.call(self.args(method="merge"), MethodRefusedForge(pulls=pulls))
+        self.assertEqual(code, 1)
+        self.assertIn("merge method: fail", out)
+        self.assertIn("merge.method", out)
         self.assertIn("not merged", out)
 
 
