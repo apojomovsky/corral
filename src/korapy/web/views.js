@@ -15,10 +15,13 @@ import {
 } from "./api.js";
 import {
   cleanText,
+  exitWord,
   formatAge,
   formatBytes,
-  formatClock,
-  formatPct,
+  formatCpu,
+  formatMem,
+  formatQuotaRead,
+  formatResetLine,
   parseEpoch,
   parseIso,
 } from "./fmt.js";
@@ -116,38 +119,67 @@ export function hideToken() {
   document.getElementById("token-msg").textContent = "";
 }
 
-function card(title, wrong) {
+function card(title, desc, wrong) {
   const section = document.createElement("section");
   section.setAttribute("class", wrong ? "card error" : "card");
   section.appendChild(el("h2", title));
-  return section;
-}
-
-function errorCard(title, body) {
-  const text = body && typeof body.error === "string" ? body.error : "unreadable";
-  const section = card(title, true);
-  section.appendChild(el("p", text));
-  return section;
-}
-
-function age(value, nowMs) {
-  return formatAge(parseEpoch(value), nowMs);
-}
-
-function quotaBar(window) {
-  const used = window && typeof window.used_pct === "number" ? window.used_pct : null;
-  const line = el("span", formatPct(used) + " resets " + formatClock(window ? window.resets_at : null));
-  if (used === null || !Number.isFinite(used)) {
-    return line;
+  if (desc !== null && desc !== undefined && String(desc) !== "") {
+    section.appendChild(el("p", String(desc), { class: "desc" }));
   }
-  const pct = Math.min(100, Math.max(0, used));
+  return section;
+}
+
+// A failed section: what broke, plus what the operator can do about
+// it. Degraded state is shown, never hidden behind a spinner.
+function errorCard(title, desc, body, todo) {
+  const text = body && typeof body.error === "string" ? body.error : "unreadable";
+  const section = card(title, desc, true);
+  section.appendChild(el("p", text));
+  section.appendChild(el("p", String(todo), { class: "todo" }));
+  return section;
+}
+
+// One labelled field with its help text: the label names the fact,
+// the value states it, the help says what it means.
+function field(label, value, help) {
+  const wrap = document.createElement("div");
+  wrap.setAttribute("class", "field");
+  wrap.appendChild(el("dt", label));
+  const shown = document.createElement("dd");
+  if (typeof value === "string") {
+    shown.appendChild(document.createTextNode(cleanText(value)));
+  } else {
+    shown.appendChild(value);
+  }
+  wrap.appendChild(shown);
+  wrap.appendChild(el("dd", String(help), { class: "help" }));
+  const list = document.createElement("dl");
+  list.setAttribute("class", "fields");
+  list.appendChild(wrap);
+  return list;
+}
+
+// A percentage meter: an SVG bar plus the number and its state as
+// text, so the state reads without color too. The class names the
+// state (meter ok, meter low, meter stale); the text says it.
+const METER_CLASS = {
+  ok: "meter ok",
+  low: "meter low",
+  high: "meter high",
+  stale: "meter stale",
+  unknown: "meter unknown",
+};
+
+function meter(frac, word, label) {
+  const state = METER_CLASS[word] ? word : "unknown";
+  const pct = Math.min(100, Math.max(0, Math.round(frac * 100)));
   const wrap = document.createElement("span");
-  wrap.setAttribute("class", "bar");
+  wrap.setAttribute("class", METER_CLASS[state]);
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("width", String(BAR_WIDTH));
   svg.setAttribute("height", String(BAR_HEIGHT));
   svg.setAttribute("role", "img");
-  svg.setAttribute("aria-label", formatPct(used) + " used");
+  svg.setAttribute("aria-label", label + " " + String(pct) + "%, " + state);
   const back = document.createElementNS(SVG_NS, "rect");
   back.setAttribute("x", "0");
   back.setAttribute("y", "0");
@@ -164,80 +196,136 @@ function quotaBar(window) {
   svg.appendChild(back);
   svg.appendChild(fill);
   wrap.appendChild(svg);
-  wrap.appendChild(line);
+  wrap.appendChild(el("span", String(pct) + "%, " + state));
   return wrap;
 }
 
-function quotaCard(quota, nowMs) {
-  if (isErrorSection(quota)) {
-    return errorCard("quota", quota);
+function age(value, nowMs) {
+  return formatAge(parseEpoch(value), nowMs);
+}
+
+// The meter state for a provider: a stale reading overrides the
+// quota state, so old numbers never wear a healthy color.
+function quotaMeterState(info) {
+  if (info.stale) {
+    return "stale";
   }
-  const section = card("quota");
+  if (info.state === "ok") {
+    return "ok";
+  }
+  if (info.state === "low") {
+    return "low";
+  }
+  if (info.state === "exhausted") {
+    return "high";
+  }
+  return "unknown";
+}
+
+// One quota window: its meter, or the reason there is no meter. The
+// reset reads as local wall-clock time plus the wait in words.
+function quotaWindow(id, window, info, nowMs) {
+  const wrap = document.createElement("li");
+  wrap.appendChild(el("span", String(id) + " "));
+  if (window === null || window === undefined || typeof window !== "object") {
+    wrap.appendChild(el("span", "no reading"));
+    return wrap;
+  }
+  const used = typeof window.used_pct === "number" ? window.used_pct : null;
+  if (used === null || !Number.isFinite(used)) {
+    wrap.appendChild(el("span", "no reading, " + formatResetLine(window.resets_at, nowMs)));
+    return wrap;
+  }
+  wrap.appendChild(meter(used / 100, quotaMeterState(info), "window " + String(id)));
+  wrap.appendChild(el("span", " " + formatResetLine(window.resets_at, nowMs)));
+  return wrap;
+}
+
+// One provider: its state in words, its reading's age, then one row
+// per window. A stale provider keeps its last numbers on screen under
+// a stale meter, never a zero bar.
+function quotaProvider(name, info, nowMs) {
+  const group = document.createElement("div");
+  group.appendChild(el("h3", String(name)));
+  const line = document.createElement("p");
+  line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + formatQuotaRead(info, nowMs))));
+  group.appendChild(line);
+  if (typeof info.error === "string" && info.error !== "") {
+    group.appendChild(el("p", "reader error: " + info.error));
+  }
+  const windows = info.windows && typeof info.windows === "object" ? info.windows : null;
+  if (windows === null) {
+    group.appendChild(el("p", "no reading recorded yet; run korapy quota refresh to take one."));
+    return group;
+  }
+  const ids = Object.keys(windows).sort();
+  if (ids.length === 0) {
+    group.appendChild(el("p", "no reading recorded yet; run korapy quota refresh to take one."));
+    return group;
+  }
+  const list = document.createElement("ul");
+  for (const id of ids) {
+    list.appendChild(quotaWindow(id, windows[id], info, nowMs));
+  }
+  group.appendChild(list);
+  return group;
+}
+
+function quotaCard(quota, nowMs) {
+  const desc = "What the providers last reported. A reading older than its freshness bound counts as stale; refresh it with korapy quota refresh.";
+  if (isErrorSection(quota)) {
+    return errorCard(
+      "quota",
+      desc,
+      quota,
+      "Quota readings could not be collected. Check the host with korapy doctor.",
+    );
+  }
+  const section = card("quota", desc);
   const providers = quota && quota.providers ? quota.providers : {};
   const names = Object.keys(providers).sort();
   if (names.length === 0) {
-    section.appendChild(el("p", "no providers"));
+    section.appendChild(el("p", "no providers configured; add providers to the account pool."));
     return section;
   }
   for (const name of names) {
-    const info = providers[name] || {};
-    const bits = [String(info.state)];
-    bits.push("read " + age(info.read_at, nowMs));
-    if (info.stale) {
-      bits.push("stale");
-    }
-    if (typeof info.error === "string" && info.error !== "") {
-      bits.push(info.error);
-    }
-    section.appendChild(el("h3", name));
-    section.appendChild(el("p", bits.join(", ")));
-    const windows = info.windows && typeof info.windows === "object" ? info.windows : null;
-    if (windows === null) {
-      section.appendChild(el("p", "no reading"));
-      continue;
-    }
-    const ids = Object.keys(windows).sort();
-    if (ids.length === 0) {
-      section.appendChild(el("p", "no reading"));
-      continue;
-    }
-    const list = document.createElement("ul");
-    for (const id of ids) {
-      const item = document.createElement("li");
-      item.appendChild(el("span", id + " "));
-      const window = windows[id];
-      item.appendChild(
-        window && typeof window === "object" ? quotaBar(window) : el("span", "no reading"),
-      );
-      list.appendChild(item);
-    }
-    section.appendChild(list);
+    section.appendChild(quotaProvider(name, providers[name] || {}, nowMs));
   }
   return section;
 }
 
-function usageTriple(triple) {
-  // A new server shape can send a null share: read it as unknown
-  // instead of throwing inside the poll loop.
-  const info = triple !== null && typeof triple === "object" ? triple : {};
-  const cpu = info.cpu_m === null || info.cpu_m === undefined ? "?" : String(info.cpu_m);
-  const mem = info.memory_mb === null || info.memory_mb === undefined ? "?" : String(info.memory_mb);
-  const pids = info.pids === null || info.pids === undefined ? "?" : String(info.pids);
-  return "cpu " + cpu + "m, mem " + mem + " MB, pids " + pids;
-}
-
-function measuredText(measured) {
-  const bits = [];
-  if (measured.cpu_usage_usec !== null && measured.cpu_usage_usec !== undefined) {
-    bits.push("cpu " + (measured.cpu_usage_usec / 1000000).toFixed(1) + "s");
+// One project's charged share in spelled-out units, with measured
+// use where the kernel reports it. A null share on a new server
+// shape reads as unknown instead of throwing inside the poll loop.
+function projectShareLine(share, measured) {
+  const info = share !== null && typeof share === "object" ? share : {};
+  const charged = [
+    info.cpu_m === null || info.cpu_m === undefined ? "CPU unknown" : formatCpu(info.cpu_m),
+    info.memory_mb === null || info.memory_mb === undefined
+      ? "memory unknown"
+      : formatMem(info.memory_mb),
+    info.pids === null || info.pids === undefined
+      ? "processes unknown"
+      : String(info.pids) + " processes",
+  ];
+  let text = "charged " + charged.join(", ");
+  const got = measured !== null && typeof measured === "object" ? measured : null;
+  if (got !== null) {
+    const bits = [];
+    if (got.cpu_usage_usec !== null && got.cpu_usage_usec !== undefined) {
+      bits.push("cpu " + (got.cpu_usage_usec / 1000000).toFixed(1) + " seconds");
+    }
+    if (got.memory_mb !== null && got.memory_mb !== undefined) {
+      bits.push(formatMem(got.memory_mb));
+    }
+    if (got.pids !== null && got.pids !== undefined) {
+      bits.push(String(got.pids) + " processes");
+    }
+    if (bits.length > 0) {
+      text += "; measured " + bits.join(", ");
+    }
   }
-  if (measured.memory_mb !== null && measured.memory_mb !== undefined) {
-    bits.push("mem " + String(measured.memory_mb) + " MB");
-  }
-  if (measured.pids !== null && measured.pids !== undefined) {
-    bits.push("pids " + String(measured.pids));
-  }
-  return bits.join(", ");
+  return text;
 }
 
 // A pressure reading outside the contract degrades to its raw value
@@ -263,55 +351,121 @@ function pressureText(pressure) {
   return bits.join(", ");
 }
 
-function resourcesCard(resources) {
-  if (isErrorSection(resources)) {
-    return errorCard("resources", resources);
+// One resource dimension: a labelled bar of charged against the host
+// budget, with both units spelled out. Without a budget there is no
+// bar, only the charged number and the reason.
+function resourceDim(labelText, abbrTitle, valueText, frac, help) {
+  const wrap = document.createElement("div");
+  wrap.setAttribute("class", "field");
+  const term = document.createElement("dt");
+  if (abbrTitle) {
+    term.appendChild(el("abbr", labelText, { title: abbrTitle }));
+  } else {
+    term.appendChild(document.createTextNode(cleanText(labelText)));
   }
-  const section = card("resources");
+  wrap.appendChild(term);
+  const shown = document.createElement("dd");
+  shown.appendChild(document.createTextNode(cleanText(valueText)));
+  if (frac !== null) {
+    const state = frac < 0.7 ? "ok" : frac < 0.9 ? "low" : "high";
+    const barRow = document.createElement("div");
+    barRow.appendChild(meter(frac, state, labelText));
+    shown.appendChild(barRow);
+  }
+  wrap.appendChild(shown);
+  wrap.appendChild(el("dd", help, { class: "help" }));
+  const list = document.createElement("dl");
+  list.setAttribute("class", "fields");
+  list.appendChild(wrap);
+  return list;
+}
+
+function resourceFrac(charged, budget) {
+  if (
+    charged === null ||
+    charged === undefined ||
+    budget === null ||
+    budget === undefined ||
+    budget <= 0
+  ) {
+    return null;
+  }
+  return charged / budget;
+}
+
+function resourcesCard(resources) {
+  const desc =
+    "Charged is what admission reserved for live agents; measured is what " +
+    "the kernel reports. Bars show charged against the host budget.";
+  if (isErrorSection(resources)) {
+    return errorCard(
+      "resources",
+      desc,
+      resources,
+      "Resource use could not be measured. Check the host with korapy doctor.",
+    );
+  }
+  const section = card("resources", desc);
   const info = resources && typeof resources === "object" ? resources : {};
   const charged = info.charged && typeof info.charged === "object" ? info.charged : null;
   const budget = info.host_budget && typeof info.host_budget === "object" ? info.host_budget : null;
   if (charged === null) {
-    section.appendChild(el("p", "no reading"));
+    section.appendChild(el("p", "no charged totals in this reading"));
     return section;
   }
-  if (budget === null) {
-    section.appendChild(el("p", "charged " + usageTriple(charged) + " (no host budget)"));
-  } else {
-    const parts = [];
-    const dims = [
-      ["cpu_m", "cpu", "m"],
-      ["memory_mb", "mem", " MB"],
-      ["pids", "pids", ""],
-    ];
-    for (const [dim, short, unit] of dims) {
-      const used = charged[dim];
-      const whole = budget[dim];
-      parts.push(
-        whole === null || whole === undefined
-          ? short + " " + String(used) + unit
-          : short + " " + String(used) + "/" + String(whole) + unit,
-      );
-    }
-    section.appendChild(el("p", "charged " + parts.join(", ")));
-  }
+  const noBudget = budget === null;
+  section.appendChild(
+    resourceDim(
+      "CPU",
+      "central processing unit",
+      noBudget
+        ? formatCpu(charged.cpu_m) + " charged (no host budget)"
+        : formatCpu(charged.cpu_m) + " of " + formatCpu(budget.cpu_m) + " budget",
+      noBudget ? null : resourceFrac(charged.cpu_m, budget.cpu_m),
+      "Processor share reserved for live agents, against the host budget.",
+    ),
+  );
+  section.appendChild(
+    resourceDim(
+      "Memory",
+      null,
+      noBudget
+        ? formatMem(charged.memory_mb) + " charged (no host budget)"
+        : formatMem(charged.memory_mb) + " of " + formatMem(budget.memory_mb) + " budget",
+      noBudget ? null : resourceFrac(charged.memory_mb, budget.memory_mb),
+      "Memory reserved for live agents, against the host budget.",
+    ),
+  );
+  const pidsText =
+    charged.pids === null || charged.pids === undefined ? "not reported" : String(charged.pids);
+  const pidsBudget =
+    noBudget || budget.pids === null || budget.pids === undefined ? null : String(budget.pids);
+  section.appendChild(
+    resourceDim(
+      "PIDs",
+      "process identifiers",
+      pidsBudget === null
+        ? pidsText + " processes charged (no host budget)"
+        : pidsText + " of " + pidsBudget + " budgeted processes",
+      pidsBudget === null ? null : resourceFrac(charged.pids, budget.pids),
+      "Process slots reserved for live agents, against the host budget.",
+    ),
+  );
   const shares = info.by_project && typeof info.by_project === "object" ? info.by_project : {};
   const measured =
     info.measured_by_project && typeof info.measured_by_project === "object"
       ? info.measured_by_project
       : {};
+  const names = Object.keys(shares).sort();
+  if (names.length > 0) {
+    section.appendChild(
+      el("p", "Charged shares by project, with measured use where the kernel reports it:"),
+    );
+  }
   const lines = document.createElement("ul");
-  for (const name of Object.keys(shares).sort()) {
-    let text = (name === "" ? "-" : name) + ": charged " + usageTriple(shares[name]);
-    const got = measured[name];
-    if (got !== null && got !== undefined && typeof got === "object") {
-      const shown = measuredText(got);
-      if (shown !== "") {
-        text += "; measured " + shown;
-      }
-    }
+  for (const name of names) {
     const item = document.createElement("li");
-    item.appendChild(el("span", text));
+    item.appendChild(el("span", (name === "" ? "-" : name) + ": " + projectShareLine(shares[name], measured[name])));
     lines.appendChild(item);
   }
   if (lines.childNodes.length > 0) {
@@ -326,39 +480,75 @@ function resourcesCard(resources) {
 }
 
 function capacityCard(capacity) {
+  const desc = "How many agents this host may run.";
   if (isErrorSection(capacity)) {
-    return errorCard("capacity", capacity);
+    return errorCard(
+      "capacity",
+      desc,
+      capacity,
+      "Admission settings or the registry could not be read. Check the host with korapy doctor.",
+    );
   }
-  const section = card("capacity");
+  const section = card("capacity", desc);
   const info = capacity && typeof capacity === "object" ? capacity : {};
-  const shares = info.by_project && typeof info.by_project === "object" ? info.by_project : {};
-  const bits = Object.keys(shares)
-    .sort()
-    .map((name) => (name === "" ? "-" : name) + ":" + String(shares[name]));
   section.appendChild(
-    el(
-      "p",
-      String(info.live) +
-        "/" +
-        String(info.total_cap) +
-        " (per repo " +
-        String(info.repo_cap) +
-        ")" +
-        (bits.length > 0 ? " " + bits.join(" ") : ""),
+    field(
+      "Total capacity",
+      String(info.live) + " of " + String(info.total_cap) + " tickets live",
+      "How many agents the host admits in total.",
     ),
   );
+  section.appendChild(
+    field(
+      "Per-repo cap",
+      info.repo_cap === 0 ? "none" : String(info.repo_cap) + " agents",
+      "How many agents one repo may hold. None means no per-repo limit.",
+    ),
+  );
+  section.appendChild(
+    field(
+      "Live now",
+      String(info.live) + " tickets",
+      "Tickets with a live agent right now: one ticket holds one slot.",
+    ),
+  );
+  const pending = Array.isArray(info.pending) ? info.pending : [];
+  section.appendChild(
+    field(
+      "Pending",
+      pending.length === 0 ? "none" : pending.map((name) => String(name)).join(", "),
+      "Launches waiting for a slot. The host does not track a queue yet.",
+    ),
+  );
+  const shares = info.by_project && typeof info.by_project === "object" ? info.by_project : {};
+  const names = Object.keys(shares).sort();
+  if (names.length > 0) {
+    section.appendChild(
+      field(
+        "By project",
+        names.map((name) => (name === "" ? "-" : name) + ": " + String(shares[name])).join("  "),
+        "Counted tickets per project, the same count admission decides from.",
+      ),
+    );
+  }
   return section;
 }
 
 function diskCard(disk) {
+  const desc = "Free space on the state and cache disks.";
   if (isErrorSection(disk)) {
-    return errorCard("disk", disk);
+    return errorCard(
+      "disk",
+      desc,
+      disk,
+      "Disk use could not be read. Check the host with korapy doctor.",
+    );
   }
-  const section = card("disk");
+  const section = card("disk", desc);
   const info = disk && typeof disk === "object" ? disk : {};
   const paths = Array.isArray(info.paths) ? info.paths : [];
   if (paths.length === 0) {
-    section.appendChild(el("p", "no paths"));
+    section.appendChild(el("p", "no disk paths reported"));
     return section;
   }
   const list = document.createElement("ul");
@@ -366,9 +556,26 @@ function diskCard(disk) {
     const row = document.createElement("li");
     if (item && typeof item.error === "string") {
       row.appendChild(el("span", String(item.path) + ": " + item.error));
+    } else if (item && typeof item.total === "number" && item.total > 0) {
+      const used = typeof item.used === "number" ? item.used / item.total : null;
+      if (used !== null) {
+        row.appendChild(meter(used, used >= 0.9 ? "high" : "ok", String(item.path)));
+        row.appendChild(document.createTextNode(" "));
+      }
+      row.appendChild(
+        el(
+          "span",
+          formatBytes(item.free) +
+            " free of " +
+            formatBytes(item.total) +
+            " (" +
+            String(item.path) +
+            ")",
+        ),
+      );
     } else if (item) {
       row.appendChild(
-        el("span", formatBytes(item.free) + " free of " + formatBytes(item.total) + " (" + String(item.path) + ")"),
+        el("span", formatBytes(item.free) + " free (" + String(item.path) + ")"),
       );
     }
     list.appendChild(row);
@@ -378,28 +585,82 @@ function diskCard(disk) {
 }
 
 function driveCard(drive, nowMs) {
+  const desc = "The drive pass: sync boards, claim tickets, start agents.";
   if (isErrorSection(drive)) {
-    return errorCard("drive", drive);
+    return errorCard(
+      "dispatch loop",
+      desc,
+      drive,
+      "The drive journal could not be read. Check the host with korapy doctor.",
+    );
   }
-  const section = card("drive");
+  const section = card("dispatch loop", desc);
   const info = drive && typeof drive === "object" ? drive : {};
-  const state = info.paused
-    ? "paused" + (info.pause_reason ? " (" + String(info.pause_reason) + ")" : "")
-    : "running";
+  if (info.paused) {
+    const reason =
+      typeof info.pause_reason === "string" && info.pause_reason !== ""
+        ? info.pause_reason
+        : "no reason recorded";
+    section.appendChild(
+      field(
+        "Status",
+        "paused: " + reason,
+        "The loop starts nothing while paused. It resumes when the drive.pause file is removed from the state dir.",
+      ),
+    );
+  } else {
+    section.appendChild(
+      field(
+        "Status",
+        info.lock_held ? "running: a pass holds the lock" : "running",
+        "The loop is active: each pass syncs boards, claims tickets and starts agents.",
+      ),
+    );
+  }
   section.appendChild(
-    el(
-      "p",
-      state +
-        ", last pass " +
-        age(info.last_pass_at, nowMs) +
-        ", exit " +
-        (info.last_exit === null || info.last_exit === undefined ? "not reported" : String(info.last_exit)) +
-        ", starts " +
-        String(info.starts_today) +
-        "/" +
-        String(info.max_starts_per_day),
+    field(
+      "Last pass",
+      age(info.last_pass_at, nowMs),
+      "When the last pass started. A growing age means the timer may have stopped.",
     ),
   );
+  section.appendChild(
+    field(
+      "Last result",
+      exitWord(info.last_exit),
+      "What the last pass reported. Exit 0 means the pass finished cleanly.",
+    ),
+  );
+  const starts =
+    info.starts_today === null || info.starts_today === undefined
+      ? "not reported"
+      : String(info.starts_today);
+  const budget =
+    info.max_starts_per_day === null || info.max_starts_per_day === undefined
+      ? "not reported"
+      : String(info.max_starts_per_day);
+  section.appendChild(
+    field(
+      "Daily budget",
+      "starts today " + starts + " of " + budget,
+      "Agent starts used today of the daily maximum. Resumes and plans never count.",
+    ),
+  );
+  const skipped = info.skipped_by_reason && typeof info.skipped_by_reason === "object"
+    ? info.skipped_by_reason
+    : {};
+  const codes = Object.keys(skipped).sort();
+  if (codes.length > 0) {
+    section.appendChild(
+      el(
+        "p",
+        "Skipped this pass: " +
+          codes.map((code) => String(skipped[code]) + " " + code).join(", ") +
+          ".",
+        { class: "desc" },
+      ),
+    );
+  }
   return section;
 }
 
@@ -425,17 +686,157 @@ function agentText(row, nowMs) {
   return { line: bits.join("  "), note: row.note };
 }
 
-function agentsSection(agents, project, nowMs) {
-  if (isErrorSection(agents)) {
-    return errorCard("agents", agents);
+// One agent row as table cells: id, ticket, role, runtime, state,
+// started, last seen, note. The id links to the detail when the row
+// has a key; every cell carries its header name for narrow screens.
+function agentRow(row, nowMs) {
+  const cells = [];
+  const key = agentKey(row);
+  if (key === null) {
+    cells.push([String(row.id), el("span", String(row.id))]);
+  } else {
+    const link = document.createElement("a");
+    link.setAttribute("href", detailHash(key));
+    link.textContent = cleanText(String(row.id));
+    cells.push([String(row.id), link]);
   }
-  const section = card("agents");
+  const ticket =
+    row.repo === null || row.repo === undefined || row.number === null || row.number === undefined
+      ? "no ticket"
+      : String(row.repo) + "#" + String(row.number);
+  cells.push([ticket, el("span", ticket)]);
+  const role = row.role === null || row.role === undefined ? "-" : String(row.role);
+  cells.push([role, el("span", role)]);
+  const runtime = row.runtime === null || row.runtime === undefined ? "-" : String(row.runtime);
+  cells.push([runtime, el("span", runtime)]);
+  cells.push([String(row.state), el("span", String(row.state))]);
+  const started =
+    row.started_at === null || row.started_at === undefined
+      ? "not reported"
+      : age(row.started_at, nowMs);
+  cells.push([started, el("span", started)]);
+  const seen =
+    row.last_seen === null || row.last_seen === undefined ? "not reported" : age(row.last_seen, nowMs);
+  cells.push([seen, el("span", seen)]);
+  const note =
+    row.note === null || row.note === undefined || String(row.note) === ""
+      ? "-"
+      : String(row.note);
+  cells.push([note, el("span", note)]);
+  const tr = document.createElement("tr");
+  const heads = ["id", "ticket", "role", "runtime", "state", "started", "last seen", "note"];
+  cells.forEach(([_, node], index) => {
+    const cell = document.createElement("td");
+    cell.setAttribute("data-th", heads[index]);
+    if (index === 0) {
+      cell.setAttribute("class", "id");
+    }
+    cell.appendChild(node);
+    tr.appendChild(cell);
+  });
+  return tr;
+}
+
+// One agents table over live and stale rows: header plus one row per
+// agent, in server order so rows never jump between polls.
+function agentTable(rows, nowMs) {
+  const table = document.createElement("table");
+  table.setAttribute("class", "agents");
+  const head = document.createElement("thead");
+  const headerRow = document.createElement("tr");
+  for (const name of ["id", "ticket", "role", "runtime", "state", "started", "last seen", "note"]) {
+    headerRow.appendChild(el("th", name));
+  }
+  head.appendChild(headerRow);
+  table.appendChild(head);
+  const body = document.createElement("tbody");
+  for (const row of rows) {
+    body.appendChild(agentRow(row, nowMs));
+  }
+  table.appendChild(body);
+  return table;
+}
+
+// Whether a row is history: only an explicit finished state sits
+// behind the toggle. Unknown states stay visible in the list rather
+// than wearing the finished label.
+function isFinishedRow(row) {
+  return row.state === "finished";
+}
+
+// Finished rows, collapsed by default. The open set lives in this
+// module so a poll re-render keeps the operator's toggle: the poll
+// loop rebuilds the tree, and the rebuild re-opens what was open.
+const openFinished = new Set();
+
+function finishedDetails(key, rows, nowMs) {
+  const box = document.createElement("details");
+  box.setAttribute("class", "finished");
+  const head = document.createElement("summary");
+  head.textContent = cleanText(String(rows.length) + " finished (history)");
+  box.appendChild(head);
+  box.appendChild(
+    el("p", "Finished entries are history, not agents. They stay here so a finished run can still be inspected.", {
+      class: "desc",
+    }),
+  );
+  if (openFinished.has(key)) {
+    box.open = true;
+  }
+  box.addEventListener("toggle", () => {
+    if (box.open) {
+      openFinished.add(key);
+    } else {
+      openFinished.delete(key);
+    }
+  });
+  box.appendChild(agentTable(rows, nowMs));
+  return box;
+}
+
+function agentGroup(name, group, nowMs) {
+  const wrap = document.createElement("div");
+  wrap.setAttribute("class", "agent-group");
+  const active = group.filter((row) => !isFinishedRow(row));
+  const finished = group.filter(isFinishedRow);
+  if (name !== "") {
+    wrap.appendChild(el("h3", name + " (" + String(active.length) + " active)"));
+  } else {
+    wrap.appendChild(el("h3", "no project (" + String(active.length) + " active)"));
+  }
+  if (active.length > 0) {
+    wrap.appendChild(agentTable(active, nowMs));
+  }
+  if (finished.length > 0) {
+    wrap.appendChild(finishedDetails(name, finished, nowMs));
+  }
+  return wrap;
+}
+
+function agentsSection(agents, project, nowMs) {
+  const desc = "Live and stale agents first; finished entries sit behind a toggle.";
+  if (isErrorSection(agents)) {
+    return errorCard(
+      "agents",
+      desc,
+      agents,
+      "The agent registry could not be read, so no agent rows can be shown. Check the host with korapy doctor.",
+    );
+  }
+  const section = card("agents", desc);
   const rows = Array.isArray(agents) ? agents : [];
   const kept = rows.filter(
     (row) => row !== null && typeof row === "object" && (project === null || row.project === project),
   );
   if (kept.length === 0) {
-    section.appendChild(el("p", project === null ? "no agents" : "no agents in this project"));
+    section.appendChild(
+      el(
+        "p",
+        project === null
+          ? "No agents recorded. Start one with korapy launch REPO NUMBER."
+          : "No agents in this project yet.",
+      ),
+    );
     return section;
   }
   // Server order is already (project, repo, number, id); regroup
@@ -449,32 +850,7 @@ function agentsSection(agents, project, nowMs) {
     groups.get(key).push(row);
   }
   for (const [name, group] of [...groups.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
-    if (project !== null) {
-      section.appendChild(el("h3", project + " (" + String(group.length) + ")"));
-    } else if (name !== "") {
-      section.appendChild(el("h3", name + " (" + String(group.length) + ")"));
-    } else {
-      section.appendChild(el("h3", "no project (" + String(group.length) + ")"));
-    }
-    const list = document.createElement("ul");
-    for (const row of group) {
-      const item = document.createElement("li");
-      const shown = agentText(row, nowMs);
-      const key = agentKey(row);
-      if (key === null) {
-        item.appendChild(el("span", shown.line));
-      } else {
-        const link = document.createElement("a");
-        link.setAttribute("href", detailHash(key));
-        link.textContent = cleanText(shown.line);
-        item.appendChild(link);
-      }
-      if (shown.note !== null && shown.note !== undefined && String(shown.note) !== "") {
-        item.appendChild(el("span", "  note: " + String(shown.note)));
-      }
-      list.appendChild(item);
-    }
-    section.appendChild(list);
+    section.appendChild(agentGroup(name, group, nowMs));
   }
   return section;
 }
@@ -536,24 +912,45 @@ export function renderTabs(current) {
   }
 }
 
+// The fleet strip: live agents as the headline number, stale beside
+// it, finished as a collapsed secondary count. Finished entries are
+// history, not agents, so they never share the headline.
 function headerLine(header) {
+  const desc = "Agents on this host right now. Finished entries are history, not agents.";
   if (isErrorSection(header)) {
-    return errorCard("fleet", header);
+    return errorCard(
+      "agents",
+      desc,
+      header,
+      "The agent registry could not be read, so no counts can be shown. Check the host with korapy doctor.",
+    );
   }
   const info = header && typeof header === "object" ? header : {};
-  const section = card("fleet");
-  section.appendChild(
-    el(
-      "p",
-      "Agents: " +
-        String(info.agents_live) +
-        " live, " +
-        String(info.agents_stale) +
-        " stale, " +
-        String(info.agents_finished) +
-        " finished",
-    ),
-  );
+  const live = typeof info.agents_live === "number" ? info.agents_live : 0;
+  const stale = typeof info.agents_stale === "number" ? info.agents_stale : 0;
+  const finished = typeof info.agents_finished === "number" ? info.agents_finished : 0;
+  const section = card("agents", desc);
+  section.setAttribute("class", "card strip");
+  const line = document.createElement("p");
+  line.setAttribute("class", "headline");
+  const count = document.createElement("strong");
+  count.textContent = cleanText(String(live) + " live");
+  line.appendChild(count);
+  line.appendChild(document.createTextNode(cleanText(", " + String(stale) + " stale")));
+  section.appendChild(line);
+  if (finished > 0) {
+    const box = document.createElement("details");
+    box.setAttribute("class", "finished");
+    const head = document.createElement("summary");
+    head.textContent = cleanText(String(finished) + " finished (history)");
+    box.appendChild(head);
+    box.appendChild(
+      el("p", "Finished entries are history, not agents. They sit behind a toggle in the agents list below.", {
+        class: "desc",
+      }),
+    );
+    section.appendChild(box);
+  }
   return section;
 }
 
@@ -616,6 +1013,9 @@ export function renderDetail(row, { nowMs }) {
   const shown = agentText(info, nowMs);
   const lines = [
     el("h2", ticketTitle(info) + "  " + String(info.state)),
+    el("p", "One agent: every field the host records, then its activity tail.", {
+      class: "desc",
+    }),
     el("p", shown.line),
   ];
   if (shown.note !== null && shown.note !== undefined && String(shown.note) !== "") {
@@ -704,7 +1104,10 @@ function eventLine(row, nowMs) {
 
 function eventsCard(view, nowMs) {
   const total = typeof view.eventsTotal === "number" ? view.eventsTotal : view.events.length;
-  const section = card("needs attention (" + String(total) + ")");
+  const section = card(
+    "needs attention (" + String(total) + ")",
+    "Unresolved events for this project, oldest first.",
+  );
   if (view.eventsState === "missing") {
     section.appendChild(el("p", "Choose a project to see its log."));
     return section;
@@ -776,7 +1179,10 @@ function journalEntryNode(row, nowMs) {
 
 function journalCard(view, nowMs) {
   const total = typeof view.journalTotal === "number" ? view.journalTotal : 0;
-  const section = card("journal (" + String(total) + ")");
+  const section = card(
+    "journal (" + String(total) + ")",
+    "The project's logbook: what the coordinator recorded, newest window last.",
+  );
   if (view.journalState === "missing") {
     section.appendChild(el("p", "Choose a project above to read its logbook."));
     return section;
@@ -862,11 +1268,11 @@ export function renderLog(view, { nowMs, notice }) {
     cards.appendChild(el("p", "Project list is derived from activity only."));
   }
   if (view.project === null) {
-    const section = card("log");
+    const section = card("log", "One project at a time: pick one above to read its log.");
     section.appendChild(el("p", "Choose a project to see its log."));
     cards.appendChild(section);
   } else if (view.unknown) {
-    const section = card("log");
+    const section = card("log", "One project at a time.");
     section.appendChild(el("p", "Unknown project " + String(view.project) + "."));
     cards.appendChild(section);
   } else {
@@ -934,6 +1340,12 @@ export function renderBoardShell({ repo, state, label }) {
   const board = document.getElementById("board");
   board.hidden = false;
   board.textContent = "";
+  board.appendChild(el("h2", "board"));
+  board.appendChild(
+    el("p", "Every ticket on the board: filter, page through, open the tracker.", {
+      class: "desc",
+    }),
+  );
   const form = document.createElement("form");
   form.setAttribute("id", "board-filters");
   const fields = [
@@ -992,7 +1404,7 @@ export function renderBoardRows(payload, { limit, offset, nowMs }) {
   const list = document.getElementById("board-rows");
   list.textContent = "";
   if (rows.length === 0) {
-    list.appendChild(el("li", "no rows"));
+    list.appendChild(el("li", "No rows match these filters. Clear a filter and apply again."));
   }
   for (const row of rows) {
     if (row !== null && typeof row === "object") {

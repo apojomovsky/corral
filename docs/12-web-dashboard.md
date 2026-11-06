@@ -160,36 +160,51 @@ agent doing right now". Everything is read-only; every control
 either navigates or filters. Four views earn their place in
 version one; a fifth (hosts) exists in hub mode only.
 
-**Overview (default, both modes).** Header counts from
-`fleet_header` (live, stale, finished), then cards: quota
-(`quota.providers` is an object keyed by provider name; one bar
-per entry of its `windows` object, keyed by window id, from
-each window's `used_pct`; `windows` may be null and a single
-window or its `used_pct` may be null, and those render as "no
-reading" text with the provider's `error`, never as a zero bar;
-the provider `state`, `read_at` age and the `stale` flag are
-shown as text, never color alone), capacity (`live` of
-`total_cap`, `repo_cap`,
-`by_project`), resources (the host budget with charged versus
-measured totals and per-project charged shares from the
+**Overview (default, both modes).** A fleet strip from
+`fleet_header`, then cards, then agents. The strip headlines the
+live count ("1 live") with the stale count beside it; the
+finished count sits behind a collapsed toggle as history, never in
+the headline. Cards: quota (`quota.providers` is an object keyed
+by provider name; one meter per entry of its `windows` object,
+keyed by window id, from each window's `used_pct`; `windows` may
+be null and a single window or its `used_pct` may be null, and
+those render as "no reading recorded yet" text naming
+`korapy quota refresh`, never as a zero bar; the provider `state`
+reads in words with its `read_at` age beside it ("read 40s ago",
+"read 6d ago, stale"), each window names its reset as local time
+plus the wait ("resets 14:00 local, in 3 d 4 h"), and a stale
+reading wears a stale meter with an on-screen note naming the
+freshness bound and the refresh verb, never color alone),
+capacity (labelled fields: total capacity of `total_cap`, the
+per-repo cap with 0 reading as "none (no per-repo limit)", live
+tickets, pending, and `by_project`, each with a one-line
+explanation), resources (labelled bars of charged against the
+host budget per dimension with both units spelled out, millicores
+as cores and MB as GB, per-project charged shares from the
 `resources` section's `host_budget`, `charged`, `by_project`
-and `measured_by_project`, plus `pressure` as text; the
-per-agent `agents` rows stay out of version one, section 11),
-disks (free of total per path in `disk.paths`),
-and the drive strip (`paused` with `pause_reason`, `last_pass_at`
-age, `last_exit`, `starts_today` of `max_starts_per_day`). Below,
-agents grouped by project: ticket (`repo#number`), state, runtime,
-model, role, age from `started_at`, `last_seen` age, and `note`
-when present. A section whose value is the `{"error": ...}` body
-(`snapshot.is_error_section`) renders as an error card with that
-text, a failed `resources` section included: degraded state is
-shown, never hidden behind a spinner,
-mirroring the `/v1/health` rule in `05-dashboard-api.md`. In hub
-mode the same cards repeat per host from that host's nested
-`snapshot`, each headed by `host_id`, its `stale` flag and
-`received_at` age; quota bars stay per (host, provider) and are
-never merged, per the merge-key rule in `05-dashboard-api.md`
-section 5.
+and `measured_by_project`, plus `pressure` as text; the per-agent
+`agents` rows stay out of version one, section 11; "charged" and
+"measured" are defined on screen: what admission reserved versus
+what the kernel reports), disks (a meter plus free of total per
+path in `disk.paths`), and the dispatch loop card (`paused` with
+`pause_reason`, `last_pass_at` age, `last_exit` in words,
+`starts_today` of `max_starts_per_day` as a labelled daily
+budget, every field with a one-line help text). Below, agents
+grouped by project as tables (id, ticket as `repo#number`, role,
+runtime, state, started age from `started_at`, last-seen age, and
+`note`; the id links to the detail): live and stale rows list
+first, finished rows sit behind a collapsed per-group toggle.
+Every section carries a one-line description under its title and
+every abbreviation an inline tooltip; a section whose value is
+the `{"error": ...}` body (`snapshot.is_error_section`) renders
+as an error card with that text plus what the operator can do
+about it, a failed `resources` section included: degraded state
+is shown, never hidden behind a spinner, mirroring the
+`/v1/health` rule in `05-dashboard-api.md`. In hub mode the same
+cards repeat per host from that host's nested `snapshot`, each
+headed by `host_id`, its `stale` flag and `received_at` age;
+quota bars stay per (host, provider) and are never merged, per
+the merge-key rule in `05-dashboard-api.md` section 5.
 
 **Agent detail.** Reached by tapping an agent row. The detail is
 keyed by the row, not the ticket: the route carries the row's
@@ -305,26 +320,29 @@ become a bottom tab bar with at least 44px targets; on wide
 screens they sit under the top bar. Tables become stacked cards
 under roughly 700px. One breakpoint, no framework grid.
 
-Overview, narrow (wide screens put the cards in two columns):
+Overview, narrow (wide screens put the cards in two columns,
+the fleet strip spanning both):
 
 ```
 +---------------------------------------------------+
 | korapy  host-1        live 12s ago      [token]  |
 | [All] [project-a] [project-b]  >                  |
 +---------------------------------------------------+
-| Agents: 6 live, 1 stale, 23 finished              |
-| Quota  provider-x  ok, read 40s ago               |
-|   window-a [========----------] 42% resets 14:00  |
-|   window-b [===---------------] 17%               |
-| Capacity 6/10 (per repo 3)  a:4 b:2               |
-| Resources: 7/10 charged, 5 measured, pressure ok  |
-| Drive: running, last pass 3m ago, starts 5/20     |
-| Disk: 82G free of 200G (state), 80G free (cache)  |
+| agents: who works here now                        |
+|   6 live, 1 stale                                 |
+|   > 23 finished (history)                         |
 +---------------------------------------------------+
-| project-a (4)                                     |
-|  repo-a#42  live   runtime-x  model-y  12m        |
-|  repo-a#43  stale  runtime-x  model-y  1h   >     |
-| project-b (2) ...                                 |
+| quota: what the providers last reported           |
+| provider-x  ok, read 40s ago                      |
+|   window-a 42%, ok  resets 14:00 local, in 3 d 4 h|
+| capacity: how many agents this host may run       |
+|   Total capacity  6 of 10 tickets live            |
+|   Per-repo cap  3 agents                          |
++---------------------------------------------------+
+| project-a (3 active)                              |
+| id ticket role runtime state started seen note    |
+| a1 repo-a#42 worker runtime-x live 12m 2m -       |
+| > 2 finished (history)                            |
 +---------------------------------------------------+
 |    [Overview]     [Board]     [Log]               |
 +---------------------------------------------------+
