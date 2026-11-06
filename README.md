@@ -45,7 +45,7 @@ make install      # uv tool install
 
 ## Quickstart
 
-From a checkout to a first agent in the inline layout:
+From a checkout to a first agent in the inline layout (the full runbook: [`docs/guide.md`](docs/guide.md)):
 
 ```bash
 make install                                  # korapy on your PATH
