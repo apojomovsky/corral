@@ -1628,6 +1628,8 @@ def _key_digest(key):
 
     Keys read ``repo|argv_hash|role``; only a three-segment key names a
     hash exactly, so a trailing segment never matches a substring.
+    Built keys never hold ``|`` inside a segment, so any other count
+    is a hand edit or corruption and reads as unknown.
     """
     if not isinstance(key, str):
         return None
@@ -2317,10 +2319,14 @@ def estimate_key(repo, argv_hash, role):
 
     The same key indexes the status costs and the rollup, so a hand
     reader with ``jq`` reproduces every estimate from the raw rows.
+    No segment may hold ``|``: the digest reader splits on pipes, so
+    a pipe would name a key no lookup ever matches.
     """
     for name, value in (("repo", repo), ("argv hash", argv_hash), ("role", role)):
         if not isinstance(value, str) or not value:
             raise HeavyError(f"estimate {name} must be a non-empty name, not {value!r}")
+        if "|" in value:
+            raise HeavyError(f"estimate {name} must not hold '|', not {value!r}")
     return f"{repo}|{argv_hash}|{role}"
 
 
@@ -2365,14 +2371,17 @@ def normalize_row(row):
     """One ledger row as estimate input, or None when it fails validation.
 
     Required: the repo, argv hash and role names plus a parseable ``at``
-    timestamp, so the window can place the row. Measurements (``wall_s``,
-    ``cpu_s``, ``peak_mb``) are optional per field but must be
-    non-negative numbers when present: a vanished cgroup records nulls,
-    and nulls simply sit out of their set. ``starved`` defaults to False
-    and ``exit`` to None when absent; unknown fields are ignored, and a
-    missing schema version reads as today's. A newer schema version
-    fails: its fields may mean something else. Normalization is
-    idempotent: feeding a normalized row back answers the same row.
+    timestamp, so the window can place the row. No name may hold ``|``:
+    the digest reader splits estimate keys on pipes, so a pipe would
+    name a key no lookup ever matches and the row sits out.
+    Measurements (``wall_s``, ``cpu_s``, ``peak_mb``) are optional per
+    field but must be non-negative numbers when present: a vanished
+    cgroup records nulls, and nulls simply sit out of their set.
+    ``starved`` defaults to False and ``exit`` to None when absent;
+    unknown fields are ignored, and a missing schema version reads as
+    today's. A newer schema version fails: its fields may mean
+    something else. Normalization is idempotent: feeding a normalized
+    row back answers the same row.
     """
     if not isinstance(row, Mapping):
         return None
@@ -2383,6 +2392,8 @@ def normalize_row(row):
     digest = row.get("argv_hash")
     role = row.get("role")
     if not all(isinstance(value, str) and value for value in (repo, digest, role)):
+        return None
+    if any("|" in value for value in (repo, digest, role)):
         return None
     at = _parse_at(row.get("at"))
     if at is None:
