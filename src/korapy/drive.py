@@ -2993,18 +2993,26 @@ def production_stuck_project(registered, repo, *, mapping=None, git=None):
     its own per-root owner lookup: only an exact tracker-repo feed
     names a project, and a short or otherwise unmapped spelling names
     none, instead of stopping a stranger's units under a guessed
-    spelling. A key the map cannot translate reads as no project too.
-    `mapping` is the pass's one short-to-tracker map; with none, the
-    builder resolves its own. `git` names the origin-lookup seam for
-    entries without an explicit tracker repo; None is the real runner.
-    Pure settings reads, no subprocess when every entry names its
-    tracker repo explicitly.
+    spelling. A key the map cannot translate falls back to the
+    per-root scan, so a tracker repo shadowed out of the pass map by
+    an earlier project sharing its short name still stops under its
+    unambiguous owner. `mapping` is the pass's one short-to-tracker
+    map; with none, the builder resolves its own. `git` names the
+    origin-lookup seam for entries without an explicit tracker repo;
+    None is the real runner. Pure settings reads, no subprocess when
+    every entry names its tracker repo explicitly.
     """
     runner = syncli._git if git is None else git
     mapping = _resolved_map(registered, mapping, runner)
     try:
         short = reviewrecord.local_repo(repo, mapping)
     except ValueError:
+        for project in registered:
+            try:
+                _local_repo(project.root, repo, git=runner)
+            except launch.LaunchError:
+                continue
+            return project.name
         return None
     for project in registered:
         try:
@@ -3033,7 +3041,7 @@ def production_stopper(registered, *, mapping=None, git=None):
         if name is None:
             raise units.UnitsError(f"no registered project feeds tracker repo {repo!r}")
         entry = next(item for item in registered if item.name == name)
-        local = _local_repo(entry.root, repo)
+        local = _local_repo(entry.root, repo, git=runner)
         tgt = launch.target(entry.root, local)
         return launch.stop(tgt, number, list_fn=listings, stop_fn=units.systemctl_stop)
 
@@ -3907,7 +3915,7 @@ def _claim_and_launch(
     return rows, started, blocked, launched
 
 
-def _local_repo(root, repo):
+def _local_repo(root, repo, *, git=None):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
     The reverse of the one short-to-tracker resolver: the spelling
@@ -3917,10 +3925,12 @@ def _local_repo(root, repo):
     tracker repo names it wins, an entry name that merely equals
     `repo` is not a mapping, and a reported problem is surfaced,
     never masked. Anything else is a `LaunchError` naming the root
-    and the repo.
+    and the repo. `git` names the origin-lookup seam for entries
+    without an explicit tracker repo; None is the real runner.
     """
+    runner = worktrees.git if git is None else git
     try:
-        mapping = syncli.root_short_map(root, worktrees.git)
+        mapping = syncli.root_short_map(root, runner)
     except settings.SettingsError as problem:
         raise launch.LaunchError(str(problem)) from None
     try:

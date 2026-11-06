@@ -1388,7 +1388,7 @@ class StopPathAgreementTest(unittest.TestCase):
         self.assertEqual(reviewrecord.local_repo("legacy", mapping), "legacy")
         self.assertIsNone(self.owner("legacy", mapping))
 
-    def test_a_tracker_only_a_later_root_feeds_reads_as_no_project(self):
+    def test_a_tracker_shadowed_out_of_the_pass_map_still_names_its_owner(self):
         other = os.path.join(self.tmp.name, "other-ops")
         os.makedirs(other)
         with open(os.path.join(other, "korapy.toml"), "w", encoding="utf-8") as handle:
@@ -1398,9 +1398,44 @@ class StopPathAgreementTest(unittest.TestCase):
         ]
         mapping = drive.production_repo_map(registered, git=dead_git)
         self.assertEqual(mapping["app"], self.TRACKER)
-        self.assertIsNone(
-            drive.production_stuck_project(registered, "other/app", mapping=mapping, git=dead_git)
+        with self.assertRaises(ValueError):
+            reviewrecord.local_repo("other/app", mapping)
+        self.assertEqual(
+            drive.production_stuck_project(registered, "other/app", mapping=mapping, git=dead_git),
+            "teal",
         )
+
+    def test_the_stopper_threads_its_git_seam_into_the_local_lookup(self):
+        clone = os.path.join(self.tmp.name, "clone")
+        os.makedirs(clone)
+        root = os.path.join(self.tmp.name, "clone-ops")
+        os.makedirs(root)
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\nclone.path = "../clone"\n')
+        registered = [
+            projects_mod.Project(name="blue", unit_prefix="blue-agent-", root=root),
+        ]
+        seen = []
+
+        def fake_git(args, cwd):
+            seen.append((tuple(args), cwd))
+            return mock.Mock(returncode=0, stdout="git@github.com:acme/app.git\n")
+
+        mapping = drive.production_repo_map(registered, git=fake_git)
+        self.assertEqual(mapping, {"app": self.TRACKER})
+        del seen[:]
+        stop = drive.production_stopper(registered, mapping=mapping, git=fake_git)
+        with (
+            mock.patch.object(
+                drive.worktrees,
+                "git",
+                side_effect=AssertionError("the stop path must use the injected seam"),
+            ),
+            mock.patch.object(drive.launch, "target", return_value="tgt"),
+            mock.patch.object(drive.launch, "stop", return_value=["u"]),
+        ):
+            self.assertEqual(stop(self.TRACKER, 7), ["u"])
+        self.assertTrue(seen, "the local lookup must shell git through the injected seam")
 
 
 class ProductionStuckInputsTest(unittest.TestCase):
