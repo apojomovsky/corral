@@ -307,6 +307,7 @@ TAIL = """# Defaults: uncomment to override.
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -444,6 +445,7 @@ commits.conventional = false
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template

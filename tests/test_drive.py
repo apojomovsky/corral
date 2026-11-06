@@ -21,7 +21,8 @@ from korapy import admission, board, cli, drive, drivehub, launch, quota_ledger,
 from korapy import syncli
 from korapy import tracker
 from korapy import projects as projects_mod
-from tests.test_tracker import FakeTracker, reading
+from korapy.github import tracker as ghtracker
+from tests.test_tracker import FakeRun, FakeTracker, reading
 
 
 def stored(path, items):
@@ -201,6 +202,145 @@ class RenderTest(unittest.TestCase):
         self.assertIn("would resume 1", text)
         self.assertIn("would review 1", text)
         self.assertIn("would fix 1", text)
+
+    def test_summary_names_the_pulls_call_count(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+            ],
+            label="pass",
+            plan=False,
+            pulls_calls=3,
+        )
+        self.assertIn("pass: 1 candidate(s)", text)
+        self.assertIn("started 1", text)
+        self.assertIn("pulls calls 3", text)
+
+    def test_summary_counts_zero_pulls_calls_by_default(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="start",
+                    reason="fresh",
+                ),
+            ],
+            label="plan",
+        )
+        self.assertIn("pulls calls 0", text)
+
+    def test_summary_flags_a_limited_pulls_lookup(self):
+        text = drive.render(
+            [
+                drive.Candidate(
+                    project="blue",
+                    repo="app",
+                    number=7,
+                    kind="start",
+                    verdict="skip",
+                    reason="app#7: linked pulls unreadable, start refused (pulls lookup limited)",
+                ),
+            ],
+            label="pass",
+            plan=False,
+            pulls_calls=1,
+            pulls_limited=True,
+        )
+        self.assertIn("pulls calls 1", text)
+        self.assertIn("pulls lookup limited", text)
+
+
+class PullsLookupPassTest(unittest.TestCase):
+    """The batched pulls lookup over a full pass. Fakes only."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-pulls-pass-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def run_pass(self, store, plan=False, found=(), **fields):
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store, self.lock, out, err, plan=plan, found=found, policy_dir=self.policies, **fields
+        )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_a_store_with_hundreds_of_rows_costs_one_pulls_listing(self):
+        numbers = list(range(1, 301))
+        store = stored(self.db, [("app", number, "open") for number in numbers])
+        self.addCleanup(store.close)
+        gh = FakeRun()
+        gh.add(
+            "repos/app/issues?state=all&sort=updated&direction=asc&per_page=100",
+            [],
+        )
+        gh.add(
+            "repos/app/pulls?state=open&sort=updated&direction=asc&per_page=100",
+            [],
+        )
+        adapter = ghtracker.GithubTracker(gh)
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", number, "start") for number in numbers])],
+            tracker_factory=lambda repo: adapter,
+            index_for=drive.pulls_index_for(lambda repo: adapter),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        pulls_calls = [call for call in gh.calls if call[1].startswith("repos/app/pulls?")]
+        self.assertEqual(len(pulls_calls), 1)
+        self.assertIn("pulls calls 1", out)
+
+    def test_a_pass_with_no_fetchable_candidate_lists_nothing(self):
+        store = stored(self.db, [("app", 7, "closed")])
+        self.addCleanup(store.close)
+        fake = FakeTracker()
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual([call for call in fake.calls if call[0] == "pulls_index"], [])
+        self.assertIn("pulls calls 0", out)
+
+    def test_a_capped_pass_reports_limited_and_refuses_starts(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker()
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            pulls_max_calls=0,
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("pulls lookup limited", out)
+        self.assertIn("linked pulls unreadable, start refused (pulls lookup limited", out)
+        self.assertIn("pulls lookup limited", out.splitlines()[-1])
 
 
 class PlanTest(unittest.TestCase):

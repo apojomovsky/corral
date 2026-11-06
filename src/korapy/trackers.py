@@ -134,14 +134,14 @@ class BoardBackedTracker(BoardTracker):
         """Every REST item, oldest first, for a full resync."""
         return self._issues.items(repo)
 
-    def linked_pulls(self, repo: str, number: int):
-        """The open pull requests linked to the ticket, through REST.
+    def pulls_index(self, repo: str, max_calls: int):
+        """The open pull requests on the repository, keyed by ticket.
 
         The board variant carries no pull requests of its own, but the
-        pull requests still live on the repository, so the link check
+        pull requests still live on the repository, so the index
         delegates to the REST adapter like the change feed does.
         """
-        return self._issues.linked_pulls(repo, number)
+        return self._issues.pulls_index(repo, max_calls)
 
     def comment(self, repo: str, number: int, body: str) -> None:
         """One decision-protocol comment, through the REST adapter."""
