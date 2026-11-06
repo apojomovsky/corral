@@ -207,6 +207,26 @@ class HeavyRow(unittest.TestCase):
             self.assertIn(token, row)
 
 
+class DriveRowDefaults(unittest.TestCase):
+    """The `korapy drive` row states the registry defaults it names.
+
+    The row names `drive.fix_round_threshold` and `quota.refresh_after_s`
+    with their defaults in parentheses. The settings table in
+    `docs/configuration.md` is generated from the registry, but this row
+    is hand-written, so the expected parentheticals render from
+    `settings.REGISTRY` and the row must carry them.
+    """
+
+    def test_drive_row_states_registry_defaults(self):
+        settings._load_providers()
+        text = COMMANDS.read_text(encoding="utf-8")
+        row = table_row(text, "drive")
+        fix_default = settings.REGISTRY["drive.fix_round_threshold"].default
+        refresh_default = settings.REGISTRY["quota.refresh_after_s"].default
+        self.assertIn(f"(default `{fix_default}`)", row)
+        self.assertIn(f"(default {refresh_default} seconds)", row)
+
+
 class SnapshotSections(unittest.TestCase):
     def test_document_keys_match_the_error_sections(self):
         self.assertEqual(document_sections(), set(snapshot.ERROR_SECTIONS))
