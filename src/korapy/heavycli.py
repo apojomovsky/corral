@@ -39,12 +39,13 @@ def _lane_exit(err):
 
 
 def _resolve(root):
-    """(cfg, budget, weight-name data) for `root`, else a raiser.
+    """(resolved, cfg, budget) for `root`, else a raiser.
 
     Loads the project settings, validates the ``[heavy]`` table, and
     resolves the live lane budget. Settings and budget failures raise
-    for the callers to map to exit 4; the wait itself re-resolves
-    nothing, and the next lane write refreshes the cached copy.
+    for the callers to map to exit 4; the queue wait re-resolves the
+    live budget every admit pass through `budget_fn`, and the next lane
+    write refreshes the cached copy.
     """
     from korapy import heavy, paths, resources, settings
 
@@ -55,6 +56,28 @@ def _resolve(root):
     host_where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
     budget = heavy.lane_budget(cfg, host, where=host_where)
     return resolved, cfg, budget
+
+
+def _live_pressure():
+    """The live queue pressure reading; unknown when unreadable, never raising."""
+    from korapy import resources
+
+    try:
+        reading, _notes = resources.read_pressure()
+    except Exception:  # noqa: BLE001 - an unreadable host reads as unknown
+        return None
+    return reading
+
+
+def _pressure_caps(resolved):
+    """The shared `[resources.pressure]` line, else the conservative built-ins."""
+    from korapy import resources
+
+    try:
+        line = resources.config(resolved).pressure
+    except Exception:  # noqa: BLE001 - unreadable config reads as built-ins
+        return resources.PressureCaps()
+    return line if line is not None else resources.PressureCaps()
 
 
 def cmd_status(args, *, state_dir=None, now=None):
@@ -98,8 +121,26 @@ def cmd_status(args, *, state_dir=None, now=None):
     return OK
 
 
-def cmd_run(args, *, run_lane=None, root=None, now=None):
-    """Run the verb. `run_lane` defaults to the live queue; tests pass a fake."""
+def cmd_run(
+    args,
+    *,
+    run_lane=None,
+    root=None,
+    now=None,
+    pressure=None,
+    pressure_caps=None,
+    pressure_fn=None,
+    budget_fn=None,
+):
+    """Run the verb. `run_lane` defaults to the live queue; tests pass a fake.
+
+    `pressure` is the admission-time reading the plan verdict reads
+    (live when None); `pressure_caps` is the shared `[resources.pressure]`
+    line (resolved when None). `pressure_fn` reads the live queue
+    pressure every admit pass and `budget_fn` re-resolves the live lane
+    budget every pass; both default to live readers, and tests pass
+    fakes. The ledger row carries the admitting pass's reading.
+    """
     from korapy import gitenv, heavy, settings
 
     argv = list(args.command or [])
@@ -129,13 +170,15 @@ def cmd_run(args, *, run_lane=None, root=None, now=None):
         if isinstance(raw_timeout, bool) or not wait_s >= 0:
             _err("--timeout needs seconds")
             return USAGE
-    try:
-        lane = heavy.read_lane()
-    except (heavy.HeavyError, settings.SettingsError) as err:
-        _err(str(err))
-        return _lane_exit(err)
-    report = heavy.plan_report(weight, lane, budget)
+    caps = pressure_caps if pressure_caps is not None else _pressure_caps(resolved)
     if args.plan:
+        try:
+            lane = heavy.read_lane()
+        except (heavy.HeavyError, settings.SettingsError) as err:
+            _err(str(err))
+            return _lane_exit(err)
+        reading = _live_pressure() if pressure is None else pressure
+        report = heavy.plan_report(weight, lane, budget, pressure=reading, pressure_caps=caps)
         if args.json:
             print(json.dumps(report, sort_keys=True))
         elif report["admitted"]:
@@ -147,6 +190,19 @@ def cmd_run(args, *, run_lane=None, root=None, now=None):
     if isinstance(cmd_timeout, bool) or not isinstance(cmd_timeout, int) or cmd_timeout <= 0:
         _err("checks.timeout_s must be a positive number of seconds")
         return USAGE
+    live_budget_fn = budget_fn
+    if live_budget_fn is None:
+
+        def live_budget_fn():
+            _resolved, _cfg, _budget = _resolve(root)
+            return _budget
+
+    live_pressure_fn = pressure_fn
+    if live_pressure_fn is None:
+
+        def live_pressure_fn():
+            return _live_pressure()
+
     runner = run_lane or functools.partial(
         heavy.run_through_lane,
         run=heavy.default_run,
@@ -155,6 +211,9 @@ def cmd_run(args, *, run_lane=None, root=None, now=None):
         max_skips=cfg.max_skips if cfg is not None else heavy.DEFAULT_MAX_SKIPS,
         scope_exists=heavy.scope_exists,
         is_alive=heavy.pid_alive,
+        pressure_caps=caps,
+        pressure_fn=live_pressure_fn,
+        budget_fn=live_budget_fn,
     )
     try:
         lane_run = runner(
