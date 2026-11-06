@@ -17,6 +17,7 @@ from tests.test_board_fields import FakePacer
 from tests.test_board_reader import (
     BoardFakeRun,
     config,
+    date_value,
     full_schema_fields,
     item_node,
     items_payload,
@@ -221,6 +222,19 @@ class BoardWriteTest(unittest.TestCase):
         self.assertEqual(run.graphql_variables("BoardItems"), [{"project": "PVT_1"}])
         self.assertEqual(len(mutations(run)), 2)
         self.assertEqual(rest_paths(run), [])
+
+    def test_locate_skips_unmapped_values_on_the_item(self):
+        run = BoardFakeRun()
+        script_schema(run, *full_schema_fields())
+        script_item(run, 7, [date_value("2026-11-15")])
+        script_mutation(run)
+        write_tracker(run).write(REPO, 7, "agent", "agent-1")
+        found = mutations(run)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(
+            found[0],
+            {"project": "PVT_1", "item": "PVTI_Issue-7", "field": "F_agent", "text": "agent-1"},
+        )
 
     def test_locate_honors_the_page_cap(self):
         run = BoardFakeRun()

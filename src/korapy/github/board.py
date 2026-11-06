@@ -113,6 +113,18 @@ _CONCEPT_ATTRS = iface.BOARD_CONCEPT_ATTRS
 #: ``_want_kind`` below.
 _SELECT_CONCEPTS = frozenset({"board_status", "priority", "area", "pool"})
 
+#: The field-value shapes korapy reads. Every other value kind (date,
+#: number, iteration, label, user, milestone, pull request, repository,
+#: reviewer) arrives without a selected field fragment and is skipped,
+#: never validated. Both read paths and the write scan key on this one
+#: set, so the skip contract cannot fork.
+_READ_TYPENAMES = frozenset(
+    {
+        "ProjectV2ItemFieldTextValue",
+        "ProjectV2ItemFieldSingleSelectValue",
+    }
+)
+
 
 def _want_kind(concept) -> str:
     """``"single_select"`` or ``"text"`` for one board concept."""
@@ -438,8 +450,9 @@ class BoardReader:
         """``(texts, selects)`` for one board node's field values, strict.
 
         Shared by the poll path and the targeted single-item read: every
-        entry is validated through ``_read_value``, so anything short of
-        the value shape fails closed on both paths.
+        entry is validated through ``_read_value``. Entries of a kind
+        korapy does not read are skipped; anything short of the value
+        shape of a kind it does read fails closed on both paths.
         """
         values = node.get("fieldValues")
         entries = values.get("nodes") if isinstance(values, dict) else None
@@ -493,12 +506,17 @@ class BoardReader:
     def _read_value(self, by_field, entry):
         """One field-value node as ``(concept, kind, value)``.
 
-        ``(None, None, None)`` for a field no concept maps; an unset
-        single-select reads as absent. A value of the wrong kind for a
-        mapped concept is a ``TrackerError``.
+        ``(None, None, None)`` for a value of a kind korapy does not
+        read and for a field no concept maps; an unset single-select
+        reads as absent. A value of the wrong kind for a mapped
+        concept, or a malformed value of a kind korapy does read, is
+        a ``TrackerError``.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
+        typename = entry.get("__typename")
+        if typename is not None and typename not in _READ_TYPENAMES:
+            return None, None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
@@ -715,6 +733,8 @@ class BoardTracker(BoardReader):
         selects = set()
         for entry in entries:
             fid, text = self._locate_value(entry)
+            if fid is None:
+                continue
             if text is None:
                 selects.add(fid)
             else:
@@ -726,11 +746,16 @@ class BoardTracker(BoardReader):
     def _locate_value(self, entry):
         """``(field id, stripped text or None)`` for one field-value node.
 
-        A select value reads as ``None``; an unset value reads as ``""``.
-        Anything short of the value shape is a ``TrackerError``.
+        A select value reads as ``None``; an unset value reads as ``""``;
+        a value of a kind korapy does not read is ``(None, None)`` and the
+        caller skips it. Anything short of the value shape of a kind
+        korapy does read is a ``TrackerError``.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
+        typename = entry.get("__typename")
+        if typename is not None and typename not in _READ_TYPENAMES:
+            return None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
