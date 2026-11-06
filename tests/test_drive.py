@@ -74,8 +74,31 @@ def project_named(name, entry=None, root=None):
     )
 
 
+def driven_for(found, store):
+    """`{project name: fixture repos}` so an older test drives its rows.
+
+    `found` is `[(name, wants)]` or `[Project]` (`Project` is a
+    named tuple, so a plain-tuple check alone cannot tell them
+    apart); the repos are the policy wants plus the store rows, so
+    every fixture row and every request stays driven exactly as
+    before scoping existed. Tests that pin scoping pass `driven`
+    explicitly instead.
+    """
+    names = [entry[0] if type(entry) is tuple else entry.name for entry in found]
+    repos = set()
+    for entry in found:
+        if type(entry) is tuple:
+            repos.update(repo for repo, _number, _kind in entry[1])
+    try:
+        repos.update(item.repo for item in store.items())
+    except (board.StoreError, sqlite3.Error):
+        pass
+    return {name: frozenset(repos) for name in names}
+
+
 def hermetic_pass(store, lock_path, out, err, plan=True, found=(), policy_dir=None, **fields):
     """`run_pass` with every host read injected: no outside world."""
+    fallback_driven = driven_for(found, store)
     if policy_dir is not None and found:
         entries = []
         for name, wants in found:
@@ -103,6 +126,7 @@ def hermetic_pass(store, lock_path, out, err, plan=True, found=(), policy_dir=No
         "gone_s": 3600.0,
     }
     values.update(fields)
+    values.setdefault("driven", fallback_driven)
     return drive.run_pass(**values)
 
 
@@ -439,6 +463,7 @@ class PullsLookupPassTest(unittest.TestCase):
                 fix_threshold="high",
                 index_for=drive.pulls_index_for(lambda repo: fake),
                 pulls_max_calls=None,
+                driven={"blue": frozenset({"app"})},
             )
         self.assertEqual(len(problems), 1)
         self.assertIn("bad pulls budget", problems[0])

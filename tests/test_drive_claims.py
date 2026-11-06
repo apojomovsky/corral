@@ -21,7 +21,7 @@ from korapy import host_ledger
 from korapy import projects as projects_mod
 from korapy import registry, units
 from korapy.runtimes import omp
-from tests.test_drive import policy_source, stored
+from tests.test_drive import driven_for, policy_source, stored
 from tests.test_reviewrecord import git_in
 from tests.test_syncli import git_ok
 from tests.test_tracker import FakeTracker, reading
@@ -58,6 +58,7 @@ def drive_pass(
     **fields,
 ):
     """`run_pass` with every host read injected: no outside world."""
+    fallback_driven = driven_for(found, store)
     if policy_dir is not None and found:
         entries = []
         for name, wants in found:
@@ -101,6 +102,7 @@ def drive_pass(
     if hub_client is not None:
         values["hub"] = drivehub.HubMode(hub_client, hub_host_id)
     values.update(fields)
+    values.setdefault("driven", fallback_driven)
     return drive.run_pass(**values)
 
 

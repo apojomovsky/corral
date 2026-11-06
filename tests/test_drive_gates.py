@@ -16,7 +16,7 @@ from unittest import mock
 
 from korapy import accounts, admission, board, drive, eligibility, policies, projects, registry
 from korapy.eligibility import LinkedPull, StartRequest, TicketRow
-from tests.test_drive import policy_source, stored
+from tests.test_drive import driven_for, policy_source, stored
 from tests.test_eligibility import item as board_item
 from tests.test_tracker import FakeTracker, reading
 
@@ -661,6 +661,7 @@ class PassWiringTest(unittest.TestCase):
             "gone_s": 3600.0,
         }
         values.update(fields)
+        values.setdefault("driven", driven_for(found, store))
         code = drive.run_pass(**values)
         return code, out.getvalue(), err.getvalue()
 
@@ -863,6 +864,7 @@ class PassWiringTest(unittest.TestCase):
                 now=2000.0,
                 projects_fn=lambda: [self.project("blue", entry)],
                 live=frozenset(),
+                driven={"blue": frozenset({"app"})},
             )
         self.assertEqual(code, 0)
         self.assertEqual(err.getvalue(), "")
