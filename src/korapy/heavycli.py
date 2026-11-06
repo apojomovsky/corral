@@ -21,6 +21,7 @@ created, 4 usage or configuration, 75 no slot.
 import argparse
 import functools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -279,7 +280,7 @@ def cmd_run(
         except (TypeError, ValueError):
             _err("--timeout needs seconds")
             return USAGE
-        if isinstance(raw_timeout, bool) or not wait_s >= 0:
+        if isinstance(raw_timeout, bool) or not math.isfinite(wait_s) or not wait_s >= 0:
             _err("--timeout needs seconds")
             return USAGE
     caps = pressure_caps if pressure_caps is not None else _pressure_caps(resolved)
