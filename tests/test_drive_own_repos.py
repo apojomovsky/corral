@@ -26,6 +26,7 @@ from korapy import settings
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher
 from tests.test_drive_stuck import FakeStop
+from tests.test_tracker import FakeTracker
 
 APP = "acme/app"
 WEB = "acme/web"
@@ -262,7 +263,9 @@ class ClaimScopeTest(OwnReposCase):
             code="",
         )
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(drive, "_gate_all", return_value=([gated], [], [(WEB, 9)])):
+        with mock.patch.object(
+            drive, "_gate_all", return_value=([gated], [], [(WEB, 9)], 0, False)
+        ):
             code = self.run_pass(
                 store,
                 out,
@@ -278,6 +281,31 @@ class ClaimScopeTest(OwnReposCase):
         self.assertEqual(code, 4, out.getvalue() + err.getvalue())
         self.assertIn(WEB, err.getvalue())
         self.assertIsNone(store.claim_of(WEB, 9))
+
+
+class PullsScopeTest(OwnReposCase):
+    def test_a_claiming_pass_lists_no_foreign_repository(self):
+        store = stored(self.db, [(APP, 7, "open"), (WEB, 9, "open"), (OTHER, 11, "open")])
+        self.addCleanup(store.close)
+        fake = FakeTracker()
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(
+            store,
+            out,
+            err,
+            plan=False,
+            projects=self.projects(),
+            driven=self.driven(),
+            launcher=FakeLauncher(),
+            host=HOST,
+            stale_after=3600.0,
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+        )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        listed = sorted(call[1] for call in fake.calls if call[0] == "pulls_index")
+        self.assertEqual(listed, [APP, WEB])
 
 
 class ShortNameCollisionTest(OwnReposCase):

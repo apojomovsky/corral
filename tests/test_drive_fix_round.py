@@ -127,7 +127,7 @@ class OpenPullPassTest(unittest.TestCase):
         self.policies = os.path.join(self.tmp.name, "policies")
         os.makedirs(self.policies)
 
-    def run_start(self, store, pulls_for, **fields):
+    def run_start(self, store, index_for, **fields):
         out, err = io.StringIO(), io.StringIO()
         launcher = FakeLauncher()
         values = {
@@ -135,7 +135,7 @@ class OpenPullPassTest(unittest.TestCase):
             "policy_dir": self.policies,
             "fake_tracker": FakeTracker([reading(repo="app", number=7, updated_at=1900.0)]),
             "launcher": launcher,
-            "pulls_for": pulls_for,
+            "index_for": index_for,
             "now": NOW,
         }
         values.update(fields)
@@ -148,7 +148,7 @@ class OpenPullPassTest(unittest.TestCase):
         store = stored(self.db, [("app", 7, "open")])
         self.addCleanup(store.close)
         code, out, err, launcher = self.run_start(
-            store, lambda repo, number: (LinkedPull(number=9, state="open"),)
+            store, lambda repo, budget: ({7: (LinkedPull(number=9, state="open"),)}, 1, True)
         )
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
@@ -186,7 +186,11 @@ class OpenPullPassTest(unittest.TestCase):
             agent_states={REVIEWER_UNIT: (FINISHED, NOW - 5.0)},
             agent_tickets={REVIEWER_UNIT: ("app", 7)},
             finished_for={("app", 7): (REVIEWER_UNIT, "reviewer")},
-            pulls_for=lambda repo, number: (LinkedPull(number=9, state="closed"),),
+            index_for=lambda repo, budget: (
+                {7: (LinkedPull(number=9, state="closed"),)},
+                1,
+                True,
+            ),
             now=NOW,
         )
         self.assertEqual(code, 0)

@@ -19,6 +19,7 @@ import ast
 import json
 import pathlib
 import re
+import tempfile
 import unittest
 
 from korapy import trackers
@@ -46,29 +47,97 @@ PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
 
 
 def top_level_bindings(tree):
-    """Every top-level ``(name, lineno, is_plain_import)`` binding of one module."""
+    """Every module-scope ``(name, lineno, is_plain_import)`` binding of one module.
+
+    One generic walk visits every node evaluated where the module body
+    runs and records each name that binds there: stored names
+    (assignment, ``for`` and ``with ... as`` targets), walrus targets
+    (a walrus binds its enclosing scope, even in a comprehension, a
+    decorator or a default), ``except ... as`` names, ``match``
+    captures, import aliases, and each ``def`` or ``class`` name.
+    Function, lambda and class bodies open a new scope, so only the
+    names around them are visited: decorators, defaults, annotations,
+    bases and keywords. Comprehension loop targets stay out for the
+    same reason. An augmented assignment never binds on its own, so
+    ``X += 1`` after ``X = 1`` is not a second binding.
+    """
     found = []
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            found.append((node.name, node.lineno, False))
-        elif isinstance(node, ast.Assign):
-            for target in node.targets:
-                found.extend(
-                    (name.id, node.lineno, False)
-                    for name in ast.walk(target)
-                    if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
-                )
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+
+    def bind(name, lineno, plain=False):
+        found.append((name, lineno, plain))
+
+    def visit(node, in_comprehension=False):
+        if isinstance(node, ast.Name):
+            if isinstance(node.ctx, ast.Store) and not in_comprehension:
+                bind(node.id, node.lineno)
+            return
+        if isinstance(node, ast.NamedExpr):
             if isinstance(node.target, ast.Name):
-                found.append((node.target.id, node.lineno, False))
+                bind(node.target.id, node.lineno)
+            visit(node.value, in_comprehension)
+            return
+        if isinstance(node, ast.ExceptHandler):
+            if node.name:
+                bind(node.name, node.lineno)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                bind(node.name, node.lineno)
+        elif isinstance(node, ast.MatchMapping):
+            if node.rest:
+                bind(node.rest, node.lineno)
         elif isinstance(node, ast.Import):
             for alias in node.names:
-                bound = alias.asname or alias.name.split(".")[0]
-                found.append((bound, node.lineno, True))
+                bind(alias.asname or alias.name.split(".")[0], node.lineno, plain=True)
+            return
         elif isinstance(node, ast.ImportFrom):
             for alias in node.names:
                 if alias.name != "*":
-                    found.append((alias.asname or alias.name, node.lineno, False))
+                    bind(alias.asname or alias.name, node.lineno)
+            return
+        elif isinstance(node, ast.AugAssign):
+            visit(node.value, in_comprehension)
+            return
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            bind(node.name, node.lineno)
+            for decorator in node.decorator_list:
+                visit(decorator, in_comprehension)
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    visit(default, in_comprehension)
+            params = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            if node.args.vararg is not None:
+                params += (node.args.vararg,)
+            if node.args.kwarg is not None:
+                params += (node.args.kwarg,)
+            for param in params:
+                if param.annotation is not None:
+                    visit(param.annotation, in_comprehension)
+            if node.returns is not None:
+                visit(node.returns, in_comprehension)
+            return
+        elif isinstance(node, ast.ClassDef):
+            bind(node.name, node.lineno)
+            for decorator in node.decorator_list:
+                visit(decorator, in_comprehension)
+            for base in node.bases:
+                visit(base, in_comprehension)
+            for keyword in node.keywords:
+                visit(keyword.value, in_comprehension)
+            return
+        elif isinstance(node, ast.Lambda):
+            for default in (*node.args.defaults, *node.args.kw_defaults):
+                if default is not None:
+                    visit(default, in_comprehension)
+            return
+        elif isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)):
+            for child in ast.iter_child_nodes(node):
+                visit(child, True)
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, in_comprehension)
+
+    for node in tree.body:
+        visit(node)
     return found
 
 
@@ -90,6 +159,15 @@ def shadowed_names(path):
         for name, entries in seen.items()
         if len(entries) > 1 and not all(plain for _, plain in entries)
     }
+
+
+def describe_offenders(offenders):
+    """One line per duplicated binding: the file, the name, every line."""
+    return [
+        f"{path}: {name} bound at lines {', '.join(map(str, lines))}"
+        for path, names in sorted(offenders.items())
+        for name, lines in sorted(names.items())
+    ]
 
 
 def graphql_queries(run):
@@ -123,7 +201,113 @@ class NoShadowedModuleNamesTest(unittest.TestCase):
             shadowed = shadowed_names(path)
             if shadowed:
                 offenders[str(path.relative_to(PACKAGE.parents[0]))] = shadowed
-        self.assertEqual(offenders, {})
+        self.assertEqual(describe_offenders(offenders), [])
+
+    def test_failure_message_names_file_name_and_lines(self):
+        self.assertEqual(
+            describe_offenders({"src/korapy/github/board.py": {"_ITEMS": [12, 40]}}),
+            ["src/korapy/github/board.py: _ITEMS bound at lines 12, 40"],
+        )
+
+
+class WrappedBindingGuardTest(unittest.TestCase):
+    """Duplicates hidden inside a compound statement still bind at module scope.
+
+    ``if``, ``try``, ``for``, ``with`` and ``match`` suites run in the
+    module scope, as do guards, decorators, defaults, bases and bare
+    expressions, so a second binding there replaces the first at import
+    time exactly like a second direct statement. Function, lambda and
+    class bodies open a new scope and stay out of the walk, as do
+    comprehension targets (a walrus inside one still binds outside).
+    Each new bypass gets a CASES entry, never a new branch: the walk is
+    generic, so one entry is the whole proof.
+    """
+
+    CASES = [
+        ("if", "if cond:\n    _DUP = 1\nelse:\n    _DUP = 2\n"),
+        ("try", "try:\n    _DUP = 1\nexcept OSError:\n    _DUP = 2\n"),
+        ("finally", "try:\n    pass\nfinally:\n    _DUP = 1\n_DUP = 2\n"),
+        ("for body", "for item in items:\n    _DUP = item\n_DUP = None\n"),
+        ("for target", "for _DUP in items:\n    pass\n_DUP = None\n"),
+        ("with body", 'with open(path) as handle:\n    _DUP = handle.read()\n_DUP = ""\n'),
+        ("with target", 'with open(path) as _DUP:\n    pass\n_DUP = ""\n'),
+        (
+            "match body",
+            'match cmd:\n    case "run":\n        _DUP = 1\n    case _:\n        _DUP = 2\n',
+        ),
+        (
+            "match capture",
+            "match cmd:\n    case [first, *_DUP]:\n        pass\n_DUP = []\n",
+        ),
+        (
+            "nested",
+            "if ready:\n    for item in items:\n        _DUP = item\nelse:\n    _DUP = None\n",
+        ),
+        ("while", "while cond:\n    _DUP = next(source)\n_DUP = None\n"),
+        ("except as", "try:\n    pass\nexcept OSError as _DUP:\n    pass\n_DUP = None\n"),
+        ("walrus in condition", "if (_DUP := load()):\n    pass\n_DUP = None\n"),
+        ("walrus in iterable", "for item in (_DUP := load()):\n    pass\n_DUP = None\n"),
+        (
+            "match-case guard",
+            "match cmd:\n    case _ if (_DUP := check()):\n        pass\n_DUP = None\n",
+        ),
+        ("bare walrus", "(_DUP := load())\n_DUP = None\n"),
+        ("assert walrus", "assert (_DUP := check())\n_DUP = None\n"),
+        ("augmented value", "_TOTAL = 0\n_TOTAL += (_DUP := 1)\n_DUP = 2\n"),
+        ("decorator", "@(_DUP := deco)\ndef handle():\n    pass\n_DUP = None\n"),
+        ("default", "def handle(arg=(_DUP := load())):\n    pass\n_DUP = None\n"),
+        ("class base", "class Thing((_DUP := Base)):\n    pass\n_DUP = None\n"),
+        (
+            "walrus in comprehension",
+            "[(_DUP := render(item)) for item in items]\n_DUP = None\n",
+        ),
+    ]
+
+    CLEAN_CASES = [
+        ("except as bound once", "try:\n    pass\nexcept OSError as _DUP:\n    print(_DUP)\n"),
+        ("walrus bound once", "if (_DUP := load()):\n    print(_DUP)\n"),
+        ("augassign is not a rebinding", "_TOTAL = 0\nif cond:\n    _TOTAL += 2\n"),
+        ("comprehension target stays out", "[_DUP for _DUP in items]\n"),
+        (
+            "lambda default walrus bound once",
+            "apply(lambda arg=(_DUP := load()): arg)\n",
+        ),
+    ]
+
+    def test_each_wrapper_reports_both_bindings(self):
+        for label, source in self.CASES:
+            with self.subTest(wrapper=label):
+                names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
+                self.assertEqual(names.count("_DUP"), 2)
+
+    def test_clean_cases_bind_no_name_twice(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-guard-clean-") as directory:
+            for index, (label, source) in enumerate(self.CLEAN_CASES):
+                with self.subTest(case=label):
+                    path = pathlib.Path(directory) / f"clean_{index}.py"
+                    path.write_text(source, encoding="utf-8")
+                    self.assertEqual(shadowed_names(path), {})
+
+    def test_wrapped_duplicate_is_shadowed(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-guard-") as directory:
+            path = pathlib.Path(directory) / "wrapped.py"
+            path.write_text("if cond:\n    _DUP = 1\nelse:\n    _DUP = 2\n", encoding="utf-8")
+            self.assertEqual(shadowed_names(path), {"_DUP": [2, 4]})
+
+    def test_function_and_class_bodies_stay_out(self):
+        source = (
+            "def first():\n    _DUP = 1\n\n"
+            "def second():\n    _DUP = 2\n\n"
+            "class Thing:\n    _DUP = 3\n"
+            "_DUP = 4\n"
+        )
+        names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
+        self.assertEqual(names.count("_DUP"), 1)
+
+    def test_wrapped_def_records_only_its_name(self):
+        source = "if cond:\n    def _DUP():\n        _DUP = 1\n    _DUP = 2\n"
+        names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
+        self.assertEqual(names.count("_DUP"), 2)
 
 
 class ReaderQueryIdentityTest(unittest.TestCase):
