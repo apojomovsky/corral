@@ -907,7 +907,7 @@ _OPTIONS_APPEND = """mutation ProvisionOptionsAppend($field: ID!, $options: [Pro
 #: Everything one populate step needs from a project: the item ids with
 #: the content behind each item. Draft items carry no content and read
 #: as skipped, never as failures.
-_ITEMS = """query ProvisionBoardItems($project: ID!, $after: String) {
+_PROVISION_ITEMS = """query ProvisionBoardItems($project: ID!, $after: String) {
   node(id: $project) {
     ... on ProjectV2 {
       items(first: 100, after: $after) {
@@ -1880,9 +1880,9 @@ class GithubBoardProvisioner:
         after = None
         while True:
             if after is None:
-                payload = self._read(_ITEMS, None, project=project_id)
+                payload = self._read(_PROVISION_ITEMS, None, project=project_id)
             else:
-                payload = self._read(_ITEMS, None, project=project_id, after=after)
+                payload = self._read(_PROVISION_ITEMS, None, project=project_id, after=after)
             node = payload.get("node") if isinstance(payload, dict) else None
             items = node.get("items") if isinstance(node, dict) else None
             if not isinstance(items, dict):
