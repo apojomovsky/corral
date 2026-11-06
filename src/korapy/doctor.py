@@ -1503,6 +1503,18 @@ def load_hub_auth(url: str | None) -> HubAuth | None:
     return HubAuth("ok", "this host's hub token is present and owner-only")
 
 
+def _close_quietly(err) -> None:
+    """Close an error response, swallowing a failure to close it.
+
+    The probe reports a failed hub as data; a close that raises must not
+    turn that report into a traceback.
+    """
+    try:
+        err.close()
+    except Exception:  # noqa: BLE001 - closing report data is best effort
+        pass
+
+
 def _typed_version_refusal(err: urllib.error.HTTPError) -> HubProbe | None:
     """A typed version refusal carried on an HTTP error, or None.
 
@@ -1553,14 +1565,21 @@ def load_hub_probe(url: str | None, token: str | None) -> HubProbe | None:
             status = response.status
             raw = response.read(65536)
     except urllib.error.HTTPError as err:
-        if err.code == 401:
-            return HubProbe(
-                "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
-            )
-        refusal = _typed_version_refusal(err)
-        if refusal is not None:
-            return refusal
-        return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+        # HTTPError subclasses tempfile._TemporaryFileWrapper: an unclosed
+        # one warns at collection and leaks the response's file. The typed
+        # refusal reads the body first, then the handle closes either way;
+        # a close that fails is report data too, never a traceback.
+        try:
+            if err.code == 401:
+                return HubProbe(
+                    "unauthorized", f"the hub at {url} refused this host's token (HTTP 401)"
+                )
+            refusal = _typed_version_refusal(err)
+            if refusal is not None:
+                return refusal
+            return HubProbe("unreachable", f"the hub at {url} answered HTTP {err.code}")
+        finally:
+            _close_quietly(err)
     except Exception as err:  # noqa: BLE001 - a failed probe is report data, never a traceback
         return HubProbe("unreachable", f"the hub at {url} cannot be reached: {err}")
     if status != 200:
