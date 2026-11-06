@@ -1,0 +1,602 @@
+"""`korapy repo rename`: migrate the store after a GitHub repository rename.
+
+A renamed tracker repository keeps its issues, so GitHub redirects the
+old `owner/repo` and reads keep working; but the board store keys every
+row by the old name, and search-based calls quietly return nothing for
+it. The operator verb migrates the store's keys in one transaction,
+refuses while anything is live, and leaves a backup behind. Fakes only:
+a temporary store, in-memory registry and unit data, a fake tracker.
+No `gh`, no systemd, no network, no real state dir.
+"""
+
+import io
+import json
+import os
+import unittest
+
+from korapy import board, registry, repodoctor
+from korapy import tracker as iface
+from tests.test_board import TempStoreTest, reading
+from tests.test_doctor import env as doctor_env
+from tests.test_tracker import FakeTracker
+
+OLD = "acme/old"
+NEW = "acme/new"
+SHORT = "app"
+NOW = 20000.0
+HOLDER = "drive-a1b2c3d4-1"
+
+
+def populated(store):
+    """A store holding OLD rows: two items, a claim, queued writes, cursors."""
+    store.upsert_item(reading(OLD, 1), operators=["alice"], now=1000.0)
+    store.upsert_item(reading(OLD, 2), operators=["alice"], now=1000.0)
+    store.claim(OLD, 1, HOLDER, "host-1", now=1000.0)
+    store.enqueue(OLD, 2, "agent", HOLDER, now=1000.0)
+    store.set_cursor(OLD, "tracker", "2024-01-01T00:00:00Z")
+    store.set_cursor(OLD, "board", "1700000000")
+    return store
+
+
+class RenameCountsTest(TempStoreTest):
+    def test_empty_store_counts_zero(self):
+        store = self.open()
+        self.assertEqual(
+            store.rename_counts(OLD),
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0},
+        )
+
+    def test_counts_cover_every_keyed_table(self):
+        store = populated(self.open())
+        self.assertEqual(
+            store.rename_counts(OLD),
+            {"items": 2, "claims": 1, "outbox": 2, "cursors": 2},
+        )
+
+    def test_counts_are_per_repo(self):
+        store = populated(self.open())
+        self.assertEqual(
+            store.rename_counts(NEW),
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0},
+        )
+
+
+class RenameRepoTest(TempStoreTest):
+    def test_migrate_moves_every_key_in_one_transaction(self):
+        store = populated(self.open())
+        counts = store.rename_repo(OLD, NEW)
+        self.assertEqual(counts, {"items": 2, "claims": 1, "outbox": 2, "cursors": 2})
+        self.assertEqual(
+            store.rename_counts(OLD),
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0},
+        )
+        self.assertEqual(store.rename_counts(NEW), counts)
+        self.assertEqual(sorted(item.number for item in store.items(repo=NEW)), [1, 2])
+        self.assertEqual(store.get_cursor(NEW, "tracker"), "2024-01-01T00:00:00Z")
+        self.assertEqual(store.get_cursor(NEW, "board"), "1700000000")
+
+    def test_claim_keeps_agent_and_epoch(self):
+        store = populated(self.open())
+        store.rename_repo(OLD, NEW)
+        held = store.claim_of(NEW, 1)
+        self.assertEqual((held.agent, held.epoch), (HOLDER, 1))
+
+    def test_claim_epoch_fences_the_next_claim(self):
+        store = populated(self.open())
+        store.rename_repo(OLD, NEW)
+        store.release(NEW, 1, HOLDER, 1, now=NOW)
+        nxt = store.claim(NEW, 1, "drive-ffff0000-1", "host-1", now=NOW)
+        self.assertGreater(nxt.epoch, 1)
+        with self.assertRaises(board.Claimed):
+            store.release(NEW, 1, HOLDER, 1, now=NOW)
+
+    def test_queued_writes_move_with_their_items(self):
+        store = populated(self.open())
+        store.rename_repo(OLD, NEW)
+        queued = store.queued_writes()
+        self.assertEqual(len(queued), 2)
+        self.assertTrue(all(row.repo == NEW for row in queued))
+
+    def test_second_run_changes_nothing(self):
+        store = populated(self.open())
+        store.rename_repo(OLD, NEW)
+        again = store.rename_repo(OLD, NEW)
+        self.assertEqual(again, {"items": 0, "claims": 0, "outbox": 0, "cursors": 0})
+        self.assertEqual(
+            store.rename_counts(NEW), {"items": 2, "claims": 1, "outbox": 2, "cursors": 2}
+        )
+
+    def test_existing_target_name_refuses_without_merging(self):
+        store = populated(self.open())
+        store.upsert_item(reading(NEW, 9), operators=["alice"], now=1000.0)
+        with self.assertRaises(board.RenameRefused):
+            store.rename_repo(OLD, NEW)
+        self.assertEqual(store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(sorted(item.number for item in store.items(repo=NEW)), [9])
+
+    def test_refusal_is_a_usage_error(self):
+        self.assertEqual(board.RenameRefused.exit_code, 4)
+
+    def test_backup_into_holds_a_consistent_snapshot(self):
+        store = populated(self.open())
+        target = os.path.join(self.tmp.name, "snap.sqlite")
+        self.assertEqual(store.backup_into(target), target)
+        with board.open_store(target) as snap:
+            self.assertEqual(snap.rename_counts(OLD)["items"], 2)
+            self.assertEqual(snap.claim_of(OLD, 1).agent, HOLDER)
+
+
+class ParseNamesTest(unittest.TestCase):
+    def test_valid_pair_round_trips(self):
+        from korapy import reponame
+
+        self.assertEqual(reponame.parse_names(OLD, NEW), (OLD, NEW))
+
+    def test_bad_shapes_are_refused(self):
+        from korapy import reponame
+
+        for bad in ("acme", "acme/old/extra", "", "acme/", "/old", None):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                reponame.parse_names(bad, NEW)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                reponame.parse_names(OLD, bad)
+
+
+class BackupNameTest(unittest.TestCase):
+    def test_names_sort_chronologically(self):
+        from korapy import reponame
+
+        first = reponame.backup_name(1000.0)
+        second = reponame.backup_name(2000.0)
+        self.assertLess(first, second)
+        self.assertTrue(first.startswith("board-backup-"))
+        self.assertTrue(first.endswith(".sqlite"))
+
+    def test_backup_path_sits_beside_the_store(self):
+        from korapy import reponame
+
+        path = reponame.backup_path(os.path.join("state", "board.sqlite"), 1000.0)
+        self.assertEqual(os.path.dirname(path), "state")
+        self.assertEqual(os.path.basename(path), reponame.backup_name(1000.0))
+
+    def test_prune_keeps_the_newest_five(self):
+        from korapy import reponame
+
+        tmp = self.tmp = __import__("tempfile").TemporaryDirectory(prefix="korapy-rename-backup-")
+        self.addCleanup(tmp.cleanup)
+        for index in range(7):
+            name = reponame.backup_name(1000.0 + index)
+            with open(os.path.join(tmp.name, name), "w", encoding="utf-8") as handle:
+                handle.write("x")
+        removed = reponame.prune_backups(tmp.name)
+        self.assertEqual(len(removed), 2)
+        kept = sorted(os.listdir(tmp.name))
+        self.assertEqual(len(kept), 5)
+        self.assertIn(reponame.backup_name(1006.0), kept)
+
+    def test_prune_ignores_foreign_files(self):
+        from korapy import reponame
+
+        tmp = __import__("tempfile").TemporaryDirectory(prefix="korapy-rename-keep-")
+        self.addCleanup(tmp.cleanup)
+        foreign = ["board.sqlite", "drive.lock", "board-backup-partial.sqlite"]
+        for name in foreign:
+            with open(os.path.join(tmp.name, name), "w", encoding="utf-8") as handle:
+                handle.write("x")
+        self.assertEqual(reponame.prune_backups(tmp.name), [])
+        self.assertEqual(sorted(os.listdir(tmp.name)), sorted(foreign))
+
+
+def entry(agent_id, repo=SHORT, number=1):
+    return {"id": agent_id, "ticket": {"project": "", "repo": repo, "number": number}}
+
+
+class LiveBlockersTest(unittest.TestCase):
+    def setUp(self):
+        from korapy import reponame
+
+        self.reponame = reponame
+
+    def blockers(self, **over):
+        params = {
+            "claims": [],
+            "entries": [],
+            "live_units": frozenset(),
+            "mapping": {SHORT: OLD},
+        }
+        params.update(over)
+        return self.reponame.live_blockers(OLD, NEW, **params)
+
+    def test_quiet_store_is_clear(self):
+        self.assertEqual(self.blockers(), [])
+
+    def test_live_agent_for_the_repo_blocks_naming_it(self):
+        found = self.blockers(entries=[(entry("agent-1"), registry.LIVE)])
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_stale_agent_blocks_like_a_live_one(self):
+        found = self.blockers(entries=[(entry("agent-1"), registry.STALE)])
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_finished_and_gone_agents_do_not_block(self):
+        self.assertEqual(
+            self.blockers(
+                entries=[
+                    (entry("agent-1"), registry.FINISHED),
+                    (entry("agent-2"), registry.GONE),
+                ]
+            ),
+            [],
+        )
+
+    def test_agent_for_another_repo_does_not_block(self):
+        self.assertEqual(
+            self.blockers(entries=[(entry("agent-1", repo="other", number=3), registry.LIVE)]),
+            [],
+        )
+
+    def test_agent_for_the_new_name_blocks_too(self):
+        found = self.blockers(
+            entries=[(entry("agent-1"), registry.LIVE)],
+            mapping={SHORT: NEW},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn("agent-1", found[0])
+
+    def test_claim_held_by_a_live_unit_blocks(self):
+        found = self.blockers(
+            claims=[(OLD, 1, HOLDER)],
+            live_units=frozenset({(SHORT, 1)}),
+            mapping={SHORT: OLD},
+        )
+        self.assertEqual(len(found), 1)
+        self.assertIn(HOLDER, found[0])
+        self.assertIn(f"{OLD}#1", found[0])
+
+    def test_live_unit_without_a_claim_does_not_block(self):
+        self.assertEqual(
+            self.blockers(live_units=frozenset({(SHORT, 2)})),
+            [],
+        )
+
+    def test_released_claims_do_not_block(self):
+        self.assertEqual(
+            self.blockers(
+                claims=[(OLD, 1, "")],
+                live_units=frozenset({(SHORT, 1)}),
+            ),
+            [],
+        )
+
+    def test_blockers_sort_for_a_stable_report(self):
+        found = self.blockers(
+            claims=[(OLD, 2, "drive-b"), (OLD, 1, "drive-a")],
+            live_units=frozenset({(SHORT, 1), (SHORT, 2)}),
+            entries=[(entry("agent-9"), registry.LIVE)],
+        )
+        self.assertEqual(found, sorted(found))
+        self.assertEqual(len(found), 3)
+
+
+class CanonicalMatchesTest(unittest.TestCase):
+    def test_same_name_matches(self):
+        from korapy import reponame
+
+        self.assertTrue(reponame.canonical_matches(OLD, OLD))
+
+    def test_case_only_is_not_a_rename(self):
+        from korapy import reponame
+
+        self.assertTrue(reponame.canonical_matches("ACME/Old", "acme/old"))
+
+    def test_another_name_does_not_match(self):
+        from korapy import reponame
+
+        self.assertFalse(reponame.canonical_matches(OLD, NEW))
+
+    def test_missing_readings_do_not_match(self):
+        from korapy import reponame
+
+        self.assertFalse(reponame.canonical_matches(OLD, None))
+        self.assertFalse(reponame.canonical_matches(None, NEW))
+
+
+class RenameRootCase(TempStoreTest):
+    def setUp(self):
+        super().setUp()
+        from korapy import repocli
+
+        self.cmd = repocli.rename_root
+        self.out = io.StringIO()
+        self.err = io.StringIO()
+
+    def rename(self, old=OLD, new=NEW, **over):
+        params = {
+            "store": self.store,
+            "store_path": self.path,
+            "registry_entries": [],
+            "live_units": frozenset(),
+            "mapping": {SHORT: OLD},
+            "now": NOW,
+            "out": self.out,
+            "err": self.err,
+        }
+        params.update(over)
+        return self.cmd(old, new, **params)
+
+    def setUpStore(self):
+        self.store = populated(self.open())
+
+    def backups(self):
+        return sorted(
+            name for name in os.listdir(self.tmp.name) if name.startswith("board-backup-")
+        )
+
+    def test_migrate_writes_keys_a_backup_and_the_config_step(self):
+        self.setUpStore()
+        code = self.rename()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 0)
+        self.assertEqual(self.store.rename_counts(NEW)["items"], 2)
+        self.assertEqual(len(self.backups()), 1)
+        text = self.out.getvalue()
+        self.assertIn(f"{OLD} -> {NEW}", text)
+        self.assertIn("backup", text)
+        self.assertIn("tracker.repo", text)
+        self.assertIn("origin", text)
+        self.assertIn("korapy doctor", text)
+
+    def test_backup_holds_the_old_keys(self):
+        self.setUpStore()
+        self.assertEqual(self.rename(), 0)
+        (name,) = self.backups()
+        with board.open_store(os.path.join(self.tmp.name, name)) as snap:
+            self.assertEqual(snap.rename_counts(OLD)["items"], 2)
+
+    def test_plan_prints_counts_and_changes_nothing(self):
+        self.setUpStore()
+        code = self.rename(plan=True)
+        self.assertEqual(code, 0)
+        self.assertIn("2 items", self.out.getvalue())
+        self.assertIn(f"{OLD} -> {NEW}", self.out.getvalue())
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.store.rename_counts(NEW)["items"], 0)
+        self.assertEqual(self.backups(), [])
+
+    def test_plan_names_the_backup_it_would_write(self):
+        self.setUpStore()
+        self.rename(plan=True)
+        self.assertIn("board-backup-", self.out.getvalue())
+
+    def test_plan_with_nothing_to_do_exits_one(self):
+        self.store = self.open()
+        code = self.rename(plan=True)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to do", self.out.getvalue())
+
+    def test_second_run_is_a_noop(self):
+        self.setUpStore()
+        self.assertEqual(self.rename(), 0)
+        out = io.StringIO()
+        err = io.StringIO()
+        code = self.rename(out=out, err=err)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to do", out.getvalue())
+        self.assertEqual(len(self.backups()), 1)
+
+    def test_existing_target_refuses_without_merging(self):
+        self.setUpStore()
+        self.store.upsert_item(reading(NEW, 9), operators=["alice"], now=1000.0)
+        code = self.rename()
+        self.assertEqual(code, 4)
+        self.assertIn(NEW, self.err.getvalue())
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.backups(), [])
+
+    def test_bad_names_are_a_usage_error(self):
+        self.store = self.open()
+        code = self.rename(old="not-a-repo", out=self.out, err=self.err)
+        self.assertEqual(code, 4)
+        self.assertIn("not-a-repo", self.err.getvalue())
+
+    def test_same_name_is_nothing_to_do(self):
+        self.setUpStore()
+        code = self.rename(old=OLD, new=OLD)
+        self.assertEqual(code, 1)
+        self.assertIn("nothing to do", self.out.getvalue())
+        self.assertEqual(self.backups(), [])
+
+    def test_live_agent_refuses_naming_it(self):
+        self.setUpStore()
+        code = self.rename(
+            registry_entries=[(entry("agent-1"), registry.LIVE)],
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("agent-1", self.err.getvalue())
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.backups(), [])
+
+    def test_claim_held_by_a_live_unit_refuses(self):
+        self.setUpStore()
+        code = self.rename(live_units=frozenset({(SHORT, 1)}))
+        self.assertEqual(code, 2)
+        self.assertIn(HOLDER, self.err.getvalue())
+        self.assertEqual(self.store.rename_counts(OLD)["items"], 2)
+        self.assertEqual(self.backups(), [])
+
+    def test_quiet_fleet_migrates(self):
+        self.setUpStore()
+        code = self.rename(
+            registry_entries=[(entry("agent-9"), registry.FINISHED)],
+            live_units=frozenset({(SHORT, 9)}),
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.store.rename_counts(NEW)["items"], 2)
+
+    def test_retention_keeps_the_newest_five_backups(self):
+        from korapy import reponame
+
+        self.setUpStore()
+        for index in range(6):
+            name = reponame.backup_name(1000.0 + index)
+            with open(os.path.join(self.tmp.name, name), "w", encoding="utf-8") as handle:
+                handle.write("x")
+        self.assertEqual(self.rename(), 0)
+        self.assertEqual(len(self.backups()), 5)
+
+
+class TrackerRowTest(unittest.TestCase):
+    def rows(self, **over):
+        from korapy import doctor
+
+        base = {
+            "name": "demo",
+            "origin": "https://example.com/acme/demo.git",
+            "branch": "ok",
+            "labels": "ok",
+            "tracker_repo": OLD,
+            "canonical": OLD,
+        }
+        base.update(over)
+        site = repodoctor.RepoSite(**base)
+        found = {}
+        for check in doctor.run_checks(doctor_env(repo_sites=(site,))):
+            found[check.name] = check
+        return found
+
+    def test_no_tracker_reading_carries_no_row(self):
+        from korapy import doctor
+
+        found = {check.name: check for check in doctor.run_checks(doctor_env(repo_sites=()))}
+        self.assertNotIn("tracker:demo", found)
+
+    def test_matching_canonical_is_ok(self):
+        self.assertEqual(self.rows()["tracker:demo"].status, "ok")
+
+    def test_renamed_canonical_warns_with_the_verb_fix(self):
+        from korapy import doctor
+
+        rows = self.rows(canonical=NEW)
+        row = rows["tracker:demo"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn(OLD, row.detail)
+        self.assertIn(NEW, row.detail)
+        self.assertIn("korapy repo rename", row.fix)
+        self.assertIn(f"{OLD} {NEW}", row.fix)
+        checks = doctor.run_checks(
+            doctor_env(
+                repo_sites=(
+                    repodoctor.RepoSite(
+                        name="demo",
+                        origin="https://example.com/acme/demo.git",
+                        branch="ok",
+                        labels="ok",
+                        tracker_repo=OLD,
+                        canonical=NEW,
+                    ),
+                )
+            )
+        )
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_case_only_answers_are_ok(self):
+        self.assertEqual(self.rows(canonical="ACME/Old")["tracker:demo"].status, "ok")
+
+    def test_unread_canonical_carries_no_row(self):
+        self.assertNotIn("tracker:demo", self.rows(canonical=None))
+
+    def test_row_order_is_remote_labels_tracker(self):
+        self.assertEqual(
+            [
+                row.name
+                for row in repodoctor.check_sites(
+                    (
+                        repodoctor.RepoSite(
+                            name="demo",
+                            origin="x",
+                            branch="ok",
+                            labels="ok",
+                            tracker_repo=OLD,
+                            canonical=NEW,
+                        ),
+                    )
+                )
+            ],
+            ["remote:demo", "labels:demo", "tracker:demo"],
+        )
+
+
+class CanonicalGatherTest(unittest.TestCase):
+    def load(self, **over):
+        from korapy import doctor
+        from tests.test_init import FakeGit
+        from tests.test_repodoctor import chdir, write_ops
+        import tempfile
+
+        params = {
+            "labels": [(OLD, [label.name for label in iface.BOOTSTRAP_LABELS])],
+        }
+        params.update(over)
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-rename-site-")
+        self.addCleanup(tmp.cleanup)
+        clone = write_ops(tmp.name)
+        chdir(self, tmp.name)
+        url = "https://github.com/acme/old.git"
+        fake = FakeTracker(**params)
+        (site,) = doctor.load_repo_sites(
+            None,
+            git=FakeGit(root=clone, origin_url=url),
+            tracker_factory={OLD: fake}.__getitem__,
+        )
+        return site, fake
+
+    def test_matching_canonical_lands_on_the_site(self):
+        site, fake = self.load(canonical={OLD: OLD})
+        self.assertEqual(site.tracker_repo, OLD)
+        self.assertEqual(site.canonical, OLD)
+        self.assertIn(("canonical_repo", OLD), fake.calls)
+
+    def test_renamed_answer_lands_on_the_site(self):
+        site, _ = self.load(canonical={OLD: NEW})
+        self.assertEqual(site.canonical, NEW)
+
+    def test_failed_canonical_read_leaves_no_row(self):
+        site, _ = self.load(canonical_error=iface.TrackerError("tracker unreachable: boom"))
+        self.assertIsNone(site.canonical)
+
+
+class CanonicalRepoTest(unittest.TestCase):
+    def run_tracker(self, payload=None, error=None):
+        from korapy.github.tracker import GithubTracker
+
+        calls = []
+
+        def run(args):
+            calls.append(list(args))
+            if error is not None:
+                raise error
+            return json.dumps(payload)
+
+        return GithubTracker(run), calls
+
+    def test_answers_the_reported_full_name(self):
+        tracker, calls = self.run_tracker({"full_name": NEW, "name": "new"})
+        self.assertEqual(tracker.canonical_repo(OLD), NEW)
+        self.assertEqual(calls, [["api", f"repos/{OLD}"]])
+
+    def test_unchanged_name_answers_itself(self):
+        tracker, _ = self.run_tracker({"full_name": OLD, "name": "old"})
+        self.assertEqual(tracker.canonical_repo(OLD), OLD)
+
+    def test_bad_payloads_fail_closed(self):
+        for payload in (None, [], {}, {"full_name": "no-slash"}, {"full_name": ""}):
+            tracker, _ = self.run_tracker(payload)
+            with self.assertRaises(iface.TrackerError, msg=repr(payload)):
+                tracker.canonical_repo(OLD)
+
+    def test_a_failed_call_is_unreachable(self):
+        tracker, _ = self.run_tracker(error=Exception("(HTTP 500) boom"))
+        with self.assertRaises(iface.TrackerError):
+            tracker.canonical_repo(OLD)

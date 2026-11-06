@@ -82,6 +82,16 @@ class ExternalItem(Exception):
     exit_code = 1
 
 
+class RenameRefused(Exception):
+    """The target repo already holds rows: refusing a merge (exit 4)."""
+
+    exit_code = 4
+
+
+#: Every table keyed by tracker repo: the rename verb moves all of them.
+RENAME_TABLES = ("items", "claims", "outbox", "cursors")
+
+
 @dataclass
 class Item:
     """One cached tracker item. ``agent``/``status`` are virtual for reads:
@@ -477,6 +487,15 @@ class Store:
             args.append(limit)
         return [OutboxRow(*row) for row in self._conn.execute(query, args).fetchall()]
 
+    def rename_counts(self, repo):
+        """Row counts per keyed table for ``repo``. Pure reads, no writes."""
+        return {
+            table: self._conn.execute(
+                f"SELECT COUNT(*) FROM {table} WHERE repo=?", (repo,)
+            ).fetchone()[0]
+            for table in RENAME_TABLES
+        }
+
     def outbox_rows(self, state=None):
         """Outbox rows for inspection, oldest first, optionally by state."""
         query = (
@@ -861,6 +880,50 @@ class Store:
                 (DROPPED, reason, _id),
             )
             self._set_confidence(row[0], row[1])
+
+    def rename_repo(self, old, new):
+        """Move every ``old`` key to ``new`` across the keyed tables.
+
+        One transaction: items, claims (agent and epoch kept, so the
+        fencing token survives the move), the outbox (queued, sent and
+        dropped rows alike, so settled history stays coherent) and the
+        sync cursors. An unknown ``old`` moves nothing and reports zero
+        counts, so a second run is a no-op (even with ``new`` holding
+        the moved rows); an ``old`` that still holds rows while ``new``
+        does too refuses with ``RenameRefused`` instead of merging two
+        repositories.
+        """
+        with _txn(self._conn):
+            counts = self.rename_counts(old)
+            if not sum(counts.values()):
+                return counts
+            for table in RENAME_TABLES:
+                present = self._conn.execute(
+                    f"SELECT 1 FROM {table} WHERE repo=? LIMIT 1", (new,)
+                ).fetchone()
+                if present is not None:
+                    raise RenameRefused(
+                        f"{new} already holds store rows: refusing a merge of two repositories"
+                    )
+            for table in RENAME_TABLES:
+                self._conn.execute(f"UPDATE {table} SET repo=? WHERE repo=?", (new, old))
+            return counts
+
+    def backup_into(self, path):
+        """Snapshot the store into ``path`` with ``VACUUM INTO``.
+
+        The snapshot reads a consistent image even beside a live
+        store; the path must not exist yet, so a backup never
+        clobbers one. ``VACUUM INTO`` takes no bound filename, so the
+        path rides as a quoted literal. Raises ``StoreError`` when the
+        snapshot cannot be written.
+        """
+        literal = "'" + str(path).replace("'", "''") + "'"
+        try:
+            self._conn.execute(f"VACUUM INTO {literal}")
+        except sqlite3.Error as err:
+            raise StoreError(f"cannot back up the board store into {path}: {err}") from err
+        return path
 
     def mark_dirty(self, _id, reason):
         """A push failed: count the attempt and flag the item dirty. The

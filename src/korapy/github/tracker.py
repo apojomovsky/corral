@@ -10,6 +10,7 @@ import json
 import re
 
 from korapy import tracker as iface
+from korapy.github import forge as ghforge
 from korapy.github.gh import is_rate_limited, retry_after_s
 from korapy.tracker import NEEDS_DECISION, PRIORITIES, PRIORITY_PREFIX
 
@@ -438,6 +439,25 @@ class GithubTracker:
         """
         have = self._list_label_names(repo)
         return tuple(label.name for label in iface.BOOTSTRAP_LABELS if label.name not in have)
+
+    def canonical_repo(self, repo: str) -> str:
+        """The tracker's canonical `owner/name` for ``repo``.
+
+        One repository read: after a rename the provider redirects the
+        old name and answers the new `full_name`. Anything short of an
+        `owner/name` shape fails closed; a failed call fails through
+        `_write_error`, like every other REST read.
+        """
+        try:
+            payload = json.loads(self._get(f"repos/{repo}"))
+        except iface.TrackerError:
+            raise
+        except Exception as err:
+            raise _fail(f"canonical repo {repo} is not JSON: {err}") from err
+        name = payload.get("full_name") if isinstance(payload, dict) else None
+        if not isinstance(name, str) or not ghforge.is_repo_name(name):
+            raise _fail(f"bad canonical name {name!r} for {repo}")
+        return name
 
     def ensure_labels(self, repo: str) -> iface.LabelReport:
         """Create the missing bootstrap labels on ``repo``, leave the rest alone.

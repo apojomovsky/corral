@@ -539,6 +539,7 @@ class ProtocolShapeTests(unittest.TestCase):
                 "add_label",
                 "ensure_labels",
                 "missing_labels",
+                "canonical_repo",
             },
         )
 

@@ -226,6 +226,17 @@ Because `--fix` cannot reach beyond the user and the clones, agents may run it.
 - **The tracker and forge** (GitHub today):
   - `gh` is logged in and can see the repository;
   - the labels exist.
+- **Renamed repositories:** when the tracker answers a different
+  canonical name than the configured `tracker.repo` (the repository was
+  renamed on the forge), `doctor` warns on a `tracker:<name>` row.
+  `korapy repo rename OLD NEW --plan` prints what would move, and
+  `korapy repo rename OLD NEW` moves the store's keys (items, claims
+  with agent and epoch, outbox, sync cursors) in one transaction,
+  refusing while a live agent or a live-held claim names the repo.
+  The verb leaves a timestamped backup beside the store (the newest
+  five are kept); to restore one, stop the dispatch timer and copy it
+  back over the store file. After the move, update the clone's origin
+  remote and `tracker.repo`, then re-run `doctor`.
 
 ## 7. Testing onboarding
 

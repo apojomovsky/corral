@@ -1074,12 +1074,28 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
         missing = repo_tracker.missing_labels(tracker_repo)
     except Exception as err:  # noqa: BLE001 - a failed read is report data
         return repodoctor.RepoSite(name, origin, cause=str(err))
+    try:
+        canonical = repo_tracker.canonical_repo(tracker_repo)
+    except Exception:  # noqa: BLE001 - an unreadable name is no row, never a traceback
+        canonical = None
     branch, branch_cause = _default_branch(origin, path, git)
     if branch_cause is not None:
         return repodoctor.RepoSite(
-            name, origin, labels="missing" if missing else "ok", cause=branch_cause
+            name,
+            origin,
+            labels="missing" if missing else "ok",
+            cause=branch_cause,
+            tracker_repo=tracker_repo,
+            canonical=canonical,
         )
-    return repodoctor.RepoSite(name, origin, branch=branch, labels="missing" if missing else "ok")
+    return repodoctor.RepoSite(
+        name,
+        origin,
+        branch=branch,
+        labels="missing" if missing else "ok",
+        tracker_repo=tracker_repo,
+        canonical=canonical,
+    )
 
 
 def load_repo_sites(

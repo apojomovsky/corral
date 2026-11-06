@@ -212,6 +212,16 @@ class Tracker(Protocol):
         """
         ...
 
+    def canonical_repo(self, repo: str) -> str:
+        """The tracker's canonical `owner/name` for ``repo``.
+
+        Read-only: a renamed repository answers its new name (the
+        provider redirects the old one), so `doctor` can warn when the
+        configured name drifts. A failed call raises ``TrackerError``;
+        a rate-limit answer raises ``TrackerRateLimited``.
+        """
+        ...
+
 
 #: Cursor wire shape: the UTC second an item was last updated. ISO by
 #: the clock, lexicographic by accident; compare as epochs, never as text.
