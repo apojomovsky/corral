@@ -54,8 +54,9 @@ test-matrix: ## Run the suite on every supported Python in parallel (PYTHONS="3.
 format: ## Format the code (ruff, through uv)
 	uv format --preview-features format-command
 
-lint: ## Fail when the code is not formatted
+lint: ## Fail when the code is not formatted or ruff flags a redefinition
 	uv format --check --preview-features format-command
+	uvx ruff check .
 
 typecheck: ## Type-check the project (ty, through uv)
 	uv check --locked --preview-features check-command

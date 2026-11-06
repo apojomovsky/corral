@@ -19,6 +19,7 @@ import ast
 import json
 import pathlib
 import re
+import tempfile
 import unittest
 
 from korapy import trackers
@@ -46,18 +47,39 @@ PACKAGE = pathlib.Path(__file__).resolve().parents[1] / "src" / "korapy"
 
 
 def top_level_bindings(tree):
-    """Every top-level ``(name, lineno, is_plain_import)`` binding of one module."""
+    """Every module-scope ``(name, lineno, is_plain_import)`` binding of one module.
+
+    The walk descends into the suites of ``if``, ``while``, ``for``,
+    ``with``, ``try`` and ``match`` statements, which all run in the
+    module scope, and records the names those statements bind themselves
+    (loop targets, ``with`` items, ``match`` captures). Function and
+    class bodies open a new scope, so only the ``def`` or ``class``
+    name itself is recorded, never the names inside.
+    """
     found = []
-    for node in tree.body:
+
+    def collect_target(target, lineno):
+        found.extend(
+            (name.id, lineno, False)
+            for name in ast.walk(target)
+            if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
+        )
+
+    def collect_pattern(pattern, lineno):
+        for node in ast.walk(pattern):
+            if isinstance(node, (ast.MatchAs, ast.MatchStar)):
+                if node.name:
+                    found.append((node.name, lineno, False))
+            elif isinstance(node, ast.MatchMapping):
+                if node.rest:
+                    found.append((node.rest, lineno, False))
+
+    def visit(node):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             found.append((node.name, node.lineno, False))
         elif isinstance(node, ast.Assign):
             for target in node.targets:
-                found.extend(
-                    (name.id, node.lineno, False)
-                    for name in ast.walk(target)
-                    if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
-                )
+                collect_target(target, node.lineno)
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
             if isinstance(node.target, ast.Name):
                 found.append((node.target.id, node.lineno, False))
@@ -69,6 +91,37 @@ def top_level_bindings(tree):
             for alias in node.names:
                 if alias.name != "*":
                     found.append((alias.asname or alias.name, node.lineno, False))
+        elif isinstance(node, (ast.If, ast.While)):
+            for child in (*node.body, *node.orelse):
+                visit(child)
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            collect_target(node.target, node.lineno)
+            for child in (*node.body, *node.orelse):
+                visit(child)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            for item in node.items:
+                if item.optional_vars is not None:
+                    collect_target(item.optional_vars, node.lineno)
+            for child in node.body:
+                visit(child)
+        elif isinstance(node, (ast.Try, ast.TryStar)):
+            for child in node.body:
+                visit(child)
+            for handler in node.handlers:
+                visit(handler)
+            for child in (*node.orelse, *node.finalbody):
+                visit(child)
+        elif isinstance(node, ast.ExceptHandler):
+            for child in node.body:
+                visit(child)
+        elif isinstance(node, ast.Match):
+            for case in node.cases:
+                collect_pattern(case.pattern, node.lineno)
+                for child in case.body:
+                    visit(child)
+
+    for node in tree.body:
+        visit(node)
     return found
 
 
@@ -124,6 +177,66 @@ class NoShadowedModuleNamesTest(unittest.TestCase):
             if shadowed:
                 offenders[str(path.relative_to(PACKAGE.parents[0]))] = shadowed
         self.assertEqual(offenders, {})
+
+
+class WrappedBindingGuardTest(unittest.TestCase):
+    """Duplicates hidden inside a compound statement still bind at module scope.
+
+    ``if``, ``try``, ``for``, ``with`` and ``match`` suites run in the
+    module scope, so a second binding there replaces the first at import
+    time exactly like a second direct statement. Function and class
+    bodies open a new scope and stay out of the walk.
+    """
+
+    CASES = [
+        ("if", "if cond:\n    _DUP = 1\nelse:\n    _DUP = 2\n"),
+        ("try", "try:\n    _DUP = 1\nexcept OSError:\n    _DUP = 2\n"),
+        ("finally", "try:\n    pass\nfinally:\n    _DUP = 1\n_DUP = 2\n"),
+        ("for body", "for item in items:\n    _DUP = item\n_DUP = None\n"),
+        ("for target", "for _DUP in items:\n    pass\n_DUP = None\n"),
+        ("with body", 'with open(path) as handle:\n    _DUP = handle.read()\n_DUP = ""\n'),
+        ("with target", 'with open(path) as _DUP:\n    pass\n_DUP = ""\n'),
+        (
+            "match body",
+            'match cmd:\n    case "run":\n        _DUP = 1\n    case _:\n        _DUP = 2\n',
+        ),
+        (
+            "match capture",
+            "match cmd:\n    case [first, *_DUP]:\n        pass\n_DUP = []\n",
+        ),
+        (
+            "nested",
+            "if ready:\n    for item in items:\n        _DUP = item\nelse:\n    _DUP = None\n",
+        ),
+        ("while", "while cond:\n    _DUP = next(source)\n_DUP = None\n"),
+    ]
+
+    def test_each_wrapper_reports_both_bindings(self):
+        for label, source in self.CASES:
+            with self.subTest(wrapper=label):
+                names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
+                self.assertEqual(names.count("_DUP"), 2)
+
+    def test_wrapped_duplicate_is_shadowed(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-guard-") as directory:
+            path = pathlib.Path(directory) / "wrapped.py"
+            path.write_text("if cond:\n    _DUP = 1\nelse:\n    _DUP = 2\n", encoding="utf-8")
+            self.assertEqual(shadowed_names(path), {"_DUP": [2, 4]})
+
+    def test_function_and_class_bodies_stay_out(self):
+        source = (
+            "def first():\n    _DUP = 1\n\n"
+            "def second():\n    _DUP = 2\n\n"
+            "class Thing:\n    _DUP = 3\n"
+            "_DUP = 4\n"
+        )
+        names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
+        self.assertEqual(names.count("_DUP"), 1)
+
+    def test_wrapped_def_records_only_its_name(self):
+        source = "if cond:\n    def _DUP():\n        _DUP = 1\n    _DUP = 2\n"
+        names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
+        self.assertEqual(names.count("_DUP"), 2)
 
 
 class ReaderQueryIdentityTest(unittest.TestCase):
