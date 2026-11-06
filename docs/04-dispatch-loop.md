@@ -205,11 +205,12 @@ Per-candidate gate order, cheapest first:
    vocabulary read as above the threshold: the loop never silently
    merges a finding it cannot grade. A finished reviewer (registry
    outcome `ok`) with no record for the ticket is a protocol failure,
-   never a finding: the row skips with code `review-missing` (`review
-   missing`) for every kind, so no worker, fix round or re-review
-   starts on it. The pass logs `reviewer finished without a review
-   record` once per pass with the ticket and the finished reviewer
-   id; the skip shows in the drive journal and in the `snapshot`
+   never a finding: the unheld row skips with code `review-missing`
+   (`review missing`) for every kind, so no worker, fix round or
+   re-review starts on it. The pass logs `reviewer finished without
+   a review record` once per pass for the unheld row, with the ticket
+   and the finished reviewer id; a held row skips as `claim` and logs
+   nothing. The skip shows in the drive journal and in the `snapshot`
    drive section's skipped-by-reason counts, where a coordinator
    sees it. Only an `ok` outcome counts: any other outcome, or no
    review map at all, gates as before. Then the fresh-start check: a
@@ -589,7 +590,7 @@ is tested through the seam its production code already injects:
 | Restart budget counts stop-plus-launch restarts in a sliding 24h window, foreign holders never restart, give-up comments and releases | fake units stop seam, fake registry, temp state dir with budget timestamps |
 | Decision comment and `needs-decision` label through the new seam; a failed write keeps the claim | fake `Tracker` recording `comment`/`add_label` calls, scripted `TrackerError` |
 | Reviewer start carries the pre-takeover worker id as `--author` | temp `Store`, fake registry with a `done` entry, author==reviewer refusal case |
-| Finished reviewer (outcome `ok`) with no record: no start, no fix round, `review-missing` skip and one `reviewer finished without a review record` line per pass | temp `Store`, finished reviewer triple with outcome `ok`, review reader returning no record, recording launcher |
+| Finished reviewer (outcome `ok`) with no record on an unheld row: no start, no fix round, `review-missing` skip and one `reviewer finished without a review record` line per pass for the unheld row; a held row skips as `claim` and logs nothing | temp `Store`, finished reviewer triple with outcome `ok`, review reader returning no record, recording launcher |
 | Day cap stops starts, not resumes; pause file stops all | temp state dir with counter and pause files |
 | `--plan` writes nothing | read-only assertion: store and outbox hashes unchanged |
 | Snapshot `drive` section on missing or corrupt journal | temp state dir, section-error shape |

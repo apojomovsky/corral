@@ -3379,7 +3379,7 @@ def _claim_and_launch(
             author = (released or {}).get(key)
             if author is None:
                 newest = (finished or {}).get(key)
-                author = newest[0] if newest is not None else None
+                author = _finished_agent(newest)
             if not author:
                 rows.append(
                     Gated(
