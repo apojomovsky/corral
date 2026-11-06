@@ -4,13 +4,17 @@
 the command in a transient scope with the lane's limits and releases
 the slot on exit. Past the wait deadline the waiter leaves with 75,
 keeping the public meaning (no free slot, try later). `run --plan`
-reports the verdict without queueing or running anything. `status`
-shows holders, waiters and learned costs. `rollup` regenerates the
-portable per-key cost summary from the raw run ledger: stdout always
-carries the JSON document, and `--out PATH` additionally writes the
-same bytes for the operator to commit. Exit codes follow the public
-table: 0 ok, 1 nothing to do (or a wait that would block, for `--plan`),
-3 the scope could not be created, 4 usage or configuration, 75 no slot.
+reports the verdict without queueing or running anything.
+`run --bypass REASON` runs now, skipping the queue inside the same
+scope limits, and records the reason in the lane journal; a bare
+`--bypass` is exit 4. `run --role NAME` names the ledger caller
+(`hand` by default). `status` shows holders, waiters and learned
+costs. `rollup` regenerates the portable per-key cost summary from
+the raw run ledger: stdout always carries the JSON document, and
+`--out PATH` additionally writes the same bytes for the operator to
+commit. Exit codes follow the public table: 0 ok, 1 nothing to do
+(or a wait that would block, for `--plan`), 3 the scope could not be
+created, 4 usage or configuration, 75 no slot.
 """
 
 import argparse
@@ -121,10 +125,88 @@ def cmd_status(args, *, state_dir=None, now=None):
     return OK
 
 
+def _cmd_bypass(
+    argv,
+    root,
+    env,
+    *,
+    reason,
+    role,
+    repo,
+    weight,
+    budget,
+    starved_ratio,
+    cmd_timeout,
+    pressure,
+    now,
+    run_bypass,
+    json_mode,
+):
+    """Run one command now, skipping the queue, inside the lane's scope limits.
+
+    `run_bypass` defaults to the live bypass runner; tests pass a fake.
+    The reason is required and is recorded in the lane journal beside
+    the run. The verdict never reports admission: a bypass holds no
+    slot, so `admitted` is false and `bypassed` is true.
+    """
+    from korapy import heavy, settings
+
+    if isinstance(cmd_timeout, bool) or not isinstance(cmd_timeout, int) or cmd_timeout <= 0:
+        _err("checks.timeout_s must be a positive number of seconds")
+        return USAGE
+    bypasser = run_bypass or functools.partial(
+        heavy.run_bypass,
+        run=heavy.default_run,
+        teardown=functools.partial(heavy.stop_scope, run=heavy.default_run),
+        scope_cgroup=heavy.show_cgroup,
+    )
+    reading = _live_pressure() if pressure is None else pressure
+    try:
+        result = bypasser(
+            argv,
+            root,
+            env,
+            role=role,
+            repo=repo,
+            reason=reason,
+            weight=weight,
+            budget=budget,
+            timeout=cmd_timeout,
+            starved_ratio=starved_ratio,
+            pressure=reading,
+            now=now,
+        )
+    except subprocess.TimeoutExpired as err:
+        _err(f"{' '.join(argv)} timed out after {err.timeout}s")
+        return NO
+    except (heavy.HeavyError, settings.SettingsError) as err:
+        _err(str(err))
+        return _lane_exit(err)
+    verdict = {
+        "schema_version": heavy.SCHEMA_VERSION,
+        "command": argv,
+        "weight": {"cpu_m": weight.cpu_m, "memory_mb": weight.memory_mb},
+        "waited_s": 0.0,
+        "admitted": False,
+        "bypassed": True,
+        "exit_code": result.exit_code,
+        "measured": result.measured,
+    }
+    if json_mode:
+        sys.stdout.write(result.stdout + result.stderr)
+        sys.stderr.write(json.dumps(verdict, sort_keys=True) + "\n")
+    else:
+        sys.stdout.write(result.stdout)
+        sys.stderr.write(result.stderr)
+        sys.stderr.write(f"heavy: bypassed {reason} in {result.wall_s}s, exit {result.exit_code}\n")
+    return result.exit_code
+
+
 def cmd_run(
     args,
     *,
     run_lane=None,
+    run_bypass=None,
     root=None,
     now=None,
     pressure=None,
@@ -134,6 +216,7 @@ def cmd_run(
 ):
     """Run the verb. `run_lane` defaults to the live queue; tests pass a fake.
 
+    `run_bypass` defaults to the live bypass runner; tests pass a fake.
     `pressure` is the admission-time reading the plan verdict reads
     (live when None); `pressure_caps` is the shared `[resources.pressure]`
     line (resolved when None). `pressure_fn` reads the live queue
@@ -152,12 +235,18 @@ def cmd_run(
     root = root or settings.find_root(os.getcwd()) or os.getcwd()
     try:
         resolved, cfg, budget = _resolve(root)
-        heavy.repo_key(root)
+        repo = heavy.repo_key(root)
         name = heavy.command_name(argv)
         weight = heavy.hand_weight(cfg, name)
     except (heavy.HeavyError, settings.SettingsError) as err:
         _err(str(err))
         return _lane_exit(err)
+    role = getattr(args, "role", "hand")
+    if role is None:
+        role = "hand"
+    if not isinstance(role, str) or not role:
+        _err("--role needs a name for the ledger row")
+        return USAGE
     raw_timeout = args.timeout
     if raw_timeout is None:
         wait_s = float(cfg.wait_timeout_s if cfg is not None else heavy.DEFAULT_WAIT_TIMEOUT_S)
@@ -171,6 +260,27 @@ def cmd_run(
             _err("--timeout needs seconds")
             return USAGE
     caps = pressure_caps if pressure_caps is not None else _pressure_caps(resolved)
+    bypass = getattr(args, "bypass", None)
+    if bypass is not None and not args.plan:
+        if not bypass:
+            _err("a bypass needs a reason: korapy heavy run --bypass REASON -- CMD [ARGS...]")
+            return USAGE
+        return _cmd_bypass(
+            argv,
+            root,
+            gitenv.clean_env(),
+            reason=bypass,
+            role=role,
+            repo=repo,
+            weight=weight,
+            budget=budget,
+            starved_ratio=cfg.starved_ratio if cfg is not None else heavy.DEFAULT_STARVED_RATIO,
+            cmd_timeout=resolved["checks.timeout_s"],
+            pressure=pressure,
+            now=now() if callable(now) else now,
+            run_bypass=run_bypass,
+            json_mode=args.json,
+        )
     if args.plan:
         try:
             lane = heavy.read_lane()
@@ -220,7 +330,7 @@ def cmd_run(
             argv,
             root,
             gitenv.clean_env(),
-            role="hand",
+            role=role,
             weight=weight,
             budget=budget,
             timeout_s=wait_s,
@@ -310,6 +420,20 @@ def add_parser(sub) -> None:
         "--timeout",
         default=None,
         help="cap this queue wait in seconds (default: heavy.wait_timeout_s)",
+    )
+    run.add_argument(
+        "--role",
+        default="hand",
+        help="ledger role naming the caller (default hand; takeoff uses its own name)",
+    )
+    run.add_argument(
+        "--bypass",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="REASON",
+        help="run now, skipping the queue, inside the same scope limits; "
+        "the reason is required and is recorded in the lane journal",
     )
     run.add_argument(
         "--plan",

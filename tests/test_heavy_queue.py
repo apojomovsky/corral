@@ -698,5 +698,144 @@ class RunThroughLaneCase(QueueCase):
         self.assertEqual(row["waited_s"], 38.1)
 
 
+class BypassCase(QueueCase):
+    """Ticket 6: `--bypass` skips the queue but stays visible and measured.
+
+    The bypass runs now inside the same scope limits the request would
+    have carried, is not charged against the lane budget, leaves no
+    waiter or holder row behind, still appends its ledger row, and
+    records a `bypassed` row naming its reason in the recent ring.
+    """
+
+    def _seams(self, run, **overrides):
+        params = {
+            "run": run,
+            "teardown": mock.Mock(),
+            "scope_cgroup": mock.Mock(return_value=None),
+            "clock": _LaneClock(ARRIVED),
+            "host": {"cores": 8, "mem_mb": 16384.0, "python": "3.11"},
+            "pressure": None,
+            "timeout": 1800,
+        }
+        params.update(overrides)
+        return params
+
+    def _bypass(self, run, **overrides):
+        params = {
+            "role": "hand",
+            "repo": "a-project",
+            "reason": "release fix",
+            "weight": WEIGHT,
+            "budget": BUDGET,
+        }
+        params.update(overrides)
+        return heavy.run_bypass(
+            ["make", "check"], self.tmp, {"PATH": "p"}, **params, **self._seams(run)
+        )
+
+    def _ledger_rows(self):
+        runs = os.path.join(os.environ["KORAPY_STATE"], "heavy", "runs")
+        rows = []
+        for name in sorted(os.listdir(runs)):
+            with open(os.path.join(runs, name), encoding="utf-8") as handle:
+                rows.extend(json.loads(line) for line in handle if line.strip())
+        return rows
+
+    def test_bypass_runs_without_queueing_and_records_the_reason(self):
+        run = _FakeRunner(code=0, stdout="green\n", stderr="")
+        result = self._bypass(run)
+        self.assertEqual(result.exit_code, 0)
+        lane = heavy.read_lane()
+        self.assertEqual(lane["holders"], [])
+        self.assertEqual(lane["waiters"], [])
+        (entry,) = lane["recent"]
+        self.assertEqual(entry["outcome"], "bypassed")
+        self.assertEqual(entry["reason"], "release fix")
+        self.assertEqual(entry["command"], ["make", "check"])
+        (row,) = self._ledger_rows()
+        self.assertEqual(row["role"], "hand")
+        self.assertEqual(row["waited_s"], 0.0)
+        self.assertEqual(row["exit"], 0)
+
+    def test_bypass_carries_the_scope_limits_without_charging_the_budget(self):
+        run = _FakeRunner(code=0)
+        blocker = self._join(timeout_s=600)
+        heavy.poll_once(blocker["id"], WEIGHT, BUDGET, ARRIVED + 1.0)
+        result = self._bypass(run)
+        self.assertEqual(result.exit_code, 0)
+        (scope, _, _) = run.calls[0]
+        self.assertIn("--property=MemoryMax=6144M", scope)
+        self.assertIn("--property=CPUQuota=300%", scope)
+        lane = heavy.read_lane()
+        self.assertEqual([h["id"] for h in lane["holders"]], [blocker["id"]])
+        self.assertEqual(lane["waiters"], [])
+
+    def test_bypass_empty_reason_is_refused_before_running(self):
+        run = _FakeRunner(code=0)
+        with self.assertRaises(heavy.HeavyError):
+            self._bypass(run, reason="")
+        self.assertEqual(run.calls, [])
+        self.assertEqual(heavy.read_lane()["recent"], [])
+        self.assertFalse(os.path.exists(os.path.join(os.environ["KORAPY_STATE"], "heavy", "runs")))
+
+    def test_bypass_command_failure_still_records(self):
+        run = _FakeRunner(code=3, stdout="", stderr="boom\n")
+        result = self._bypass(run)
+        self.assertEqual(result.exit_code, 3)
+        (entry,) = heavy.read_lane()["recent"]
+        self.assertEqual(entry["outcome"], "bypassed")
+        (row,) = self._ledger_rows()
+        self.assertEqual(row["exit"], 3)
+
+    def test_bypass_scope_failure_records_nothing(self):
+        def missing(argv, cwd, timeout):
+            raise OSError("no such program")
+
+        with self.assertRaises(heavy.HeavyError):
+            self._bypass(missing)
+        self.assertEqual(heavy.read_lane()["recent"], [])
+
+    def test_record_bypass_names_the_reason_in_the_ring(self):
+        heavy.record_bypass(["make", "check"], "hotfix", now=ARRIVED)
+        (entry,) = heavy.read_lane()["recent"]
+        self.assertEqual(entry["outcome"], "bypassed")
+        self.assertEqual(entry["reason"], "hotfix")
+        self.assertEqual(entry["at"], "2023-11-14T22:13:20+00:00")
+
+    def test_record_bypass_empty_reason_is_refused(self):
+        with self.assertRaises(heavy.HeavyError):
+            heavy.record_bypass(["make", "check"], "", now=ARRIVED)
+        self.assertEqual(heavy.read_lane()["recent"], [])
+
+    def test_recent_ring_trims_to_the_limit(self):
+        for index in range(heavy.RECENT_LIMIT + 5):
+            heavy.record_bypass(["make", "check"], f"fix {index}", now=ARRIVED + index)
+        recent = heavy.read_lane()["recent"]
+        self.assertEqual(len(recent), heavy.RECENT_LIMIT)
+        self.assertEqual(recent[0]["reason"], "fix 5")
+        self.assertEqual(recent[-1]["reason"], f"fix {heavy.RECENT_LIMIT + 4}")
+
+
+class ReleaseRingCase(QueueCase):
+    """Ticket 6: the normal path records a `released` row in the recent ring."""
+
+    def test_release_appends_the_released_row(self):
+        first = self._join(timeout_s=600)
+        heavy.poll_once(first["id"], WEIGHT, BUDGET, ARRIVED + 1.0)
+        heavy.release_lane(first["id"], BUDGET, now=ARRIVED + 9.0)
+        lane = heavy.read_lane()
+        self.assertEqual(lane["holders"], [])
+        (entry,) = lane["recent"]
+        self.assertEqual(entry["outcome"], "released")
+        self.assertEqual(entry["id"], first["id"])
+        self.assertEqual(entry["command"], ["make", "check"])
+        self.assertEqual(entry["unit"], "")
+        self.assertEqual(entry["at"], "2023-11-14T22:13:29+00:00")
+
+    def test_release_of_an_unknown_holder_records_nothing(self):
+        heavy.release_lane("0" * 32, BUDGET, now=ARRIVED)
+        self.assertEqual(heavy.read_lane()["recent"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

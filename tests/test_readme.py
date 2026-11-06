@@ -162,6 +162,23 @@ class Table(unittest.TestCase):
         self.assertEqual(table_tokens(section), {"deps"})
 
 
+class HeavyRow(unittest.TestCase):
+    """The README heavy run row names the lane's bypass and role flags."""
+
+    def heavy_run_row(self):
+        section = commands_section()
+        for line in section.splitlines():
+            if line.startswith("|") and "heavy run" in line:
+                cells = re.split(r"(?<!\\)\|", line)
+                return cells[2]
+        raise AssertionError("no heavy run row in the Commands table")
+
+    def test_heavy_run_row_names_bypass_and_role(self):
+        row = self.heavy_run_row()
+        for token in ("--bypass", "--role", "journal", "hand"):
+            self.assertIn(token, row)
+
+
 class SnapshotSections(unittest.TestCase):
     def test_document_keys_match_the_error_sections(self):
         self.assertEqual(document_sections(), set(snapshot.ERROR_SECTIONS))
