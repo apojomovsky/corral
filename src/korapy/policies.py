@@ -53,6 +53,8 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     Open, unheld, unblocked, with no open linked pull, claimed or not:
     a missing or non-string title reads as empty and a non-tuple labels
     value reads as none, so odd data selects or skips without raising.
+    Unreadable pulls (None) are never selected: a ticket whose links
+    the pass could not read fails closed here, as in the gate.
     """
     if row.state != "open":
         return False
@@ -68,6 +70,8 @@ def _selectable(row: eligibility.TicketRow) -> bool:
     if extra.get("blocked_by"):
         return False
     if "blocked" in labels:
+        return False
+    if row.pulls is None:
         return False
     pulls = row.pulls if isinstance(row.pulls, (tuple, list)) else ()
     return all(getattr(pull, "state", "") != "open" for pull in pulls)

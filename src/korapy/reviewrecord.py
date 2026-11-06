@@ -236,6 +236,12 @@ def approves(record):
 #: loop opens a fix round only for findings at or above its threshold.
 SEVERITIES = ("high", "normal", "low")
 
+#: The default fix-round threshold: findings at or above `normal` open a
+#: fix round, so approving reviews with only lows are merge-ready. One
+#: constant on purpose: the settings default, the gate default and the
+#: grading defaults below all read it, and an agreement test pins them.
+DEFAULT_FIX_THRESHOLD = "normal"
+
 
 def severity_rank(severity) -> int:
     """One severity's rank, higher first. Pure.
@@ -264,7 +270,7 @@ def check_threshold(value) -> str:
     return name
 
 
-def meets_threshold(findings, threshold="normal") -> bool:
+def meets_threshold(findings, threshold=DEFAULT_FIX_THRESHOLD) -> bool:
     """Whether any finding reaches `threshold`. Pure.
 
     An unknown threshold raises ValueError; an unknown severity reads
@@ -280,7 +286,7 @@ def meets_threshold(findings, threshold="normal") -> bool:
     return False
 
 
-def fix_wanted(record, threshold="normal") -> bool:
+def fix_wanted(record, threshold=DEFAULT_FIX_THRESHOLD) -> bool:
     """Whether a review record asks for a fix round. Pure.
 
     No record says nothing, so no fix. A `block` verdict always wants

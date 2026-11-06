@@ -134,6 +134,9 @@ class SelectionTest(unittest.TestCase):
         pull = eligibility.LinkedPull(number=11, state="open")
         self.assertEqual(selected([row(7, pulls=(pull,))]), [])
 
+    def test_unreadable_linked_pulls_are_skipped_fail_closed(self):
+        self.assertEqual(selected([row(7, pulls=None)]), [])
+
     def test_closed_linked_pull_is_selected(self):
         pull = eligibility.LinkedPull(number=11, state="closed")
         self.assertEqual(selected([row(7, pulls=(pull,))]), [("app", 7)])
