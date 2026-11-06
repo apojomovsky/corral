@@ -463,7 +463,10 @@ def _check_heavy_stuck(state: ResourceReadings) -> ResourceRow | None:
         parts.append(f"waiter {str(wid)[:8]} past its wait deadline")
     for holder, elapsed, p90 in stuck_holders:
         hid = holder.get("id", "?") if isinstance(holder, Mapping) else "?"
-        parts.append(f"holder {str(hid)[:8]} running {elapsed:.0f}s past {p90:.0f}s typical")
+        parts.append(
+            f"holder {str(hid)[:8]} running {elapsed:.0f}s"
+            f" past {state.heavy_wait_factor:.1f}x{p90:.0f}s typical"
+        )
     return ResourceRow(
         "heavy-stuck",
         "warn",

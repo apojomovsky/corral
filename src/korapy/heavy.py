@@ -1618,14 +1618,28 @@ def _estimate_p90(estimate):
     return None
 
 
+def _key_digest(key):
+    """The argv hash segment of an estimate key, or None when malformed.
+
+    Keys read ``repo|argv_hash|role``; only a three-segment key names a
+    hash exactly, so a trailing segment never matches a substring.
+    """
+    if not isinstance(key, str):
+        return None
+    parts = key.split("|")
+    if len(parts) != 3 or not parts[1]:
+        return None
+    return parts[1]
+
+
 def stuck_holders(lane, estimates, now, wait_factor):
     """Holders running past wait_factor times their duration p90.
 
     Pure: the lane, the per-key estimates, one clock reading and the
     configured factor in, (holder, elapsed, p90) tuples out. A holder
-    carries no repo or role, so it matches every estimate whose key
-    names its argv hash; the match uses the largest p90, so one slow
-    role does not condemn the rest. A holder with no matching estimate
+    carries no repo or role, so it matches every repo's estimate for
+    its argv hash; the match uses the largest p90, so one slow role or
+    repo does not condemn the rest. A holder with no matching estimate
     is never stuck: unknown never accuses. The doctor only names these;
     pressure never touches a holder.
     """
@@ -1642,7 +1656,7 @@ def stuck_holders(lane, estimates, now, wait_factor):
         p90s = [
             p90
             for key, estimate in rows.items()
-            if isinstance(key, str) and f"|{digest}|" in key
+            if _key_digest(key) == digest
             for p90 in [_estimate_p90(estimate)]
             if p90 is not None
         ]
