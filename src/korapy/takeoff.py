@@ -51,6 +51,7 @@ from korapy import (
     resources,
     reviewrecord,
     settings,
+    syncli,
     worktrees,
 )
 from korapy.github import gh
@@ -680,6 +681,10 @@ def run_takeoff(
         raise TakeoffError(str(err)) from None
     main_clone = os.path.realpath(gitenv.worktree_main_checkout(toplevel) or toplevel)
     repo, matched = _ticket_repo(ops_root, main_clone)
+    try:
+        repo = reviewrecord.local_repo(repo, syncli.short_to_tracker(ops_root, _git))
+    except ValueError as err:
+        raise TakeoffError(str(err)) from None
     try:
         if matched:
             resolved = settings.load(root=ops_root, repo=repo)

@@ -1129,24 +1129,46 @@ def _store_labels(store, now):
     return read
 
 
-def review_records_for(items, *, read):
+def review_records_for(items, *, read, err):
     """{(repo, number): latest review record} for rows with one on file.
 
     `read` is the injected review-record reader ((repo, number) ->
-    record or None, for example `reviewrecord.latest_record`); a row it
-    cannot read counts as having no record, exactly as before. The pass
-    builds this map once from its rows and the gate reads it, so the
-    record files are listed once per pass, not once per candidate.
+    record or None, for example a `reviewrecord.store_reader` over the
+    pass's short-to-tracker map); a row it cannot read counts as
+    having no record, exactly as before. A row it refuses (an
+    unresolvable repository, any other lookup failure) is one loud
+    line on `err` naming the key, never a silent gap: an empty result
+    means no records, not swallowed exceptions. The pass builds this
+    map once from its rows and the gate reads it, so the record files
+    are listed once per pass, not once per candidate.
     """
     found = {}
     for item in items or ():
         try:
             record = read(item.repo, item.number)
-        except Exception:
+        except Exception as exc:
+            print(
+                f"korapy drive: cannot read the review record for "
+                f"{item.repo}#{item.number} ({exc})",
+                file=err,
+            )
             continue
         if record is not None:
             found[(item.repo, item.number)] = record
     return found
+
+
+def production_review_reader(registered, *, git):
+    """A `review_records_for` read over the store's tracker-repo keys.
+
+    Builds the one short-to-tracker map and returns the reader that
+    finds each row's record under its short session dir, so the loop
+    sees what the reviewer wrote. Raises SettingsError for bad
+    registry or project settings, like the sibling production
+    builders: the pass refuses instead of gating blind.
+    """
+    mapping = _tracker_repo_map(registered, git=git)
+    return reviewrecord.store_reader(mapping)
 
 
 def tracker_pulls_for(tracker_factory):
@@ -1509,7 +1531,11 @@ def _pass(
     finished = resolve_finished(
         finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
     )
-    reviews = review_records_for(items, read=review_reader) if review_reader is not None else None
+    reviews = (
+        review_records_for(items, read=review_reader, err=err)
+        if review_reader is not None
+        else None
+    )
     gated_rows, problems, _ = _gate_all(
         items,
         registered,
@@ -4205,7 +4231,7 @@ def _launching_pass(
             print(f"korapy drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
     if review_reader is not None:
-        reviews = review_records_for(_items, read=review_reader)
+        reviews = review_records_for(_items, read=review_reader, err=err)
     else:
         reviews = None
     gated_rows, problems, eligible_keys = _gate_all(

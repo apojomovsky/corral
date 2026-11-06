@@ -111,6 +111,27 @@ def repo_operators(root, names, git):
     return entries, None
 
 
+def short_to_tracker(root, git):
+    """`{short [[repo]] name: tracker repo}` for one ops root.
+
+    The single-root projection of the shared `repo_operators` map:
+    the review-record callers (record, show, takeoff, merge) resolve
+    their ticket repo through it, so one map feeds every spelling
+    decision. No root reads as no entries; a configuration problem
+    reads as no entries too, so short names (the on-disk truth every
+    writer uses) keep resolving: only a tracker spelling the map
+    cannot translate fails, loudly, at the caller.
+    """
+    from korapy import settings
+
+    if not root:
+        return {}
+    entries, problem = repo_operators(root, settings.repo_names(root), git)
+    if problem is not None or entries is None:
+        return {}
+    return {name: tracker for name, (tracker, _ops) in entries.items()}
+
+
 def _has_board_reader(tracker) -> bool:
     """Whether ``tracker`` can run the board step, through the factory's
     predicate. A board-variant repo whose tracker lacks this is a
