@@ -203,5 +203,30 @@ class ExitCode(unittest.TestCase):
         self.assertEqual(doctor.exit_code(checks), 1)
 
 
+class BuiltinFallback(unittest.TestCase):
+    def test_falling_to_builtin_while_profiles_are_declared_warns(self):
+        fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
+        checks = check(state(parsed=fast), [dep("omp")])
+        rows = by_name(checks)
+        self.assertEqual(rows["profile-default"].status, "warn")
+        self.assertIn("built-in", rows["profile-default"].detail)
+        self.assertTrue(rows["profile-default"].fix)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_a_declared_default_carries_no_fallback_note(self):
+        checks = check(state(parsed=declared()), [dep("muse"), dep("omp")])
+        self.assertNotIn("profile-default", by_name(checks))
+
+    def test_a_selected_default_carries_no_fallback_note(self):
+        fast = profiles.validate({"fast": {"runtime": "omp"}}, ["provider-a"])
+        selections = profiles.Selections(default="fast")
+        checks = check(state(parsed=fast, selections=selections), [dep("omp")])
+        self.assertNotIn("profile-default", by_name(checks))
+
+    def test_no_declarations_carry_no_fallback_note(self):
+        checks = check(state(), [dep("muse"), dep("omp")])
+        self.assertNotIn("profile-default", by_name(checks))
+
+
 if __name__ == "__main__":
     unittest.main()

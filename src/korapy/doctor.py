@@ -721,14 +721,52 @@ def _check_profile_shadows(state: ProfileState) -> list[Check]:
     return checks
 
 
+def _check_profile_default(state: ProfileState) -> list[Check]:
+    """The `profile-default` note: a launch with no selection would use
+    the built-in default while profiles are declared.
+
+    Warns only when declarations validate, at least one profile is
+    declared, no `[profiles.default]` table exists, and no layer-6
+    selection (local or committed) names a default: then an unselected
+    launch silently runs the built-in runtime instead of a declared
+    setup. A warn, never a fail: the launch path resolves the same way.
+    """
+    if state.error is not None or not state.parsed:
+        return []
+    if profiles.declared_default(state.parsed) is not None:
+        return []
+    selections = state.selections
+    if selections is not None and selections.default is not None:
+        return []
+    committed = state.committed or {}
+    if isinstance(committed.get("default"), str) and committed["default"]:
+        return []
+    if selections is None:
+        return []
+    count = len(state.parsed)
+    return [
+        Check(
+            "profile-default",
+            "warn",
+            f"{count} declared profile(s) but no default selected: "
+            "a launch with no profile selection uses the built-in default "
+            f"(runtime {profiles.BUILTIN_DEFAULT.runtime})",
+            "declare [profiles.default] with a runtime, or select a default "
+            "(`korapy profile set --global NAME` or committed `profile.default`), "
+            "then run `korapy doctor` again",
+        )
+    ]
+
+
 def check_profiles(state: ProfileState, dep_results) -> list[Check]:
-    """The profile rows: declarations, runtimes, override and shadows.
+    """The profile rows: declarations, runtimes, override, default and shadows.
 
     Pure over the readings in `state`: declarations validate, every
     selection, pin, override and committed default names a declared
-    profile, every referenced runtime resolves, and an expired override
-    fails until reset. Unknown runtime, missing binary and expiry fail;
-    a shadowed name is a note.
+    profile, every referenced runtime resolves, an expired override
+    fails until reset, and an unselected default over declared profiles
+    warns. Unknown runtime, missing binary and expiry fail; a shadowed
+    name or a built-in fallback is a note.
     """
     if state.error is not None:
         return [
@@ -739,6 +777,7 @@ def check_profiles(state: ProfileState, dep_results) -> list[Check]:
         *_check_profile_declarations(state),
         *_check_profile_runtimes(state, dep_results),
         *_check_profile_override(state),
+        *_check_profile_default(state),
         *_check_profile_shadows(state),
     ]
 

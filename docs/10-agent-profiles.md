@@ -121,9 +121,10 @@ profiles goes through it; a launch that resolves an invalid profile
 fails with exit 4 before anything is made (no worktree, no unit).
 
 The built-in `default` profile is defined once, hardcoded in
-`profiles.py`: the shipped default setup (runtime `muse` with the
-default model chains). Layer 6 falls back to it, so resolution always
-succeeds.
+`profiles.py`: the shipped default setup (runtime `omp` with no chains
+or options of its own, per `runtimes.DEFAULT_RUNTIME`: one fact, one
+place). Layer 6 falls back to it only when no `[profiles.default]`
+table is declared, so resolution always succeeds.
 
 ## 2. Scopes and precedence
 
