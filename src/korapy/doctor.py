@@ -766,7 +766,7 @@ def check_profiles(state: ProfileState, dep_results) -> list[Check]:
     profile, every referenced runtime resolves, an expired override
     fails until reset, and an unselected default over declared profiles
     warns. Unknown runtime, missing binary and expiry fail; a shadowed
-    name or a built-in fallback is a note.
+    name is a note.
     """
     if state.error is not None:
         return [

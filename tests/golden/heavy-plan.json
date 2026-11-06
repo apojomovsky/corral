@@ -1,0 +1,10 @@
+{
+  "admitted": false,
+  "position": 1,
+  "reason": "waiting behind 1 waiter(s), head is 22222222",
+  "schema_version": 1,
+  "weight": {
+    "cpu_m": 1000,
+    "memory_mb": 1024
+  }
+}
