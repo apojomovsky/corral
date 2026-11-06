@@ -901,9 +901,9 @@ function for both paths, reporting `added`, `kept`, `refused`, and a
    (closed within the last three days; older closed issues stay
    history for people to add by hand). Pull requests are never
    adopted: their linked issue's card shows them.
-3. At most `board.add_per_pass` issues are added per pass (default
-   `20`), so a first catch-up never bursts the pacing budget; the
-   remainder carries to the next pass.
+3. At most `board.add_per_pass` issues are added per repo per pass
+   (default `20`), so a first catch-up never bursts the pacing
+   budget; the remainder carries to the next pass.
 4. Every add goes through the paced mutation path, so the shared
    GraphQL bucket meters the pass; a cooldown or rate limit stops the
    adopt cleanly with the rest left for the next pass.

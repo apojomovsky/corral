@@ -291,9 +291,9 @@ accepted for renames). Scalar board settings in the registry:
 `tracker.variant` (default `"labels"`), `board.poll_pages`,
 `board.schema_max_age_s`, `board.item_max_age_s` for freshness-gated
 reads, and `board.add_per_pass` (default `20`): at most that many
-missing issues the board step adopts per pass, so a first catch-up
-never bursts the pacing budget; the remainder carries to the next
-pass. The doctor gains one board check per repo in board mode: the board
+missing issues the board step adopts per repo per pass, so a first
+catch-up never bursts the pacing budget; the remainder carries to
+the next pass. The doctor gains one board check per repo in board mode: the board
 resolves, every mapped field and every mapped option id exists, and no
 queued writes predate a variant flip. The check names the repo, the
 field, and the missing id; a one-time run after a board edit reports an

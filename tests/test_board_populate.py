@@ -122,6 +122,15 @@ class PopulateTests(unittest.TestCase):
         self.assertEqual(len(run.mutations()), 1)
         self.assertIn("contentId=I_5", run.flag_values("AddItem", ""))
 
+    def test_an_unexpected_state_is_skipped(self):
+        run = ProvisionFakeRun()
+        items_route(run, items_page())
+        issues_route(run, [issue(2, state="bogus"), issue(5)])
+        add_route(run, [added_answer("ITEM_5")])
+        report = provisioner_for(run).populate("PVT_1", "example/demo")
+        self.assertEqual(report.added, ("example/demo#5",))
+        self.assertEqual(len(run.mutations()), 1)
+
     def test_an_external_authors_open_issue_is_added(self):
         run = ProvisionFakeRun()
         items_route(run, items_page())

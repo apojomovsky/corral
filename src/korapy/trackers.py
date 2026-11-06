@@ -86,7 +86,7 @@ class BoardBackedTracker(BoardTracker):
 
     @property
     def board_adopt_limit(self) -> int | None:
-        """The per-pass adopt cap carried from settings, or None when unset."""
+        """The per-repo-per-pass adopt cap carried from settings, or None when unset."""
         return self._adopt_limit
 
     def _fetch_project_cached(self):
@@ -284,9 +284,9 @@ class SetupEntry(NamedTuple):
     both derive from this, so no caller re-loads settings to recover
     them. ``board`` is the resolved ``[repo.board]`` table (or None
     when the entry names none), ``max_pages`` is the resolved board
-    poll cap, and ``adopt_limit`` the resolved per-pass adopt cap. No
-    tracker is built here: setup builds it lazily, per entry, inside
-    its loop.
+    poll cap, and ``adopt_limit`` the resolved per-repo-per-pass
+    adopt cap. No tracker is built here: setup builds it lazily, per
+    entry, inside its loop.
     """
 
     name: str  # the entry name, which the reports print
@@ -295,7 +295,7 @@ class SetupEntry(NamedTuple):
     variant: str  # "labels" | "board", as resolved
     board: object  # the resolved board table, or None
     max_pages: int  # the resolved board poll cap
-    adopt_limit: int  # the resolved per-pass adopt cap
+    adopt_limit: int  # the resolved per-repo-per-pass adopt cap
 
 
 def setup_entry(root, name, *, git) -> SetupEntry:

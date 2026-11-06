@@ -755,10 +755,13 @@ class BoardTracker(BoardReader):
         The adds run through the one shared adder setup uses. A listing
         that falls over raises ``TrackerError`` instead of adopting on
         partial knowledge; a rate limit halts the run with the rest left
-        for the next pass.
+        for the next pass. A zero limit adopts nothing and lists
+        nothing.
         """
         if not isinstance(project_id, str) or not project_id:
             raise ValueError("board adopt needs a project id")
+        if limit == 0:
+            return iface.BoardAdopt((), (), (), None)
         candidates = [
             ((repo, number), node_id, f"{repo}#{number}")
             for node_id, number in self._adoptable_issue_refs(repo, now)
@@ -777,49 +780,73 @@ class BoardTracker(BoardReader):
 
         Pull requests are never board items this tracker creates, and
         closed issues older than ``ADOPT_RECENT_DAYS`` stay history for
-        people to add by hand. A malformed page fails closed, never as
-        a partial set.
+        people to add by hand. The page-walk is the shared listing
+        helper below; an unexpected state fails the whole adopt, since
+        the pass must prove membership before it adds.
         """
-        base = f"repos/{repo}/issues?state=all&per_page=100"
-        page = 1
-        while True:
-            path = base if page == 1 else f"{base}&page={page}"
-            try:
-                payload = json.loads(gh.paced_run(["api", path], run=self._run, pacer=self._pacer))
-            except gh.GhError as err:
-                text = str(err) or repr(err)
-                if gh.is_rate_limited(text):
-                    raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-                raise iface.TrackerError(f"board unreachable: {text}") from err
-            except Exception as err:
-                raise iface.TrackerError(f"board unreachable: {err}") from err
-            if not isinstance(payload, list):
-                raise _fail(f"issues of {repo} are not a list")
-            for entry in payload:
-                if not isinstance(entry, dict):
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if "pull_request" in entry:
-                    continue
-                state = entry.get("state")
-                if state not in ("open", "closed"):
-                    raise _fail(f"bad issue state {state!r} on {repo}")
-                number = entry.get("number")
-                node_id = entry.get("node_id")
-                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if not isinstance(node_id, str) or not node_id:
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if state == "closed" and not _recently_closed(entry.get("closed_at"), now):
-                    continue
-                yield node_id, number
-            if len(payload) < 100:
-                return
-            page += 1
+        for entry in _list_issue_entries(self._run, self._pacer, repo, "all"):
+            if "pull_request" in entry:
+                continue
+            state = entry.get("state")
+            if state not in ("open", "closed"):
+                raise _fail(f"bad issue state {state!r} on {repo}")
+            node_id, number = _issue_ref(entry, repo)
+            if state == "closed" and not _recently_closed(entry.get("closed_at"), now):
+                continue
+            yield node_id, number
 
 
 #: How long a closed issue still counts as adoptable: older closed
 #: issues stay history for people to add by hand.
 ADOPT_RECENT_DAYS = 3
+
+
+def _list_issue_entries(run, pacer, repo, state):
+    """Each raw entry of the tracker's paged issue listing, in order.
+
+    The one page-walk every issue-listing reader shares: ``state`` is
+    the listing's own ``state`` parameter. A listing that falls over
+    raises ``TrackerError`` instead of yielding partial knowledge, and
+    a rate-limit answer raises ``TrackerRateLimited``; a malformed
+    page fails closed, never as a partial entry set. Callers classify
+    each entry's own state themselves: the pass adopt fails a page
+    carrying an unexpected state (it must prove membership before it
+    adds), while the open-only listing skips anything but open (it
+    asked for open only).
+    """
+    base = f"repos/{repo}/issues?state={state}&per_page=100"
+    page = 1
+    while True:
+        path = base if page == 1 else f"{base}&page={page}"
+        try:
+            payload = json.loads(gh.paced_run(["api", path], run=run, pacer=pacer))
+        except gh.GhError as err:
+            text = str(err) or repr(err)
+            if gh.is_rate_limited(text):
+                raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
+            raise iface.TrackerError(f"board unreachable: {text}") from err
+        except Exception as err:
+            raise iface.TrackerError(f"board unreachable: {err}") from err
+        if not isinstance(payload, list):
+            raise _fail(f"issues of {repo} are not a list")
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise _fail(f"bad issue {entry!r} on {repo}")
+            yield entry
+        if len(payload) < 100:
+            return
+        page += 1
+
+
+def _issue_ref(entry, repo):
+    """``(node id, number)`` for one listing entry, else ``TrackerError``."""
+    number = entry.get("number")
+    node_id = entry.get("node_id")
+    if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+        raise _fail(f"bad issue {entry!r} on {repo}")
+    if not isinstance(node_id, str) or not node_id:
+        raise _fail(f"bad issue {entry!r} on {repo}")
+    return node_id, number
 
 
 def _recently_closed(closed_at, now) -> bool:
@@ -1394,11 +1421,13 @@ def add_missing_issues(run, pacer, *, project_id, present, candidates, limit=Non
     ``present`` holds the keys already on the board (opaque to this
     function: node ids for setup, ``(repo, number)`` for the pass) and
     ``candidates`` are ``(key, content id, name)`` in listing order.
-    ``limit`` caps the adds; the rest carries to the next pass. Every
-    add goes through the one issue-add path above, paced through the
-    shared bucket; a rate limit halts the run with ``stopped`` set, and
-    a failed add is one ``refused`` line naming the issue, retried on
-    the next pass. A malformed add answer fails closed.
+    ``limit`` caps the attempted adds (a refused add still consumes
+    the budget, so a failing run cannot retry the whole backlog in one
+    pass); the rest carries to the next pass. Every add goes through
+    the one issue-add path above, paced through the shared bucket; a
+    rate limit halts the run with ``stopped`` set, and a failed add is
+    one ``refused`` line naming the issue, retried on the next pass.
+    A malformed add answer fails closed.
     """
     added: list = []
     kept: list = []
@@ -1420,8 +1449,8 @@ def add_missing_issues(run, pacer, *, project_id, present, candidates, limit=Non
             refused.append(f"could not add {name} to the board: {err}")
         else:
             added.append(name)
-            if remaining is not None:
-                remaining -= 1
+        if remaining is not None:
+            remaining -= 1
     return iface.BoardAdopt(tuple(added), tuple(kept), tuple(refused), None)
 
 
@@ -2094,41 +2123,16 @@ class GithubBoardProvisioner:
         """``(node id, number)`` for the tracker repo's open issues.
 
         Closed issues stay people's history to add by hand, and pull
-        requests are never board items korapy creates. A malformed page
-        fails closed, never as a partial issue set.
+        requests are never board items korapy creates. The page-walk is
+        the shared listing helper; anything but open is skipped, since
+        this listing asked for open only.
         """
-        base = f"repos/{repo}/issues?state=open&per_page=100"
-        page = 1
-        while True:
-            path = base if page == 1 else f"{base}&page={page}"
-            try:
-                payload = json.loads(gh.paced_run(["api", path], run=self._run, pacer=self._pacer))
-            except gh.GhError as err:
-                text = str(err) or repr(err)
-                if gh.is_rate_limited(text):
-                    raise iface.TrackerRateLimited(text, gh.retry_after_s(text)) from err
-                raise iface.TrackerError(f"board unreachable: {text}") from err
-            except Exception as err:
-                raise iface.TrackerError(f"board unreachable: {err}") from err
-            if not isinstance(payload, list):
-                raise _fail(f"issues of {repo} are not a list")
-            for entry in payload:
-                if not isinstance(entry, dict):
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if "pull_request" in entry:
-                    continue
-                if entry.get("state") != "open":
-                    continue
-                number = entry.get("number")
-                node_id = entry.get("node_id")
-                if isinstance(number, bool) or not isinstance(number, int) or number < 1:
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                if not isinstance(node_id, str) or not node_id:
-                    raise _fail(f"bad issue {entry!r} on {repo}")
-                yield node_id, number
-            if len(payload) < 100:
-                return
-            page += 1
+        for entry in _list_issue_entries(self._run, self._pacer, repo, "open"):
+            if "pull_request" in entry:
+                continue
+            if entry.get("state") != "open":
+                continue
+            yield _issue_ref(entry, repo)
 
     def _add_item(self, project_id, content_id):
         """One issue added to the board: its item id, or ``_ItemRefused``.

@@ -33,7 +33,7 @@ settings.register(
     "board.add_per_pass",
     int,
     20,
-    "missing board issues added per pass (default: 20; 0 adopts nothing)",
+    "missing board issues added per repo per pass (default: 20; 0 adopts nothing)",
 )
 settings.register(
     "board.schema_max_age_s",

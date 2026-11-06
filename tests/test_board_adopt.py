@@ -118,6 +118,14 @@ class SharedLoopTest(unittest.TestCase):
         again = loop(rerun, present={"I_2"}, candidates=[candidate(2), candidate(3)], limit=1)
         self.assertEqual(again.added, (f"{REPO}#3",))
 
+    def test_refused_adds_consume_the_cap(self):
+        run = ProvisionFakeRun()
+        add_route(run, [gh.GhError("other", "boom (HTTP 500)") for _ in range(3)])
+        report = loop(run, candidates=[candidate(2), candidate(3), candidate(4)], limit=2)
+        self.assertEqual(len(report.refused), 2)
+        self.assertEqual(report.added, ())
+        self.assertEqual(len(run.mutations()), 2)
+
     def test_a_rate_limit_mid_pass_stops_with_the_rest_left(self):
         run = ProvisionFakeRun()
         add_route(run, [added_answer("ITEM_2"), rate_limited_answer()])
@@ -187,6 +195,20 @@ class AdoptingTrackerTest(unittest.TestCase):
         report = self.adopt(run)
         self.assertEqual(report.added, (f"{REPO}#2",))
         self.assertIsNotNone(report.stopped)
+
+    def test_an_unexpected_state_fails_the_adopt(self):
+        run = BoardFakeRun()
+        listing_route(run, [listed(2, state="bogus")])
+        with self.assertRaises(tracker.TrackerError):
+            self.adopt(run)
+
+    def test_zero_limit_lists_nothing(self):
+        run = BoardFakeRun()
+        seen = []
+        run.rest_fallback = lambda path: seen.append(path) or json.dumps([])
+        report = self.adopt(run, limit=0)
+        self.assertEqual(report, tracker.BoardAdopt((), (), (), None))
+        self.assertEqual(seen, [])
 
 
 class SharedFunctionTest(unittest.TestCase):
@@ -341,6 +363,32 @@ class DriveAdoptTest(unittest.TestCase):
             operators=["alice"],
             now=T0 - 100,
         )
+
+    def test_each_repo_adopts_up_to_its_own_cap(self):
+        other = "example/other"
+        self.store.upsert_item(
+            board.Item(repo=other, number=7, tracker_updated_at=T0 - 100, author="alice"),
+            operators=["alice"],
+            now=T0 - 100,
+        )
+        first = AdoptingBoardTracker(
+            items=[reading(repo=REPO, number=7, updated_at=T0)],
+            board_items=[reading(repo=REPO, number=7, updated_at=T0)],
+            adopt_report=failed_adopt(),
+        )
+        second = AdoptingBoardTracker(
+            items=[reading(repo=other, number=7, updated_at=T0)],
+            board_items=[reading(repo=other, number=7, updated_at=T0)],
+            adopt_report=tracker.BoardAdopt((), (), (f"{other}#9: boom",), None),
+        )
+        by_repo = {REPO: first, other: second}
+        seen, errors, store_errors, refused, adopt_errors = drive.sync_all(
+            self.store, lambda repo: by_repo[repo], operators=["alice"], now=T0
+        )
+        self.assertEqual(first.adopt_calls[0]["limit"], 20)
+        self.assertEqual(second.adopt_calls[0]["limit"], 20)
+        self.assertEqual(adopt_errors, [f"{REPO}#9: boom", f"{other}#9: boom"])
+        self.assertEqual(errors, [])
 
     def test_failed_adds_ride_along_without_failing_the_pass(self):
         fake = AdoptingBoardTracker(
