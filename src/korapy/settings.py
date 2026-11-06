@@ -178,6 +178,12 @@ class Resolved:
     #: config. Project files and repo entries cannot set it: the host
     #: budget is one machine fact, and it reads as unknown there.
     resources: "Tables | None" = None
+    #: The raw ``[heavy]`` table from the project file, or {} when it
+    #: sets none. The lane validates it through ``heavy.check_table``;
+    #: this stays unchecked here so the shape errors name the lane in
+    #: one place. Repo entries cannot set it: the table is project-wide,
+    #: and it reads as unknown settings there.
+    heavy: dict = field(default_factory=dict)
     #: Raw ``[profiles.<name>]`` tables, the host config shadowing the
     #: project file per name. The launch path validates them through
     #: ``profiles.validate``; this stays unchecked here so the shape and
@@ -626,6 +632,9 @@ def resolve(
         result["resources.gone_s"] = Value(_check("resources.gone_s", nested_gone, host_name), HOST)
 
     repos = project.pop("repo", [])
+    heavy_raw = project.pop("heavy", {})
+    if not isinstance(heavy_raw, dict):
+        raise SettingsError(f"{project_name}: [heavy] must be a table")
     if "models" in project:
         _reject_models(project_name)
     private = _check_private(project.pop("private", {}), project_name)
@@ -686,6 +695,7 @@ def resolve(
         private,
         board,
         resources.check_tables(resource_tables, host_name),
+        heavy=dict(heavy_raw),
         profiles={**project_profiles, **host_profiles},
         profile_committed={
             "default": profile_default,
