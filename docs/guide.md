@@ -540,11 +540,13 @@ korapy repo rename OLD NEW
 migrates items, claims (agent and epoch kept), the outbox and the
 sync cursors in a single transaction. Session directories and review
 records are keyed by the short `[[repo]]` name and are not touched
-(see #479). The verb refuses with exit 2 while a live agent or a
-live-held claim names either name, or while a drive pass holds its
-lock. Every run leaves a timestamped backup beside the store; the
-newest five are kept and older ones are pruned. To restore one, stop
-the loop and copy it back over the store file.
+(see #479). The verb refuses with exit 2 while a live or stale agent
+entry or a live-held claim names either name, or while a drive pass
+holds its lock. A stale entry is an agent that died without closing:
+confirm nothing runs under its id, clear it with `korapy agent done`
+ID, and retry. Every successful migration leaves a timestamped backup
+beside the store; the newest five are kept and older ones are pruned.
+To restore one, stop the loop and copy it back over the store file.
 
 Run the move while the repo is quiet: pause the loop with the pause
 file (the loop section above), stop the repo's agents (`korapy stop
