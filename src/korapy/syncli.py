@@ -126,7 +126,11 @@ def short_to_tracker(root, git):
 
     if not root:
         return {}
-    entries, problem = repo_operators(root, settings.repo_names(root), git)
+    try:
+        names = settings.repo_names(root)
+    except settings.SettingsError:
+        return {}
+    entries, problem = repo_operators(root, names, git)
     if problem is not None or entries is None:
         return {}
     return {name: tracker for name, (tracker, _ops) in entries.items()}

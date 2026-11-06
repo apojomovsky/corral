@@ -22,7 +22,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from korapy import drive, mergecli, reviewcli, reviewrecord
+from korapy import drive, mergecli, reviewcli, reviewrecord, syncli
 from korapy import projects as projects_mod
 from korapy.eligibility import StartRequest, TicketRow
 from tests.test_drive import stored
@@ -461,6 +461,204 @@ class MergeCliKeyTest(unittest.TestCase):
         code, _, err = self.merge(repo="acme/gone")
         self.assertEqual(code, 4)
         self.assertIn("acme/gone", err)
+
+
+class MalformedConfigTest(unittest.TestCase):
+    """A malformed korapy.toml never blocks the reviewer: resolution is fail-soft.
+
+    `short_to_tracker` documents that a configuration problem reads as
+    no entries, so short names (the on-disk truth every writer uses)
+    keep resolving: only a tracker spelling the empty map cannot
+    translate fails, loudly, at the caller.
+    """
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-malformed-key-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.ops = os.path.join(self.tmp, "ops")
+        self.clone = os.path.join(self.ops, "clone")
+        os.makedirs(self.clone)
+        with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write("[[repo\nname = \n")
+        self.sessions = os.path.join(self.tmp, "sessions")
+        os.environ["KORAPY_SESSIONS"] = self.sessions
+        os.environ["KORAPY_STATE"] = os.path.join(self.tmp, "state")
+        os.environ["KORAPY_CONFIG"] = os.path.join(self.tmp, "config")
+        git_in(self.clone, "init", "-q", "-b", "master")
+        with open(os.path.join(self.clone, "a.txt"), "w", encoding="utf-8") as handle:
+            handle.write("one\n")
+        git_in(self.clone, "add", "-A")
+        git_in(self.clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "one")
+        self.commit = git_in(self.clone, "rev-parse", "HEAD")
+        here = os.getcwd()
+        os.chdir(self.clone)
+        self.addCleanup(os.chdir, here)
+
+    def test_a_broken_config_reads_as_no_entries(self):
+        self.assertEqual(syncli.short_to_tracker(self.ops, dead_git), {})
+
+    def record(self, repo):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = reviewcli.cmd_record(
+                argparse.Namespace(
+                    repo=repo,
+                    number=1,
+                    commit=self.commit,
+                    verdict="approve",
+                    finding=[],
+                    reviewer="reviewer-1",
+                    author="worker-1",
+                    question="",
+                    session="",
+                )
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def test_record_with_a_short_name_succeeds_despite_a_broken_config(self):
+        code, _out, err = self.record(SHORT)
+        self.assertEqual((code, err), (0, ""))
+        record = reviewrecord.read_record(SHORT, 1, self.commit, sessions_root=self.sessions)
+        self.assertIsNotNone(record)
+
+    def test_an_unresolvable_key_still_fails_naming_the_key(self):
+        code, _, err = self.record("acme/gone")
+        self.assertEqual(code, 4)
+        self.assertIn("acme/gone", err)
+
+
+TWO_ENTRY_TOML = """\
+[[repo]]
+name = "app"
+tracker.repo = "acme/app"
+
+[[repo]]
+name = "web"
+tracker.repo = "acme/app"
+"""
+
+
+class ResolverAgreementTest(unittest.TestCase):
+    """The two short-to-tracker builders agree over the same fixture.
+
+    `syncli.short_to_tracker` (one root, fail-soft) and
+    `drive.production_repo_map` (registered roots, strict) build the
+    same fact; this pins them together so they cannot drift. A
+    tracker repo two shorts feed resolves to the first short name on
+    both sides: the drive map keeps the first entry and `local_repo`
+    takes the first match.
+    """
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-resolver-agreement-")
+        self.addCleanup(tmp.cleanup)
+        self.root = os.path.join(tmp.name, "ops")
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TWO_ENTRY_TOML)
+        self.registered = [
+            projects_mod.Project(name="blue", unit_prefix="blue-agent-", root=self.root),
+        ]
+
+    def test_both_builders_agree_on_one_root(self):
+        expected = {SHORT: TRACKER, "web": TRACKER}
+        self.assertEqual(syncli.short_to_tracker(self.root, dead_git), expected)
+        self.assertEqual(drive.production_repo_map(self.registered, git=dead_git), expected)
+
+    def test_a_shared_tracker_repo_resolves_to_the_first_short_name(self):
+        mapping = syncli.short_to_tracker(self.root, dead_git)
+        self.assertEqual(reviewrecord.local_repo(TRACKER, mapping), SHORT)
+
+
+METHOD_TOML = """\
+[[repo]]
+name = "app"
+clone.path = "clone"
+tracker.repo = "acme/app"
+
+[repo.merge]
+method = "merge"
+"""
+
+
+class MergeMethodKeyTest(unittest.TestCase):
+    """`merge` loads per-repo settings for the translated entry.
+
+    The ticket spelling (`acme/app`) resolves to the short entry
+    (`app`) before `settings.load`, so the entry's `merge.method`
+    applies instead of the default.
+    """
+
+    def setUp(self):
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        tmp = tempfile.TemporaryDirectory(prefix="korapy-merge-method-key-")
+        self.addCleanup(tmp.cleanup)
+        self.tmp = os.path.realpath(tmp.name)
+        self.clone = os.path.join(self.tmp, "clone")
+        os.makedirs(self.clone)
+        with open(os.path.join(self.tmp, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(METHOD_TOML)
+        self.sessions = os.path.join(self.tmp, "sessions")
+        os.environ["KORAPY_SESSIONS"] = self.sessions
+        os.environ["KORAPY_STATE"] = os.path.join(self.tmp, "state")
+        os.environ["KORAPY_CONFIG"] = os.path.join(self.tmp, "config")
+        git_in(self.clone, "init", "-q", "-b", "master")
+        with open(os.path.join(self.clone, "a.txt"), "w", encoding="utf-8") as handle:
+            handle.write("one\ntwo\nthree\n")
+        git_in(self.clone, "add", "-A")
+        git_in(
+            self.clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"
+        )
+        git_in(self.clone, "checkout", "-q", "-b", "feat/1-x")
+        with open(os.path.join(self.clone, "feature.txt"), "w", encoding="utf-8") as handle:
+            handle.write("feature\n")
+        git_in(self.clone, "add", "-A")
+        git_in(
+            self.clone, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "work"
+        )
+        self.head = git_in(self.clone, "rev-parse", "HEAD")
+        self.base = git_in(self.clone, "rev-parse", "master")
+        reviewrecord.write_record(
+            SHORT,
+            1,
+            self.head,
+            reviewer="reviewer-1",
+            author="worker-1",
+            verdict="approve",
+            sessions_root=self.sessions,
+        )
+        here = os.getcwd()
+        os.chdir(self.clone)
+        self.addCleanup(os.chdir, here)
+
+    def test_the_tracker_spelling_honors_the_entry_merge_method(self):
+        fake = FakeForge(
+            pulls=[make_pr(repo=TRACKER, number=7, base_sha=self.base, head_sha=self.head)]
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = mergecli.cmd_merge(
+                argparse.Namespace(
+                    repo=TRACKER,
+                    number=1,
+                    forge_repo=TRACKER,
+                    pr=7,
+                    head=self.head,
+                    method=None,
+                    skip=["checks"],
+                    plan=False,
+                    json=False,
+                ),
+                forge=fake,
+            )
+        self.assertEqual((code, err.getvalue()), (0, ""))
+        self.assertEqual(fake.calls, [("merge", TRACKER, 7, self.head, "merge")])
 
 
 if __name__ == "__main__":
