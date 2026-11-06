@@ -13,7 +13,7 @@ make bootstrap    # Python, the locked environment, git hooks, then the host che
 1. Write the tests first, with fakes at the seams (`unittest`, never `pytest`).
 2. Work in a worktree under `.worktrees/`, on a branch named `<type>/<issue>-<slug>`, never on `master`.
 3. Commit with Conventional Commits: a single subject line, at most 3 lines, no trailers, no em-dashes.
-4. Run `make check`: lint (format check plus `ruff check`), type check, and the suite on Python 3.11 and 3.14.
+4. Run `make check`: lint (format check), type check, and the suite on Python 3.11 and 3.14. The AST guard in `tests/test_board_items_query.py` is the one enforcement of "no module binds the same top-level name twice"; it runs in the suite.
 5. Merge `origin/master` into your branch when master moves on; never rebase a pushed branch.
 
 ## Review gate

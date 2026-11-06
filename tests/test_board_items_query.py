@@ -52,9 +52,12 @@ def top_level_bindings(tree):
     The walk descends into the suites of ``if``, ``while``, ``for``,
     ``with``, ``try`` and ``match`` statements, which all run in the
     module scope, and records the names those statements bind themselves
-    (loop targets, ``with`` items, ``match`` captures). Function and
-    class bodies open a new scope, so only the ``def`` or ``class``
-    name itself is recorded, never the names inside.
+    (loop targets, ``with`` items, ``except ... as`` names, ``match``
+    captures) plus walrus targets in their conditions, iterables and
+    assigned values. Function and class bodies open a new scope, so
+    only the ``def`` or ``class`` name itself is recorded, never the
+    names inside. An augmented assignment never binds on its own, so
+    ``X += 1`` after ``X = 1`` is not a second binding.
     """
     found = []
 
@@ -65,14 +68,19 @@ def top_level_bindings(tree):
             if isinstance(name, ast.Name) and isinstance(name.ctx, ast.Store)
         )
 
-    def collect_pattern(pattern, lineno):
+    def collect_walrus(expr):
+        for node in ast.walk(expr):
+            if isinstance(node, ast.NamedExpr):
+                collect_target(node.target, node.lineno)
+
+    def collect_pattern(pattern):
         for node in ast.walk(pattern):
             if isinstance(node, (ast.MatchAs, ast.MatchStar)):
                 if node.name:
-                    found.append((node.name, lineno, False))
+                    found.append((node.name, node.lineno, False))
             elif isinstance(node, ast.MatchMapping):
                 if node.rest:
-                    found.append((node.rest, lineno, False))
+                    found.append((node.rest, node.lineno, False))
 
     def visit(node):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
@@ -80,9 +88,12 @@ def top_level_bindings(tree):
         elif isinstance(node, ast.Assign):
             for target in node.targets:
                 collect_target(target, node.lineno)
-        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            collect_walrus(node.value)
+        elif isinstance(node, ast.AnnAssign):
             if isinstance(node.target, ast.Name):
                 found.append((node.target.id, node.lineno, False))
+            if node.value is not None:
+                collect_walrus(node.value)
         elif isinstance(node, ast.Import):
             for alias in node.names:
                 bound = alias.asname or alias.name.split(".")[0]
@@ -92,14 +103,17 @@ def top_level_bindings(tree):
                 if alias.name != "*":
                     found.append((alias.asname or alias.name, node.lineno, False))
         elif isinstance(node, (ast.If, ast.While)):
+            collect_walrus(node.test)
             for child in (*node.body, *node.orelse):
                 visit(child)
         elif isinstance(node, (ast.For, ast.AsyncFor)):
             collect_target(node.target, node.lineno)
+            collect_walrus(node.iter)
             for child in (*node.body, *node.orelse):
                 visit(child)
         elif isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
+                collect_walrus(item.context_expr)
                 if item.optional_vars is not None:
                     collect_target(item.optional_vars, node.lineno)
             for child in node.body:
@@ -112,11 +126,14 @@ def top_level_bindings(tree):
             for child in (*node.orelse, *node.finalbody):
                 visit(child)
         elif isinstance(node, ast.ExceptHandler):
+            if node.name:
+                found.append((node.name, node.lineno, False))
             for child in node.body:
                 visit(child)
         elif isinstance(node, ast.Match):
+            collect_walrus(node.subject)
             for case in node.cases:
-                collect_pattern(case.pattern, node.lineno)
+                collect_pattern(case.pattern)
                 for child in case.body:
                     visit(child)
 
@@ -143,6 +160,15 @@ def shadowed_names(path):
         for name, entries in seen.items()
         if len(entries) > 1 and not all(plain for _, plain in entries)
     }
+
+
+def describe_offenders(offenders):
+    """One line per duplicated binding: the file, the name, every line."""
+    return [
+        f"{path}: {name} bound at lines {', '.join(map(str, lines))}"
+        for path, names in sorted(offenders.items())
+        for name, lines in sorted(names.items())
+    ]
 
 
 def graphql_queries(run):
@@ -176,7 +202,13 @@ class NoShadowedModuleNamesTest(unittest.TestCase):
             shadowed = shadowed_names(path)
             if shadowed:
                 offenders[str(path.relative_to(PACKAGE.parents[0]))] = shadowed
-        self.assertEqual(offenders, {})
+        self.assertEqual(describe_offenders(offenders), [])
+
+    def test_failure_message_names_file_name_and_lines(self):
+        self.assertEqual(
+            describe_offenders({"src/korapy/github/board.py": {"_ITEMS": [12, 40]}}),
+            ["src/korapy/github/board.py: _ITEMS bound at lines 12, 40"],
+        )
 
 
 class WrappedBindingGuardTest(unittest.TestCase):
@@ -209,6 +241,15 @@ class WrappedBindingGuardTest(unittest.TestCase):
             "if ready:\n    for item in items:\n        _DUP = item\nelse:\n    _DUP = None\n",
         ),
         ("while", "while cond:\n    _DUP = next(source)\n_DUP = None\n"),
+        ("except as", "try:\n    pass\nexcept OSError as _DUP:\n    pass\n_DUP = None\n"),
+        ("walrus in condition", "if (_DUP := load()):\n    pass\n_DUP = None\n"),
+        ("walrus in iterable", "for item in (_DUP := load()):\n    pass\n_DUP = None\n"),
+    ]
+
+    CLEAN_CASES = [
+        ("except as bound once", "try:\n    pass\nexcept OSError as _DUP:\n    print(_DUP)\n"),
+        ("walrus bound once", "if (_DUP := load()):\n    print(_DUP)\n"),
+        ("augassign is not a rebinding", "_TOTAL = 0\nif cond:\n    _TOTAL += 2\n"),
     ]
 
     def test_each_wrapper_reports_both_bindings(self):
@@ -216,6 +257,14 @@ class WrappedBindingGuardTest(unittest.TestCase):
             with self.subTest(wrapper=label):
                 names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
                 self.assertEqual(names.count("_DUP"), 2)
+
+    def test_clean_cases_bind_no_name_twice(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-guard-clean-") as directory:
+            for index, (label, source) in enumerate(self.CLEAN_CASES):
+                with self.subTest(case=label):
+                    path = pathlib.Path(directory) / f"clean_{index}.py"
+                    path.write_text(source, encoding="utf-8")
+                    self.assertEqual(shadowed_names(path), {})
 
     def test_wrapped_duplicate_is_shadowed(self):
         with tempfile.TemporaryDirectory(prefix="korapy-guard-") as directory:
