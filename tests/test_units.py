@@ -886,6 +886,9 @@ class SealTest(unittest.TestCase):
                 ("units.py", "systemctl", "slice_set_property_argv"),
                 ("units.py", "systemctl", "slice_start_argv"),
                 ("units.py", "systemd-run", "unit_argv"),
+                ("heavy.py", "systemctl", "show_cgroup"),
+                ("heavy.py", "systemctl", "stop_scope"),
+                ("heavy.py", "systemd-run", "scope_argv"),
                 ("drive.py", "systemctl", "timer_state"),
                 ("drive.py", "systemctl", "_timer_systemctl"),
                 ("doctor.py", "systemctl", "_check_drive_timer"),
@@ -909,7 +912,7 @@ class SealTest(unittest.TestCase):
                         }
                         if {"systemctl", "stop"} <= strings:
                             found.add((name, func.name))
-        self.assertEqual(found, {("units.py", STOP_NAME)})
+        self.assertEqual(found, {("units.py", STOP_NAME), ("heavy.py", "stop_scope")})
 
     def test_no_test_calls_a_manager_seam_without_an_injected_fake(self):
         """Every listed direct manager-seam call in tests injects its fake.
@@ -927,6 +930,8 @@ class SealTest(unittest.TestCase):
             ("units", "start"): ("run",),
             ("units", "list_units"): ("run",),
             ("units", "stop"): ("list_fn", "stop_fn"),
+            ("heavy", "show_cgroup"): ("run",),
+            ("heavy", "stop_scope"): ("run",),
             ("resourcedoctor", "load_slice_actual"): ("run",),
             ("drive", "_timer_systemctl"): ("run",),
         }
