@@ -258,12 +258,13 @@ Purpose: regenerate the portable per-key summary
 Arguments: `[--out PATH]`. Standard output always carries
 the rollup JSON document, and the verb refreshes the
 default file at `heavy.rollup_path()`
-(`<state>/heavy/rollup.json`) with the same bytes;
-`--out PATH` additionally writes them atomically to the
-given path. Exit 0 with an empty key set when the ledger
-is empty (nothing learned yet, not a failure), 4 on
-usage. The verb never commits; the operator commits the
-copy it points at.
+(`<state>/heavy/rollup.json`) with the same bytes and
+writes them to the path given by `--out PATH` when one is
+given; both writes are atomic
+(`paths.atomic_write_text`). Exit 0 with an empty key set
+when the ledger is empty (nothing learned yet, not a
+failure), 4 on usage. The verb never commits; the operator
+commits the copy it points at.
 
 ## 4. State: files and single resolvers
 
