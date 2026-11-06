@@ -3,9 +3,9 @@
 It stays short: no command, settings or exit-code tables (those live in
 `docs/commands.md` and `docs/configuration.md`), no wide tables, no
 em-dashes. The repository's own owner and name appear only in the
-README's CI badge and clone URL: the address tests pin both URL forms
-and scan the rest of the tracked tree for the login. Local git reads
-only (the remote URL, the tracked file list); no network, no state.
+README's CI badge and clone URL: the address tests derive both from
+the clone URL and scan the rest of the tracked tree for the login.
+Local git reads only (the tracked file list); no network, no state.
 """
 
 import re
@@ -19,38 +19,14 @@ from korapy import drive, eligibility, runtimes
 ROOT = Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
 
-# The repository's own public path, in one place: the owner this
-# checkout was cloned from, and the repository's current name. The
-# configured remote still carries the pre-rename name, so the name is
-# pinned here while the owner is cross-checked against the remote
-# whenever one is configured. This module holds the tree's only copy
-# outside the README's two allowed URL forms, so the scan below
-# exempts it by path.
-_PINNED_OWNER = "apojomovsky"
-_PINNED_NAME = "korapy"
-
-# Tracked files the login may appear in: the copyright notice, the
-# README's two allowed URL forms, and this module's single copy above.
-_EXEMPT = frozenset({"LICENSE", "README.md", "tests/test_readme.py"})
-
-_REMOTE_OWNER_RE = re.compile(r"github\.com[/:](?P<owner>[^/\s:]+)/")
-
-
-def _remote_owner() -> str | None:
-    """The owner segment of origin's URL, or None when git has no answer."""
-    try:
-        proc = subprocess.run(
-            ["git", "-C", str(ROOT), "remote", "get-url", "origin"],
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if proc.returncode != 0:
-        return None
-    match = _REMOTE_OWNER_RE.search(proc.stdout.strip())
-    return match.group("owner") if match else None
+# The clone URL is the one place the repository's own public path is
+# read from; the badge tests below reuse whatever it names. Tracked
+# files the login may appear in: the copyright notice and the README's
+# two allowed URL forms.
+_CLONE_RE = re.compile(
+    r"git clone https://github\.com/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)"
+)
+_EXEMPT = frozenset({"LICENSE", "README.md"})
 
 
 def _tracked_files() -> list[Path]:
@@ -173,17 +149,15 @@ class RepositoryAddress(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.text = readme_text()
+        match = _CLONE_RE.search(cls.text)
+        assert match is not None, "no clone URL in README.md"
+        cls.owner = match.group("owner")
+        cls.repo = match.group("repo")
         cls.badge_image = (
-            f"https://github.com/{_PINNED_OWNER}/{_PINNED_NAME}/actions/workflows/ci.yml/badge.svg"
+            f"https://github.com/{cls.owner}/{cls.repo}/actions/workflows/ci.yml/badge.svg"
         )
-        cls.badge_link = f"https://github.com/{_PINNED_OWNER}/{_PINNED_NAME}/actions/workflows/ci"
-        cls.clone_line = f"git clone https://github.com/{_PINNED_OWNER}/{_PINNED_NAME}"
-
-    def test_the_pinned_owner_matches_the_remote(self):
-        remote = _remote_owner()
-        if remote is None:
-            self.skipTest("no git remote configured")
-        self.assertEqual(remote, _PINNED_OWNER)
+        cls.badge_link = f"https://github.com/{cls.owner}/{cls.repo}/actions/workflows/ci"
+        cls.clone_line = f"git clone https://github.com/{cls.owner}/{cls.repo}"
 
     def test_the_ci_badge_points_at_this_repository(self):
         head = self.text.split("## ", 1)[0]
@@ -201,7 +175,7 @@ class RepositoryAddress(unittest.TestCase):
         self.assertNotIn("github.com/", rest)
 
     def test_the_owner_login_stays_out_of_the_rest_of_the_tree(self):
-        marker = _PINNED_OWNER.encode("ascii")
+        marker = self.owner.encode("ascii")
         offenders = [
             str(path.relative_to(ROOT))
             for path in _tracked_files()
