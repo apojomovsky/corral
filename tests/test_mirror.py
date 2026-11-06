@@ -10,6 +10,7 @@ from typing import Any
 from korapy import board, mirror, mirrorcli, sync, syncli, tracker
 from korapy.github import gh as ghmod
 from korapy.github import tracker as ghtracker
+from tests.test_reponame import RecordingLock
 from tests.test_syncli import git_ok
 from tests.test_tracker import FakeRun, FakeTracker, item_payload, reading
 
@@ -515,6 +516,8 @@ class MirrorCliTest(unittest.TestCase):
             "out": self.out,
             "err": self.err,
             "operators": {"acme/app": ["alice"]},
+            "lock": RecordingLock(),
+            "lock_path": "/state/drive.lock",
         }
         params.update(over)
         return mirrorcli.mirror_root(self.root, (), **params)
@@ -636,6 +639,8 @@ class SyncPushTest(unittest.TestCase):
             out=self.out,
             err=self.err,
             push=True,
+            lock=RecordingLock(),
+            lock_path="/state/drive.lock",
         )
         self.assertEqual(code, 0)
         self.assertEqual(fake.writes, [(REPO, 1, "agent", "agent-1")])
@@ -675,9 +680,68 @@ class SyncPushTest(unittest.TestCase):
             out=self.out,
             err=self.err,
             push=True,
+            lock=RecordingLock(),
+            lock_path="/state/drive.lock",
         )
         self.assertEqual(fake.writes, [(REPO, 1, "agent", "agent-1")])
         self.assertEqual(code, 3)
+
+
+class MirrorLockTest(MirrorCliTest):
+    def run_locked(self, fake, lock, lock_path="/state/drive.lock", **over):
+        return self.run_mirror(fake, lock=lock, lock_path=lock_path, **over)
+
+    def test_held_lock_exits_2_and_keeps_the_outbox(self):
+        from tests.test_reponame import HeldLock
+
+        self.seed()
+        self.store.enqueue("acme/app", 1, "agent", "agent-1", now=T0 - 50)
+        code = self.run_locked(MirrorTracker(), HeldLock())
+        self.assertEqual(code, 2)
+        self.assertIn("another drive pass", self.err.getvalue())
+        self.assertIn("/state/drive.lock", self.err.getvalue())
+        self.assertEqual(len(self.store.queued_writes()), 1)
+
+    def test_mirror_writes_run_under_the_lock(self):
+        from tests.test_reponame import RecordingLock
+
+        self.seed()
+        self.store.enqueue("acme/app", 1, "agent", "agent-1", now=T0 - 50)
+        rec = RecordingLock()
+        seen = {}
+
+        class WatchingTracker(MirrorTracker):
+            def write(self, repo, number, field, value):
+                seen["held"] = rec.held
+                super().write(repo, number, field, value)
+
+        code = self.run_locked(WatchingTracker(), rec)
+        self.assertEqual(code, 0)
+        self.assertTrue(seen.get("held"))
+        self.assertEqual(rec.paths, ["/state/drive.lock"])
+
+    def test_missing_lock_fails_closed(self):
+        self.seed()
+        self.store.enqueue("acme/app", 1, "agent", "agent-1", now=T0 - 50)
+        code = self.run_locked(MirrorTracker(), None)
+        self.assertEqual(code, 4)
+        self.assertIn("lock", self.err.getvalue())
+        self.assertEqual(len(self.store.queued_writes()), 1)
+
+    def test_lock_setup_failure_exits_4(self):
+        from korapy import drive
+
+        self.seed()
+        self.store.enqueue("acme/app", 1, "agent", "agent-1", now=T0 - 50)
+
+        class BrokenLock:
+            def __call__(self, path):
+                raise drive.LockError(f"cannot open the drive lock {path}: boom")
+
+        code = self.run_locked(MirrorTracker(), BrokenLock())
+        self.assertEqual(code, 4)
+        self.assertIn("boom", self.err.getvalue())
+        self.assertEqual(len(self.store.queued_writes()), 1)
 
 
 if __name__ == "__main__":

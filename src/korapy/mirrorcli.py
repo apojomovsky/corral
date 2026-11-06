@@ -1,4 +1,8 @@
-"""`korapy mirror`: push the board store's outbox into the tracker."""
+"""`korapy mirror`: push the board store's outbox into the tracker.
+
+Exit codes: 0 a write landed, 1 nothing queued, 2 a rename or a
+drive pass holds the drive lock, 3 every attempted write failed or a
+rate limit stopped the pass with nothing sent, 4 usage error."""
 
 import argparse
 import json
@@ -8,7 +12,7 @@ import time
 
 from korapy import board, mirror, settings, syncli
 
-OK, NOTHING, UNREACHABLE, USAGE = 0, 1, 3, 4
+OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
 
 
 def _err(text, err):
@@ -29,6 +33,8 @@ def mirror_root(
     err,
     operators=None,
     tracker_factory=None,
+    lock=None,
+    lock_path=None,
 ) -> int:
     """Push the queued outbox writes into the tracker and report.
 
@@ -37,10 +43,59 @@ def mirror_root(
     does. ``tracker_factory`` maps a tracker repo to its tracker, built by
     the one factory (labels or board); when omitted the single ``tracker``
     serves every repo, pushing through each repo's own tracker otherwise.
-    All seams injected; exit codes follow the module docstring: 0 a
-    write landed, 1 nothing queued, 3 every attempted write failed or a
-    rate limit stopped the pass with nothing sent, 4 usage error.
+    All seams injected; exit codes follow the module docstring. ``lock``
+    is the drive-lock seam (``drive.drive_lock``, taking ``lock_path``
+    from the one resolver ``drive.lock_path``), required: the whole
+    pass runs under it, so a mirror cannot push while a rename migrates
+    the keys it writes through; a held lock refuses with exit 2 naming
+    the holder, and a missing lock fails closed with exit 4 instead of
+    mirroring unguarded.
     """
+    if lock is None:
+        _err("cannot mirror without the drive lock: refusing unguarded", err)
+        return USAGE
+    from korapy import drive
+
+    try:
+        with lock(lock_path):
+            return _mirror_body(
+                root,
+                names,
+                limit=limit,
+                as_json=as_json,
+                tracker=tracker,
+                store=store,
+                git=git,
+                now=now,
+                out=out,
+                err=err,
+                operators=operators,
+                tracker_factory=tracker_factory,
+            )
+    except drive.LockHeld as held:
+        _err(str(held), err)
+        return RACE
+    except drive.LockError as problem:
+        _err(str(problem), err)
+        return USAGE
+
+
+def _mirror_body(
+    root,
+    names,
+    *,
+    limit,
+    as_json,
+    tracker,
+    store,
+    git,
+    now,
+    out,
+    err,
+    operators=None,
+    tracker_factory=None,
+) -> int:
+    """The resolve and push behind `mirror_root`: run unlocked."""
     try:
         wanted = settings.repo_names(root)
     except settings.SettingsError as problem:
@@ -110,7 +165,7 @@ def mirror_root(
 
 
 def cmd_mirror(args: argparse.Namespace) -> int:
-    from korapy import trackers
+    from korapy import drive, trackers
 
     root = settings.find_root(os.getcwd())
     if root is None:
@@ -149,6 +204,8 @@ def cmd_mirror(args: argparse.Namespace) -> int:
             out=sys.stdout,
             err=sys.stderr,
             tracker_factory=by_repo.__getitem__,
+            lock=drive.drive_lock,
+            lock_path=drive.lock_path(),
         )
 
 
