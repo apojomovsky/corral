@@ -1915,7 +1915,7 @@ def sync_all(store, tracker_factory, *, operators, now):
     try:
         repos = store.repos()
     except (board.StoreError, sqlite3.Error) as err:
-        return 0, [], [f"store repo listing unreadable: {err}"], [], []
+        return 0, [], [f"store repo listing unreadable: {err}"], [], [], []
     for repo in sorted(repos):
         try:
             tracker = tracker_factory(repo)

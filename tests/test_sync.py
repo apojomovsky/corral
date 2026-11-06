@@ -496,6 +496,19 @@ class ResyncAdoptionTest(StoreCase):
         self.assertIn(drive.MANAGED_PREFIX, sync.RESERVED_AGENT_PREFIXES)
 
 
+class UnreadableListingStore:
+    """A store whose repo listing and rows cannot be read."""
+
+    def __init__(self, problem):
+        self.problem = problem
+
+    def repos(self):
+        raise self.problem
+
+    def items(self, *args, **kwargs):
+        raise self.problem
+
+
 class SyncAllTest(StoreCase):
     OTHER = "acme/api"
 
@@ -595,6 +608,25 @@ class SyncAllTest(StoreCase):
         self.assertIn("tracker rejected", refused[0])
         self.assertEqual(store_errors, [])
         self.assertEqual(adopt_errors, [])
+
+    def test_unreadable_repo_listing_is_one_store_line(self):
+        for problem in (
+            board.StoreError("test listing unreadable"),
+            sqlite3.OperationalError("test listing unreadable"),
+        ):
+            with self.subTest(problem=type(problem).__name__):
+                store = UnreadableListingStore(problem)
+                self.assertEqual(
+                    drive.sync_all(store, self.factory({}), operators=["alice"], now=T0),
+                    (
+                        0,
+                        [],
+                        [f"store repo listing unreadable: {problem}"],
+                        [],
+                        [],
+                        [],
+                    ),
+                )
 
     def test_rejected_board_schema_is_refused_not_an_error(self):
         class RejectingBoardTracker(FakeTracker):

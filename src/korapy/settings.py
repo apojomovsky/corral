@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 from korapy import paths
+from korapy.boardstatus import STATUS_ID_ATTRS
 from korapy.trackers import VARIANTS
 
 if TYPE_CHECKING:
@@ -366,15 +367,12 @@ _BOARD_COLUMNS = (
     "blocked_by_column",
 )
 
-#: Concept keys holding a Status option id per derived state; all
-#: default to unmapped when the table omits them, and a state with no
-#: id is never synced.
-_BOARD_STATUS_IDS = (
-    "status_available",
-    "status_claimed",
-    "status_review",
-    "status_done",
-)
+#: Concept keys holding a Status option id per derived state; the one
+#: source is ``boardstatus.STATUS_ID_ATTRS`` (the state-to-attribute
+#: map the status step and the doctor resolve ids through), read here
+#: as plain attribute names. All default to unmapped when the table
+#: omits them, and a state with no id is never synced.
+_BOARD_STATUS_IDS = tuple(attr for _, attr in STATUS_ID_ATTRS)
 
 #: The concept keys a ``[[repo]]`` entry's ``[board]`` table may hold, on
 #: the ``[private]`` precedent: strict keys, so a typo fails here instead

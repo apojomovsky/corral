@@ -8,7 +8,7 @@ import os
 import tempfile
 import unittest
 
-from korapy import settings
+from korapy import boardstatus, settings
 
 
 def resolve(**kw):
@@ -312,6 +312,12 @@ class KeyLinkage(unittest.TestCase):
 
     def test_status_ids_are_a_subset_of_keys(self):
         self.assertLessEqual(set(settings._BOARD_STATUS_IDS), set(settings._BOARD_KEYS))
+
+    def test_status_ids_are_the_status_step_attributes(self):
+        self.assertEqual(
+            tuple(settings._BOARD_STATUS_IDS),
+            tuple(attr for _, attr in boardstatus.STATUS_ID_ATTRS),
+        )
 
     def test_keys_are_address_columns_status_ids_and_map(self):
         self.assertEqual(
