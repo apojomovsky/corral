@@ -189,6 +189,19 @@ class GuideTest(unittest.TestCase):
             with self.subTest(snippet=snippet):
                 self.assertIn(snippet, self.text)
 
+    def test_the_guide_documents_the_repo_rename_verb(self):
+        self.assertNotIn("There is no rename verb", self.text)
+        for snippet in (
+            "korapy repo rename OLD NEW",
+            "outbox",
+            "cursors",
+            "not touched",
+            "backup",
+            "pause",
+        ):
+            with self.subTest(snippet=snippet):
+                self.assertIn(snippet, self.text)
+
 
 if __name__ == "__main__":
     unittest.main()

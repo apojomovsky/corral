@@ -11,6 +11,7 @@ from typing import Any
 from unittest import mock
 
 from korapy import board, cli, settings, sync, syncli, tracker
+from tests.test_reponame import RecordingLock
 from tests.test_tracker import FakeTracker, reading
 
 
@@ -75,6 +76,8 @@ class SyncRootCase(unittest.TestCase):
             "now": T0,
             "out": self.out,
             "err": self.err,
+            "lock": RecordingLock(),
+            "lock_path": "/state/drive.lock",
         }
         params.update(over)
         return syncli.sync_root(self.root, list(names), **params)
@@ -432,6 +435,61 @@ class RepoOperatorsTest(SyncRootCase):
         entries, problem = syncli.repo_operators(self.root, ["app"], git_ok())
         self.assertIsNone(entries)
         self.assertIn("not-a-repo", problem)
+
+
+class SyncLockTest(SyncRootCase):
+    def run_locked(self, fake, lock, lock_path="/state/drive.lock", **over):
+        return self.run_sync(fake, lock=lock, lock_path=lock_path, **over)
+
+    def test_held_lock_exits_2_and_writes_nothing(self):
+        from tests.test_reponame import HeldLock
+
+        fake = FakeTracker([reading(number=1, updated_at=T0)])
+        code = self.run_locked(fake, HeldLock())
+        self.assertEqual(code, 2)
+        self.assertIn("another drive pass", self.err.getvalue())
+        self.assertIn("/state/drive.lock", self.err.getvalue())
+        found, _ = self.store.item(REPO, 1, now=T0)
+        self.assertIsNone(found)
+        self.assertIsNone(self.store.get_cursor(REPO, sync.CURSOR_NAME))
+
+    def test_sync_writes_run_under_the_lock(self):
+        from tests.test_reponame import RecordingLock
+
+        rec = RecordingLock()
+        seen = {}
+
+        class WatchingTracker(FakeTracker):
+            def changes(self, repo, cursor):
+                seen["held"] = rec.held
+                return super().changes(repo, cursor)
+
+        code = self.run_locked(WatchingTracker([reading(number=1, updated_at=T0)]), rec)
+        self.assertEqual(code, 0)
+        self.assertTrue(seen.get("held"))
+        self.assertEqual(rec.paths, ["/state/drive.lock"])
+
+    def test_missing_lock_fails_closed(self):
+        fake = FakeTracker([reading(number=1, updated_at=T0)])
+        code = self.run_locked(fake, None)
+        self.assertEqual(code, 4)
+        self.assertIn("lock", self.err.getvalue())
+        found, _ = self.store.item(REPO, 1, now=T0)
+        self.assertIsNone(found)
+
+    def test_lock_setup_failure_exits_4(self):
+        from korapy import drive
+
+        class BrokenLock:
+            def __call__(self, path):
+                raise drive.LockError(f"cannot open the drive lock {path}: boom")
+
+        fake = FakeTracker([reading(number=1, updated_at=T0)])
+        code = self.run_locked(fake, BrokenLock())
+        self.assertEqual(code, 4)
+        self.assertIn("boom", self.err.getvalue())
+        found, _ = self.store.item(REPO, 1, now=T0)
+        self.assertIsNone(found)
 
 
 if __name__ == "__main__":
