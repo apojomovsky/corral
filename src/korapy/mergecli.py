@@ -62,7 +62,7 @@ def _production_forge():
 
 
 def cmd_merge(args: argparse.Namespace, forge=None) -> int:
-    from korapy import forge as iface, merge, settings
+    from korapy import forge as iface, merge, reviewrecord, settings, syncli
     from korapy.github import forge as ghforge
 
     if args.pr is None:
@@ -77,8 +77,13 @@ def cmd_merge(args: argparse.Namespace, forge=None) -> int:
         return USAGE
     try:
         root = settings.find_root(os.getcwd())
-        if root is not None and args.repo in settings.repo_names(root):
-            resolved = settings.load(root=root, repo=args.repo)
+        ticket_repo = reviewrecord.local_repo(args.repo, syncli.short_to_tracker(root, _git))
+    except ValueError as err:
+        _err(f"korapy merge: {err}")
+        return USAGE
+    try:
+        if root is not None and ticket_repo in settings.repo_names(root):
+            resolved = settings.load(root=root, repo=ticket_repo)
         else:
             resolved = settings.load(root=root)
     except settings.SettingsError as err:
@@ -92,7 +97,7 @@ def cmd_merge(args: argparse.Namespace, forge=None) -> int:
     adapter = forge if forge is not None else _production_forge()
     try:
         result = merge.run_merge(
-            args.repo,
+            ticket_repo,
             args.number,
             want,
             args.pr,

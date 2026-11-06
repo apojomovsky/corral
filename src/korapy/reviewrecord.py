@@ -33,6 +33,54 @@ from korapy import paths
 #: Where review records live under a ticket's session dir.
 REVIEWS_DIRNAME = "reviews"
 
+
+def local_repo(repo, short_to_tracker):
+    """The session-dir repo name for a store key or entry name. Pure.
+
+    `short_to_tracker` is the `{short [[repo]] name: tracker repo}`
+    map (the drive pass builds it once per pass through its one
+    resolver; single-root callers through the shared per-repo map).
+    Records live beside the ticket's session dir, which is named for
+    the short entry name, while the store and the loop key tickets by
+    the tracker repo: this is the one place that spelling is decided,
+    so writers and every reader agree on the directory.
+
+    A known short name reads as itself; a known tracker repo reads as
+    its short name (the first entry wins when two shorts feed one
+    tracker repo). Any other plain name keeps itself, so records
+    written under a short name no project registers anymore still
+    read. Anything else (a tracker repo no entry feeds, a blank)
+    raises ValueError naming the key: the caller reports it, never an
+    empty result from a swallowed lookup.
+    """
+    key = str(repo or "")
+    if key in short_to_tracker:
+        return key
+    for short, tracker in short_to_tracker.items():
+        if tracker == key:
+            return short
+    if paths.plain_repo_name(key):
+        return key
+    raise ValueError(f"unknown repository {key!r}: no [[repo]] entry feeds it")
+
+
+def store_reader(short_to_tracker, sessions_root=None):
+    """A `review_records_for` read over store keys: `(repo, number) -> record`.
+
+    Translates the store's tracker repo through :func:`local_repo`
+    before reading the ticket's latest record, so the loop finds the
+    record the reviewer wrote under the short name. `sessions_root`
+    pins the session tree (tests); None reads the host default. An
+    unresolvable key raises ValueError naming it, for the caller to
+    report loudly.
+    """
+
+    def read(repo, number):
+        return latest_record(local_repo(repo, short_to_tracker), number, sessions_root)
+
+    return read
+
+
 #: The verdicts a reviewer may state.
 VERDICTS = ("approve", "approve-with-findings", "block")
 
