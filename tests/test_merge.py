@@ -510,13 +510,14 @@ class MergeMethodTest(MergeCase):
 class PendingWaitTest(MergeCase):
     """Pending checks are a wait, not a failure; `--wait` polls the forge."""
 
-    def pr(self, checks_state):
+    def pr(self, checks_state, pending=0):
         return make_pr(
             repo=FORGE_REPO,
             number=PR,
             base_sha=self.base,
             head_sha=self.head,
             checks_state=checks_state,
+            checks_pending=pending,
         )
 
     def clock(self):
@@ -533,18 +534,21 @@ class PendingWaitTest(MergeCase):
         return now_fn, sleep_fn, sleeps
 
     def test_pending_checks_report_pending_with_wait_advice(self):
-        result = self.do_merge(self.fake(checks_state="pending"), plan=True)
+        result = self.do_merge(self.fake(checks_state="pending", checks_pending=2), plan=True)
         self.assertEqual(result.exit_code, 1)
         row = self.row(result, "checks")
         self.assertEqual(row.status, "pending")
+        self.assertIn("2", row.detail)
         self.assertIn("wait", row.detail)
         self.assertNotIn("fix the branch", row.detail)
         self.assertFalse(result.merged)
 
     def test_pending_checks_block_the_merge_without_merging(self):
-        result = self.do_merge(self.fake(checks_state="pending"))
+        result = self.do_merge(self.fake(checks_state="pending", checks_pending=2))
         self.assertEqual(result.exit_code, 1)
-        self.assertEqual(self.row(result, "checks").status, "pending")
+        row = self.row(result, "checks")
+        self.assertEqual(row.status, "pending")
+        self.assertIn("2", row.detail)
         self.assertFalse(result.merged)
         self.assertIsNone(result.merge_sha)
 
@@ -560,7 +564,7 @@ class PendingWaitTest(MergeCase):
         self.commit("more work")
         head = self.rev("HEAD")
         self.approve(head, verdict="block")
-        fake = SequenceForge([self.pr("pending")._replace(head_sha=head)])
+        fake = SequenceForge([self.pr("pending", 2)._replace(head_sha=head)])
         now_fn, sleep_fn, sleeps = self.clock()
         result = merge.run_merge(
             REPO,
@@ -583,7 +587,7 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(len(fake.requested), 1)
 
     def test_wait_polls_until_passing_then_merges(self):
-        fake = SequenceForge([self.pr("pending"), self.pr("pending"), self.pr("passing")])
+        fake = SequenceForge([self.pr("pending", 2), self.pr("pending", 1), self.pr("passing")])
         now_fn, sleep_fn, sleeps = self.clock()
         result = merge.run_merge(
             REPO,
@@ -606,7 +610,7 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(len(fake.calls), 1)
 
     def test_wait_stops_on_a_failing_check(self):
-        fake = SequenceForge([self.pr("pending"), self.pr("failing")])
+        fake = SequenceForge([self.pr("pending", 2), self.pr("failing")])
         now_fn, sleep_fn, sleeps = self.clock()
         result = merge.run_merge(
             REPO,
@@ -630,7 +634,7 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(sleeps, [10])
 
     def test_wait_times_out_with_pending(self):
-        fake = SequenceForge([self.pr("pending")])
+        fake = SequenceForge([self.pr("pending", 3)])
         now_fn, sleep_fn, sleeps = self.clock()
         result = merge.run_merge(
             REPO,
@@ -647,7 +651,11 @@ class PendingWaitTest(MergeCase):
             sleep_fn=sleep_fn,
         )
         self.assertEqual(result.exit_code, 1)
-        self.assertEqual(self.row(result, "checks").status, "pending")
+        row = self.row(result, "checks")
+        self.assertEqual(row.status, "pending")
+        self.assertIn("3", row.detail)
+        self.assertIn("wait", row.detail)
+        self.assertNotIn("fix the branch", row.detail)
         self.assertFalse(result.merged)
         self.assertEqual(fake.calls, [])
         self.assertEqual(len(sleeps), 10)
@@ -871,9 +879,12 @@ class CliTest(MergeCase):
         self.assertIn("not merged", out)
 
     def test_pending_text_names_the_wait(self):
-        code, out, _ = self.call(self.args(plan=True), self.fake(checks_state="pending"))
+        code, out, _ = self.call(
+            self.args(plan=True), self.fake(checks_state="pending", checks_pending=1)
+        )
         self.assertEqual(code, 1)
         self.assertIn("merge checks: pending", out)
+        self.assertIn("1", out)
         self.assertIn("wait", out)
         self.assertIn("not merged", out)
 

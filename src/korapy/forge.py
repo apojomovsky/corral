@@ -60,6 +60,10 @@ class PullRequest(NamedTuple):
     labels: tuple[str, ...]
     checks_state: str  # "passing" | "failing" | "pending" on the head SHA
     merge_sha: str | None  # the merge commit once merged, else None
+    # How many checks on the head SHA are still running. The adapter
+    # fills it from the check-runs read; the default is only for
+    # readers that never performed one (fakes set it explicitly).
+    checks_pending: int = 0
 
 
 class Forge(Protocol):

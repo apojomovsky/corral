@@ -520,9 +520,14 @@ PR fetch, so the merge gate needs no second seam:
 
 - `checks_state: str`: `"passing"`, `"failing"` or `"pending"`,
   summarizing the forge's check statuses on the head SHA;
+- `checks_pending: int`: how many checks on the head SHA are
+  still running, read from the provider's check-runs for that
+  SHA right after the PR fetch;
 - `merge_sha: str | None`: the merge commit SHA once the PR
   state is `merged`, else None. The verify step ties this SHA to
-  the pinned head.
+  the pinned head. The merge verdict still comes from the one PR
+  read; the count only decorates the pending row, so a slow
+  second read can never flip a decision.
 
 Only the adapters know the provider shape (the GitHub adapter
 parses both from the same `gh api` PR fetch it already

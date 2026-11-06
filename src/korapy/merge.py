@@ -9,8 +9,9 @@ Checks, in gate order: `lock` (the per-repo lock is free), `open`
 pinned `--head`), `review` (the same `mergeup.find_record` reader
 takeoff uses, so both gates agree, including inheritance across a
 clean merge-up), `checks` (the forge check statuses are green; the
-only waivable row: `pending` while they are still running, with a
-wait message and no fix advice), `fork` (the PR is not from a fork;
+only waivable row: `pending` while they are still running, with
+the running count, a wait message and no fix advice), `fork` (the
+PR is not from a fork;
 a maintainer merges those by hand).
 
 `--wait` polls the forge (never the lock) until the `checks` row
@@ -358,7 +359,14 @@ def _evaluate(
     elif pr.checks_state == "passing":
         checks.append(Check("checks", OK_S, "the checks are passing"))
     elif pr.checks_state == "pending":
-        checks.append(Check("checks", PENDING, "the checks are pending: wait for them to finish"))
+        checks.append(
+            Check(
+                "checks",
+                PENDING,
+                f"the checks are pending ({pr.checks_pending} still running): "
+                "wait for them to finish",
+            )
+        )
     else:
         checks.append(
             Check(
