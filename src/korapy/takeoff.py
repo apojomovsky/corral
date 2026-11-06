@@ -15,44 +15,40 @@ check runner (`run_cmd`) are injected seams with no default, so tests use
 fakes and temp repositories; the CLI wires the real ones. Every other git
 call here is a local verb.
 
-The commands step runs under a host-level lock, so two worktrees on one
-host never run the full suite at once: a second takeoff waits for the
-lock up to `checks.suite_lock_timeout_s` (resolved once per run), then
-gives up with exit 75. The lock is an advisory `flock` on
-`takeoff-suite.lock` inside `paths.state_dir()`; the kernel releases it
-when the holder dies, so a dead holder leaves nothing to reap. A takeoff
-with no commands to run never takes the lock.
+A command the project's `[heavy]` table lists runs through the heavy
+lane instead of beside it: in a transient scope with CPU and memory
+limits from the lane budget, with role `takeoff`, and with one ledger
+row recorded per run. An unlisted command runs as before. A takeoff
+with no commands to run starts nothing.
 
 Exit codes: 0 every check ok, skipped or planned, 1 a check failed, 3 the remote
-is unreachable, 4 usage or configuration, 75 the suite lock stayed held
-past the wait. `--skip NAME` waives one policy check and records the
-skip; an unknown name or an identity check (`base`, `worktree`) is
-exit 4. `--plan` resolves every check without running the configured
-commands: each command is reported as `planned`, the suite lock is
-never taken, and `run_cmd` is never called. Exit codes mirror the
-resolved rows.
+is unreachable or a lane scope could not be created, 4 usage or
+configuration. Lane queue waits (exit 75) arrive with the queue ticket;
+this ticket runs listed commands without queueing. `--skip NAME`
+waives one policy check and records the skip; an unknown name or an
+identity check (`base`, `worktree`) is exit 4. `--plan` resolves every
+check without running the configured commands: each command is reported
+as `planned`, and neither `run_cmd` nor the lane runner is ever called.
+Exit codes mirror the resolved rows.
 """
 
-import contextlib
-import errno
-import fcntl
 import functools
 import importlib.machinery
 import importlib.util
 import os
 import re
 import subprocess
-import time
-from collections.abc import Callable
 from typing import NamedTuple
 
 from korapy import (
     detect,
     gitenv,
+    heavy,
     leakcli,
     leakguard,
     mergeup,
     paths,
+    resources,
     reviewrecord,
     settings,
     worktrees,
@@ -71,12 +67,6 @@ OK, FAIL, SKIPPED, PLANNED = STATUSES
 EM_DASH = chr(0x2014)
 settings.register("checks.takeoff", list, [], "takeoff gate commands, run in order in the worktree")
 settings.register("checks.timeout_s", int, 1800, "seconds before a takeoff command is killed")
-settings.register(
-    "checks.suite_lock_timeout_s",
-    int,
-    3600,
-    "seconds a second takeoff waits for the full-suite lock before giving up (exit 75)",
-)
 
 settings.register(
     "checks.no_em_dash", bool, True, "takeoff refuses added lines and bodies with an em-dash"
@@ -513,74 +503,6 @@ def _expired_tail(err):
     return "\n".join(((out or "") + (errs or "")).splitlines()[-20:])
 
 
-#: The full-suite lock file inside the state dir.
-SUITE_LOCK_NAME = "takeoff-suite.lock"
-
-#: Seconds between lock retries while another takeoff holds the suite lock.
-SUITE_LOCK_POLL_S = 1.0
-
-
-class SuiteBusy(Exception):
-    """The suite lock stayed held past the wait (exit 75, try later)."""
-
-    exit_code = 75
-
-
-def suite_lock_path():
-    """The host-level full-suite lock file: inside the state dir.
-
-    The only path join for it (AGENTS.md, "One fact, one place").
-    """
-    return os.path.join(paths.state_dir(), SUITE_LOCK_NAME)
-
-
-#: The lock seams: production locks with fcntl, waits on the monotonic
-#: clock and sleeps between retries; tests assign fakes.
-_flock: Callable[[int, int], None] = fcntl.flock
-_sleep: Callable[[float], None] = time.sleep
-_monotonic: Callable[[], float] = time.monotonic
-
-
-@contextlib.contextmanager
-def suite_lock(path, timeout_s):
-    """Hold an exclusive flock on `path`, waiting up to `timeout_s` seconds.
-
-    The first try is immediate; while another takeoff holds the lock the
-    wait retries every SUITE_LOCK_POLL_S. Contention past the deadline
-    raises SuiteBusy; setup and unexpected lock failures raise
-    TakeoffError. The kernel releases the lock when the holder dies, so a
-    dead holder is already reclaimed when the next waiter tries.
-    """
-    parent = os.path.dirname(path)
-    if parent:
-        try:
-            os.makedirs(parent, exist_ok=True)
-        except OSError as err:
-            raise TakeoffError(f"cannot set up the suite lock: {err}") from None
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as err:
-        raise TakeoffError(f"cannot open the suite lock {path}: {err}") from None
-    deadline = _monotonic() + timeout_s
-    try:
-        while True:
-            try:
-                _flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except OSError as err:
-                if err.errno not in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-                    raise TakeoffError(f"cannot lock {path}: {err}") from None
-            if _monotonic() >= deadline:
-                raise SuiteBusy(
-                    f"another takeoff holds the full-suite lock ({path}): "
-                    f"waited {timeout_s}s, run takeoff again later"
-                )
-            _sleep(SUITE_LOCK_POLL_S)
-        yield
-    finally:
-        os.close(fd)
-
-
 def _wanted_commands(commands, test_command, with_test):
     """The takeoff commands to run or plan, in order (the one resolver).
 
@@ -598,12 +520,41 @@ def _wanted_commands(commands, test_command, with_test):
 def _planned_checks(wanted):
     """One `planned` row per command: the plan lists what would run.
 
-    Nothing executes and the suite lock is never taken. With no commands
-    the group reports ok, the same row a run would report.
+    Nothing executes: neither `run_cmd` nor the lane runner is called.
+    With no commands the group reports ok, the same row a run would
+    report.
     """
     if not wanted:
         return [Check("checks", OK, "no takeoff commands configured", "")]
     return [Check("checks", PLANNED, f"`{cmd}`", "") for cmd in wanted]
+
+
+def _timed_out_row(cmd, err, scrub, timeout_s):
+    """The checks row for a command killed past `checks.timeout_s`."""
+    tail = _expired_tail(err)
+    detail = f"`{cmd}` exceeded checks.timeout_s ({timeout_s}s)"
+    if tail.strip():
+        detail += f":\n{tail}"
+    return Check(
+        "checks",
+        FAIL,
+        scrub(detail),
+        f"raise checks.timeout_s or fix the hang: run `{cmd}` in the worktree",
+    )
+
+
+def _failed_row(cmd, code, text, scrub):
+    """The checks row for a command that exited nonzero, with the tail shown."""
+    tail = "\n".join((text or "").splitlines()[-20:])
+    detail = f"`{cmd}` exited {code}"
+    if tail.strip():
+        detail += f":\n{tail}"
+    return Check(
+        "checks",
+        FAIL,
+        scrub(detail),
+        f"run `{cmd}` in the worktree and fix what it reports",
+    )
 
 
 def _check_commands(
@@ -615,54 +566,74 @@ def _check_commands(
     scrub,
     timeout_s,
     *,
-    lock_path,
-    lock_timeout_s,
+    heavy_cfg=None,
+    budget=None,
+    heavy_run=None,
+    repo_key=None,
 ):
     """Each configured takeoff command exits 0, with the tail shown on failure.
 
-    The commands run under the host-level suite lock, so two worktrees on
-    one host never run the full suite at once; when the lock stays held
-    past `lock_timeout_s` the wait raises SuiteBusy instead of returning
-    a row. A takeoff with nothing to run returns ok without the lock.
+    A command the project's `[heavy]` table lists runs through the lane
+    instead of beside it: in a transient scope with the lane budget, with
+    role `takeoff`, through the `heavy_run` seam (required whenever the
+    lane could route, so a missed fake fails closed). `repo_key` is the
+    resolved ledger repo, computed once per run by the caller. An
+    unlisted command runs through `run_cmd` as before. A takeoff with
+    nothing to run returns ok and starts nothing. A lane scope the
+    manager cannot create propagates as heavy.ScopeUnreachable (the
+    caller maps it to exit 3); other lane failures raise TakeoffError.
     """
     wanted = _wanted_commands(commands, test_command, with_test)
     if not wanted:
         return Check("checks", OK, "no takeoff commands configured", "")
-    with suite_lock(lock_path, lock_timeout_s):
-        for cmd in wanted:
+    env = None
+    for cmd in wanted:
+        if heavy_cfg is not None and heavy.is_heavy(heavy_cfg, cmd):
+            if heavy_run is None:
+                raise TakeoffError("a heavy command is listed but no lane runner was given")
+            if repo_key is None:
+                try:
+                    repo_key = heavy.repo_key(toplevel)
+                except settings.SettingsError as err:
+                    raise TakeoffError(str(err)) from None
+            if env is None:
+                env = gitenv.clean_env()
             try:
-                proc = run_cmd(cmd, toplevel)
+                result = heavy_run(
+                    ["/bin/sh", "-c", cmd],
+                    toplevel,
+                    env,
+                    role="takeoff",
+                    repo=repo_key,
+                    weight=heavy.weight_for(heavy_cfg, cmd),
+                    budget=budget,
+                    timeout=timeout_s,
+                    starved_ratio=heavy_cfg.starved_ratio,
+                )
             except subprocess.TimeoutExpired as err:
-                tail = _expired_tail(err)
-                detail = f"`{cmd}` exceeded checks.timeout_s ({timeout_s}s)"
-                if tail.strip():
-                    detail += f":\n{tail}"
-                return Check(
-                    "checks",
-                    FAIL,
-                    scrub(detail),
-                    f"raise checks.timeout_s or fix the hang: run `{cmd}` in the worktree",
-                )
-            except Exception as err:
-                return Check(
-                    "checks",
-                    FAIL,
-                    f"`{cmd}` could not run: {err}",
-                    f"run `{cmd}` in the worktree and fix what it reports",
-                )
-            if proc is None or getattr(proc, "returncode", 1) != 0:
-                code = getattr(proc, "returncode", "?")
-                text = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
-                tail = "\n".join(text.splitlines()[-20:])
-                detail = f"`{cmd}` exited {code}"
-                if tail.strip():
-                    detail += f":\n{tail}"
-                return Check(
-                    "checks",
-                    FAIL,
-                    scrub(detail),
-                    f"run `{cmd}` in the worktree and fix what it reports",
-                )
+                return _timed_out_row(cmd, err, scrub, timeout_s)
+            except heavy.ScopeUnreachable:
+                raise
+            except heavy.HeavyError as err:
+                raise TakeoffError(str(err)) from None
+            if result.command_exit != 0:
+                return _failed_row(cmd, result.command_exit, result.output, scrub)
+            continue
+        try:
+            proc = run_cmd(cmd, toplevel)
+        except subprocess.TimeoutExpired as err:
+            return _timed_out_row(cmd, err, scrub, timeout_s)
+        except Exception as err:
+            return Check(
+                "checks",
+                FAIL,
+                f"`{cmd}` could not run: {err}",
+                f"run `{cmd}` in the worktree and fix what it reports",
+            )
+        if proc is None or getattr(proc, "returncode", 1) != 0:
+            code = getattr(proc, "returncode", "?")
+            text = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
+            return _failed_row(cmd, code, text, scrub)
     return Check("checks", OK, "; ".join(f"`{c}`" for c in wanted) if wanted else "", "")
 
 
@@ -676,23 +647,26 @@ def run_takeoff(
     plan=False,
     ls_remote,
     run_cmd,
+    heavy_run,
 ):
     """Run the takeoff gate over `path`; returns a Result.
 
     `ls_remote(branch, cwd)` returns the remote base SHA or raises
-    LsRemoteError; `run_cmd(cmd, cwd)` runs one takeoff command. Both are
-    required: no default may silently answer for the remote or the suite.
+    LsRemoteError; `run_cmd(cmd, cwd)` runs one takeoff command;
+    `heavy_run(argv, cwd, env, ...)` runs one listed heavy command
+    through the lane with role `takeoff`. All three are required: no
+    default may silently answer for the remote, the suite or the lane.
     `skips` names policy checks `--skip` waives; an unknown or identity
     name raises TakeoffError before anything runs. With `plan` every check
     that needs no execution still resolves, and each configured command is
-    reported as `planned` without running it: the suite lock is never taken
-    and `run_cmd` is never called. Usage and configuration problems raise
+    reported as `planned` without running it: neither `run_cmd` nor
+    `heavy_run` is ever called. Usage and configuration problems raise
     TakeoffError (exit 4). Exit 3 returns before any check row, when the
-    remote is unreadable; exit 75 returns the rows so far with the suite
-    wait as the failing checks row.
+    remote is unreadable; exit 3 also returns the rows so far with a
+    failing checks row, when a lane scope cannot be created.
     """
-    if ls_remote is None or run_cmd is None:
-        raise TypeError("run_takeoff needs ls_remote and run_cmd seams")
+    if ls_remote is None or run_cmd is None or heavy_run is None:
+        raise TypeError("run_takeoff needs ls_remote, run_cmd and heavy_run seams")
     skip_set = _resolve_skips(skips)
     if not path or not os.path.isdir(path):
         raise TakeoffError(f"{path}: not a directory")
@@ -770,18 +744,25 @@ def run_takeoff(
     timeout_s = resolved["checks.timeout_s"]
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
         raise TakeoffError("checks.timeout_s must be a positive number of seconds")
-    lock_timeout_s = resolved["checks.suite_lock_timeout_s"]
-    if (
-        isinstance(lock_timeout_s, bool)
-        or not isinstance(lock_timeout_s, int)
-        or lock_timeout_s <= 0
-    ):
-        raise TakeoffError("checks.suite_lock_timeout_s must be a positive number of seconds")
+    project_where = (
+        os.path.join(ops_root, settings.PROJECT_FILE) if ops_root else settings.PROJECT_FILE
+    )
+    try:
+        heavy_cfg = heavy.check_table(resolved.heavy, project_where)
+    except settings.SettingsError as err:
+        raise TakeoffError(str(err)) from None
+    budget = None
+    if heavy_cfg is not None and heavy_cfg.commands:
+        host_where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
+        try:
+            budget = heavy.lane_budget(heavy_cfg, resources.config(resolved).host, where=host_where)
+        except settings.SettingsError as err:
+            raise TakeoffError(str(err)) from None
     if "checks" in skip_set:
-        # A waived group runs nothing and takes no lock.
+        # A waived group runs nothing and starts nothing.
         checks.append(_flag_skip("checks"))
     elif plan:
-        # A plan lists what would run: no lock, no execution.
+        # A plan lists what would run: no execution.
         checks.extend(
             _planned_checks(
                 _wanted_commands(resolved["checks.takeoff"], resolved["checks.test"], with_test)
@@ -800,20 +781,21 @@ def run_takeoff(
                     run_cmd,
                     scrub,
                     timeout_s,
-                    lock_path=suite_lock_path(),
-                    lock_timeout_s=lock_timeout_s,
+                    heavy_cfg=heavy_cfg,
+                    budget=budget,
+                    heavy_run=heavy_run,
                 )
             )
-        except SuiteBusy as busy:
+        except heavy.ScopeUnreachable as gone:
             checks.append(
                 Check(
                     "checks",
                     FAIL,
-                    scrub(str(busy)),
-                    "wait for the other takeoff to finish, then run takeoff again",
+                    scrub(str(gone)),
+                    "check the user manager answers, then run takeoff again",
                 )
             )
-            return Result(base, checks, 75)
+            return Result(base, checks, 3)
     if any(check.status == FAIL for check in checks):
         return Result(base, checks, 1)
     return Result(base, checks, 0)
