@@ -1153,24 +1153,49 @@ def _store_labels(store, now):
     return read
 
 
-def review_records_for(items, *, read):
+def review_records_for(items, *, read, err):
     """{(repo, number): latest review record} for rows with one on file.
 
     `read` is the injected review-record reader ((repo, number) ->
-    record or None, for example `reviewrecord.latest_record`); a row it
-    cannot read counts as having no record, exactly as before. The pass
-    builds this map once from its rows and the gate reads it, so the
-    record files are listed once per pass, not once per candidate.
+    record or None, for example a `reviewrecord.store_reader` over the
+    pass's short-to-tracker map); a row it cannot read counts as
+    having no record, exactly as before. A row it refuses (an
+    unresolvable repository, any other lookup failure) is one loud
+    line on `err` naming the key, never a silent gap: an empty result
+    means no records, not swallowed exceptions. The pass builds this
+    map once from its rows and the gate reads it, so the record files
+    are listed once per pass, not once per candidate.
     """
     found = {}
     for item in items or ():
         try:
             record = read(item.repo, item.number)
-        except Exception:
+        except Exception as exc:
+            print(
+                f"korapy drive: cannot read the review record for "
+                f"{item.repo}#{item.number} ({exc})",
+                file=err,
+            )
             continue
         if record is not None:
             found[(item.repo, item.number)] = record
     return found
+
+
+def production_review_reader(registered, *, git, mapping=None):
+    """A `review_records_for` read over the store's tracker-repo keys.
+
+    Returns the reader that finds each row's record under its short
+    session dir, so the loop sees what the reviewer wrote. `mapping`
+    is the pass's one short-to-tracker map (`production_repo_map`):
+    every builder in one pass gets the same one, so a config edit
+    between them cannot make two joins disagree; with none, the
+    builder resolves its own. Raises SettingsError for bad registry
+    or project settings, like the sibling production builders: the
+    pass refuses instead of gating blind.
+    """
+    mapping = _resolved_map(registered, mapping, git)
+    return reviewrecord.store_reader(mapping)
 
 
 def missing_review_records(finished, reviews) -> list:
@@ -1584,7 +1609,11 @@ def _pass(
     finished = resolve_finished(
         finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
     )
-    reviews = review_records_for(items, read=review_reader) if review_reader is not None else None
+    reviews = (
+        review_records_for(items, read=review_reader, err=err)
+        if review_reader is not None
+        else None
+    )
     gated_rows, problems, _ = _gate_all(
         items,
         registered,
@@ -2868,8 +2897,9 @@ def production_repo_map(registered, *, git=None):
     """`{short [[repo]] name: tracker repo}` across registered roots.
 
     The one resolver for the tracker repo behind a registry entry's
-    short ticket repo: each root's entries resolve through the shared
-    `repo_operators`, and the first project naming a short name wins.
+    short ticket repo: each root resolves through the shared
+    `syncli.root_short_map`, and the first project naming a short
+    name wins.
     A configuration problem raises SettingsError, so the pass refuses
     with exit 4 instead of joining against a guess. The CLI builds it
     once per pass and threads it into the admission live set, the
@@ -2883,11 +2913,7 @@ def production_repo_map(registered, *, git=None):
     git = syncli._git if git is None else git
     found = {}
     for project in registered:
-        names = settings.repo_names(project.root)
-        entries, problem = syncli.repo_operators(project.root, names, git)
-        if problem is not None:
-            raise settings.SettingsError(problem)
-        for name, (tracker_repo, _operators) in entries.items():
+        for name, tracker_repo in syncli.root_short_map(project.root, git).items():
             found.setdefault(name, tracker_repo)
     return found
 
@@ -3863,19 +3889,26 @@ def _claim_and_launch(
 def _local_repo(root, repo):
     """The `[[repo]]` entry name behind tracker repo `repo`.
 
-    The reverse of the one short-to-tracker resolver, read through the
-    same shared `repo_operators`: only the entry whose resolved tracker
-    repo names it wins, an entry name that merely equals `repo` is not
-    a mapping, and a reported problem is surfaced, never masked.
-    Anything else is a `LaunchError` naming the root and the repo.
+    The reverse of the one short-to-tracker resolver: the spelling
+    itself is decided by `reviewrecord.local_repo` over the root's
+    shared short-to-tracker map, so this never grows a second copy
+    of the tracker-to-short join. Only the entry whose resolved
+    tracker repo names it wins, an entry name that merely equals
+    `repo` is not a mapping, and a reported problem is surfaced,
+    never masked. Anything else is a `LaunchError` naming the root
+    and the repo.
     """
-    entries, problem = syncli.repo_operators(root, settings.repo_names(root), worktrees.git)
-    if problem is not None:
-        raise launch.LaunchError(problem)
-    for name, (tracker_repo, _operators) in entries.items():
-        if tracker_repo == repo:
-            return name
-    raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
+    try:
+        mapping = syncli.root_short_map(root, worktrees.git)
+    except settings.SettingsError as problem:
+        raise launch.LaunchError(str(problem)) from None
+    try:
+        short = reviewrecord.local_repo(repo, mapping)
+    except ValueError as err:
+        raise launch.LaunchError(f"{root}: {err}") from None
+    if mapping.get(short) != repo:
+        raise launch.LaunchError(f"{root}: no [[repo]] entry feeds tracker repo {repo!r}")
+    return short
 
 
 def _overlay_text(root):
@@ -4335,7 +4368,7 @@ def _launching_pass(
             print(f"korapy drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
     if review_reader is not None:
-        reviews = review_records_for(_items, read=review_reader)
+        reviews = review_records_for(_items, read=review_reader, err=err)
     else:
         reviews = None
     gated_rows, problems, eligible_keys = _gate_all(
