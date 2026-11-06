@@ -369,6 +369,25 @@ class StatusCase(HeavyCliCase):
         self.assertIn("make check", out)
         self.assertIn("released", out)
 
+    def test_status_text_with_malformed_recent_rows_is_exit_0(self):
+        from korapy import heavycli
+
+        self._seed_lane()
+        heavy.record_bypass(["make", "check"], "release fix", now=ARRIVED + 20.0)
+        path = heavy.lane_path()
+        with open(path, encoding="utf-8") as handle:
+            lane = json.load(handle)
+        lane["recent"].append({"outcome": "x", "command": 5})
+        lane["recent"].append({"outcome": "y", "command": "make check"})
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(lane))
+        code, out, _ = self._read_stdout(heavycli.cmd_status, _status_args(), now=ARRIVED + 30.0)
+        self.assertEqual(code, 0)
+        self.assertIn("recent x", out)
+        self.assertIn("recent y", out)
+        self.assertIn("make check", out)
+        self.assertNotIn("m a k e", out)
+
     def test_status_text_with_no_recent_says_so(self):
         from korapy import heavycli
 
