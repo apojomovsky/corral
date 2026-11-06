@@ -23,7 +23,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from korapy import board, drive, registry
+from korapy import board, drive, registry, settings
 from korapy import projects as projects_mod
 from tests.test_drive import stored
 from tests.test_drive_claims import FakeLauncher, drive_pass
@@ -133,11 +133,192 @@ class BuilderKeyTest(RepoKeyCase):
 
     def test_entries_for_an_unmapped_name_keep_their_short_key(self):
         self.register_done(UNIT, at=OLD)
-        with mock.patch.object(drive, "_tracker_repo_map", return_value={}):
+        with mock.patch.object(drive, "production_repo_map", return_value={}):
             states, _, tickets, finished_for = self.builders()
         self.assertEqual(tickets, {UNIT: (SHORT, NUMBER)})
         self.assertEqual(finished_for, {(SHORT, NUMBER): (UNIT, "worker")})
         self.assertIn(UNIT, states)
+
+
+class OneMapPerPassTest(RepoKeyCase):
+    def test_given_the_pass_map_the_builders_never_resolve_their_own(self):
+        self.register_done(UNIT_R1, at=OLD)
+        with mock.patch.object(
+            drive,
+            "production_repo_map",
+            side_effect=AssertionError("the pass must build the map once"),
+        ):
+            states, _, tickets = drive.production_stuck_inputs(
+                self.registered, now=NOW, path=self.regdir, git=dead_git, mapping={SHORT: TRACKER}
+            )
+            finished_for = drive.production_finished_for(
+                self.registered,
+                now=NOW,
+                cfg=self.cfg,
+                path=self.regdir,
+                git=dead_git,
+                mapping={SHORT: TRACKER},
+            )
+        self.assertEqual(tickets, {UNIT_R1: (TRACKER, NUMBER)})
+        self.assertEqual(finished_for, {(TRACKER, NUMBER): (UNIT_R1, "worker")})
+        self.assertIn(UNIT_R1, states)
+
+    def test_given_the_pass_map_orphan_inputs_never_resolve_their_own(self):
+        listed = [(UNIT_R1, "active", "running")]
+        with (
+            mock.patch.object(drive.units, "list_units", return_value=list(listed)),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=AssertionError("the pass must build the map once"),
+            ),
+        ):
+            _present, live, _gone = drive.production_orphan_inputs(
+                self.registered,
+                now=NOW,
+                path=self.regdir,
+                git=dead_git,
+                mapping={SHORT: TRACKER},
+            )
+        self.assertEqual(live, {(TRACKER, NUMBER)})
+
+    def test_the_pass_map_is_the_one_resolver_over_the_roots(self):
+        self.assertEqual(drive.production_repo_map(self.registered, git=dead_git), {SHORT: TRACKER})
+
+    def test_two_roots_sharing_a_short_name_keep_the_first_tracker(self):
+        other = os.path.join(self.tmp.name, "ops2")
+        os.makedirs(other)
+        with open(os.path.join(other, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(TOML.replace(TRACKER, "other/app"))
+        registered = list(self.registered) + [
+            projects_mod.Project(name="green", unit_prefix="green-agent-", root=other),
+        ]
+        self.assertEqual(drive.production_repo_map(registered, git=dead_git), {SHORT: TRACKER})
+
+    def test_the_admission_live_set_keys_on_the_tracker_repo(self):
+        triples = {("blue", SHORT, NUMBER), ("blue", "other/repo", 9)}
+        with mock.patch.object(drive.launch, "admission_state", return_value=triples):
+            live = drive._default_live(self.registered, git=dead_git)
+        self.assertEqual(live, {("blue", TRACKER, NUMBER), ("blue", "other/repo", 9)})
+
+    def test_the_admission_live_set_takes_the_pass_map_when_given(self):
+        triples = {("blue", SHORT, NUMBER)}
+        with (
+            mock.patch.object(drive.launch, "admission_state", return_value=triples),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=AssertionError("the pass must build the map once"),
+            ),
+        ):
+            live = drive._default_live(self.registered, mapping={SHORT: TRACKER})
+        self.assertEqual(live, {("blue", TRACKER, NUMBER)})
+
+    def test_the_pass_threads_its_map_into_the_admission_live_set(self):
+        store = self.claimed_tracker_store()
+        triples = {("blue", SHORT, NUMBER)}
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive.launch, "admission_state", return_value=triples),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=AssertionError("the pass must build the map once"),
+            ),
+        ):
+            code = drive.run_pass(
+                plan=True,
+                store=store,
+                lock_path=os.path.join(self.tmp.name, "drive.lock"),
+                out=out,
+                err=err,
+                now=NOW,
+                projects_fn=lambda: list(self.registered),
+                live=None,
+                limits=drive.admission.Limits(total=4),
+                quotas={},
+                ledger={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                present_agents=frozenset(),
+                live_units=frozenset(),
+                gone_s=3600.0,
+                repo_map={SHORT: TRACKER},
+            )
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_a_claiming_pass_threads_its_map_into_orphan_recovery(self):
+        store = self.claimed_tracker_store()
+        seen = {}
+
+        def fake_orphan(registered, *, now, path=None, git=None, mapping=None):
+            seen.update(registered=registered, mapping=mapping)
+            return frozenset(), frozenset(), GONE_S
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(drive, "production_orphan_inputs", side_effect=fake_orphan),
+            mock.patch.object(
+                drive,
+                "production_repo_map",
+                side_effect=AssertionError("the pass must build the map once"),
+            ),
+        ):
+            code = drive.run_pass(
+                plan=False,
+                store=store,
+                lock_path=os.path.join(self.tmp.name, "drive.lock"),
+                out=out,
+                err=err,
+                now=NOW,
+                projects_fn=lambda: list(self.registered),
+                live=frozenset(),
+                limits=drive.admission.Limits(total=4),
+                quotas={},
+                ledger={},
+                read_labels=lambda kind, repo, number: [],
+                hold_label="hold",
+                present_agents=None,
+                live_units=None,
+                gone_s=None,
+                repo_map={SHORT: TRACKER},
+            )
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual(seen.get("mapping"), {SHORT: TRACKER})
+        self.assertIsNotNone(seen.get("registered"))
+
+
+class BrokenConfigTest(unittest.TestCase):
+    """A project root whose korapy.toml cannot resolve refuses, never guesses."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-broken-config-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = os.path.join(self.tmp.name, "ops")
+        os.makedirs(self.root)
+        with open(os.path.join(self.root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "not-a-repo"\n')
+        self.registered = [
+            projects_mod.Project(name="blue", unit_prefix="blue-agent-", root=self.root),
+        ]
+        patcher = mock.patch.object(
+            drive.registry, "config", return_value=registry.default_config()
+        )
+        self.addCleanup(patcher.stop)
+        patcher.start()
+
+    def test_stuck_inputs_refuse_a_broken_project_config(self):
+        with self.assertRaises(settings.SettingsError):
+            drive.production_stuck_inputs(self.registered, now=NOW, git=dead_git)
+
+    def test_finished_for_refuses_a_broken_project_config(self):
+        with self.assertRaises(settings.SettingsError):
+            drive.production_finished_for(self.registered, now=NOW, git=dead_git)
+
+    def test_orphan_inputs_refuse_a_broken_project_config(self):
+        with self.assertRaises(settings.SettingsError):
+            drive.production_orphan_inputs(self.registered, now=NOW, git=dead_git)
 
 
 class FinishedKeptTest(RepoKeyCase):
