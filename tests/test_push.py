@@ -4,7 +4,7 @@ import unittest
 import unittest.mock
 from contextlib import redirect_stdout
 
-from korapy import push
+from korapy import checkstamp, push
 
 
 def _proc(rc=0, out="", err=""):
@@ -27,6 +27,7 @@ class FakeGit:
         self.digest = digest
         self.remote = remote
         self.branch = branch
+        self.dirty = False
         self.stamp = ""
         self.suite_runs = 0
         self.pushes = 0
@@ -56,6 +57,8 @@ class FakeGit:
             return _proc(0, "" if self.detached else self.branch + "\n")
         if args[:1] == ["hash-object"]:
             return _proc(0, self.digest + "\n")
+        if args == ["status", "--porcelain"]:
+            return _proc(0, " M f\n" if self.dirty else "")
         if args[:1] == ["ls-remote"]:
             if self.ls_error is not None:
                 return _proc(*self.ls_error)
@@ -148,6 +151,153 @@ class VerifiedPushTest(unittest.TestCase):
         self.assertEqual(git.pushes, 0)
 
 
+class ProofDecisionTest(unittest.TestCase):
+    """The hook's one skip resolver: own stamp and matrix proof in, decision out.
+
+    A dirty tree, a missing, corrupt, stale, foreign-tree or
+    foreign-interpreter proof all run the suite. Only an own-stamp hit,
+    or a fresh matrix proof for the identical clean tree, skips it.
+    """
+
+    TREE = "9" * 40
+    OTHER = "8" * 40
+    DIGEST = "d" * 40
+    NOW = 1_800_000_000
+    PYTHONS = ("3.11", "3.14")
+
+    def decide(self, own="hit", matrix="fresh", dirty=False):
+        stamps = {
+            "hit": (f"{self.TREE} {self.DIGEST}\n", f"{self.TREE} {self.DIGEST}"),
+            "miss": ("", f"{self.TREE} {self.DIGEST}"),
+            "unresolvable": ("", ""),
+        }
+        matrices = {
+            "fresh": checkstamp.format_stamp(self.TREE, self.PYTHONS, self.NOW),
+            "missing": "",
+            "corrupt": "not-a-stamp\n",
+            "stale": checkstamp.format_stamp(
+                self.TREE, self.PYTHONS, self.NOW - checkstamp.STAMP_MAX_AGE_S - 1
+            ),
+            "different-tree": checkstamp.format_stamp(self.OTHER, self.PYTHONS, self.NOW),
+            "different-pythons": checkstamp.format_stamp(self.TREE, ("3.11",), self.NOW),
+        }
+        own_text, own_expected = stamps[own]
+        return push.proof_decision(
+            own_text,
+            own_expected,
+            matrices[matrix],
+            tree=self.TREE,
+            pythons=self.PYTHONS,
+            now=self.NOW,
+            dirty=dirty,
+        )
+
+    def test_own_stamp_only_skips_the_suite(self):
+        self.assertEqual(self.decide(own="hit", matrix="missing"), (True, "own-stamp"))
+
+    def test_matrix_proof_only_skips_the_suite(self):
+        self.assertEqual(self.decide(own="miss", matrix="fresh"), (True, "matrix-proof"))
+
+    def test_both_proofs_skip_on_the_own_stamp(self):
+        self.assertEqual(self.decide(own="hit", matrix="fresh"), (True, "own-stamp"))
+
+    def test_no_proof_runs_the_suite(self):
+        self.assertEqual(self.decide(own="miss", matrix="missing"), (False, "missing"))
+
+    def test_a_stale_matrix_proof_runs_the_suite(self):
+        self.assertEqual(self.decide(own="miss", matrix="stale"), (False, "stale"))
+
+    def test_a_matrix_proof_for_another_tree_runs_the_suite(self):
+        self.assertEqual(
+            self.decide(own="miss", matrix="different-tree"), (False, "different-tree")
+        )
+
+    def test_a_dirty_tree_runs_the_suite_despite_a_fresh_matrix_proof(self):
+        self.assertEqual(self.decide(own="miss", matrix="fresh", dirty=True), (False, "dirty-tree"))
+
+    def test_a_dirty_tree_runs_the_suite_despite_an_own_stamp_hit(self):
+        self.assertEqual(self.decide(own="hit", matrix="fresh", dirty=True), (False, "dirty-tree"))
+
+    def test_a_corrupt_matrix_proof_runs_the_suite(self):
+        self.assertEqual(self.decide(own="miss", matrix="corrupt"), (False, "corrupt"))
+
+    def test_a_matrix_proof_for_other_interpreters_runs_the_suite(self):
+        self.assertEqual(
+            self.decide(own="miss", matrix="different-pythons"),
+            (False, "different-pythons"),
+        )
+
+    def test_an_unresolvable_tree_never_hits_the_own_stamp(self):
+        self.assertEqual(self.decide(own="unresolvable", matrix="missing"), (False, "missing"))
+
+
+class HookDecisionTest(unittest.TestCase):
+    """hook_decision gathers the hook's real inputs through injectable seams."""
+
+    TREE = "9" * 40
+    DIGEST = "d" * 40
+    NOW = 1_800_000_000
+
+    def setUp(self):
+        self.dirty = False
+        self.own_text = ""
+        self.matrix_text = ""
+
+    def git(self, argv, timeout=300, env=None):
+        args = argv[3:] if argv[1] == "-C" else argv[1:]
+        if args == ["rev-parse", "--absolute-git-dir"]:
+            return _proc(0, "/fake/.git\n")
+        if args == ["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"]:
+            return _proc(0, "/fake/.githooks/pre-push\n")
+        if args == ["rev-parse", "HEAD^{tree}"]:
+            return _proc(0, self.TREE + "\n")
+        if args[:1] == ["hash-object"]:
+            return _proc(0, self.DIGEST + "\n")
+        if args == ["status", "--porcelain"]:
+            return _proc(0, " M f\n" if self.dirty else "")
+        raise AssertionError(f"unexpected git call: {args}")
+
+    def read(self, path):
+        if not self.own_text:
+            raise OSError("no stamp")
+        return self.own_text
+
+    def matrix_read(self, path):
+        if not self.matrix_text:
+            raise OSError("no stamp")
+        return self.matrix_text
+
+    def decide(self):
+        return push.hook_decision(
+            "/fake",
+            run=self.git,
+            read=self.read,
+            matrix_read=self.matrix_read,
+            env={},
+            now=self.NOW,
+        )
+
+    def fresh_matrix(self):
+        return checkstamp.format_stamp(self.TREE, checkstamp.MATRIX_PYTHONS, self.NOW)
+
+    def test_an_own_stamp_hit_skips_the_suite(self):
+        self.own_text = f"{self.TREE} {self.DIGEST}\n"
+        self.assertEqual(self.decide(), (True, "own-stamp"))
+
+    def test_a_fresh_matrix_proof_skips_the_suite(self):
+        self.matrix_text = self.fresh_matrix()
+        self.assertEqual(self.decide(), (True, "matrix-proof"))
+
+    def test_a_dirty_tree_runs_the_suite(self):
+        self.own_text = f"{self.TREE} {self.DIGEST}\n"
+        self.matrix_text = self.fresh_matrix()
+        self.dirty = True
+        self.assertEqual(self.decide(), (False, "dirty-tree"))
+
+    def test_no_proof_runs_the_suite(self):
+        self.assertEqual(self.decide(), (False, "missing"))
+
+
 class PushEnvTest(unittest.TestCase):
     ENV = {
         "GIT_CONFIG_COUNT": "3",
@@ -197,29 +347,51 @@ class PushEnvTest(unittest.TestCase):
 
 
 class StampTest(unittest.TestCase):
+    """The own stamp round-trips through record_pass into hook_decision."""
+
+    NOW = 1_800_000_000
+
+    def decide(self, git):
+        def missing(path):
+            raise OSError("no stamp")
+
+        return push.hook_decision(
+            "/fake", run=git.run, read=git.read, matrix_read=missing, env={}, now=self.NOW
+        )
+
     def test_stamp_hit_skips_suite(self):
         git = FakeGit()
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (False, "missing"))
         push.record_pass("/fake", run=git.run, write=git.write)
-        self.assertFalse(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (True, "own-stamp"))
 
     def test_tree_change_invalidates_stamp(self):
         git = FakeGit()
         push.record_pass("/fake", run=git.run, write=git.write)
         git.tree = "TREE2"
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (False, "missing"))
 
     def test_hook_change_invalidates_stamp(self):
         git = FakeGit()
         push.record_pass("/fake", run=git.run, write=git.write)
         git.digest = "DIGEST2"
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (False, "missing"))
 
     def test_missing_hook_never_stamps(self):
         git = FakeGit()
         git.digest = ""
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
         self.assertFalse(push.record_pass("/fake", run=git.run, write=git.write))
+        self.assertEqual(self.decide(git), (False, "missing"))
+
+
+class WorkingDirtyTest(unittest.TestCase):
+    """An unreadable status reads as dirty: the gate fails closed."""
+
+    def test_an_unreadable_status_reads_as_dirty(self):
+        def run(argv, timeout=300, env=None):
+            return _proc(1, "", "fatal: cannot lock ref")
+
+        self.assertTrue(push.working_dirty("/fake", run=run))
 
 
 if __name__ == "__main__":
