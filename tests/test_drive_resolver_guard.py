@@ -56,17 +56,13 @@ TICKET_COMPARE_ALLOW = {
 
 #: (file, enclosing function) pairs allowed to compare a holder id
 #: against a `[0]`-subscripted entry id. `reviewed_claims` reads
-#: `finished` from `resolve_finished`, whose values are holder ids
-#: from this pass's capture, so `newest[0] == agent` there is
-#: holder-vs-holder, never holder-vs-registry. `gate` reads the
-#: finished agent id through `_finished_agent`, so no raw comparison
-#: remains there. `resolve_finished` keeps the raw `prior[0] == agent`
-#: fast path only for same-namespace fixtures with no ticket index
-#: (production always passes one and resolves through
-#: `entry_for_claim`, comparing registry-vs-registry as
+#: `finished` through `_finished_agent`/`_finished_role`, so no raw
+#: comparison remains there. `resolve_finished` keeps the raw
+#: `prior[0] == agent` fast path only for same-namespace fixtures
+#: with no ticket index (production always passes one and resolves
+#: through `entry_for_claim`, comparing registry-vs-registry as
 #: `entry[0] == prior[0]`).
 HOLDER_COMPARE_ALLOW = {
-    ("drive.py", "reviewed_claims"),
     ("drive.py", "resolve_finished"),
 }
 
