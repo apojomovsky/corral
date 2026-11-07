@@ -397,13 +397,14 @@ class DriveAdoptTest(unittest.TestCase):
             adopt_report=tracker.BoardAdopt((), (), (f"{other}#9: boom",), None),
         )
         by_repo = {REPO: first, other: second}
-        seen, errors, store_errors, refused, adopt_errors = drive.sync_all(
+        seen, errors, store_errors, refused, adopt_errors, status_errors = drive.sync_all(
             self.store, lambda repo: by_repo[repo], operators=["alice"], now=T0
         )
         self.assertEqual(first.adopt_calls[0]["limit"], 20)
         self.assertEqual(second.adopt_calls[0]["limit"], 20)
         self.assertEqual(adopt_errors, [f"{REPO}#9: boom", f"{other}#9: boom"])
         self.assertEqual(errors, [])
+        self.assertEqual(status_errors, [])
 
     def test_failed_adds_ride_along_without_failing_the_pass(self):
         fake = AdoptingBoardTracker(
@@ -411,12 +412,13 @@ class DriveAdoptTest(unittest.TestCase):
             board_items=[reading(repo=REPO, number=7, updated_at=T0)],
             adopt_report=failed_adopt(),
         )
-        seen, errors, store_errors, refused, adopt_errors = drive.sync_all(
+        seen, errors, store_errors, refused, adopt_errors, status_errors = drive.sync_all(
             self.store, lambda repo: fake, operators=["alice"], now=T0
         )
         self.assertEqual(errors, [])
         self.assertEqual(refused, [])
         self.assertEqual(adopt_errors, [f"{REPO}#9: boom"])
+        self.assertEqual(status_errors, [])
         self.assertEqual(len(fake.adopt_calls), 1)
         self.assertEqual(fake.adopt_calls[0]["present"], {(REPO, 7)})
 

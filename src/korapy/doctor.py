@@ -38,6 +38,7 @@ from korapy import (
     profiles,
     projects,
     prompts,
+    pushenv,
     quota,
     quota_ledger,
     quotacli,
@@ -1177,14 +1178,35 @@ def _default_branch(origin: str, path: str, git) -> tuple[str, str | None]:
     return "missing", None
 
 
-def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.RepoSite:
+def _push_reading(origin: str, push_probe) -> str | None:
+    """The site's push mode from the gathered probe readings, or None.
+
+    `push_probe` is the `(ssh_ok, gh_ok)` pair gathered once per
+    report, or None when the caller has no reading: then the report
+    carries no push row. The one resolver (`pushenv.resolve`) maps the
+    pair and the origin to the row's reading, so the report agrees with
+    every path that pushes; the pair arrives as injected probes, so the
+    seams never run twice.
+    """
+    if push_probe is None or not origin:
+        return None
+    ssh_ok, gh_ok = push_probe
+    return pushenv.resolve(origin, ssh_probe=lambda: ssh_ok, gh_login=lambda: gh_ok).mode
+
+
+def _repo_site(
+    root: str, name: str, *, git, tracker_factory, push_probe=None
+) -> repodoctor.RepoSite:
     """One repo's remote readings: the origin URL plus label presence.
 
     Read-only: one local `git remote get-url` per clone (no network),
     one label listing per tracker repo, and one `git ls-remote
     --symref` for the remote's default branch, all only when a remote
     is set. Every gather failure degrades to an "unknown" reading
-    naming the repo and the cause, never a raise.
+    naming the repo and the cause, never a raise. `push_probe` is the
+    `(ssh_ok, gh_ok)` pair gathered once per report (None for no push
+    row); the same pair feeds every site, so the probe runs once, not
+    per repo.
     """
     try:
         resolved = settings.load(root, repo=name)
@@ -1216,21 +1238,22 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
     origin = (getattr(proc, "stdout", "") or "").strip()
     if not origin:
         return repodoctor.RepoSite(name, None)
+    push = _push_reading(origin, push_probe)
     tracker_repo = resolved["tracker.repo"] or detect.remote_slug(origin)
     if not tracker_repo:
         return repodoctor.RepoSite(
-            name, origin, cause=f"no owner/name in the origin remote of {path}"
+            name, origin, push=push, cause=f"no owner/name in the origin remote of {path}"
         )
     try:
         repo_tracker = tracker_factory(tracker_repo)
     except KeyError:
-        return repodoctor.RepoSite(name, origin, cause=f"no tracker for {tracker_repo}")
+        return repodoctor.RepoSite(name, origin, push=push, cause=f"no tracker for {tracker_repo}")
     except Exception as err:  # noqa: BLE001 - a failed factory is report data
-        return repodoctor.RepoSite(name, origin, cause=str(err))
+        return repodoctor.RepoSite(name, origin, push=push, cause=str(err))
     try:
         missing = repo_tracker.missing_labels(tracker_repo)
     except Exception as err:  # noqa: BLE001 - a failed read is report data
-        return repodoctor.RepoSite(name, origin, cause=str(err))
+        return repodoctor.RepoSite(name, origin, push=push, cause=str(err))
     try:
         canonical = repo_tracker.canonical_repo(tracker_repo)
     except Exception:  # noqa: BLE001 - an unreadable name is no row, never a traceback
@@ -1240,6 +1263,7 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
         return repodoctor.RepoSite(
             name,
             origin,
+            push=push,
             labels="missing" if missing else "ok",
             cause=branch_cause,
             tracker_repo=tracker_repo,
@@ -1248,6 +1272,7 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
     return repodoctor.RepoSite(
         name,
         origin,
+        push=push,
         branch=branch,
         labels="missing" if missing else "ok",
         tracker_repo=tracker_repo,
@@ -1256,7 +1281,7 @@ def _repo_site(root: str, name: str, *, git, tracker_factory) -> repodoctor.Repo
 
 
 def load_repo_sites(
-    settings_error: str | None, *, git, tracker_factory
+    settings_error: str | None, *, git, tracker_factory, push_probe=None
 ) -> tuple[repodoctor.RepoSite, ...]:
     """Remote-dependent sites for the live report. Never raises.
 
@@ -1264,7 +1289,9 @@ def load_repo_sites(
     read per clone, one remote default-branch read, one label listing
     per tracker repo. Without settings there are no sites (the settings
     row already carries the failure); a repo whose own gathering fails
-    still gets warn rows naming it and the cause.
+    still gets warn rows naming it and the cause. `push_probe` is the
+    `(ssh_ok, gh_ok)` pair gathered once per report (None for no push
+    row); the same pair feeds every site.
     """
     if settings_error is not None:
         return ()
@@ -1278,7 +1305,10 @@ def load_repo_sites(
         names = settings.repo_names(root)
     except (settings.SettingsError, OSError):
         return ()
-    return tuple(_repo_site(root, name, git=git, tracker_factory=tracker_factory) for name in names)
+    return tuple(
+        _repo_site(root, name, git=git, tracker_factory=tracker_factory, push_probe=push_probe)
+        for name in names
+    )
 
 
 def load_prompts_state() -> tuple[tuple[str, ...], tuple[str, ...], str | None]:
@@ -1864,10 +1894,16 @@ def production_env() -> Env:
         resolved, list_fn=production_list_fn, run=production_run
     )
     board_sites, board_error = load_board_sites(settings_error)
+    # The push readings, gathered once per report: one SSH probe and one
+    # `gh` login check feed every site, so neither runs per repo. Both
+    # degrade to False on failure (never a traceback); a wrong-False
+    # only pessimizes the row, never blocks the report.
+    push_probe = (pushenv.default_ssh_probe(), pushenv.default_gh_login())
     repo_sites = load_repo_sites(
         settings_error,
         git=production_git,
         tracker_factory=production_tracker_factory,
+        push_probe=push_probe,
     )
     project_problems, project_policies = load_project_report()
     timer_state = load_timer_state()

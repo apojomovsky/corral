@@ -85,7 +85,7 @@ file never depends on the defaults again).
 | --- | --- | --- | --- | --- |
 | `agent` | `agent_field` | `Agent` | text | korapy (outbox) |
 | `status` | `status_field` | `Agent state` | text | korapy (outbox) |
-| `board_status` | `status_column` | `Status` | single-select | people (read-only) |
+| `board_status` | `status_column` | `Status` | single-select | korapy (Status sync, when mapped), else people |
 | `priority` | `priority_column` | `Priority` | single-select | people (read-only) |
 | `area` | `area_column` | `Area` | single-select | people (read-only) |
 | `pool` | `pool_column` | `Pool` | single-select | people (read-only) |
@@ -109,7 +109,12 @@ REST issue payload, the edges from the sub-issues endpoints
   korapy assigns them no meaning and never tops up a kept field's
   options by name (section 2, step 6). korapy carries the display
   name verbatim into `extra["board_status"]` and gives it no meaning; what a status
-  allows is project eligibility policy, as today. A new GitHub Project
+  allows is project eligibility policy, as today. When the project
+  maps Status option ids in `[repo.board]` (`status_available`,
+  `status_claimed`, `status_review`, `status_done`), korapy also sets
+  the column from the derived state every pass instead of leaving it
+  to people (section 4, "The board step syncs Status every pass").
+  A new GitHub Project
   ships a built-in `Status` single-select field with exactly these
   options, each with a color and a description (VERIFIED: section 9,
   item U1), beside built-in fields for title, assignees, labels,
@@ -176,6 +181,9 @@ Required for board mode to be healthy (doctor section 5 enforces):
 - Every concept the project maps in `korapy.toml` exists on the board
   with the kind above, and every option id in `priority_map` exists on
   the live `Priority` field. This is the existing doctor contract.
+- Every mapped Status option id exists on the live `Status` field.
+  The doctor fails naming the field, the id and the derived state it
+  stands for (section 5).
 
 The standard provisions all seven fields above (subject to the
 `Area`/`Pool` rule). A team may then, without breaking the standard:
@@ -910,6 +918,37 @@ function for both paths, reporting `added`, `kept`, `refused`, and a
 5. A failed add is logged with the issue number and retried on the
    next pass; it never fails the sync and exit codes are unchanged.
 
+### The board step syncs Status every pass
+
+Decision: the same board step also sets the `Status` column from the
+issue's state, so a project board keeps itself current. The project
+names its option ids in `[repo.board]` (`status_available`,
+`status_claimed`, `status_review`, `status_done`); option ids live in
+the file, display names stay comments, and the pass never matches a
+name in code. A project that maps none of them keeps today's
+read-only behavior; a partial map syncs only what it names.
+
+Derived state, in order: a closed issue means done; an open linked
+pull request means in review; a ticket holding a live claim means
+claimed; otherwise available. Writes land only when the live Status
+differs from the derived one, one write per changed card, through the
+same paced mutation path as the adopt, at most `board.status_per_pass`
+per repo per pass (default `20`); the rest carries to the next pass,
+so a one-time catch-up of a stale board spreads itself across passes.
+A rate limit stops the step with the rest left for the next pass; a
+failed write is logged with the issue number and retried, and neither
+fails the sync. Open pulls resolve through one listing per repo per
+pass under the same `drive.pulls_max_calls` budget as the dispatch
+gate; an unreadable or capped listing leaves the open cards alone
+(closed cards still reach Done, which needs no pulls) until the next
+pass.
+
+A person's manual move wins until the derived state changes: korapy
+records the Status it last set per card in the board store, and a
+card whose live Status differs from that record is left alone until
+its derived state changes, then written again. This replaces the
+people-owned, read-only rule for the mapped `Status` column only.
+
 ### What the first sync does
 
 Nothing new is built here; this is the existing machinery meeting a
@@ -961,6 +1000,7 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 | Mapped field missing on the live board | fail, naming repo, concept and field name | `korapy github setup` (creates the missing field, alters nothing) |
 | Mapped field present with the wrong kind | fail, naming concept, field and both kinds | rename or delete the field on the board, then `korapy github setup` |
 | A `priority_map` option id is gone from the board | fail (exists, `check_options`), naming field, id and rank | re-add the option on the board, or delete the board table and re-run `korapy github setup` |
+| A mapped Status option id is gone from the board | fail, naming field, id and state | re-add the option on the board, or delete the board table and re-run `korapy github setup` |
 | A live priority option the map does not name | warn, naming the option's display name | add its id to `priority_map`, or leave it: those items keep their stored rank |
 | Variant flip with queued writes | fail (exists, `flip_refusal`) | drain the outbox, then flip |
 | Label and board priority disagree; unparseable `blocked_by` | fail (exists, `parity_lines`) | backfill on the board, then resync |
