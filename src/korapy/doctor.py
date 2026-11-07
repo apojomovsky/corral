@@ -26,6 +26,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 from korapy import (
     accounts,
+    admission,
     boarddoctor,
     deps,
     detect,
@@ -1521,7 +1522,11 @@ def load_resource_readings(
         where = "the host config"
     try:
         base = resources.config(resolved)
-        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        try:
+            total_cap = resolved["admission.total_cap"]
+        except KeyError:
+            total_cap = admission.DEFAULT_TOTAL_CAP
+        shares = projects.budget_shares(registered, total_cap=total_cap)
         foreign = (ledger or {}).get("foreign", [])
         if not isinstance(foreign, list):
             foreign = []

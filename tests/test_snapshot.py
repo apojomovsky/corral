@@ -476,6 +476,41 @@ class ErrorHelpers(unittest.TestCase):
                 self.assertFalse(snapshot.is_error_section(other))
 
 
+class HumanFinishedCount(unittest.TestCase):
+    """A hand-crafted non-finite finished count reads as 0, like the dashboard."""
+
+    def first_line(self, finished):
+        doc = {
+            "agents": [],
+            "fleet_header": {
+                "host": HOST,
+                "now": T0,
+                "agents_live": 0,
+                "agents_stale": 0,
+                "agents_finished": finished,
+            },
+        }
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            snapshot._show(doc)
+        return out.getvalue().splitlines()[0]
+
+    def test_nan_finished_reads_zero(self):
+        line = self.first_line(float("nan"))
+        self.assertIn("0 finished", line)
+        self.assertNotIn("nan", line)
+
+    def test_infinite_finished_reads_zero(self):
+        for value in (float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                line = self.first_line(value)
+                self.assertIn("0 finished", line)
+                self.assertNotIn("inf", line)
+
+    def test_finite_finished_passes_through(self):
+        self.assertIn("2 finished", self.first_line(2))
+
+
 class CapacityAgreesWithRegistry(unittest.TestCase):
     def test_capacity_ignores_other_hosts(self):
         foreign = entry("a9", repo="repo-b", number=9)
