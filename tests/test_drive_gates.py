@@ -1087,14 +1087,14 @@ class PullsCheckNeededTest(unittest.TestCase):
         self.assertFalse(self.check(board_item(labels=["needs-decision"])))
         self.assertFalse(self.check(board_item(labels=["needs-triage"])))
 
-    def test_a_ticket_claimed_by_a_live_agent_needs_no_check(self):
+    def test_a_ticket_claimed_by_a_live_managed_agent_needs_the_check(self):
         item = board_item(agent="drive-host-1-abc-7")
-        self.assertFalse(self.check(item, live=[("blue", "app", 7)]))
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)]))
 
-    def test_a_live_claim_needs_no_check_for_start_or_review(self):
+    def test_a_live_managed_claim_needs_the_check_for_start_and_review(self):
         item = board_item(agent="drive-host-1-abc-7")
-        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="start"))
-        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="review"))
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="start"))
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="review"))
 
     def test_a_live_managed_claim_needs_the_check_for_fix_and_resume(self):
         item = board_item(agent="drive-host-1-abc-7")
@@ -1104,6 +1104,11 @@ class PullsCheckNeededTest(unittest.TestCase):
     def test_a_live_foreign_claim_needs_no_check_for_fix(self):
         item = board_item(agent="human-1")
         self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="fix"))
+
+    def test_a_live_foreign_claim_needs_no_check_for_start_or_review(self):
+        item = board_item(agent="human-1")
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="start"))
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="review"))
 
     def test_a_managed_claim_without_a_live_agent_still_needs_the_check(self):
         self.assertTrue(self.check(board_item(agent="drive-host-1-abc-7")))

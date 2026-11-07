@@ -1407,11 +1407,14 @@ def pulls_check_needed(row, *, live_keys, hold_label, kind="start") -> bool:
     internally owned ticket no human holds. Anything else skips before
     the gate ever reads row pulls (closed, external, held, waiting on
     a human, foreign-claimed), so listing for it would spend GitHub
-    calls no verdict uses. A live-claimed ticket needs the listing
-    only for `fix` and `resume`: those are the only kinds that reach
-    the pulls reads with a holder, while `start` and `review` skip on
-    the claim first. `live_keys` holds the (repo, number) pairs with a
-    live agent, and `kind` is the wanted request kind.
+    calls no verdict uses. Any managed-held ticket needs the listing
+    for every kind: `fix` and `resume` proceed with the holder, while a
+    `start` or `review` on a live-claimed row whose finished worker
+    matches is reclassified to `review` (takeover) and then reads the
+    row pulls too. Without the listing that takeover would proceed
+    blind, missing an open linked pull or a tracker outage. `live_keys`
+    holds the (repo, number) pairs with a live agent, and `kind` is the
+    wanted request kind.
     """
     if row is None or row.state != "open" or row.external:
         return False
@@ -1423,8 +1426,6 @@ def pulls_check_needed(row, *, live_keys, hold_label, kind="start") -> bool:
     holder = row.agent or ""
     if not holder:
         return True
-    if (row.repo, row.number) in live_keys:
-        return kind in ("fix", "resume") and is_managed_agent(holder)
     return is_managed_agent(holder)
 
 
@@ -1676,9 +1677,8 @@ def _gate_all(
     `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
     setting) caps the listing calls for the pass. The map is built
     lazily: a pulls-less eligibility run first finds which tickets any
-    project wants, then only the fetchable ones (open, unheld, and in
-    a repository the pass drives, with live-claimed tickets fetched
-    only for `fix` and `resume`) trigger one
+    project wants, then only the fetchable ones (open, unheld or
+    managed-held, and in a repository the pass drives) trigger one
     listing per repository; with none to check the tracker is never
     contacted. A pass that hits the cap
     prints "pulls lookup limited" and refuses the unchecked starts,
