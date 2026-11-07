@@ -510,6 +510,12 @@ class HumanFinishedCount(unittest.TestCase):
     def test_finite_finished_passes_through(self):
         self.assertIn("2 finished", self.first_line(2))
 
+    def test_non_number_finished_reads_zero(self):
+        for value in (True, "2", None):
+            with self.subTest(value=value):
+                line = self.first_line(value)
+                self.assertIn("0 finished", line)
+
 
 class CapacityAgreesWithRegistry(unittest.TestCase):
     def test_capacity_ignores_other_hosts(self):
