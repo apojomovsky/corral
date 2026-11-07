@@ -292,6 +292,7 @@ TAIL = """# Defaults: uncomment to override.
 # board.poll_pages = 5  # board poll page cap per pass (default: small)
 # board.ready = "ready"  # label that makes an issue eligible
 # board.schema_max_age_s = 3600  # seconds before the board step refreshes the cached board schema
+# board.status_per_pass = 20  # board Status writes per repo per pass (default: 20; 0 or less syncs nothing)
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash
@@ -431,6 +432,7 @@ commits.conventional = false
 # board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
 # board.poll_pages = 5  # board poll page cap per pass (default: small)
 # board.schema_max_age_s = 3600  # seconds before the board step refreshes the cached board schema
+# board.status_per_pass = 20  # board Status writes per repo per pass (default: 20; 0 or less syncs nothing)
 #
 # [checks]
 # checks.no_em_dash = true  # takeoff refuses added lines and bodies with an em-dash

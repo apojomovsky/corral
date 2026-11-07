@@ -606,17 +606,26 @@ _CLEAR_TEXT = """mutation BoardClearField($project: ID!, $item: ID!, $field: ID!
   }
 }"""
 
+_WRITE_SELECT = """mutation BoardWriteSelect($project: ID!, $item: ID!, $field: ID!, $option: ID!) {
+  updateProjectV2ItemFieldValue(input: {projectId: $project, itemId: $item, fieldId: $field, value: {singleSelectOptionId: $option}}) {
+    projectV2Item { id }
+  }
+}"""
+
 
 class BoardTracker(BoardReader):
-    """Korapy-owned writes as board text-field mutations, over the same seam.
+    """Korapy-owned writes as board mutations, over the same seam.
 
-    Only ``agent`` and ``status`` are writable, each through the one
-    configured text field for the concept; any other field is refused with
-    ``ValueError``. A write whose concept the config never mapped raises
-    ``UnknownOption`` (the mirror drops it); a write whose field is missing
-    from the live board raises ``TrackerError`` instead, so the rows stay
-    queued for the next pass. A write that changes nothing sends no
-    mutation. Reads stay with ``BoardReader`` and the board sync step.
+    ``agent`` and ``status`` are writable through their configured text
+    fields; any other field is refused with ``ValueError``. The Status
+    column is writable through ``write_option``, which sets one live
+    option id; it shares the schema fetch and the per-item scan with
+    the text writes. A write whose concept the config never mapped
+    raises ``UnknownOption`` (the mirror drops it); a write whose field
+    is missing from the live board raises ``TrackerError`` instead, so
+    the rows stay queued for the next pass. A write that changes
+    nothing sends no mutation. Reads stay with ``BoardReader`` and the
+    board sync step.
 
     One adapter instance covers one mirror pass: the schema is fetched once
     and each item's node id is resolved once and reused across that item's
@@ -682,14 +691,48 @@ class BoardTracker(BoardReader):
             self._graphql(_CLEAR_TEXT, project=project_id, item=item_id, field=field_id)
         texts[field_id] = value
 
+    def write_option(self, repo: str, number: int, option_id: str) -> None:
+        """Set the Status column to one live option id for ``repo#number``.
+
+        Resolves the configured Status column to its live field id,
+        locates the board item behind ``repo#number``, and sends one
+        select mutation. An already-matching card sends nothing. An
+        option id the live field does not offer is a ``TrackerError``,
+        like a missing field; an unmapped Status column is an
+        ``UnknownOption``. Rate-limit answers raise
+        ``TrackerRateLimited`` through the shared classifier.
+        """
+        if not isinstance(option_id, str) or not option_id:
+            raise iface.TrackerError(f"bad board option for 'board_status': {option_id!r}")
+        name = self._board.status_column
+        if not name:
+            raise iface.UnknownOption("board maps no field for 'board_status'")
+        project_id, by_name = self._cached_schema()
+        node = by_name.get(name)
+        if node is None:
+            raise iface.TrackerError(f"board field {name!r} for board_status is missing")
+        field = self._parse_field("board_status", name, node)
+        if option_id not in field.options:
+            raise iface.TrackerError(f"board option {option_id!r} is not on field {name!r}")
+        item_id, texts, selects = self._locate(project_id, repo, number)
+        if field.id in texts:
+            raise _fail("board value for a select field is text")
+        if selects.get(field.id) == option_id:
+            return
+        self._graphql(
+            _WRITE_SELECT, project=project_id, item=item_id, field=field.id, option=option_id
+        )
+        selects[field.id] = option_id
+
     def _locate(self, project_id, repo, number):
         """``(item node id, texts, selects)`` for one issue.
 
         Resolved once per item and cached on the instance, so a second
         field on the same item reuses the one scan. ``texts`` maps a field
-        id to its stripped text; ``selects`` holds the field ids with a
-        select value, so the write refuses a select behind a text field
-        id. An unset field is in neither: it reads as ``""``.
+        id to its stripped text; ``selects`` maps a field id holding a
+        select value to its option id, so the text write refuses a select
+        behind a text field id and the option write skips an already-set
+        option. An unset field is in neither: it reads as ``""``.
         """
         key = (repo, number)
         hit = self._located.get(key)
@@ -751,34 +794,35 @@ class BoardTracker(BoardReader):
         if not isinstance(entries, list):
             raise _fail("board field values are not a list")
         texts: dict = {}
-        selects = set()
+        selects: dict = {}
         for entry in entries:
-            fid, text = self._locate_value(entry)
+            fid, text, oid = self._locate_value(entry)
             if fid is None:
                 continue
-            if text is None:
-                selects.add(fid)
-            else:
+            if oid is not None:
+                selects[fid] = oid
+            elif text is not None:
                 texts[fid] = text
         if got_repo != repo or got_number != number:
             return None
         return item_id, texts, selects
 
     def _locate_value(self, entry):
-        """``(field id, stripped text or None)`` for one field-value node.
+        """``(field id, stripped text or None, option id or None)`` for one node.
 
-        A select value reads as ``None``; an unset value reads as ``""``;
-        a value of a kind korapy does not read is ``(None, None)`` and the
-        caller skips it. Anything short of the value shape of a kind
-        korapy does read is a ``TrackerError``: both shapes go through
-        the shared ``_checked_text`` and ``_checked_option`` checks, so
-        the scan fails exactly where the poll path fails.
+        A set select value reads as its option id; an unset value reads
+        as ``(fid, None, None)``; a value of a kind korapy does not read
+        is ``(None, None, None)`` and the caller skips it. Anything short
+        of the value shape of a kind korapy does read is a
+        ``TrackerError``: both shapes go through the shared
+        ``_checked_text`` and ``_checked_option`` checks, so the scan
+        fails exactly where the poll path fails.
         """
         if not isinstance(entry, dict):
             raise _fail(f"bad board value {entry!r}")
         typename = entry.get("__typename")
         if typename is not None and typename not in _READ_TYPENAMES:
-            return None, None
+            return None, None, None
         field = entry.get("field")
         fid = field.get("id") if isinstance(field, dict) else None
         if not isinstance(fid, str) or not fid:
@@ -786,20 +830,20 @@ class BoardTracker(BoardReader):
         if typename == "ProjectV2ItemFieldTextValue":
             if "text" not in entry:
                 raise _fail(f"board value for {fid} is not text")
-            return fid, _checked_text(entry, fid)
+            return fid, _checked_text(entry, fid), None
         if typename == "ProjectV2ItemFieldSingleSelectValue":
             if entry.get("optionId") is None:
                 if "text" in entry:
                     raise _fail(f"board value for {fid} is not a select")
-                return fid, ""
-            _checked_option(entry, fid)
-            return fid, None
+                return fid, None, None
+            oid, _ = _checked_option(entry, fid)
+            return fid, None, oid
         if "text" in entry:
-            return fid, _checked_text(entry, fid)
+            return fid, _checked_text(entry, fid), None
         if entry.get("optionId") is not None:
-            _checked_option(entry, fid)
-            return fid, None
-        return fid, ""
+            oid, _ = _checked_option(entry, fid)
+            return fid, None, oid
+        return fid, None, None
 
     def adopt_missing(self, project_id, repo, present, *, limit, now):
         """Add the repo's missing open and recently closed issues, up to ``limit``.

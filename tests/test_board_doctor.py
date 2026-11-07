@@ -403,6 +403,44 @@ class FieldComparison(unittest.TestCase):
         cfg = config(priority_column="", priority_map={})
         self.assertEqual(self.compare(cfg=cfg), ())
 
+    def test_a_gone_status_option_id_is_a_failure_naming_field_id_and_state(self):
+        fields = [
+            live_field("Status", "single_select", (("opt-a", "Available"),))
+            if f.name == "Status"
+            else f
+            for f in full_live_fields()
+        ]
+        cfg = config(status_available="opt-a", status_done="opt-d")
+        (finding,) = self.compare(cfg=cfg, fields=fields)
+        self.assertEqual(finding.severity, "fail")
+        self.assertIn(REPO, finding.detail)
+        self.assertIn("Status", finding.detail)
+        self.assertIn("opt-d", finding.detail)
+        self.assertIn("done", finding.detail)
+        self.assertIn("re-add the option", finding.fix)
+
+    def test_mapped_status_option_ids_all_present_are_silent(self):
+        fields = [
+            live_field(
+                "Status",
+                "single_select",
+                (("opt-a", "Available"), ("opt-d", "Done")),
+            )
+            if f.name == "Status"
+            else f
+            for f in full_live_fields()
+        ]
+        cfg = config(status_available="opt-a", status_done="opt-d")
+        self.assertEqual(self.compare(cfg=cfg, fields=fields), ())
+
+    def test_status_ids_with_no_status_concept_are_a_finding(self):
+        cfg = config(status_column="", status_done="opt-d")
+        (finding,) = self.compare(cfg=cfg)
+        self.assertEqual(finding.severity, "fail")
+        self.assertIn(REPO, finding.detail)
+        self.assertIn("status", finding.detail)
+        self.assertIn("not checked", finding.detail)
+
 
 class DuplicateTitle(unittest.TestCase):
     def test_a_second_board_with_the_same_title_warns_naming_title_and_numbers(self):
