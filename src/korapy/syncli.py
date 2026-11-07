@@ -367,6 +367,7 @@ def _sync_body(
         board_refused = list(board_result.refused) if board_result is not None else []
         board_store_errors = list(board_result.store_errors) if board_result is not None else []
         board_adopt_errors = list(board_result.adopt_errors) if board_result is not None else []
+        board_status_errors = list(board_result.status_errors) if board_result is not None else []
         results[name] = {
             "tracker": tracker_repo,
             "seen": result.items_seen + board_seen,
@@ -376,6 +377,7 @@ def _sync_body(
             "store_errors": list(result.store_errors) + board_store_errors,
             "conflicts": list(result.conflicts),
             "adopt_errors": list(board_adopt_errors),
+            "status_errors": list(board_status_errors),
         }
         if board_result is not None:
             results[name]["board_seen"] = board_seen
@@ -394,6 +396,8 @@ def _sync_body(
         for line in board_store_errors:
             _err(line, err)
         for line in board_adopt_errors:
+            _err(line, err)
+        for line in board_status_errors:
             _err(line, err)
         for line in result.conflicts:
             _err(f"claim conflict: {line} (korapy wins)", err)

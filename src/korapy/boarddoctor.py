@@ -20,7 +20,7 @@ the GraphQL board reader and the real store in ``doctor.production_env``.
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
-from korapy import board, paths, settings
+from korapy import board, boardstatus, paths, settings
 from korapy import tracker as iface
 from korapy.github import gh
 
@@ -60,6 +60,34 @@ _WANT_KIND = {field.concept: field.kind for field in iface.STANDARD_BOARD}
 
 #: How many missing issue numbers one row names before counting the rest.
 _SHOWN_MISSING = 5
+
+
+def _status_options(
+    repo: str, board_config: settings.BoardConfig, field_name: str, live: iface.LiveField
+) -> list[FieldFinding]:
+    """Failures for the live Status options against the configured ids.
+
+    Like the Priority map: option ids are matched by stable id, never
+    by display name, so a rename is free while a deleted or replaced id
+    is a configuration error naming the repo, the field, the missing id
+    and the derived state it stood for. States with no mapped id are
+    never synced and never checked.
+    """
+    findings = []
+    live_ids = {option.id for option in live.options}
+    for state, option_id in sorted(boardstatus.status_ids(board_config).items()):
+        if option_id not in live_ids:
+            findings.append(
+                FieldFinding(
+                    "fail",
+                    f"{repo}: board field {field_name!r} has no"
+                    f" option {option_id!r} (mapped to {state!r}); the option was"
+                    " deleted or replaced upstream",
+                    "re-add the option on the board, or delete the board table"
+                    " and re-run `korapy github setup`",
+                )
+            )
+    return findings
 
 
 def _priority_options(
@@ -116,9 +144,10 @@ def compare_fields(
     """The live raw field list against the config, as findings. Pure.
 
     Every mapped concept must exist with its standard kind; the Priority
-    option ids must exist with a warn for live options the map does not
-    name. Duplicate live names (fields or options) refuse with a fix
-    line instead of this picking one. Unmapped concepts are silent.
+    option ids and the mapped Status option ids must exist, with a warn
+    for live Priority options the map does not name. Duplicate live
+    names (fields or options) refuse with a fix line instead of this
+    picking one. Unmapped concepts are silent.
     """
     findings: list[FieldFinding] = []
     by_name: dict[str, list] = {}
@@ -164,6 +193,8 @@ def compare_fields(
             continue
         if concept == "priority":
             findings.extend(_priority_options(repo, board_config, name, live))
+        if concept == "board_status":
+            findings.extend(_status_options(repo, board_config, name, live))
     if not board_config.priority_column and board_config.priority_map:
         findings.append(
             FieldFinding(
@@ -172,6 +203,15 @@ def compare_fields(
                 " so the mapped option ids were not checked",
                 "map the priority concept in the [repo.board] table,"
                 " then run `korapy github setup`",
+            )
+        )
+    if not board_config.status_column and boardstatus.status_ids(board_config):
+        findings.append(
+            FieldFinding(
+                "fail",
+                f"{repo}: the status concept maps to no board field,"
+                " so the mapped option ids were not checked",
+                "map the status concept in the [repo.board] table, then run `korapy github setup`",
             )
         )
     return tuple(findings)

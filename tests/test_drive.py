@@ -22,6 +22,7 @@ from korapy import syncli
 from korapy import tracker
 from korapy import projects as projects_mod
 from korapy.github import tracker as ghtracker
+from tests.test_sync import UnreadableListingStore
 from tests.test_tracker import FakeRun, FakeTracker, reading
 
 
@@ -941,6 +942,47 @@ class CmdDriveMapFailureTest(unittest.TestCase):
     def test_claiming_with_a_broken_repo_map_is_a_usage_error(self):
         self.assertEqual(self.run_cmd(plan=False), 4)
         self.assertIn("korapy drive: test config names no tracker repo", self.err.getvalue())
+
+
+class UnreadableListingTest(unittest.TestCase):
+    """A store whose repo listing cannot be read fails the pass cleanly.
+
+    `sync_all` reports one store line instead of raising, and both the
+    plan and the claiming pass exit 4 naming the problem.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-listing-")
+        self.addCleanup(self.tmp.cleanup)
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def run_pass(self, plan, problem):
+        store = UnreadableListingStore(problem)
+        fields = {}
+        if not plan:
+            fields["tracker_factory"] = lambda repo: FakeTracker()
+        code = hermetic_pass(
+            store,
+            os.path.join(self.tmp.name, "drive.lock"),
+            self.out,
+            self.err,
+            plan=plan,
+            **fields,
+        )
+        return code
+
+    def test_plan_with_an_unreadable_listing_is_exit_four(self):
+        code = self.run_pass(plan=True, problem=board.StoreError("test listing unreadable"))
+        self.assertEqual(code, 4)
+        self.assertIn("korapy drive: test listing unreadable", self.err.getvalue())
+
+    def test_claiming_with_an_unreadable_listing_is_exit_four(self):
+        code = self.run_pass(plan=False, problem=board.StoreError("test listing unreadable"))
+        self.assertEqual(code, 4)
+        self.assertIn(
+            "korapy drive: store repo listing unreadable: test listing unreadable",
+            self.err.getvalue(),
+        )
 
 
 class HoldLabelWiringTest(unittest.TestCase):
