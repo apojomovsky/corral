@@ -9,7 +9,7 @@ import unittest
 from unittest import mock
 from typing import Any
 
-from korapy import board
+from korapy import board, boardstatus
 
 
 def reading(repo="app", number=7, **over: Any):
@@ -677,7 +677,7 @@ class OpenTest(unittest.TestCase):
             conn.commit()
             conn.close()
             with board.open_store(path) as store:
-                self.assertEqual(board.SCHEMA_VERSION, 2)
+                self.assertEqual(board.SCHEMA_VERSION, 3)
                 row, _ = store.item("app", 7, now=1000.0)
                 self.assertEqual(row.title, "Kept")
                 self.assertIsNone(store.get_cursor("app", "tracker"))
@@ -714,11 +714,44 @@ class OpenTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             conn = sqlite3.connect(path)
-            conn.execute("PRAGMA user_version=3")
+            conn.execute("PRAGMA user_version=4")
             conn.commit()
             conn.close()
             with self.assertRaises(board.StoreError):
                 board.open_store(path)
+
+    def test_each_migration_step_stamps_its_own_version(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            conn = sqlite3.connect(path)
+            try:
+                board._migrate_1_to_2(conn)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                self.assertEqual(version, 2)
+                board._migrate_2_to_3(conn)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                self.assertEqual(version, board.SCHEMA_VERSION)
+            finally:
+                conn.close()
+
+    def test_version_2_migrates_forward_adding_status_sets(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE items(repo TEXT NOT NULL, number INTEGER NOT NULL,"
+                " title TEXT NOT NULL DEFAULT '',"
+                " PRIMARY KEY(repo, number))"
+            )
+            conn.execute("PRAGMA user_version=2")
+            conn.commit()
+            conn.close()
+            with board.open_store(path) as store:
+                store.record_status_set("app", 7, "opt-c", "claimed", now=1000.0)
+                self.assertEqual(
+                    store.status_set_of("app", 7),
+                    boardstatus.StatusRecord(option_id="opt-c", derived="claimed"),
+                )
 
     def test_absent_mark_is_dirty_without_deleting(self):
         with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
