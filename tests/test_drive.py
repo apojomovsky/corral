@@ -430,6 +430,77 @@ class PullsLookupPassTest(unittest.TestCase):
         self.assertIn("pulls calls 1", out)
         self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
 
+    def test_takeover_start_on_a_live_claimed_row_with_unreadable_pulls_is_refused(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            finished_for={("app", 7): ("drive-host-1-x", "worker")},
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("linked pulls unreadable, review refused", out)
+        self.assertIn("tracker down", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_takeover_start_on_a_live_claimed_row_with_a_held_pull_is_hold_skipped(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 12, kind="pr", state="open")]}
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7)}),
+            finished_for={("app", 7): ("drive-host-1-x", "worker")},
+            read_labels=lambda kind, repo, number: ["hold"] if kind == "pr" else [],
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#12", out)
+        self.assertIn("pulls calls 1", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
+    def test_takeover_starts_in_one_repo_share_a_single_listing(self):
+        store = stored(self.db, [("app", 7, "open"), ("app", 8, "open")])
+        self.addCleanup(store.close)
+        store.claim("app", 7, "drive-host-1-x", "host-1", now=1000.0)
+        store.claim("app", 8, "drive-host-1-y", "host-1", now=1000.0)
+        fake = FakeTracker()
+        fake.index_errors["app"] = "tracker down"
+        code, out, _ = self.run_pass(
+            store,
+            plan=False,
+            found=[("blue", [("app", 7, "start"), ("app", 8, "start")])],
+            tracker_factory=lambda repo: fake,
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            live=frozenset({("blue", "app", 7), ("blue", "app", 8)}),
+            finished_for={
+                ("app", 7): ("drive-host-1-x", "worker"),
+                ("app", 8): ("drive-host-1-y", "worker"),
+            },
+            stale_after=10**12,
+            launcher=None,
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("app#7: linked pulls unreadable, review refused", out)
+        self.assertIn("app#8: linked pulls unreadable, review refused", out)
+        self.assertEqual(len([call for call in fake.calls if call[0] == "pulls_index"]), 1)
+
     def test_a_bad_pulls_setting_is_recorded_and_the_pass_caps_at_the_default(self):
         from korapy import eligibility
 
@@ -474,6 +545,39 @@ class PullsLookupPassTest(unittest.TestCase):
         self.assertEqual(pulls_calls, 1)
         self.assertFalse(pulls_limited)
         self.assertEqual(len(gated), 1)
+
+
+class PullsBudgetValidationTest(unittest.TestCase):
+    """`drive.pulls_max_calls` takes only a positive integer."""
+
+    def test_the_validator_refuses_anything_but_a_positive_integer(self):
+        for value in (0, -3, True, "x"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    drive._positive_calls(value)
+
+    def test_the_validator_passes_a_positive_integer_through(self):
+        self.assertEqual(drive._positive_calls(1), 1)
+        self.assertEqual(drive._positive_calls(20), 20)
+
+    def test_the_resolver_names_the_key(self):
+        for value in (0, -3, True, "x"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(settings.SettingsError, "drive.pulls_max_calls"):
+                    settings.resolve(project={"drive": {"pulls_max_calls": value}})
+
+    def test_a_bad_file_value_names_the_file_and_key(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-pulls-budget-"))
+        config = os.path.join(tmp, "config")
+        os.makedirs(config)
+        root = os.path.join(tmp, "ops")
+        os.makedirs(root)
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write("[drive]\npulls_max_calls = 0\n")
+        with self.assertRaisesRegex(
+            settings.SettingsError, r"korapy\.toml.*drive\.pulls_max_calls"
+        ):
+            settings.load(root=root, env={"KORAPY_CONFIG": config})
 
 
 class PlanTest(unittest.TestCase):
