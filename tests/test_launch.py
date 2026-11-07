@@ -1180,7 +1180,7 @@ class PushEnvTest(OpsCase):
         unit, _ = self.start()
         env = self.setenv(self.system.started[-1])
         self.assertEqual(env["KORAPY_AGENT_ID"], unit)
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
         self.assertEqual(env["GIT_CONFIG_KEY_0"], "url.https://github.com/.insteadOf")
         self.assertEqual(env["GIT_CONFIG_VALUE_0"], "git@github.com:")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
@@ -1189,7 +1189,7 @@ class PushEnvTest(OpsCase):
         with mock.patch.object(runtimes, "get", return_value=FakeAdapter()):
             _, _ = self.start(number=6, role="reviewer")
         env = self.setenv(self.system.started[-1])
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
     def test_a_healthy_agent_gets_no_push_env(self):

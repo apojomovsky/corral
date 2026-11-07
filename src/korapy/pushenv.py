@@ -18,6 +18,7 @@ the credential helper at push time, as in a normal `gh` setup.
 """
 
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 
@@ -25,16 +26,24 @@ from dataclasses import dataclass
 #: other launch refusal for a host that cannot do the work.
 REFUSAL_EXIT_CODE = 4
 
-#: SSH GitHub address forms, matched case-insensitively: the scp-like
-#: form git prints by default and the explicit ssh scheme.
-_SSH_PREFIXES = ("git@github.com:", "ssh://git@github.com/")
+#: The scp-like SSH GitHub address form git prints by default.
+#: Matched case-sensitively, the way git matches `insteadOf` prefixes.
+_SSH_SCP_PREFIX = "git@github.com:"
 
-#: Entries laid over the base environment for the HTTPS fallback: two
-#: rewrites (scp-like and ssh-scheme SSH addresses become HTTPS) and
-#: the host `gh` login as the credential helper for github.com.
+#: The explicit ssh-scheme SSH GitHub address form, with an optional
+#: numeric port (`ssh://git@github.com/owner/repo.git`,
+#: `ssh://git@github.com:22/owner/repo.git`). Matched
+#: case-sensitively, the way git matches `insteadOf` prefixes.
+_SSH_SCHEME_RE = re.compile(r"^ssh://git@github\.com(?::(\d+))?/")
+
+#: Entries laid over the base environment for the HTTPS fallback: one
+#: rewrite per rewritable SSH address form (scp-like, bare ssh-scheme,
+#: and the explicit-port ssh-scheme form) and the host `gh` login as
+#: the credential helper for github.com.
 _FALLBACK_ENTRIES = (
     ("url.https://github.com/.insteadOf", "git@github.com:"),
     ("url.https://github.com/.insteadOf", "ssh://git@github.com/"),
+    ("url.https://github.com/.insteadOf", "ssh://git@github.com:22/"),
     ("credential.https://github.com.helper", "!gh auth git-credential"),
 )
 
@@ -78,9 +87,35 @@ class PushRefused(Exception):
 
 
 def is_ssh_github_url(url) -> bool:
-    """True for the SSH GitHub address forms the fallback rewrites."""
-    text = (url or "").strip().lower()
-    return text.startswith(_SSH_PREFIXES)
+    """True for the SSH GitHub address forms the fallback handles.
+
+    The scp-like form, and the ssh-scheme form with an optional numeric
+    port. Matched case-sensitively: git's `insteadOf` prefix match is
+    case-sensitive, so an uppercase address takes the plain SSH path
+    (or the refusal) rather than a fallback that would silently miss.
+    """
+    text = (url or "").strip()
+    if text.startswith(_SSH_SCP_PREFIX):
+        return True
+    return _SSH_SCHEME_RE.match(text) is not None
+
+
+def _can_rewrite(url) -> bool:
+    """True when the fallback env rewrites this SSH GitHub address.
+
+    The env carries one `insteadOf` entry per known form (scp-like,
+    bare ssh-scheme, explicit `:22` ssh-scheme). A form the env has no
+    entry for (another explicit port) is recognized but not rewritten:
+    the decision refuses rather than starting an agent whose push the
+    fallback cannot fix.
+    """
+    text = (url or "").strip()
+    if text.startswith(_SSH_SCP_PREFIX):
+        return True
+    match = _SSH_SCHEME_RE.match(text)
+    if match is None:
+        return False
+    return match.group(1) in (None, "22")
 
 
 def decide(ssh_ok: bool, origin, gh_ok: bool) -> Decision:
@@ -89,13 +124,15 @@ def decide(ssh_ok: bool, origin, gh_ok: bool) -> Decision:
     Origins that are not SSH GitHub addresses push as they always did:
     HTTPS remotes, other hosts' SSH remotes and local paths never need
     the agent, so a dead agent and a logged-out `gh` change nothing for
-    them and no seam ever runs.
+    them and no seam ever runs. An SSH GitHub address the fallback
+    cannot rewrite (an explicit port with no `insteadOf` entry) refuses
+    with both fixes, even when `gh` is logged in.
     """
     if not is_ssh_github_url(origin):
         return Decision("ssh", "")
     if ssh_ok:
         return Decision("ssh", "")
-    if gh_ok:
+    if gh_ok and _can_rewrite(origin):
         return Decision("https", HTTPS_NOTE)
     return Decision("refuse", REFUSAL)
 

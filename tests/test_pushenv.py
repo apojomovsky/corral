@@ -45,8 +45,15 @@ class UrlFormTest(unittest.TestCase):
         self.assertFalse(pushenv.is_ssh_github_url(None))
         self.assertFalse(pushenv.is_ssh_github_url("   "))
 
-    def test_the_match_ignores_case(self):
-        self.assertTrue(pushenv.is_ssh_github_url("GIT@GITHUB.COM:owner/repo.git"))
+    def test_ssh_scheme_with_explicit_port_is_ssh(self):
+        self.assertTrue(pushenv.is_ssh_github_url("ssh://git@github.com:22/owner/repo.git"))
+
+    def test_ssh_scheme_with_another_port_is_recognized(self):
+        self.assertTrue(pushenv.is_ssh_github_url("ssh://git@github.com:443/owner/repo.git"))
+
+    def test_the_match_is_case_sensitive_like_git_insteadof(self):
+        self.assertFalse(pushenv.is_ssh_github_url("GIT@GITHUB.COM:owner/repo.git"))
+        self.assertFalse(pushenv.is_ssh_github_url("SSH://GIT@GITHUB.COM/owner/repo.git"))
 
 
 class DecideTest(unittest.TestCase):
@@ -79,17 +86,41 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(pushenv.decide(False, None, False).mode, "ssh")
         self.assertEqual(pushenv.decide(False, "", False).mode, "ssh")
 
+    def test_an_uppercase_origin_is_left_alone_like_git(self):
+        decision = pushenv.decide(False, "GIT@GITHUB.COM:owner/repo.git", False)
+        self.assertEqual(decision.mode, "ssh")
+
+    def test_an_explicit_port_falls_back_to_https(self):
+        decision = pushenv.decide(False, "ssh://git@github.com:22/owner/repo.git", True)
+        self.assertEqual(decision.mode, "https")
+
+    def test_an_explicit_port_without_gh_refuses(self):
+        decision = pushenv.decide(False, "ssh://git@github.com:22/owner/repo.git", False)
+        self.assertEqual(decision.mode, "refuse")
+        self.assertIn("gh auth login", decision.note)
+
+    def test_a_port_without_a_rewrite_refuses_even_with_gh(self):
+        decision = pushenv.decide(False, "ssh://git@github.com:443/owner/repo.git", True)
+        self.assertEqual(decision.mode, "refuse")
+        self.assertIn("agent", decision.note)
+        self.assertIn("gh auth login", decision.note)
+
+    def test_a_working_agent_uses_ssh_whatever_the_port(self):
+        decision = pushenv.decide(True, "ssh://git@github.com:443/owner/repo.git", False)
+        self.assertEqual(decision.mode, "ssh")
+
 
 class HttpsEnvTest(unittest.TestCase):
     def test_the_env_rewrites_ssh_github_urls_and_names_the_gh_helper(self):
         env = pushenv.https_env()
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
         pairs = [
             (env[f"GIT_CONFIG_KEY_{n}"], env[f"GIT_CONFIG_VALUE_{n}"])
             for n in range(int(env["GIT_CONFIG_COUNT"]))
         ]
         self.assertIn(("url.https://github.com/.insteadOf", "git@github.com:"), pairs)
         self.assertIn(("url.https://github.com/.insteadOf", "ssh://git@github.com/"), pairs)
+        self.assertIn(("url.https://github.com/.insteadOf", "ssh://git@github.com:22/"), pairs)
         self.assertIn(("credential.https://github.com.helper", "!gh auth git-credential"), pairs)
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
 
@@ -100,7 +131,7 @@ class HttpsEnvTest(unittest.TestCase):
         base = {"KORAPY_AGENT_ID": "unit-1", "PATH": "/usr/bin"}
         merged = pushenv.extra_env(pushenv.Decision("https", "note"), base=base)
         self.assertEqual(merged["KORAPY_AGENT_ID"], "unit-1")
-        self.assertEqual(merged["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(merged["GIT_CONFIG_COUNT"], "4")
         self.assertNotIn("GIT_CONFIG_COUNT", base)
 
 
@@ -186,6 +217,22 @@ class ResolveTest(unittest.TestCase):
         decision = pushenv.resolve(SSH, ssh_probe=lambda: False, gh_login=lambda: False)
         self.assertEqual(decision.mode, "refuse")
 
+    def test_an_explicit_port_with_gh_falls_back_to_https(self):
+        decision = pushenv.resolve(
+            "ssh://git@github.com:22/owner/repo.git",
+            ssh_probe=lambda: False,
+            gh_login=lambda: True,
+        )
+        self.assertEqual(decision.mode, "https")
+
+    def test_an_unrewritable_port_refuses_even_with_gh(self):
+        decision = pushenv.resolve(
+            "ssh://git@github.com:443/owner/repo.git",
+            ssh_probe=lambda: False,
+            gh_login=lambda: True,
+        )
+        self.assertEqual(decision.mode, "refuse")
+
 
 class LaunchEnvTest(unittest.TestCase):
     def stub_git(self, url):
@@ -203,8 +250,18 @@ class LaunchEnvTest(unittest.TestCase):
             ssh_probe=lambda: False,
             gh_login=lambda: True,
         )
-        self.assertEqual(env["GIT_CONFIG_COUNT"], "3")
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
         self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_an_explicit_port_origin_without_an_agent_gets_the_https_env(self):
+        env = pushenv.launch_env(
+            "/clone",
+            git=self.stub_git("ssh://git@github.com:22/owner/repo.git"),
+            ssh_probe=lambda: False,
+            gh_login=lambda: True,
+        )
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
+        self.assertIn("ssh://git@github.com:22/", env.values())
 
     def test_a_healthy_agent_gets_no_extra_env(self):
         env = pushenv.launch_env(

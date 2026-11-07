@@ -1159,13 +1159,15 @@ def _push_reading(origin: str, push_probe) -> str | None:
 
     `push_probe` is the `(ssh_ok, gh_ok)` pair gathered once per
     report, or None when the caller has no reading: then the report
-    carries no push row. The pure `pushenv.decide` maps the pair and
-    the origin to the row's reading.
+    carries no push row. The one resolver (`pushenv.resolve`) maps the
+    pair and the origin to the row's reading, so the report agrees with
+    every path that pushes; the pair arrives as injected probes, so the
+    seams never run twice.
     """
     if push_probe is None or not origin:
         return None
     ssh_ok, gh_ok = push_probe
-    return pushenv.decide(ssh_ok, origin, gh_ok).mode
+    return pushenv.resolve(origin, ssh_probe=lambda: ssh_ok, gh_login=lambda: gh_ok).mode
 
 
 def _repo_site(

@@ -551,6 +551,10 @@ class LoadPushProbe(unittest.TestCase):
         self.assertEqual(site.push, "https")
         self.assertIn("HTTPS", by_name(rows(site))["push:demo"].detail)
 
+    def test_an_explicit_port_with_gh_reads_https(self):
+        (site,) = self.load("ssh://git@github.com:22/acme/demo.git", (False, True))
+        self.assertEqual(site.push, "https")
+
     def test_neither_path_reads_refuse_and_fails_the_report(self):
         (site,) = self.load(self.SSH, (False, False))
         self.assertEqual(site.push, "refuse")
