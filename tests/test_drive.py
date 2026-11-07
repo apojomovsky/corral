@@ -581,6 +581,42 @@ class PullsBudgetValidationTest(unittest.TestCase):
             settings.load(root=root, env={"KORAPY_CONFIG": config})
 
 
+class BrokenPolicyIsolationTest(unittest.TestCase):
+    """One broken policy skips only its project; the pass still runs others."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-broken-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_broken_policy_skips_only_that_project(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        good_path = os.path.join(self.policies, "good.py")
+        with open(good_path, "w", encoding="utf-8") as handle:
+            handle.write(policy_source([("app", 7, "start")]))
+        good = project_named("good", good_path + ":eligible")
+        bad = project_named("bad", "missing_policy_xyz:eligible")
+        out, err = io.StringIO(), io.StringIO()
+        code = hermetic_pass(
+            store,
+            self.lock,
+            out,
+            err,
+            plan=True,
+            found=[good, bad],
+            driven={"good": frozenset({"app"}), "bad": frozenset({"app"})},
+        )
+        self.assertEqual(code, 4)
+        named = [line for line in err.getvalue().splitlines() if "project bad" in line]
+        self.assertEqual(len(named), 1)
+        self.assertIn("missing_policy_xyz:eligible", named[0])
+        self.assertIn("good app#7: start", out.getvalue())
+
+
 class PlanTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-")
