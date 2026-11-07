@@ -40,7 +40,7 @@ normalized to `{}` on build so label-only rows are unchanged.
 | --- | --- | --- |
 | `agent` | claim holder id | korapy (outbox) |
 | `status` | in-flight state | korapy (outbox) |
-| `board_status` | workflow state column | people (read-only) |
+| `board_status` | workflow state column | korapy (Status sync, when mapped), else people |
 | `priority` | triage rank | people (read-only) |
 | `area` | area or component | people (read-only) |
 | `milestone` | milestone title | people (read-only) |
@@ -85,6 +85,13 @@ Ownership follows `00-design.md` field ownership with no new rule:
   editing a label: their edit either confirms the queue or loses to a
   newer queued write, and the drop is logged.
 
+A project that maps Status option ids hands the `Status` column to
+korapy under the derived-state rule (section 4): a closed issue means
+done, an open linked pull request means in review, a ticket holding a
+live claim means claimed, otherwise available. A person's manual move
+wins until the derived state changes. A project mapping no Status
+option id keeps the read-only behavior above.
+
 `TicketRow` gains `extra: Mapping[str, object] | None` defaulting to `None`
 and normalized to `{}` when the row is built, carrying these concepts.
 Precedence between the two sources of rank is resolved in exactly one
@@ -125,7 +132,9 @@ organization-owned boards resolve the same way.
 Cost per read, budgeted up front: one page of up to 100 items with all
 mapped field values costs one GraphQL read call; field and option
 definitions cost one call per board and are cached (below); one mutation
-per field write at mutation cost. A full board poll of N items is about
+per field write at mutation cost. A Status sync write is one select
+mutation per changed card, at most `board.status_per_pass` per repo
+per pass. A full board poll of N items is about
 `ceil(N/100)` read calls plus schema refreshes. A per-pass page cap
 (`board.poll_pages`, default small) bounds one pass; the poll resumes
 where it stopped on the next pass.
@@ -228,6 +237,15 @@ External and closed items drop the same way (`external`, `closed`), and a
 rate-limit answer halts the drain with `TrackerRateLimited`, leaving rows
 queued for the next pass.
 
+Status sync writes do not go through the outbox. The mirror drops
+writes for closed items, but the derived state for a closed issue is
+done, so Status writes land directly from the board step, at most
+`board.status_per_pass` per repo per pass, paced through the shared
+bucket. Each write goes only when the live Status differs from the
+derived one; a person's manual move is recognized through the
+last-set record the step keeps in the board store, and wins until the
+derived state changes.
+
 Two board-specific cases:
 
 - An option disappears or is renamed on the board. Reads match by stable
@@ -243,6 +261,9 @@ Two board-specific cases:
   configuration error surfaced once per pass: the write raises
   `TrackerError`, so the rows stay queued for the next pass and the pass
   continues with the other rows. The doctor names the repo and the field.
+  A Status write whose option id or column is gone the same way is one
+  status line per card, retried on the next pass without failing the
+  sync.
 
 ## 5. Configuration: the project declares its board
 
@@ -268,7 +289,11 @@ project_owner = "example"   # board owner login
 project_number = 3          # board number; node id accepted instead
 agent_field = "Agent"       # korapy-owned text field for the agent id
 status_field = "Agent state" # korapy-owned text field for in-flight status
-status_column = "Status"    # people-owned workflow column (optional)
+status_column = "Status"    # workflow column; korapy-owned when Status ids map it
+status_available = "opt-a"  # derived states as option ids; names are comments only
+status_claimed = "opt-c"
+status_review = "opt-r"
+status_done = "opt-d"
 priority_column = "Priority"
 area_column = "Area"
 pool_column = "Pool"
@@ -293,10 +318,15 @@ accepted for renames). Scalar board settings in the registry:
 reads, and `board.add_per_pass` (default `20`): at most that many
 missing issues the board step adopts per repo per pass, so a first
 catch-up never bursts the pacing budget; the remainder carries to
-the next pass. The doctor gains one board check per repo in board mode: the board
-resolves, every mapped field and every mapped option id exists, and no
+the next pass. `board.status_per_pass` (default `20`) caps the Status
+writes the same way: a state the map does not name is never synced,
+so a partial map syncs only what it names and a project mapping none
+of them keeps the read-only behavior. The doctor gains one board check per repo in board mode: the board
+resolves, every mapped field, every mapped option id and every
+mapped Status option id exists, and no
 queued writes predate a variant flip. The check names the repo, the
-field, and the missing id; a one-time run after a board edit reports an
+field, and the missing id (plus the derived state for a Status id);
+a one-time run after a board edit reports an
 id that no longer exists on the board. A flip with a non-empty outbox is
 refused as a configuration error so no write crosses variants.
 
@@ -325,6 +355,7 @@ Exit codes are unchanged (AGENTS.md fixes their meaning):
 | --- | --- |
 | Board poll degraded to store data, pass otherwise complete | 0, with notes |
 | Board adopt failed some adds, pass otherwise complete | 0, with lines (retried next pass) |
+| Status sync failed some writes, pass otherwise complete | 0, with lines (retried next pass) |
 | Pass synced nothing at all (tracker and board both unreachable) | 3 |
 | Lost claim race on a board-backed row | 2, same `Claimed` path |
 | Bad board config, unknown field or option at config or doctor time, flip with queued writes | 4 |
@@ -356,6 +387,10 @@ fails if either real one is touched:
 | A missing option id drops with `unknown-option` and an error line; a missing field stays queued; rename by id is free | fake schema payloads |
 | Rate-limit answer halts the drain, rows stay queued, cooldown honored | fake `run` rate-limit text, fake pacer |
 | Budget exhausted: pass continues on store data with a board-outage line; stale-gated claim skips | fake pacer in cooldown, fake `Tracker` |
+| Derived Status per card (closed to done, open pull to in review, live claim to claimed, else available) and one select mutation per changed card only | fake `run` payloads, temp store |
+| A manual Status move wins until the derived state changes, then writes again; the last-set record decides | fake `run` payloads, temp store |
+| A partial Status map syncs only what it names; an unmapped project changes nothing | fake `run` payloads, temp store |
+| The per-pass Status cap spreads a catch-up; a rate limit halts the step with the rest left for the next pass | fake `run` payloads, temp store |
 | Schema cache refresh past `schema_max_age_s`, else reused without a call | fake `run` call counts |
 | Variant flip with queued writes refused; doctor parity flags mismatches; doctor names repo, field and missing option id | temp store plus outbox rows |
 | The documented `[repo.board]` table loads through `resolve()`; an unknown concept key is `SettingsError` (exit 4) naming repo and key | project TOML fixtures, no live file reads |
@@ -415,3 +450,9 @@ Each is sized for one agent, with acceptance criteria.
    introduces `TicketRow`) landing first. Criteria: a stale-gated claim
    re-reads live through the board adapter and skips when unreachable,
    per section 2.
+9. Status sync. The board step sets the `Status` column from the
+   derived state every pass (section 4): the project names option ids
+   in `[repo.board]`, a manual move wins until the derived state
+   changes against a last-set record in the board store, writes are
+   capped per pass, and the doctor checks the mapped ids. Criteria: the
+   section 7 Status rows pass; exit codes unchanged.
