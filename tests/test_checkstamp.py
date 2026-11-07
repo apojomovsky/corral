@@ -177,6 +177,26 @@ class SuiteCommandAgreement(unittest.TestCase):
         self.assertEqual(definition.removeprefix("UNITTEST = ").split(), list(module.SUITE_ARGV))
 
 
+class MatrixPythonsAgreement(unittest.TestCase):
+    """The hook's proof check covers the interpreters `make check` stamps.
+
+    The Makefile owns `PYTHONS`; `checkstamp.MATRIX_PYTHONS` repeats it
+    for the pre-push hook, which cannot query make at push time. The two
+    must agree, or a matrix proof would read as foreign interpreters.
+    """
+
+    def test_the_matrix_pythons_match_the_makefile(self):
+        makefile = Path(__file__).resolve().parent.parent / "Makefile"
+        definition = next(
+            line
+            for line in makefile.read_text(encoding="utf-8").splitlines()
+            if line.startswith("PYTHONS ")
+        )
+        self.assertEqual(
+            definition.removeprefix("PYTHONS ?= ").split(), list(checkstamp.MATRIX_PYTHONS)
+        )
+
+
 class StampPath(unittest.TestCase):
     def test_the_stamp_lives_under_the_cache_dir(self):
         env = {"KORAPY_CACHE": "/tmp/cache-for-a-stamp-test"}
