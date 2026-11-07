@@ -1709,7 +1709,10 @@ def _gate_all(
     dropped, and rows no registered project drives never enter the
     held-row loop either, so a foreign row is never a candidate and
     never claimed. Each project with a dropped row prints how many
-    foreign rows it ignored. Nothing is written.
+    foreign rows it ignored. Each resolving policy loads once per
+    pass: the pulls-less pre-pass and the main loop share the loaded
+    policies, so a policy's top-level code runs once per pass.
+    Nothing is written.
     """
     if driven is None:
         driven = {}
@@ -1728,16 +1731,29 @@ def _gate_all(
     pulls_calls = 0
     pulls_limited = False
     union = _driven_union(driven)
+    policies: dict = {}
+    policy_errors: dict = {}
+    for project in registered:
+        if not project.eligibility:
+            continue
+        try:
+            policies[project.name] = eligibility.load_policy(
+                project.eligibility, project=project.name, base=project.root
+            )
+        except eligibility.EligibilityError as problem:
+            policy_errors[project.name] = problem
     if index_for is not None:
         wanted: dict = {}
         for project in registered:
+            policy = policies.get(project.name)
+            if policy is None:
+                continue
             try:
-                outcome = eligibility.for_project(project, items, now=now)
+                requests = policy.eligible(eligibility.rows_from_items(items), now=now)
             except eligibility.EligibilityError:
                 continue
-            if outcome.skipped is None:
-                for request in outcome.requests:
-                    wanted.setdefault((request.repo, request.number), set()).add(request.kind)
+            for request in requests:
+                wanted.setdefault((request.repo, request.number), set()).add(request.kind)
         pre_by_key = _released_rows(items, released)
         live_keys = {(repo, number) for _, repo, number in live_set}
         fetch_keys = {
@@ -1788,17 +1804,27 @@ def _gate_all(
                 problems.append(f"korapy drive: {problem}")
                 continue
         shown = [item for item in items if item.repo in allowed]
+        if project.name in policy_errors:
+            problems.append(f"korapy drive: {policy_errors[project.name]}")
+            continue
+        policy = policies.get(project.name)
+        if policy is None:
+            print(
+                f"project {project.name}: project {project.name} has no eligibility entry: skipped",
+                file=out,
+            )
+            continue
         try:
-            outcome = eligibility.for_project(
-                project, shown, now=now, pulls_by_key=pulls_by_key, pulls_errors=pull_errors
+            requests = policy.eligible(
+                eligibility.rows_from_items(
+                    shown, pulls_by_key=pulls_by_key, pulls_errors=pull_errors
+                ),
+                now=now,
             )
         except eligibility.EligibilityError as problem:
             problems.append(f"korapy drive: {problem}")
             continue
-        if outcome.skipped is not None:
-            print(f"project {project.name}: {outcome.skipped}", file=out)
-            continue
-        for requested in outcome.requests:
+        for requested in requests:
             key = (requested.repo, requested.number)
             if requested.repo not in allowed:
                 if key in by_key:
