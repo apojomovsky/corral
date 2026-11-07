@@ -319,7 +319,8 @@ eligibility = "lead_policy:eligible"
 The ops root is first on the import search path while the module
 imports, so the file needs no installation; when the same module name
 exists elsewhere, the ops root's copy wins. `korapy doctor` verifies
-the entry resolves. A board whose Status column gates the work, for
+the entry resolves, and its `drive-projects` row names the file each
+project's entry loaded from. A board whose Status column gates the work, for
 example, starts only tickets whose Status reads Ready:
 
 ```python

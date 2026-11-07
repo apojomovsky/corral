@@ -91,7 +91,10 @@ failure); when the same module name exists both in the ops root and
 elsewhere, the ops root's copy wins, and the loaded file is recorded
 on the policy. `korapy doctor` verifies every registration's entry
 resolves; the `drive-projects` row fails naming the project, the
-module and the reason when one does not.
+module and the reason when one does not, and names the file each
+resolving entry loaded from when all do. Cached modules from another
+project's root never leak across: each load resolves against its own
+root even when two projects name the same module.
 
 A policy only sees its own project's repositories. The board store is
 shared per host and keyed by tracker repository, so one project's rows

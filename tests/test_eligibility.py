@@ -685,9 +685,9 @@ class OpsRootImportTest(unittest.TestCase):
             policy = eligibility.load_policy(
                 "ops_shadow_policy:eligible", project="blue", base=self.ops
             )
-            module = sys.modules["ops_shadow_policy"]
-        self.assertEqual(module.MARKER, "ops")
+        self.assertEqual(getattr(policy.func, "__globals__", {}).get("MARKER"), "ops")
         self.assertEqual(policy.source, expected)
+        self.assertNotIn("ops_shadow_policy", sys.modules)
         rows = eligibility.rows_from_items([item()])
         requests = policy.eligible(rows, now=2000.0)
         self.assertEqual([(request.repo, request.number) for request in requests], [("app", 7)])
@@ -746,6 +746,85 @@ class OpsRootImportTest(unittest.TestCase):
             [(request.repo, request.number) for request in outcome.requests], [("app", 7)]
         )
         self.assertNotIn(self.ops, sys.path)
+
+
+SAME_POLICY_TEMPLATE = """\
+MARKER = {marker!r}
+NUMBER = {number!r}
+
+
+def eligible(rows, *, now):
+    from korapy.eligibility import StartRequest
+
+    return [StartRequest(repo="app", number=NUMBER, kind="start")]
+"""
+
+
+class TwoRootsSameNameTest(unittest.TestCase):
+    """One dotted name in two ops roots resolves per root, never cross-cached.
+
+    A single `korapy drive` pass loads every project's policy in one
+    process: the second project must run its own file, not the first
+    project's cached module, and an installed copy of the name must
+    lose to the ops root's copy without leaking into later imports.
+    """
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-two-"))
+        self.root_a = os.path.join(self.tmp, "ops-a")
+        self.root_b = os.path.join(self.tmp, "ops-b")
+        os.makedirs(self.root_a)
+        os.makedirs(self.root_b)
+        self.file_a = self.write_policy(self.root_a, "A", 1)
+        self.file_b = self.write_policy(self.root_b, "B", 2)
+        self.addCleanup(sys.modules.pop, "same_policy", None)
+
+    def write_policy(self, root, marker, number):
+        path = os.path.join(root, "same_policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(SAME_POLICY_TEMPLATE.format(marker=marker, number=number))
+        return path
+
+    def load(self, root, project):
+        return eligibility.load_policy("same_policy:eligible", project=project, base=root)
+
+    def numbers(self, policy):
+        rows = eligibility.rows_from_items([item()])
+        return [(request.repo, request.number) for request in policy.eligible(rows, now=2000.0)]
+
+    def test_each_root_loads_its_own_copy(self):
+        first = self.load(self.root_a, "alpha")
+        second = self.load(self.root_b, "beta")
+        self.assertEqual(first.source, self.file_a)
+        self.assertEqual(second.source, self.file_b)
+        self.assertEqual(self.numbers(first), [("app", 1)])
+        self.assertEqual(self.numbers(second), [("app", 2)])
+        self.assertNotIn(self.root_a, sys.path)
+        self.assertNotIn(self.root_b, sys.path)
+
+    def test_each_root_loads_its_own_copy_in_reverse_order(self):
+        second = self.load(self.root_b, "beta")
+        first = self.load(self.root_a, "alpha")
+        self.assertEqual(first.source, self.file_a)
+        self.assertEqual(second.source, self.file_b)
+        self.assertEqual(self.numbers(first), [("app", 1)])
+        self.assertEqual(self.numbers(second), [("app", 2)])
+
+    def test_an_installed_copy_loses_to_the_ops_root_and_is_restored(self):
+        installed = os.path.join(self.tmp, "installed")
+        os.makedirs(installed)
+        with open(os.path.join(installed, "same_policy.py"), "w", encoding="utf-8") as handle:
+            handle.write(SAME_POLICY_TEMPLATE.format(marker="installed", number=9))
+        with mock.patch.object(sys, "path", [installed, *sys.path]):
+            import importlib
+
+            installed_module = importlib.import_module("same_policy")
+            self.assertEqual(installed_module.MARKER, "installed")
+            policy = self.load(self.root_a, "alpha")
+            self.assertEqual(policy.source, self.file_a)
+            self.assertEqual(self.numbers(policy), [("app", 1)])
+            self.assertIs(sys.modules["same_policy"], installed_module)
+        self.assertNotIn(self.root_a, sys.path)
 
 
 if __name__ == "__main__":

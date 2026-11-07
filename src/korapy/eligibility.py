@@ -164,22 +164,93 @@ def rows_from_items(
     return rows
 
 
+def _module_files(module: Any) -> list[str]:
+    """The files a cached module loaded from: its file plus package dirs."""
+    files = []
+    file = getattr(module, "__file__", None)
+    if isinstance(file, str) and file:
+        files.append(file)
+    try:
+        locations = list(getattr(module, "__path__", None) or [])
+    except TypeError:
+        locations = []
+    files.extend(entry for entry in locations if isinstance(entry, str) and entry)
+    return files
+
+
+def _under_root(path: str, root: str) -> bool:
+    """Whether `path` is the root itself or something inside it."""
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+
+def _root_provides(root: str, name: str) -> bool:
+    """Whether the ops root holds the top-level package or module `name`."""
+    package = os.path.join(root, *name.split("."))
+    return os.path.isfile(package + ".py") or os.path.isfile(os.path.join(package, "__init__.py"))
+
+
 def _import_dotted(head: str, *, entry: str, project: str, base: str | None = None) -> Any:
     """The module `head` names, with the ops root first when `base` is given.
 
     The import runs through the shared import-path helper accounts uses
     for readers, so prepending and restoring happen in exactly one
     place. Prepending (never appending) keeps an ops-root copy winning
-    over an installed copy of the same name.
+    over an installed copy of the same name. The module cache does not
+    consult that path, so with an ops root the cached entries for the
+    module (and an ancestor package the root provides) whose files live
+    elsewhere are set aside before importing and put back afterwards:
+    one project's policy cannot leak into the next project's load, and
+    a name imported earlier still resolves to the ops root's copy.
     """
     dirs = [base] if base else []
-    with accounts._with_reader_path(dirs):
+    with accounts.with_reader_path(dirs):
+        if not base:
+            try:
+                return importlib.import_module(head)
+            except Exception as err:
+                raise EligibilityError(
+                    f"project {project}: eligibility {entry!r} does not import: {err}"
+                ) from None
+        root = os.path.realpath(base)
+        saved: dict[str, Any] = {}
+        stashed = [
+            head,
+            *[".".join(head.split(".")[:depth]) for depth in range(1, len(head.split(".")))],
+        ]
+        for key in [name for name in stashed if name in sys.modules]:
+            if key != head and not _root_provides(root, key):
+                continue
+            module = sys.modules[key]
+            files = _module_files(module)
+            if files and all(not _under_root(found, root) for found in files):
+                saved[key] = module
+                del sys.modules[key]
+        for key in [
+            name for name in list(sys.modules) if name.startswith(head + ".") and name not in saved
+        ]:
+            module = sys.modules[key]
+            files = _module_files(module)
+            if files and all(not _under_root(found, root) for found in files):
+                saved[key] = module
+                del sys.modules[key]
+        before = set(sys.modules)
         try:
             return importlib.import_module(head)
         except Exception as err:
             raise EligibilityError(
                 f"project {project}: eligibility {entry!r} does not import: {err}"
             ) from None
+        finally:
+            for key in [
+                name
+                for name in list(sys.modules)
+                if (name == head or name.startswith(head + ".") or head.startswith(name + "."))
+                and name not in before
+                and name not in saved
+            ]:
+                sys.modules.pop(key, None)
+            sys.modules.update(saved)
 
 
 def _resolve(

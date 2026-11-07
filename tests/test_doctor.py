@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -575,6 +576,56 @@ class DriveRows(unittest.TestCase):
         ordered = names(checks)
         self.assertLess(ordered.index("user-manager"), ordered.index("drive-timer"))
         self.assertLess(ordered.index("drive-timer"), ordered.index("drive-projects"))
+
+    def test_an_ok_row_names_each_loaded_policy_file(self):
+        checks = doctor.run_checks(
+            env(
+                project_problems=(),
+                project_policies=(
+                    ("blue", "blue_policy:eligible", "/srv/ops/blue/blue_policy.py"),
+                    ("green", "green_policy:eligible", "/srv/ops/green/green_policy.py"),
+                ),
+            )
+        )
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertIn("blue", found[0].detail)
+        self.assertIn("blue_policy:eligible", found[0].detail)
+        self.assertIn("/srv/ops/blue/blue_policy.py", found[0].detail)
+        self.assertIn("green", found[0].detail)
+        self.assertIn("/srv/ops/green/green_policy.py", found[0].detail)
+        self.assertEqual(doctor.exit_code(checks), 0)
+
+    def test_an_ok_row_without_a_policy_reading_stays_generic(self):
+        checks = doctor.run_checks(env(project_problems=()))
+        found = [check for check in checks if check.name == "drive-projects"]
+        self.assertEqual([check.status for check in found], ["ok"])
+        self.assertIn("every policy entry resolves", found[0].detail)
+
+    def test_load_project_policies_reports_each_resolving_entry(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-doctor-policies-"))
+        ops = os.path.join(tmp, "ops")
+        os.makedirs(ops)
+        expected = os.path.join(ops, "blue_policy.py")
+        with open(expected, "w", encoding="utf-8") as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        config = os.path.join(tmp, "config")
+        os.makedirs(os.path.join(config, "projects.d"))
+        with open(os.path.join(config, "projects.d", "blue.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'name = "blue"\nunit_prefix = "blue-agent"\n'
+                f'root = "{ops}"\n'
+                'eligibility = "blue_policy:eligible"\n'
+            )
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
+        with mock.patch.dict(os.environ, dict(kept, KORAPY_CONFIG=config), clear=True):
+            try:
+                self.assertEqual(
+                    doctor.load_project_policies(),
+                    [("blue", "blue_policy:eligible", expected)],
+                )
+            finally:
+                sys.modules.pop("blue_policy", None)
 
 
 HUB_URL = "http://host-1:8080"

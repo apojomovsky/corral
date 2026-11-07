@@ -283,6 +283,29 @@ def limits(found: list[Project], *, total_cap: int, repo_cap: int) -> admission.
     return built
 
 
+def policy_sources(config_dir: str | None = None) -> list[tuple[str, str, str | None]]:
+    """Every resolving eligibility entry as (project, entry, source file).
+
+    Sorted by project name, like `load_all`. Projects without an entry
+    and entries that do not resolve are skipped: `check` already
+    reports the broken ones. Resolving imports the policy module but
+    never calls the entry function.
+    """
+    found = load_all(config_dir)
+    sources = []
+    for project in found:
+        if project.eligibility is None:
+            continue
+        try:
+            policy = eligibility.load_policy(
+                project.eligibility, project=project.name, base=project.root
+            )
+        except eligibility.EligibilityError:
+            continue
+        sources.append((project.name, project.eligibility, policy.source))
+    return sources
+
+
 def check(config_dir: str | None = None) -> list[str]:
     """Problems with the registry: bad files, ceilings above the host total,
     and eligibility entries that do not resolve.

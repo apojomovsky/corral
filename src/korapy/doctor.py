@@ -183,6 +183,11 @@ class Env(NamedTuple):
     #: or the exception reading it raised. None means the caller has no
     #: reading, and then the report carries no quota row.
     quota_view: Mapping[str, object] | Exception | None = None
+    #: Every resolving eligibility entry as (project, entry, source
+    #: file), gathered once by production. None means the caller has no
+    #: reading, and then the ok row stays generic; a bad entry is
+    #: already a failing row through `project_problems`.
+    project_policies: Sequence[tuple[str, str, str | None]] | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -322,26 +327,45 @@ def _check_drive_timer(state: str | None) -> list[Check]:
     ]
 
 
-def _check_drive_projects(problems: Sequence[str] | None) -> list[Check]:
+def _check_drive_projects(
+    problems: Sequence[str] | None,
+    policies: Sequence[tuple[str, str, str | None]] | None = None,
+) -> list[Check]:
     """The registry row: no row without a reading, one fail row joining
-    every bad registration and every unreadable policy entry."""
+    every bad registration and every unreadable policy entry, else one
+    ok row naming the file each resolving entry loaded from."""
     if problems is None:
         return []
-    if not problems:
+    if problems:
+        return [
+            Check(
+                "drive-projects",
+                "fail",
+                "; ".join(problems),
+                "fix the named registration file or policy entry, then run `korapy doctor` again",
+            )
+        ]
+    if policies:
+        joined = "; ".join(
+            f"project {name}: {entry!r} loaded from {source}"
+            if source
+            else f"project {name}: {entry!r} loaded"
+            for name, entry, source in policies
+        )
         return [
             Check(
                 "drive-projects",
                 "ok",
-                "every registration loads and every policy entry resolves",
+                f"every registration loads and every policy entry resolves: {joined}",
                 "",
             )
         ]
     return [
         Check(
             "drive-projects",
-            "fail",
-            "; ".join(problems),
-            "fix the named registration file or policy entry, then run `korapy doctor` again",
+            "ok",
+            "every registration loads and every policy entry resolves",
+            "",
         )
     ]
 
@@ -856,7 +880,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_linger(env.user, env.run),
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_drive_timer(env.timer_state),
-        *_check_drive_projects(env.project_problems),
+        *_check_drive_projects(env.project_problems, env.project_policies),
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
@@ -1532,6 +1556,18 @@ def load_project_problems() -> list[str]:
         return [str(err)]
 
 
+def load_project_policies() -> list[tuple[str, str, str | None]] | None:
+    """Every resolving eligibility entry for the live report, as
+    (project, entry, source file). None when the registry cannot even
+    be listed: then the ok row stays generic and the failure already
+    reads through `load_project_problems`. Entries that do not resolve
+    are skipped here and reported there."""
+    try:
+        return list(projects.policy_sources())
+    except (projects.ProjectsError, paths.PathError, OSError):
+        return None
+
+
 def load_profile_state(resolved, settings_error: str | None) -> ProfileState:
     """The profile readings for the live report, gathered once.
 
@@ -1818,6 +1854,7 @@ def production_env() -> Env:
         tracker_factory=production_tracker_factory,
     )
     project_problems = load_project_problems()
+    project_policies = load_project_policies()
     timer_state = load_timer_state()
     hub_url = _production_hub_url(resolved)
     hub_token = read_hub_token() if hub_url else None
@@ -1849,6 +1886,7 @@ def production_env() -> Env:
         board_error=board_error,
         repo_sites=repo_sites,
         project_problems=project_problems,
+        project_policies=project_policies,
         timer_state=timer_state,
         hub_url=hub_url or None,
         hub_auth=hub_auth,
