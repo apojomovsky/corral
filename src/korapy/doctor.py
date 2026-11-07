@@ -1546,26 +1546,42 @@ def load_resource_readings(
     )
 
 
+def load_project_report() -> tuple[list[str], list[tuple[str, str, str | None]] | None]:
+    """Registry problems plus every resolving policy entry, in one pass.
+
+    Returns (problems, sources): `sources` holds one (project, entry,
+    source file) per resolving entry, or None when the registry cannot
+    even be listed. Each policy module imports once here, so a policy's
+    top-level code runs once per report, not once per answer. A
+    gathering failure is one problem and no sources, never a
+    traceback. The one loader for the live report; the two readers
+    below are thin views over it.
+    """
+    try:
+        problems, sources = projects.check_and_sources()
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
+        return [str(err)], None
+    return problems, list(sources)
+
+
 def load_project_problems() -> list[str]:
     """The registry problems for the live report: bad files and policy
     entries that do not resolve. A gathering failure is one problem
-    naming it, never a traceback."""
-    try:
-        return list(projects.check())
-    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
-        return [str(err)]
+    naming it, never a traceback. One view over `load_project_report`,
+    so reading problems never re-imports a policy module."""
+    problems, _ = load_project_report()
+    return problems
 
 
 def load_project_policies() -> list[tuple[str, str, str | None]] | None:
     """Every resolving eligibility entry for the live report, as
-    (project, entry, source file). None when the registry cannot even
-    be listed: then the ok row stays generic and the failure already
-    reads through `load_project_problems`. Entries that do not resolve
-    are skipped here and reported there."""
-    try:
-        return list(projects.policy_sources())
-    except (projects.ProjectsError, paths.PathError, OSError):
-        return None
+    (project, entry, source file). Empty when nothing resolves: then
+    the ok row stays generic and any failure already reads through
+    `load_project_problems`. Entries that do not resolve are skipped
+    here and reported there. One view over `load_project_report`, so
+    reading sources never re-imports a policy module."""
+    _, sources = load_project_report()
+    return sources
 
 
 def load_profile_state(resolved, settings_error: str | None) -> ProfileState:
@@ -1853,8 +1869,7 @@ def production_env() -> Env:
         git=production_git,
         tracker_factory=production_tracker_factory,
     )
-    project_problems = load_project_problems()
-    project_policies = load_project_policies()
+    project_problems, project_policies = load_project_report()
     timer_state = load_timer_state()
     hub_url = _production_hub_url(resolved)
     hub_token = read_hub_token() if hub_url else None

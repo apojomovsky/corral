@@ -627,6 +627,38 @@ class DriveRows(unittest.TestCase):
             finally:
                 sys.modules.pop("blue_policy", None)
 
+    def test_load_project_report_imports_each_policy_once(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-doctor-report-"))
+        ops = os.path.join(tmp, "ops")
+        os.makedirs(ops)
+        marker = os.path.join(tmp, "imports.log")
+        expected = os.path.join(ops, "blue_policy.py")
+        with open(expected, "w", encoding="utf-8") as handle:
+            handle.write(
+                f"with open({marker!r}, 'a', encoding='utf-8') as handle:\n"
+                "    handle.write('imported\\n')\n"
+                "def eligible(rows, *, now):\n"
+                "    return []\n"
+            )
+        config = os.path.join(tmp, "config")
+        os.makedirs(os.path.join(config, "projects.d"))
+        with open(os.path.join(config, "projects.d", "blue.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                'name = "blue"\nunit_prefix = "blue-agent"\n'
+                f'root = "{ops}"\n'
+                'eligibility = "blue_policy:eligible"\n'
+            )
+        kept = {k: v for k, v in os.environ.items() if not k.startswith("KORAPY_")}
+        with mock.patch.dict(os.environ, dict(kept, KORAPY_CONFIG=config), clear=True):
+            try:
+                problems, sources = doctor.load_project_report()
+            finally:
+                sys.modules.pop("blue_policy", None)
+        self.assertEqual(problems, [])
+        self.assertEqual(sources, [("blue", "blue_policy:eligible", expected)])
+        with open(marker, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "imported\n")
+
 
 HUB_URL = "http://host-1:8080"
 

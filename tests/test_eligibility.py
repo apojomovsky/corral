@@ -8,6 +8,7 @@ is a temporary `KORAPY_CONFIG`.
 """
 
 import dataclasses
+import importlib
 import os
 import sys
 import tempfile
@@ -825,6 +826,205 @@ class TwoRootsSameNameTest(unittest.TestCase):
             self.assertEqual(self.numbers(policy), [("app", 1)])
             self.assertIs(sys.modules["same_policy"], installed_module)
         self.assertNotIn(self.root_a, sys.path)
+
+
+PKG_POLICY_TEMPLATE = """\
+MARKER = {marker!r}
+NUMBER = {number!r}
+
+
+def eligible(rows, *, now):
+    from korapy.eligibility import StartRequest
+
+    return [StartRequest(repo="app", number=NUMBER, kind="start")]
+"""
+
+
+class TwoRootsSamePackageTest(unittest.TestCase):
+    """One dotted package head in two ops roots resolves per root.
+
+    The ancestor-package eviction in the dotted import only runs for
+    dotted heads: these tests pin it. Each project loads its own
+    `samepkg.policy`, in both orders, and a root package shadows an
+    installed one without leaking it into later imports.
+    """
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-pkg-"))
+        self.root_a = os.path.join(self.tmp, "ops-a")
+        self.root_b = os.path.join(self.tmp, "ops-b")
+        os.makedirs(self.root_a)
+        os.makedirs(self.root_b)
+        self.file_a = self.write_policy(self.root_a, "A", 1)
+        self.file_b = self.write_policy(self.root_b, "B", 2)
+        for name in ("samepkg", "samepkg.policy"):
+            self.addCleanup(sys.modules.pop, name, None)
+
+    def write_policy(self, root, marker, number):
+        package = os.path.join(root, "samepkg")
+        os.makedirs(package, exist_ok=True)
+        with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as handle:
+            handle.write(f"MARKER = {marker!r}\n")
+        path = os.path.join(package, "policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(PKG_POLICY_TEMPLATE.format(marker=marker, number=number))
+        return path
+
+    def load(self, root, project):
+        return eligibility.load_policy("samepkg.policy:eligible", project=project, base=root)
+
+    def numbers(self, policy):
+        rows = eligibility.rows_from_items([item()])
+        return [(request.repo, request.number) for request in policy.eligible(rows, now=2000.0)]
+
+    def test_each_root_loads_its_own_package(self):
+        first = self.load(self.root_a, "alpha")
+        second = self.load(self.root_b, "beta")
+        self.assertEqual(first.source, self.file_a)
+        self.assertEqual(second.source, self.file_b)
+        self.assertEqual(self.numbers(first), [("app", 1)])
+        self.assertEqual(self.numbers(second), [("app", 2)])
+        self.assertNotIn(self.root_a, sys.path)
+        self.assertNotIn(self.root_b, sys.path)
+
+    def test_each_root_loads_its_own_package_in_reverse_order(self):
+        second = self.load(self.root_b, "beta")
+        first = self.load(self.root_a, "alpha")
+        self.assertEqual(first.source, self.file_a)
+        self.assertEqual(second.source, self.file_b)
+        self.assertEqual(self.numbers(first), [("app", 1)])
+        self.assertEqual(self.numbers(second), [("app", 2)])
+
+    def test_a_root_package_shadows_an_installed_one_and_restores_it(self):
+        installed = os.path.join(self.tmp, "installed")
+        package = os.path.join(installed, "samepkg")
+        os.makedirs(package)
+        with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as handle:
+            handle.write('MARKER = "installed"\n')
+        with open(os.path.join(package, "policy.py"), "w", encoding="utf-8") as handle:
+            handle.write(PKG_POLICY_TEMPLATE.format(marker="installed", number=9))
+        with mock.patch.object(sys, "path", [installed, *sys.path]):
+            installed_policy = importlib.import_module("samepkg.policy")
+            self.assertEqual(installed_policy.MARKER, "installed")
+            installed_parent = sys.modules["samepkg"]
+            policy = self.load(self.root_a, "alpha")
+            self.assertEqual(policy.source, self.file_a)
+            self.assertEqual(self.numbers(policy), [("app", 1)])
+            self.assertIs(sys.modules["samepkg"], installed_parent)
+            self.assertEqual(sys.modules["samepkg"].MARKER, "installed")
+        self.assertNotIn(self.root_a, sys.path)
+
+
+class TwoRootsNamespacePackageTest(unittest.TestCase):
+    """A namespace package head (a directory with no `__init__.py`).
+
+    The ops root provides the directory itself, so a cached copy from
+    another root or an installed tree must never be silently kept.
+    A cached namespace copy re-resolves against the prepended root;
+    a cached regular copy does not, so the root's namespace copy
+    evicts it, and an installed regular package of the same name
+    (which always wins the import) is a named error, never a quiet
+    wrong policy.
+    """
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-ns-"))
+        self.root_a = os.path.join(self.tmp, "ops-a")
+        self.root_b = os.path.join(self.tmp, "ops-b")
+        os.makedirs(self.root_a)
+        os.makedirs(self.root_b)
+        for name in ("nsamepkg", "nsamepkg.policy"):
+            self.addCleanup(sys.modules.pop, name, None)
+
+    def write_regular(self, root, marker, number):
+        package = os.path.join(root, "nsamepkg")
+        os.makedirs(package, exist_ok=True)
+        with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as handle:
+            handle.write(f"MARKER = {marker!r}\n")
+        path = os.path.join(package, "policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(PKG_POLICY_TEMPLATE.format(marker=marker, number=number))
+        return path
+
+    def write_namespace(self, root, marker, number):
+        package = os.path.join(root, "nsamepkg")
+        os.makedirs(package, exist_ok=True)
+        path = os.path.join(package, "policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(PKG_POLICY_TEMPLATE.format(marker=marker, number=number))
+        return path
+
+    def cache_copy(self, root):
+        with mock.patch.object(sys, "path", [root, *sys.path]):
+            importlib.import_module("nsamepkg.policy")
+
+    def load(self, root, project):
+        return eligibility.load_policy("nsamepkg.policy:eligible", project=project, base=root)
+
+    def numbers(self, policy):
+        rows = eligibility.rows_from_items([item()])
+        return [(request.repo, request.number) for request in policy.eligible(rows, now=2000.0)]
+
+    def test_namespace_roots_resolve_per_root(self):
+        file_a = self.write_namespace(self.root_a, "A", 1)
+        file_b = self.write_namespace(self.root_b, "B", 2)
+        self.cache_copy(self.root_b)
+        policy = self.load(self.root_a, "alpha")
+        self.assertEqual(policy.source, file_a)
+        self.assertEqual(self.numbers(policy), [("app", 1)])
+        self.assertNotIn(self.root_a, sys.path)
+
+    def test_namespace_roots_resolve_per_root_in_reverse_order(self):
+        file_a = self.write_namespace(self.root_a, "A", 1)
+        file_b = self.write_namespace(self.root_b, "B", 2)
+        self.cache_copy(self.root_a)
+        policy = self.load(self.root_b, "beta")
+        self.assertEqual(policy.source, file_b)
+        self.assertEqual(self.numbers(policy), [("app", 2)])
+        self.assertNotIn(self.root_b, sys.path)
+
+    def test_a_namespace_root_evicts_a_cached_regular_copy(self):
+        file_a = self.write_namespace(self.root_a, "A", 1)
+        self.write_regular(self.root_b, "B", 2)
+        self.cache_copy(self.root_b)
+        policy = self.load(self.root_a, "alpha")
+        self.assertEqual(policy.source, file_a)
+        self.assertEqual(self.numbers(policy), [("app", 1)])
+        self.assertNotIn(self.root_a, sys.path)
+
+    def test_a_regular_root_evicts_a_cached_namespace_copy(self):
+        file_a = self.write_regular(self.root_a, "A", 1)
+        self.write_namespace(self.root_b, "B", 2)
+        self.cache_copy(self.root_b)
+        policy = self.load(self.root_a, "alpha")
+        self.assertEqual(policy.source, file_a)
+        self.assertEqual(self.numbers(policy), [("app", 1)])
+        self.assertNotIn(self.root_a, sys.path)
+
+    def test_an_installed_regular_package_is_a_named_error(self):
+        installed = os.path.join(self.tmp, "installed")
+        package = os.path.join(installed, "rsamepkg")
+        os.makedirs(package)
+        with open(os.path.join(package, "__init__.py"), "w", encoding="utf-8") as handle:
+            handle.write('MARKER = "installed"\n')
+        with open(os.path.join(package, "policy.py"), "w", encoding="utf-8") as handle:
+            handle.write(PKG_POLICY_TEMPLATE.format(marker="installed", number=9))
+        root = os.path.join(self.tmp, "ops")
+        os.makedirs(os.path.join(root, "rsamepkg"))
+        with open(os.path.join(root, "rsamepkg", "policy.py"), "w", encoding="utf-8") as handle:
+            handle.write(PKG_POLICY_TEMPLATE.format(marker="ops", number=5))
+        self.addCleanup(sys.modules.pop, "rsamepkg", None)
+        self.addCleanup(sys.modules.pop, "rsamepkg.policy", None)
+        with mock.patch.object(sys, "path", [installed, *sys.path]):
+            installed_module = importlib.import_module("rsamepkg")
+            self.assertEqual(installed_module.MARKER, "installed")
+            with self.assertRaises(eligibility.EligibilityError) as ctx:
+                eligibility.load_policy("rsamepkg.policy:eligible", project="alpha", base=root)
+            self.assertEqual(ctx.exception.exit_code, 4)
+            self.assertIn("alpha", str(ctx.exception))
+            self.assertIn("rsamepkg.policy:eligible", str(ctx.exception))
+            self.assertIs(sys.modules["rsamepkg"], installed_module)
+        self.assertNotIn(root, sys.path)
 
 
 if __name__ == "__main__":

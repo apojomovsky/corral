@@ -300,6 +300,45 @@ class PolicySourcesTest(HostCase):
         self.assertEqual(projects.policy_sources(), [])
 
 
+class CheckAndSourcesTest(HostCase):
+    def write_ops_policy(self, name, text="def eligible(rows, *, now):\n    return []\n"):
+        root = self.roots[name]
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, "blue_policy.py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_one_pass_reports_problems_and_sources_together(self):
+        expected_a = self.write_ops_policy("project-a")
+        expected_b = self.write_ops_policy("project-b")
+        self.write_project("project-a", eligibility="blue_policy:eligible")
+        self.write_project("project-b", eligibility="blue_policy:eligible")
+        try:
+            problems, sources = projects.check_and_sources()
+            self.assertEqual(problems, [])
+            self.assertEqual(
+                sources,
+                [
+                    ("project-a", "blue_policy:eligible", expected_a),
+                    ("project-b", "blue_policy:eligible", expected_b),
+                ],
+            )
+        finally:
+            sys.modules.pop("blue_policy", None)
+
+    def test_one_pass_reports_problems_without_sources(self):
+        self.write_project("project-a")
+        self.write_project(
+            "project-b",
+            eligibility="missing_policy_xyz:eligible",
+        )
+        problems, sources = projects.check_and_sources()
+        self.assertEqual(len(problems), 1)
+        self.assertIn("project-b", problems[0])
+        self.assertEqual(sources, [])
+
+
 class AdmitAcrossProjectsTest(HostCase):
     def setUp(self):
         super().setUp()

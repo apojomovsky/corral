@@ -185,9 +185,18 @@ def _under_root(path: str, root: str) -> bool:
 
 
 def _root_provides(root: str, name: str) -> bool:
-    """Whether the ops root holds the top-level package or module `name`."""
+    """Whether the ops root holds the top-level package or module `name`.
+
+    A bare directory counts: a namespace package (no `__init__.py`)
+    is still a copy the root provides, so it evicts a cached copy
+    like a regular one instead of silently keeping it.
+    """
     package = os.path.join(root, *name.split("."))
-    return os.path.isfile(package + ".py") or os.path.isfile(os.path.join(package, "__init__.py"))
+    return (
+        os.path.isfile(package + ".py")
+        or os.path.isfile(os.path.join(package, "__init__.py"))
+        or os.path.isdir(package)
+    )
 
 
 def _import_dotted(head: str, *, entry: str, project: str, base: str | None = None) -> Any:
@@ -202,6 +211,10 @@ def _import_dotted(head: str, *, entry: str, project: str, base: str | None = No
     elsewhere are set aside before importing and put back afterwards:
     one project's policy cannot leak into the next project's load, and
     a name imported earlier still resolves to the ops root's copy.
+    When the root provides the name but the import still resolves
+    elsewhere (a regular package always beats the root's namespace
+    copy, whatever the path order), that is a configuration error
+    naming the project and the entry, never a quiet wrong policy.
     """
     dirs = [base] if base else []
     with accounts.with_reader_path(dirs):
@@ -236,7 +249,19 @@ def _import_dotted(head: str, *, entry: str, project: str, base: str | None = No
                 del sys.modules[key]
         before = set(sys.modules)
         try:
-            return importlib.import_module(head)
+            module = importlib.import_module(head)
+            loaded = _module_files(module)
+            if _root_provides(root, head) and (
+                not loaded or all(not _under_root(found, root) for found in loaded)
+            ):
+                shown = loaded[0] if loaded else "an unknown file"
+                raise EligibilityError(
+                    f"project {project}: eligibility {entry!r} loaded from {shown} "
+                    f"instead of the ops root {root}"
+                )
+            return module
+        except EligibilityError:
+            raise
         except Exception as err:
             raise EligibilityError(
                 f"project {project}: eligibility {entry!r} does not import: {err}"
