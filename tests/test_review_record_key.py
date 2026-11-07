@@ -443,6 +443,8 @@ class MergeCliKeyTest(unittest.TestCase):
             "skip": ["checks"],
             "plan": False,
             "json": False,
+            "wait": False,
+            "timeout": None,
         }
         base.update(overrides)
         fake = FakeForge(
@@ -719,6 +721,8 @@ class MergeMethodKeyTest(unittest.TestCase):
                     skip=["checks"],
                     plan=False,
                     json=False,
+                    wait=False,
+                    timeout=None,
                 ),
                 forge=fake,
             )

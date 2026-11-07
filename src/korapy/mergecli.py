@@ -11,13 +11,19 @@ and PR number name what is merged; `--head` pins the exact head the
 caller approved. The method is `--method` when given, else the
 `merge.method` project setting (a squash by default, or a merge
 commit). `--skip` waives only `checks`; `--plan` reports the rows
-without taking the lock and without merging.
+without taking the lock and without merging. A `pending` checks row
+blocks with exit 1 but reports `pending` (a wait, with no fix
+advice) instead of `fail`. `--wait` polls the forge until the
+checks row leaves pending, any row fails, or `--timeout` (default
+ten minutes) lands, so a coordinator waits instead of polling
+itself; a `--timeout` without `--wait` is exit 4.
 
 Exit codes: 0 merged (under `--plan`: mergeable), 1 a precondition
-failed, the merge was refused, or the forge or the repository settings
-disallow the method (the `method` row names `merge.method`),
-2 another merger holds the lock, 3 the forge is unreachable, 4 usage
-(a bad `--skip`, `--method`, `--head`, or `--forge-repo`, a bad
+failed or is still pending, the merge was refused, or the forge or
+the repository settings disallow the method (the `method` row names
+`merge.method`), 2 another merger holds the lock, 3 the forge is
+unreachable, 4 usage (a bad `--skip`, `--method`, `--head`,
+`--forge-repo`, `--timeout`, or `--timeout` without `--wait`, a bad
 `merge.method` setting, or a missing `--pr`).
 """
 
@@ -105,6 +111,8 @@ def cmd_merge(args: argparse.Namespace, forge=None) -> int:
             method=method,
             skips=args.skip or [],
             plan=args.plan,
+            wait=args.wait,
+            timeout=args.timeout,
             forge=adapter,
         )
     except merge.MergeError as err:
@@ -160,8 +168,8 @@ def add_parser(sub) -> None:
         "The method is --method when given, else the merge.method project "
         "setting (a squash by default, or a merge commit). "
         "Exit 0 when merged (under --plan: mergeable), 1 when a precondition "
-        "fails, the merge is refused, or the forge or the repository settings "
-        "disallow the method, 2 when another merger holds the "
+        "fails or is still pending, the merge is refused, or the forge or the "
+        "repository settings disallow the method, 2 when another merger holds the "
         "per-repo lock, 3 when the forge is unreachable, 4 on usage.",
     )
     p.add_argument(
@@ -199,5 +207,19 @@ def add_parser(sub) -> None:
         "--plan",
         action="store_true",
         help="report every row and the lock state without taking the lock and without merging",
+    )
+    p.add_argument(
+        "--wait",
+        action="store_true",
+        help="poll the forge while the checks row is pending, until it leaves "
+        "pending, any row fails, or --timeout lands (a timeout still reports "
+        "pending with exit 1); the wait never holds the merge lock",
+    )
+    p.add_argument(
+        "--timeout",
+        default=None,
+        metavar="SECS",
+        help="with --wait: seconds to poll for pending checks (default: ten "
+        "minutes); without --wait this is exit 4",
     )
     p.set_defaults(func=cmd_merge)
