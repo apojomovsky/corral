@@ -22,33 +22,25 @@ while read -r local_ref local_oid remote_ref remote_oid; do
   fi
 done
 
-# Suite stamp: a verified push (`korapy push`) retries a dropped connection,
-# and the retry must not pay for the suite twice. Stamp the tree the suite
-# passed, keyed on the tree hash plus this hook's own content hash, so any
-# tree or hook change runs the suite again. src/korapy/push.py computes the
-# same stamp with `git hash-object`.
+# Suite skip: one resolver decides, `push.hook_decision()` in
+# src/korapy/push.py, with the tree and the clock injected and every
+# input covered by a case table in tests/test_push.py. It skips only on
+# proof for the identical clean tree: the hook's own stamp for this
+# tree (a verified push retries a dropped connection, and the retry
+# must not pay for the suite twice), or a fresh green-matrix proof
+# from `make check` covering the same interpreters. Any miss (no
+# proof, dirty tree, stale, corrupt or foreign proof) falls through
+# and runs the suite below. A hook that cannot reach the resolver
+# runs the suite (fail closed).
 stamp_file="$(git rev-parse --absolute-git-dir 2>/dev/null)/korapy-pre-push-stamp"
 tree="$(git rev-parse 'HEAD^{tree}' 2>/dev/null)"
 hook_sum="$(git hash-object "${0}" 2>/dev/null)"
-if [ -n "$tree" ] && [ -n "$hook_sum" ] && [ -f "$stamp_file" ] \
-    && grep -qx "$tree $hook_sum" "$stamp_file" 2>/dev/null; then
+proof="$(uv run --locked --quiet python -c 'from korapy import push; skip, why = push.hook_decision(); print(("skip " if skip else "run ") + why)' 2>/dev/null)" || proof="run unavailable"
+if [ "$proof" = "skip own-stamp" ]; then
     echo "pre-push: suite already passed for this tree, skipping"
     exit 0
 fi
-
-# Green-matrix proof: `make check` stamps the tree it passed on every
-# interpreter under the cache dir. When that proof is fresh for this
-# identical clean tree, the suite the hook would run is already
-# proven, so the push skips it the same way. Any miss (no proof, dirty
-# tree, stale, corrupt or foreign proof) falls through and runs the
-# suite below. src/korapy/push.py resolves both proofs through one
-# decision function; a hook that cannot reach it runs the suite.
-matrix_proof="$(uv run --locked --quiet python -c 'from korapy import push; skip, why = push.hook_decision(); print(("skip " if skip else "run ") + why)' 2>/dev/null)" || matrix_proof="run unavailable"
-if [ "$matrix_proof" = "skip own-stamp" ]; then
-    echo "pre-push: suite already passed for this tree, skipping"
-    exit 0
-fi
-if [ "$matrix_proof" = "skip matrix-proof" ]; then
+if [ "$proof" = "skip matrix-proof" ]; then
     echo "pre-push: reusing the green matrix proof for this tree, skipping the suite"
     exit 0
 fi

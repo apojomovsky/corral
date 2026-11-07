@@ -27,6 +27,7 @@ class FakeGit:
         self.digest = digest
         self.remote = remote
         self.branch = branch
+        self.dirty = False
         self.stamp = ""
         self.suite_runs = 0
         self.pushes = 0
@@ -56,6 +57,8 @@ class FakeGit:
             return _proc(0, "" if self.detached else self.branch + "\n")
         if args[:1] == ["hash-object"]:
             return _proc(0, self.digest + "\n")
+        if args == ["status", "--porcelain"]:
+            return _proc(0, " M f\n" if self.dirty else "")
         if args[:1] == ["ls-remote"]:
             if self.ls_error is not None:
                 return _proc(*self.ls_error)
@@ -344,29 +347,51 @@ class PushEnvTest(unittest.TestCase):
 
 
 class StampTest(unittest.TestCase):
+    """The own stamp round-trips through record_pass into hook_decision."""
+
+    NOW = 1_800_000_000
+
+    def decide(self, git):
+        def missing(path):
+            raise OSError("no stamp")
+
+        return push.hook_decision(
+            "/fake", run=git.run, read=git.read, matrix_read=missing, env={}, now=self.NOW
+        )
+
     def test_stamp_hit_skips_suite(self):
         git = FakeGit()
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (False, "missing"))
         push.record_pass("/fake", run=git.run, write=git.write)
-        self.assertFalse(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (True, "own-stamp"))
 
     def test_tree_change_invalidates_stamp(self):
         git = FakeGit()
         push.record_pass("/fake", run=git.run, write=git.write)
         git.tree = "TREE2"
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (False, "missing"))
 
     def test_hook_change_invalidates_stamp(self):
         git = FakeGit()
         push.record_pass("/fake", run=git.run, write=git.write)
         git.digest = "DIGEST2"
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
+        self.assertEqual(self.decide(git), (False, "missing"))
 
     def test_missing_hook_never_stamps(self):
         git = FakeGit()
         git.digest = ""
-        self.assertTrue(push.suite_needed("/fake", run=git.run, read=git.read))
         self.assertFalse(push.record_pass("/fake", run=git.run, write=git.write))
+        self.assertEqual(self.decide(git), (False, "missing"))
+
+
+class WorkingDirtyTest(unittest.TestCase):
+    """An unreadable status reads as dirty: the gate fails closed."""
+
+    def test_an_unreadable_status_reads_as_dirty(self):
+        def run(argv, timeout=300, env=None):
+            return _proc(1, "", "fatal: cannot lock ref")
+
+        self.assertTrue(push.working_dirty("/fake", run=run))
 
 
 if __name__ == "__main__":

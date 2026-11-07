@@ -162,20 +162,6 @@ def record_pass(cwd, run=None, write=None, tree=None, digest=None, env=None):
     return True
 
 
-def stamp_valid(cwd, run=None, read=None, tree=None, digest=None, env=None):
-    """True when the stamp covers this tree under this hook version."""
-    tree = tree if tree is not None else tree_hash(cwd, run, env)
-    digest = digest if digest is not None else hook_digest(cwd, run, env)
-    if not tree or not digest:
-        return False
-    return read_stamp(cwd, run, read, env) == f"{tree} {digest}"
-
-
-def suite_needed(cwd, run=None, read=None, env=None):
-    """The hook's skip decision: run the suite unless the stamp hits."""
-    return not stamp_valid(cwd, run, read, env)
-
-
 def working_dirty(cwd, run=None, env=None):
     """True when the working tree has uncommitted changes.
 

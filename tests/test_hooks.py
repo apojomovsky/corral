@@ -226,6 +226,21 @@ class MatrixProof(PrePush):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("green matrix", r.stdout + r.stderr)
 
+    def test_a_dirty_tree_with_an_own_stamp_runs_the_suite(self):
+        # The setUp push minted the own stamp for this tree. An untracked
+        # failing test keeps the tree hash but dirties the working tree,
+        # so the hook must run the suite and the push must fail.
+        (self.repo / "tests" / "test_broken_untracked.py").write_text(
+            "import unittest\n\nclass Broken(unittest.TestCase):\n"
+            "    def test_broken(self):\n        self.fail('untracked')\n"
+        )
+        r = self.push("origin", "master:copy")
+        # The hook exits 2; git reports the refused push as 1.
+        self.assertNotEqual(r.returncode, 0, r.stderr)
+        self.assertIn("test suite failed", r.stdout + r.stderr)
+        self.assertNotIn("suite already passed", r.stdout + r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
+
     def test_a_stale_matrix_proof_runs_the_suite(self):
         self.commit("chore: three", name="h")
         self.write_stamp(now=self.time.time() - self.checkstamp.STAMP_MAX_AGE_S - 1)
