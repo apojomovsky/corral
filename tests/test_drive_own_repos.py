@@ -563,5 +563,92 @@ class StuckScopeTest(OwnReposCase):
         self.assertIn(OTHER, out.getvalue())
 
 
+class ReviewLookupScopeTest(OwnReposCase):
+    """A foreign row never reaches the review-record lookup.
+
+    The store holds rows for two repositories on one board while only
+    one project drives each repo. The review reader is a recording
+    fake: a lookup the pass should not make shows up in `seen`.
+    """
+
+    def reading(self, seen, failures=()):
+        def read(repo, number):
+            seen.append((repo, number))
+            if (repo, number) in failures:
+                raise RuntimeError("disk hiccup")
+            return None
+
+        return read
+
+    def test_a_plan_pass_reads_no_record_for_a_foreign_row(self):
+        store = stored(self.db, [(APP, 7, "open"), (OTHER, 11, "open")])
+        self.addCleanup(store.close)
+        seen = []
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(
+            store,
+            out,
+            err,
+            plan=True,
+            projects=self.projects(),
+            driven=self.driven(),
+            review_reader=self.reading(seen),
+        )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        self.assertEqual(sorted(seen), [(APP, 7)])
+        self.assertNotIn("cannot read the review record", err.getvalue())
+        self.assertIn("project blue: ignored 1 foreign row", text)
+        self.assertIn("project green: ignored 2 foreign rows", text)
+
+    def test_a_broken_record_on_an_owned_row_is_still_reported(self):
+        store = stored(self.db, [(APP, 7, "open"), (OTHER, 11, "open")])
+        self.addCleanup(store.close)
+        seen = []
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(
+            store,
+            out,
+            err,
+            plan=True,
+            projects=self.projects(),
+            driven=self.driven(),
+            review_reader=self.reading(seen, failures={(APP, 7)}),
+        )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        self.assertIn(
+            f"korapy drive: cannot read the review record for {APP}#7 (disk hiccup)",
+            err.getvalue(),
+        )
+        self.assertNotIn(OTHER, err.getvalue())
+        self.assertNotIn(OTHER, [repo for repo, _number in seen])
+        self.assertIn("project blue: ignored 1 foreign row", text)
+
+    def test_a_claiming_pass_reads_no_record_for_a_foreign_row(self):
+        store = stored(self.db, [(APP, 7, "open"), (OTHER, 11, "open")])
+        self.addCleanup(store.close)
+        launcher = FakeLauncher()
+        seen = []
+        out, err = io.StringIO(), io.StringIO()
+        code = self.run_pass(
+            store,
+            out,
+            err,
+            plan=False,
+            projects=self.projects(),
+            driven=self.driven(),
+            launcher=launcher,
+            host=HOST,
+            stale_after=3600.0,
+            tracker_factory=None,
+            review_reader=self.reading(seen),
+        )
+        text = out.getvalue()
+        self.assertEqual(code, 0, text + err.getvalue())
+        self.assertEqual(sorted(seen), [(APP, 7)])
+        self.assertNotIn("cannot read the review record", err.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

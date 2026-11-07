@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from korapy import (
     accounts,
     agentcli,
+    boardcli,
     coordcli,
     deps,
     diskcli,
@@ -249,6 +250,7 @@ def build_parser() -> argparse.ArgumentParser:
     reviewcli.add_parser(sub)
     mergecli.add_parser(sub)
     agentcli.add_parser(sub)
+    boardcli.add_parser(sub)
     ghcli.add_parser(sub)
     githubcli.add_parser(sub)
     heavycli.add_parser(sub)

@@ -397,8 +397,8 @@ class DriveAdoptTest(unittest.TestCase):
             adopt_report=tracker.BoardAdopt((), (), (f"{other}#9: boom",), None),
         )
         by_repo = {REPO: first, other: second}
-        seen, errors, store_errors, refused, adopt_errors, status_errors = drive.sync_all(
-            self.store, lambda repo: by_repo[repo], operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(self.store, lambda repo: by_repo[repo], operators=["alice"], now=T0)
         )
         self.assertEqual(first.adopt_calls[0]["limit"], 20)
         self.assertEqual(second.adopt_calls[0]["limit"], 20)
@@ -412,8 +412,8 @@ class DriveAdoptTest(unittest.TestCase):
             board_items=[reading(repo=REPO, number=7, updated_at=T0)],
             adopt_report=failed_adopt(),
         )
-        seen, errors, store_errors, refused, adopt_errors, status_errors = drive.sync_all(
-            self.store, lambda repo: fake, operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(self.store, lambda repo: fake, operators=["alice"], now=T0)
         )
         self.assertEqual(errors, [])
         self.assertEqual(refused, [])
