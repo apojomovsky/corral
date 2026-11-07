@@ -41,6 +41,7 @@ from korapy import (
     accounts,
     admission,
     board,
+    boardsweep,
     disk,
     eligibility,
     hold,
@@ -2061,16 +2062,18 @@ def sync_all(store, tracker_factory, *, operators, now, pulls_max_calls=None):
     reader's ``pulls_index`` seam, capped by ``pulls_max_calls`` (None
     reads the ``drive.pulls_max_calls`` host setting, the same budget
     the gate's linked-pull map spends). Returns
-    (seen, errors, store_errors, refused, adopt_errors, status_errors):
-    the rows applied, one line per tracker/outage failure, one line per
-    corrupt stored row, one line per refused read (a validation rejection
-    the tracker answered, toward exit 1, never 3), one line per failed
-    board add and one per failed Status write (both retried next pass,
-    never counted toward an exit). A failed repo keeps its rows and its
-    cursor (that is `sync_repo`'s contract) and the pass moves on to the
-    next repo; a repo the factory does not know is an error line, never
-    a silent skip. With no factory there is nothing to sync from: no
-    rows move and no errors are reported.
+    (seen, errors, store_errors, refused, adopt_errors, status_errors,
+    adopted, written): the rows applied, one line per tracker/outage
+    failure, one line per corrupt stored row, one line per refused read
+    (a validation rejection the tracker answered, toward exit 1, never
+    3), one line per failed board add and one per failed Status write
+    (both retried next pass, never counted toward an exit), the
+    ``repo#N`` names the adopt step added, and the ``repo#N`` names the
+    Status step set. A failed repo keeps its rows and its cursor (that
+    is `sync_repo`'s contract) and the pass moves on to the next repo;
+    a repo the factory does not know is an error line, never a silent
+    skip. With no factory there is nothing to sync from: no rows move
+    and no errors are reported.
 
     The repo list itself parses no row JSON (`Store.repos`), so one
     corrupt row cannot hide the healthy repos; each repo's rows are then
@@ -2082,17 +2085,19 @@ def sync_all(store, tracker_factory, *, operators, now, pulls_max_calls=None):
     read setup aborts earlier with exit 4 on a corrupt row anyway.
     """
     if tracker_factory is None:
-        return 0, [], [], [], [], []
+        return 0, [], [], [], [], [], (), ()
     seen = 0
     errors = []
     store_errors = []
     refused = []
     adopt_errors: list = []
     status_errors: list = []
+    adopted: list = []
+    written: list = []
     try:
         repos = store.repos()
     except (board.StoreError, sqlite3.Error) as err:
-        return 0, [], [f"store repo listing unreadable: {err}"], [], [], []
+        return 0, [], [f"store repo listing unreadable: {err}"], [], [], [], (), ()
     for repo in sorted(repos):
         try:
             tracker = tracker_factory(repo)
@@ -2143,7 +2148,18 @@ def sync_all(store, tracker_factory, *, operators, now, pulls_max_calls=None):
         store_errors.extend(board_result.store_errors)
         adopt_errors.extend(board_result.adopt_errors)
         status_errors.extend(board_result.status_errors)
-    return seen, errors, store_errors, refused, adopt_errors, status_errors
+        adopted.extend(board_result.adopted)
+        written.extend(board_result.status_written)
+    return (
+        seen,
+        errors,
+        store_errors,
+        refused,
+        adopt_errors,
+        status_errors,
+        tuple(adopted),
+        tuple(written),
+    )
 
 
 def refresh_row(store, tracker_factory, repo, number, *, operators, now, stale_after):
@@ -4781,6 +4797,8 @@ def _launching_pass(
             sync_refused,
             sync_adopt_errors,
             sync_status_errors,
+            sync_adopted,
+            sync_written,
         ) = sync_all(
             store, tracker_factory, operators=operators, now=now, pulls_max_calls=pulls_max_calls
         )
@@ -4794,6 +4812,13 @@ def _launching_pass(
         sync_errors + sync_store_errors + sync_refused + sync_adopt_errors + sync_status_errors
     ):
         print(f"korapy drive: {line}", file=err)
+    try:
+        drift_remaining = len(store.drift_flags())
+    except (board.StoreError, sqlite3.Error):
+        drift_remaining = 0
+    board_kept = boardsweep.board_line(len(sync_adopted), len(sync_written), drift_remaining)
+    if board_kept is not None:
+        print(f"korapy drive: {board_kept}", file=err)
     if hub is not None:
         if not getattr(hub, "host_id", ""):
             print("korapy drive: hub host id is empty: register this host first", file=err)

@@ -36,6 +36,7 @@ def populated(store):
     store.set_cursor(OLD, "tracker", "2024-01-01T00:00:00Z")
     store.set_cursor(OLD, "board", "1700000000")
     store.record_status_set(OLD, 1, "opt-c", "claimed", now=1000.0)
+    store.note_drift(OLD, 2, now=1000.0)
     return store
 
 
@@ -44,21 +45,21 @@ class RenameCountsTest(TempStoreTest):
         store = self.open()
         self.assertEqual(
             store.rename_counts(OLD),
-            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0},
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0, "drift": 0},
         )
 
     def test_counts_cover_every_keyed_table(self):
         store = populated(self.open())
         self.assertEqual(
             store.rename_counts(OLD),
-            {"items": 2, "claims": 1, "outbox": 2, "cursors": 2, "status_sets": 1},
+            {"items": 2, "claims": 1, "outbox": 2, "cursors": 2, "status_sets": 1, "drift": 1},
         )
 
     def test_counts_are_per_repo(self):
         store = populated(self.open())
         self.assertEqual(
             store.rename_counts(NEW),
-            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0},
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0, "drift": 0},
         )
 
 
@@ -67,11 +68,12 @@ class RenameRepoTest(TempStoreTest):
         store = populated(self.open())
         counts = store.rename_repo(OLD, NEW)
         self.assertEqual(
-            counts, {"items": 2, "claims": 1, "outbox": 2, "cursors": 2, "status_sets": 1}
+            counts,
+            {"items": 2, "claims": 1, "outbox": 2, "cursors": 2, "status_sets": 1, "drift": 1},
         )
         self.assertEqual(
             store.rename_counts(OLD),
-            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0},
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0, "drift": 0},
         )
         self.assertEqual(store.rename_counts(NEW), counts)
         self.assertEqual(sorted(item.number for item in store.items(repo=NEW)), [1, 2])
@@ -80,6 +82,9 @@ class RenameRepoTest(TempStoreTest):
         self.assertIsNone(store.status_set_of(OLD, 1))
         record = store.status_set_of(NEW, 1)
         self.assertEqual((record.option_id, record.derived), ("opt-c", "claimed"))
+        self.assertEqual(
+            [(repo, number) for repo, number, _since in store.drift_flags()], [(NEW, 2)]
+        )
 
     def test_claim_keeps_agent_and_epoch(self):
         store = populated(self.open())
@@ -108,11 +113,12 @@ class RenameRepoTest(TempStoreTest):
         store.rename_repo(OLD, NEW)
         again = store.rename_repo(OLD, NEW)
         self.assertEqual(
-            again, {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0}
+            again,
+            {"items": 0, "claims": 0, "outbox": 0, "cursors": 0, "status_sets": 0, "drift": 0},
         )
         self.assertEqual(
             store.rename_counts(NEW),
-            {"items": 2, "claims": 1, "outbox": 2, "cursors": 2, "status_sets": 1},
+            {"items": 2, "claims": 1, "outbox": 2, "cursors": 2, "status_sets": 1, "drift": 1},
         )
 
     def test_existing_target_name_refuses_without_merging(self):

@@ -23,6 +23,7 @@ HELD_RETRY_RE = re.compile(r"\[\s*\$code\s+-eq\s+2\s*\]\s*&&\s*sleep\s+\S+\s*&&\
 
 EXPECTED_VERBS = frozenset(
     {
+        "board sweep",
         "coord wait",
         "coord events",
         "coord ack",
