@@ -50,10 +50,10 @@ _FALLBACK_ENTRIES = (
 #: A departing agent must never hang on a password prompt.
 _TERMINAL_PROMPT = ("GIT_TERMINAL_PROMPT", "0")
 
-#: Files that count as "a key that can be used" when no agent socket
-#: answers: the default private key names ssh tries on its own. An
-#: encrypted key still needs its agent; the probe cannot tell cheaply,
-#: so the reading stays best-effort and the doctor row keeps it visible.
+#: The default private key names ssh tries on its own. A file only
+#: counts as "a key that can be used" when it is provably usable
+#: without an agent (see `_key_usable_without_agent`): file existence
+#: alone says nothing, since an encrypted key still needs its agent.
 _KEY_FILES = ("id_ed25519", "id_ecdsa", "id_rsa")
 
 #: The `ssh-add -l` exit codes that mean the socket answered: keys
@@ -68,7 +68,7 @@ HTTPS_NOTE = "no usable SSH agent: pushing over HTTPS with the host gh login"
 REFUSAL = (
     "cannot push: no usable SSH agent and gh is not logged in. "
     "Restore the SSH agent (or add a key usable without one), "
-    "or run `gh auth login`; refusing to start an agent that cannot push"
+    "or run `gh auth login`; refusing work that cannot be pushed"
 )
 
 
@@ -106,7 +106,7 @@ def _can_rewrite(url) -> bool:
     The env carries one `insteadOf` entry per known form (scp-like,
     bare ssh-scheme, explicit `:22` ssh-scheme). A form the env has no
     entry for (another explicit port) is recognized but not rewritten:
-    the decision refuses rather than starting an agent whose push the
+    the decision refuses rather than starting work whose push the
     fallback cannot fix.
     """
     text = (url or "").strip()
@@ -171,12 +171,30 @@ def origin_url(clone, git):
     return (getattr(proc, "stdout", "") or "").strip() or None
 
 
-def default_ssh_probe(run=None, home=None) -> bool:
-    """True when an agent socket answers or a default key file exists.
+def _key_usable_without_agent(run, path: str) -> bool:
+    """True when the key file at `path` needs no agent to use.
 
-    `run(argv)` runs `ssh-add -l` (production: a local subprocess call);
-    `home` is the directory holding `.ssh` (production: the user's
-    home). Both injectable; tests pass fakes and temp dirs.
+    `ssh-keygen -y` with an empty passphrase prints the public key
+    (discarded here) and exits 0 only for an unencrypted key: an
+    encrypted key would need a passphrase the non-interactive launch
+    cannot give. Any failure (an encrypted or unreadable key, a missing
+    ssh-keygen) reads as unusable. Only the path crosses the seam; key
+    material is never read or logged here.
+    """
+    try:
+        proc = run(["ssh-keygen", "-y", "-P", "", "-f", path])
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc is not None and getattr(proc, "returncode", 1) == 0
+
+
+def default_ssh_probe(run=None, home=None) -> bool:
+    """True when an agent socket answers or a default key needs no agent.
+
+    `run(argv)` runs `ssh-add -l` and, per default key file present,
+    `ssh-keygen -y` (production: a local subprocess call); `home` is
+    the directory holding `.ssh` (production: the user's home). Both
+    injectable; tests pass fakes and temp dirs.
     """
     if run is None:
 
@@ -191,7 +209,11 @@ def default_ssh_probe(run=None, home=None) -> bool:
         return True
     base = home if home is not None else os.path.expanduser("~")
     ssh_dir = os.path.join(base, ".ssh")
-    return any(os.path.exists(os.path.join(ssh_dir, name)) for name in _KEY_FILES)
+    for name in _KEY_FILES:
+        path = os.path.join(ssh_dir, name)
+        if os.path.exists(path) and _key_usable_without_agent(run, path):
+            return True
+    return False
 
 
 def default_gh_login(gh_run=None) -> bool:
@@ -236,7 +258,7 @@ def launch_env(clone, *, git, ssh_probe=None, gh_login=None) -> dict:
 
     The one resolver (`resolve`) decides from the clone's origin URL;
     anything that refuses to push raises `PushRefused` (exit 4) naming
-    both fixes instead of starting an agent that cannot push.
+    both fixes instead of starting work that cannot be pushed.
     """
     decision = resolve(origin_url(clone, git), ssh_probe=ssh_probe, gh_login=gh_login)
     if decision.mode == "refuse":

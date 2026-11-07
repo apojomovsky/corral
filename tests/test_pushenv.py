@@ -158,31 +158,108 @@ class OriginUrlTest(unittest.TestCase):
 
 
 class SshProbeTest(unittest.TestCase):
-    def home_with_key(self):
+    def home_with_keys(self, *names):
         tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-push-"))
         ssh_dir = os.path.join(tmp, ".ssh")
         os.makedirs(ssh_dir)
-        with open(os.path.join(ssh_dir, "id_ed25519"), "w", encoding="utf-8") as handle:
-            handle.write("fake-key")
+        for name in names:
+            with open(os.path.join(ssh_dir, name), "w", encoding="utf-8") as handle:
+                handle.write("fake-key")
         return tmp
 
-    def test_an_answering_agent_is_usable_with_or_without_identities(self):
+    def dead_agent(self, key_rc=0, keygen_fails=False):
+        """ssh-add refuses; ssh-keygen reports the key state via key_rc."""
+
+        def run(argv):
+            if list(argv) == ["ssh-add", "-l"]:
+                return _proc(2, "", "connection refused")
+            if keygen_fails:
+                raise OSError("no ssh-keygen")
+            return _proc(key_rc)
+
+        return run
+
+    def test_an_answering_agent_is_usable_without_checking_key_files(self):
         for rc in (0, 1):
-            self.assertTrue(pushenv.default_ssh_probe(run=lambda argv: _proc(rc), home="/none"))
+            calls = []
 
-    def test_a_refusing_socket_falls_back_to_a_default_key(self):
-        def probe(argv):
-            return _proc(2, "", "refused")
+            def run(argv, calls=calls, rc=rc):
+                calls.append(list(argv))
+                return _proc(rc)
 
-        self.assertTrue(pushenv.default_ssh_probe(run=probe, home=self.home_with_key()))
-        self.assertFalse(pushenv.default_ssh_probe(run=probe, home="/none"))
+            self.assertTrue(pushenv.default_ssh_probe(run=run, home="/none"))
+            self.assertEqual(calls, [["ssh-add", "-l"]])
 
-    def test_a_missing_ssh_add_falls_back_to_a_default_key(self):
+    def test_a_refusing_socket_with_an_unencrypted_key_is_usable(self):
+        home = self.home_with_keys("id_ed25519")
+        self.assertTrue(pushenv.default_ssh_probe(run=self.dead_agent(key_rc=0), home=home))
+
+    def test_a_refusing_socket_with_an_encrypted_key_is_not_usable(self):
+        home = self.home_with_keys("id_ed25519")
+        self.assertFalse(pushenv.default_ssh_probe(run=self.dead_agent(key_rc=1), home=home))
+
+    def test_a_refusing_socket_without_a_key_is_not_usable(self):
+        calls = []
+
+        def run(argv):
+            calls.append(list(argv))
+            return _proc(2, "", "connection refused")
+
+        self.assertFalse(pushenv.default_ssh_probe(run=run, home="/none"))
+        self.assertEqual(calls, [["ssh-add", "-l"]])
+
+    def test_a_missing_ssh_add_with_an_unencrypted_key_is_usable(self):
         def missing(argv):
-            raise OSError("no ssh-add")
+            if list(argv) == ["ssh-add", "-l"]:
+                raise OSError("no ssh-add")
+            return _proc(0)
 
-        self.assertTrue(pushenv.default_ssh_probe(run=missing, home=self.home_with_key()))
-        self.assertFalse(pushenv.default_ssh_probe(run=missing, home="/none"))
+        home = self.home_with_keys("id_ed25519")
+        self.assertTrue(pushenv.default_ssh_probe(run=missing, home=home))
+
+    def test_a_missing_ssh_add_with_an_encrypted_key_is_not_usable(self):
+        def missing(argv):
+            if list(argv) == ["ssh-add", "-l"]:
+                raise OSError("no ssh-add")
+            return _proc(1)
+
+        home = self.home_with_keys("id_ed25519")
+        self.assertFalse(pushenv.default_ssh_probe(run=missing, home=home))
+
+    def test_an_unreadable_key_is_not_usable(self):
+        home = self.home_with_keys("id_ed25519")
+        self.assertFalse(
+            pushenv.default_ssh_probe(run=self.dead_agent(keygen_fails=True), home=home)
+        )
+
+    def test_an_encrypted_key_falls_through_to_the_next_key(self):
+        def run(argv):
+            if list(argv) == ["ssh-add", "-l"]:
+                return _proc(2, "", "connection refused")
+            if argv[-1].endswith("id_ed25519"):
+                return _proc(1)
+            return _proc(0)
+
+        home = self.home_with_keys("id_ed25519", "id_ecdsa")
+        self.assertTrue(pushenv.default_ssh_probe(run=run, home=home))
+
+    def test_the_key_probe_passes_an_empty_passphrase_and_no_key_bytes(self):
+        seen = []
+
+        def run(argv):
+            seen.append(list(argv))
+            if list(argv) == ["ssh-add", "-l"]:
+                return _proc(2, "", "connection refused")
+            return _proc(0)
+
+        home = self.home_with_keys("id_rsa")
+        self.assertTrue(pushenv.default_ssh_probe(run=run, home=home))
+        keygen = [call for call in seen if call[0] == "ssh-keygen"]
+        self.assertEqual(len(keygen), 1)
+        self.assertEqual(keygen[0][keygen[0].index("-P") + 1], "")
+        self.assertIn("-f", keygen[0])
+        flat = [arg for call in seen for arg in call]
+        self.assertNotIn("fake-key", flat)
 
 
 class GhLoginTest(unittest.TestCase):
@@ -232,6 +309,58 @@ class ResolveTest(unittest.TestCase):
             gh_login=lambda: True,
         )
         self.assertEqual(decision.mode, "refuse")
+
+
+class ProbeWiringTest(unittest.TestCase):
+    def ssh_probe(self, names, key_rc=0, keygen_fails=False):
+        tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-push-"))
+        ssh_dir = os.path.join(tmp, ".ssh")
+        os.makedirs(ssh_dir)
+        for name in names:
+            with open(os.path.join(ssh_dir, name), "w", encoding="utf-8") as handle:
+                handle.write("fake-key")
+
+        def run(argv):
+            if list(argv) == ["ssh-add", "-l"]:
+                return _proc(2, "", "connection refused")
+            if keygen_fails:
+                raise OSError("unreadable key")
+            return _proc(key_rc)
+
+        return lambda: pushenv.default_ssh_probe(run=run, home=tmp)
+
+    def test_an_encrypted_key_with_gh_falls_back_to_https(self):
+        decision = pushenv.resolve(
+            SSH,
+            ssh_probe=self.ssh_probe(("id_ed25519",), key_rc=1),
+            gh_login=lambda: True,
+        )
+        self.assertEqual(decision.mode, "https")
+
+    def test_an_encrypted_key_without_gh_refuses(self):
+        decision = pushenv.resolve(
+            SSH,
+            ssh_probe=self.ssh_probe(("id_ed25519",), key_rc=1),
+            gh_login=lambda: False,
+        )
+        self.assertEqual(decision.mode, "refuse")
+        self.assertIn("gh auth login", decision.note)
+
+    def test_an_unencrypted_key_pushes_over_ssh(self):
+        decision = pushenv.resolve(
+            SSH,
+            ssh_probe=self.ssh_probe(("id_ed25519",), key_rc=0),
+            gh_login=_refuse,
+        )
+        self.assertEqual(decision.mode, "ssh")
+
+    def test_an_unreadable_key_with_gh_falls_back_to_https(self):
+        decision = pushenv.resolve(
+            SSH,
+            ssh_probe=self.ssh_probe(("id_ed25519",), keygen_fails=True),
+            gh_login=lambda: True,
+        )
+        self.assertEqual(decision.mode, "https")
 
 
 class LaunchEnvTest(unittest.TestCase):
