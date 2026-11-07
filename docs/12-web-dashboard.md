@@ -231,7 +231,11 @@ without it the store reports every existing row fresh and the
 `fresh` flag would be decoration. Columns: `repo#number`, title,
 state, priority, labels, claim holder (`claim.agent`,
 `claim.host` and epoch when held), `fetched_at` age with `fresh`
-and `confidence` as text. The row's `url` links out to the
+and `confidence` as text. The pager line also shows the reply's
+`drift` count whenever it is nonzero: the cards the board step
+recorded as out of step with their issues, the same number
+`korapy doctor` reports in its `board-drift` rows. The row's `url`
+links out to the
 tracker
 only when its scheme is `http` or `https`, with
 `rel="noopener noreferrer"`; anything else renders as text. The

@@ -677,7 +677,7 @@ class OpenTest(unittest.TestCase):
             conn.commit()
             conn.close()
             with board.open_store(path) as store:
-                self.assertEqual(board.SCHEMA_VERSION, 3)
+                self.assertEqual(board.SCHEMA_VERSION, 4)
                 row, _ = store.item("app", 7, now=1000.0)
                 self.assertEqual(row.title, "Kept")
                 self.assertIsNone(store.get_cursor("app", "tracker"))
@@ -714,7 +714,7 @@ class OpenTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")
             conn = sqlite3.connect(path)
-            conn.execute("PRAGMA user_version=4")
+            conn.execute("PRAGMA user_version=5")
             conn.commit()
             conn.close()
             with self.assertRaises(board.StoreError):
@@ -729,6 +729,9 @@ class OpenTest(unittest.TestCase):
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 self.assertEqual(version, 2)
                 board._migrate_2_to_3(conn)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                self.assertEqual(version, 3)
+                board._migrate_3_to_4(conn)
                 version = conn.execute("PRAGMA user_version").fetchone()[0]
                 self.assertEqual(version, board.SCHEMA_VERSION)
             finally:
@@ -764,6 +767,50 @@ class OpenTest(unittest.TestCase):
                 self.assertEqual(row.confidence, board.DIRTY)
                 with self.assertRaises(board.StoreError):
                     store.mark_absent("app", 404, now=2000.0)
+
+    def test_version_3_migrates_forward_adding_drift(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE items(repo TEXT NOT NULL, number INTEGER NOT NULL,"
+                " PRIMARY KEY(repo, number))"
+            )
+            conn.execute("PRAGMA user_version=3")
+            conn.commit()
+            conn.close()
+            with board.open_store(path) as store:
+                store.note_drift("app", 7, now=1000.0)
+                self.assertEqual(store.drift_flags(), [("app", 7, 1000.0)])
+
+
+class DriftFlagsTest(TempStoreTest):
+    def test_no_flags_on_a_fresh_store(self):
+        self.assertEqual(self.open().drift_flags(), [])
+
+    def test_first_sighting_wins(self):
+        store = self.open()
+        store.note_drift("acme/app", 7, now=1000.0)
+        store.note_drift("acme/app", 7, now=2000.0)
+        self.assertEqual(store.drift_flags(), [("acme/app", 7, 1000.0)])
+
+    def test_flags_order_by_repo_and_number(self):
+        store = self.open()
+        store.note_drift("acme/app", 9, now=1000.0)
+        store.note_drift("acme/api", 2, now=1000.0)
+        store.note_drift("acme/app", 7, now=1000.0)
+        self.assertEqual(
+            store.drift_flags(),
+            [("acme/api", 2, 1000.0), ("acme/app", 7, 1000.0), ("acme/app", 9, 1000.0)],
+        )
+
+    def test_clear_drift_drops_one_flag(self):
+        store = self.open()
+        store.note_drift("acme/app", 7, now=1000.0)
+        store.note_drift("acme/app", 9, now=1000.0)
+        store.clear_drift("acme/app", 7)
+        store.clear_drift("acme/app", 404)
+        self.assertEqual(store.drift_flags(), [("acme/app", 9, 1000.0)])
 
 
 class ReposTest(TempStoreTest):

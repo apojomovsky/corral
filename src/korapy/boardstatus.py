@@ -31,6 +31,26 @@ def status_ids(board_config) -> dict:
     }
 
 
+def option_names(id_to_name) -> dict:
+    """The display name to option id map for one Status field. Pure.
+
+    A name two options share resolves to neither: the step reads the
+    card as unknown rather than picking a side, the same way the
+    doctor refuses the ambiguity instead of resolving to one pick.
+    The one place that decides, shared by the status step, the sweep
+    and the doctor.
+    """
+    by_name = {}
+    ambiguous = set()
+    for option_id, name in dict(id_to_name).items():
+        if name in by_name:
+            ambiguous.add(name)
+        by_name[name] = option_id
+    for name in ambiguous:
+        del by_name[name]
+    return by_name
+
+
 def derive(state, has_open_pull, claimed):
     """The derived status key for one card: closed wins over everything,
     then an open linked pull request, then a live claim, else available.

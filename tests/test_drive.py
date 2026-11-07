@@ -22,6 +22,7 @@ from korapy import syncli
 from korapy import tracker
 from korapy import projects as projects_mod
 from korapy.github import tracker as ghtracker
+from tests.test_board_adopt import AdoptingBoardTracker
 from tests.test_sync import UnreadableListingStore
 from tests.test_tracker import FakeRun, FakeTracker, reading
 
@@ -983,6 +984,60 @@ class UnreadableListingTest(unittest.TestCase):
             "korapy drive: store repo listing unreadable: test listing unreadable",
             self.err.getvalue(),
         )
+
+
+class BoardKeptLineTest(unittest.TestCase):
+    """The pass prints one board line when the step changed or found drift.
+
+    A pass that adopted a card or still sees drift verdicts names the
+    counts on stderr, so the journal shows the board being kept; a
+    quiet pass prints no board line at all. Fakes only: a scripted
+    board tracker plus a temporary store, through the hermetic pass.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-boardline-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.lock = os.path.join(self.tmp.name, "drive.lock")
+        self.out, self.err = io.StringIO(), io.StringIO()
+
+    def drive_pass(self, store, fake):
+        return hermetic_pass(
+            store,
+            self.lock,
+            self.out,
+            self.err,
+            plan=False,
+            tracker_factory=lambda repo: fake,
+        )
+
+    def test_changed_board_step_prints_one_line(self):
+        store = stored(self.db, [("example/demo", 7, "open"), ("example/demo", 8, "open")])
+        self.addCleanup(store.close)
+        fake = AdoptingBoardTracker(
+            items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            board_items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            adopt_report=tracker.BoardAdopt(("example/demo#8",), (), (), None),
+        )
+        code = self.drive_pass(store, fake)
+        self.assertEqual(code, drive.OK)
+        self.assertIn(
+            "korapy drive: board kept: 1 added, drift remaining: 1",
+            self.err.getvalue(),
+        )
+
+    def test_quiet_board_step_prints_no_line(self):
+        store = stored(self.db, [("example/demo", 7, "open")])
+        self.addCleanup(store.close)
+        fake = AdoptingBoardTracker(
+            items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            board_items=[reading(repo="example/demo", number=7, updated_at=2000.0)],
+            adopt_report=tracker.BoardAdopt((), (), (), None),
+        )
+        code = self.drive_pass(store, fake)
+        self.assertEqual(code, drive.OK)
+        self.assertNotIn("board kept", self.err.getvalue())
 
 
 class HoldLabelWiringTest(unittest.TestCase):

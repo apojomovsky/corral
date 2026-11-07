@@ -495,19 +495,26 @@ def _page_float(raw: str | None, name: str) -> tuple[float | None, str | None]:
 
 
 def _board_row(
-    item: board.Item, fresh: bool, claim: board.Claim | None, slim: bool = False
+    item: board.Item,
+    fresh: bool,
+    claim: board.Claim | None,
+    slim: bool = False,
+    drift: bool = False,
 ) -> dict:
-    """One board row: the stored item, its freshness, and its holder.
+    """One board row: the stored item, its freshness, its holder, its drift.
 
     Slim rows (`body=0`) drop exactly `body` and `extra`: the list
     view never renders them and stops paying their bytes on every
     poll, while every other key stays identical to the full row.
+    `drift` marks the cards the board step recorded as out of step
+    with their issues, the same verdicts the doctor counts.
     """
     row = asdict(item)
     if slim:
         row.pop("body", None)
         row.pop("extra", None)
     row["fresh"] = fresh
+    row["drift"] = drift
     if claim is None:
         row["claim"] = None
     else:
@@ -854,6 +861,10 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             with opener() as store:
                 listed = store.items(repo=repo, state=state, label=label)
+                flagged = {
+                    (flagged_repo, flagged_number)
+                    for flagged_repo, flagged_number, _since in store.drift_flags()
+                }
                 rows = []
                 for got in listed:
                     item, fresh = store.item(got.repo, got.number, now=now, max_age=max_age)
@@ -861,7 +872,11 @@ class _Handler(BaseHTTPRequestHandler):
                         continue
                     rows.append(
                         _board_row(
-                            item, fresh, store.claim_of(item.repo, item.number), slim=not full
+                            item,
+                            fresh,
+                            store.claim_of(item.repo, item.number),
+                            slim=not full,
+                            drift=(item.repo, item.number) in flagged,
                         )
                     )
         except Exception as exc:  # noqa: BLE001 - a request never drops the connection
@@ -874,6 +889,7 @@ class _Handler(BaseHTTPRequestHandler):
                 "now": now,
                 "board": rows[offset : offset + limit],
                 "total": len(rows),
+                "drift": sum(1 for row in rows if row["drift"]),
                 "limit": limit,
                 "offset": offset,
             },

@@ -14,7 +14,7 @@ a validation rejection is refused, not unreachable: it is reported in
 
 from typing import Iterator, NamedTuple
 
-from korapy import board, boardstatus, settings, tracker as iface
+from korapy import board, boardsweep, boardstatus, settings, tracker as iface
 
 settings.register(
     "tracker.repo", str, "", "tracker repository as owner/name (default: the clone's origin)"
@@ -40,6 +40,12 @@ settings.register(
     int,
     20,
     "board Status writes per repo per pass (default: 20; 0 or less syncs nothing)",
+)
+settings.register(
+    "board.drift_max_age_s",
+    int,
+    600,
+    "seconds a card may stay out of step with its issue before the doctor fails the repo",
 )
 settings.register(
     "board.schema_max_age_s",
@@ -99,6 +105,8 @@ class SyncResult(NamedTuple):
     status_errors: tuple[
         str, ...
     ] = ()  # failed Status writes, retried next pass, never counted toward an exit
+    adopted: tuple[str, ...] = ()  # "repo#N" the adopt step added this call
+    status_written: tuple[str, ...] = ()  # "repo#N" the Status step set this call
 
 
 class StatusOutcome(NamedTuple):
@@ -178,69 +186,61 @@ def sync_repo(
     return SyncResult(seen, nxt, (), store_errors=tuple(store_errors))
 
 
-def _adopt_after_poll(reader, schema, repo, found, *, page_after, resume, now):
-    """Add the tracker's missing issues to the board: ``(adopt, outage, refused)``.
+def _adopt_after_poll(reader, schema, repo, found, *, page_after, resume, now, uncapped=False):
+    """Add the tracker's missing issues to the board.
 
-    The adopt runs only on a complete view: the poll started at the
-    head (no resume token) and reached the end, so the polled items are
-    the whole membership and adding cannot duplicate. A reader without
-    an adopt cap (``board_adopt_limit``) skips the adopt. A failed add
-    is one adopt line naming the issue, retried on the next pass and
-    never counted toward an exit; a rate limit halts the run with an
-    outage line, the rest carrying to the next pass.
+    Returns ``(added, adopt_lines, refused_lines, outage_lines)``: the
+    ``repo#N`` names adopted this call, one line per failed add
+    (retried next pass, never counted toward an exit), the rejection
+    line when the tracker answered with one, and the outage line when
+    the tracker was unreachable or rate limited. The adopt runs only
+    on a complete view: the poll started at the head (no resume token)
+    and reached the end, so the polled items are the whole membership
+    and adding cannot duplicate. A reader without an adopt cap
+    (``board_adopt_limit``) skips the adopt, unless the sweep runs
+    uncapped: then the cap reads as unlimited and every missing issue
+    is adopted in one run.
     """
-    limit = getattr(reader, "board_adopt_limit", None)
-    if limit is None or resume is not None or page_after is not None:
-        return (), (), ()
+    limit = None if uncapped else getattr(reader, "board_adopt_limit", None)
+    if limit is None and not uncapped:
+        return (), (), (), ()
+    if resume is not None or page_after is not None:
+        return (), (), (), ()
     present = {(item.repo, item.number) for item in found}
     try:
         adopted = reader.adopt_missing(schema.project_id, repo, present, limit=limit, now=now)
     except iface.TrackerRejected as err:
-        return (), (), (f"{repo}: {err}",)
+        return (), (), (f"{repo}: {err}",), ()
     except iface.TrackerError as err:
-        return (), (f"{repo}: {err}",), ()
-    errors: list[str] = []
+        return (), (), (), (f"{repo}: {err}",)
+    outage: list[str] = []
     if adopted.stopped is not None:
         message, retry_after = adopted.stopped
-        errors.append(
+        outage.append(
             f"{repo}: board add rate limited, retry after {retry_after:g}s"
             f" ({message}); the rest carries to the next pass"
         )
-    return tuple(adopted.refused), tuple(errors), ()
+    return tuple(adopted.added), tuple(adopted.refused), (), tuple(outage)
 
 
-def _option_names(options):
-    """The display name to option id map for one Status field's options.
-
-    Pure. A name two options share resolves to neither: the step reads
-    the card as unknown rather than picking a side, the same way the
-    doctor refuses the ambiguity instead of picking one.
-    """
-    by_name = {}
-    ambiguous = set()
-    for option_id, name in options.items():
-        if name in by_name:
-            ambiguous.add(name)
-        by_name[name] = option_id
-    for name in ambiguous:
-        del by_name[name]
-    return by_name
-
-
-def _status_setup(reader, schema):
+def _status_setup(reader, schema, *, uncapped=False):
     """``(limit, write, ids, field)`` when the Status step may write, else None.
 
     One predicate for the step's activation: a capped reader carrying
     the Status option ids, and a schema with the Status column. Both
     the step and the pulls resolution read this, so an unmapped
-    project never pays for a pulls listing it cannot use.
+    project never pays for a pulls listing it cannot use. The sweep
+    runs uncapped: the cap reads as unlimited, while a missing writer,
+    missing ids or missing column still read as unmapped.
     """
-    limit = getattr(reader, "board_status_limit", None)
+    limit = None if uncapped else getattr(reader, "board_status_limit", None)
     write = getattr(reader, "write_option", None)
     ids = getattr(reader, "board_status_ids", None)
-    if limit is None or write is None or not ids:
+    if limit is None and not uncapped:
         return None
-    if limit <= 0:
+    if write is None or not ids:
+        return None
+    if limit is not None and limit <= 0:
         return None
     field = schema.fields.get("board_status")
     if field is None:
@@ -298,7 +298,7 @@ def _resolve_status_pulls(reader, repo, *, max_calls):
 
 
 def sync_board_status(
-    store, reader, schema, repo, cards, *, now, pulls=None, pulls_error=""
+    store, reader, schema, repo, cards, *, now, pulls=None, pulls_error="", uncapped=False
 ) -> StatusOutcome:
     """Set the Status column from the derived state, up to the pass cap.
 
@@ -313,6 +313,7 @@ def sync_board_status(
     state changes, then writes again. Writes only land when the live
     Status differs from the derived one, one write per changed card, at
     most the reader's cap per pass; the rest carries to the next pass.
+    The sweep runs uncapped: every drifted card is written in one run.
     A failed card is one status line and the step moves on.
 
     ``pulls`` is the per-issue set of issue numbers holding an open
@@ -323,11 +324,11 @@ def sync_board_status(
     cause, while a closed card still derives Done, which needs no
     pulls.
     """
-    setup = _status_setup(reader, schema)
+    setup = _status_setup(reader, schema, uncapped=uncapped)
     if setup is None:
         return StatusOutcome((), (), ())
     limit, write, ids, field = setup
-    by_name = _option_names(field.options)
+    by_name = boardstatus.option_names(field.options)
     written: list[str] = []
     errors: list[str] = []
     status_errors: list[str] = []
@@ -353,7 +354,7 @@ def sync_board_status(
                 card.repo, card.number, payload.option_id, payload.derived, now=now
             )
         elif action == "write":
-            if len(written) >= limit:
+            if limit is not None and len(written) >= limit:
                 continue
             try:
                 write(card.repo, card.number, payload)
@@ -371,18 +372,21 @@ def sync_board_status(
     return StatusOutcome(tuple(written), tuple(errors), tuple(status_errors))
 
 
-def _sync_board_status(store, reader, schema, repo, cards, *, now, pulls_max_calls):
+def _sync_board_status(store, reader, schema, repo, cards, *, now, pulls_max_calls, uncapped=False):
     """The Status step with its pulls resolved once for the repo.
 
     Skips the listing when the step cannot write or no open ticket
     needs pulls, so unmapped projects and closed-only polls never
     contact the tracker. A rate-limited listing halts the step with
     the outage line; an unreadable or capped one rests the open cards
-    with the cause while closed cards still derive Done.
+    with the cause while closed cards still derive Done. Returns the
+    outcome with the resolved pulls, so the drift recording reads the
+    same listing instead of resolving it twice; a halted listing
+    resolves to unknown, and the recording rests the open cards too.
     """
     pulls: set[int] | None = set()
     pulls_error = ""
-    if _status_setup(reader, schema) is not None and any(
+    if _status_setup(reader, schema, uncapped=uncapped) is not None and any(
         getattr(card, "kind", "issue") == "issue" and card.state != "closed" for card in cards
     ):
         try:
@@ -390,18 +394,72 @@ def _sync_board_status(store, reader, schema, repo, cards, *, now, pulls_max_cal
                 reader, repo, max_calls=_pulls_budget(pulls_max_calls)
             )
         except iface.TrackerRateLimited as err:
-            return StatusOutcome(
-                (),
-                (
-                    f"{repo}: board status rate limited, retry after {err.retry_after:g}s"
-                    f" ({err}); the rest carries to the next pass",
+            return (
+                StatusOutcome(
+                    (),
+                    (
+                        f"{repo}: board status rate limited, retry after {err.retry_after:g}s"
+                        f" ({err}); the rest carries to the next pass",
+                    ),
+                    (),
                 ),
-                (),
+                None,
+                "",
             )
         except iface.TrackerError as err:
             pulls, pulls_error = None, str(err)
-    return sync_board_status(
-        store, reader, schema, repo, cards, now=now, pulls=pulls, pulls_error=pulls_error
+    return (
+        sync_board_status(
+            store,
+            reader,
+            schema,
+            repo,
+            cards,
+            now=now,
+            pulls=pulls,
+            pulls_error=pulls_error,
+            uncapped=uncapped,
+        ),
+        pulls,
+        pulls_error,
+    )
+
+
+def _record_board_drift(store, reader, schema, repo, found, *, pulls, pulls_error, now, complete):
+    """Reconcile this poll's drift verdicts in the store.
+
+    The one recording path: the status and missing verdicts come from
+    the same ``boardsweep`` finders the sweep runs, over the same poll
+    cards, pulls and store state, so the pass, the sweep, the doctor
+    and the dashboard never disagree on what drifted. What counts is
+    the mapping, not the caps: the sweep fixes everything mapped
+    without the per-pass caps, so mapped drift is always fixable in
+    one command, while an unmapped project (no Status column, no
+    option ids, no writer) has no fix path and records nothing. The
+    per-pass caps only pace the pass; the verdicts stay objective. A
+    corrupt stored row raises ``board.StoreError``: the caller reports
+    it as one store line and records nothing, the way it already
+    reports rows the upsert cannot apply.
+    """
+    mapped = _status_setup(reader, schema, uncapped=True)
+    status_active = mapped is not None
+    names = boardstatus.option_names(mapped[3].options) if mapped is not None else {}
+    ids = dict(mapped[2]) if mapped is not None else {}
+    present = {(item.repo, item.number) for item in found}
+    boardsweep.reconcile(
+        store,
+        repo,
+        cards=boardsweep.poll_cards(found),
+        open_cards=boardsweep.store_cards(store.items(repo=repo, state="open")),
+        present=present,
+        names=names,
+        ids=ids,
+        pulls=pulls,
+        pulls_error=pulls_error,
+        now=now,
+        complete=complete,
+        status_active=status_active,
+        adopt_active=True,
     )
 
 
@@ -415,6 +473,7 @@ def sync_board_repo(
     now: float,
     max_pages: int,
     pulls_max_calls=None,
+    uncapped=False,
 ) -> SyncResult:
     """Apply one board poll for ``repo``: page the board items oldest first
     (at most ``max_pages`` pages per call), upsert every returned reading,
@@ -452,7 +511,14 @@ def sync_board_repo(
     the ``drive.pulls_max_calls`` host setting): an unreadable or
     capped listing rests the open cards with the cause while closed
     cards still derive Done, and a rate-limited one halts the step
-    with an outage line.
+    with an outage line. The sweep runs uncapped: both caps read as
+    unlimited and every drifted card is fixed in one run.
+
+    Every poll also reconciles the board-drift verdicts in the store
+    (``adopted`` and ``status_written`` name what this call fixed):
+    the doctor and the dashboard read those flags, and the sweep lists
+    them. A corrupt stored row the verdict read cannot parse is one
+    store line, and records nothing.
     """
     old = store.get_cursor(repo, BOARD_CURSOR_NAME)
     page_after = store.get_cursor(repo, BOARD_PAGE_NAME)
@@ -472,12 +538,46 @@ def sync_board_repo(
             store_errors.append(str(err))
             continue
         seen += 1
-    adopt_errors, adopt_outage, adopt_refused = _adopt_after_poll(
-        reader, schema, repo, found, page_after=page_after, resume=resume, now=now
+    adopt_added, adopt_lines, adopt_refused, adopt_outage = _adopt_after_poll(
+        reader,
+        schema,
+        repo,
+        found,
+        page_after=page_after,
+        resume=resume,
+        now=now,
+        uncapped=uncapped,
     )
-    status = _sync_board_status(
-        store, reader, schema, repo, found, now=now, pulls_max_calls=pulls_max_calls
+    status, pulls, pulls_error = _sync_board_status(
+        store,
+        reader,
+        schema,
+        repo,
+        found,
+        now=now,
+        pulls_max_calls=pulls_max_calls,
+        uncapped=uncapped,
     )
+    if not store_errors:
+        try:
+            _record_board_drift(
+                store,
+                reader,
+                schema,
+                repo,
+                found,
+                pulls=pulls,
+                pulls_error=pulls_error,
+                now=now,
+                complete=resume is None and page_after is None,
+            )
+        except board.StoreError as err:
+            # The upserts above read clean, so this is new information
+            # (a claims, status-set or drift row the verdict read could
+            # not parse), worth its own line. When the upserts already
+            # failed, the verdict read hits the same corruption, so it
+            # is skipped instead of reporting the same row twice.
+            store_errors.append(str(err))
     if resume is None:
         store.clear_cursor(repo, BOARD_PAGE_NAME)
     else:
@@ -489,8 +589,10 @@ def sync_board_repo(
             tuple(adopt_outage) + tuple(status.errors),
             store_errors=tuple(store_errors),
             refused=tuple(adopt_refused),
-            adopt_errors=tuple(adopt_errors),
+            adopt_errors=tuple(adopt_lines),
             status_errors=tuple(status.status_errors),
+            adopted=tuple(adopt_added),
+            status_written=tuple(status.written),
         )
     cursor = iface.format_cursor(max(item.updated_at for item in found))
     if before is not None and before > iface.parse_cursor(cursor):
@@ -502,8 +604,10 @@ def sync_board_repo(
         tuple(adopt_outage) + tuple(status.errors),
         store_errors=tuple(store_errors),
         refused=tuple(adopt_refused),
-        adopt_errors=tuple(adopt_errors),
+        adopt_errors=tuple(adopt_lines),
         status_errors=tuple(status.status_errors),
+        adopted=tuple(adopt_added),
+        status_written=tuple(status.written),
     )
 
 

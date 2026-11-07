@@ -1007,6 +1007,7 @@ codes (`TrackerError` is exit 3 through sync, mirror and setup;
 | Board provisioned but variant still `labels` | warn, naming the table | the `07` section 6 flip steps, or remove the table |
 | Another board under the same owner shares the configured board's title | warn, naming the title and every matching number | delete the board the config does not address, by hand (the racing-setups duplicate of section 2; korapy deletes no board) |
 | Open issues missing from the board | fail, naming the count and the first few numbers | `korapy github setup --populate` (needs the section 8 ticket 6 seam; not in the first doctor ticket) |
+| Cards out of step with their issues (closed but not Done, open but missing from the board, Status differing from the derived state with no manual-move record), recorded by every board step | `board-drift` row per repo: fail when any card drifted longer than `board.drift_max_age_s` (default 600 seconds), warn below, ok at zero, naming the count and the first few numbers | `korapy board sweep --apply` |
 
 Six implementation notes, so the rows above are buildable rather
 than aspirational:
