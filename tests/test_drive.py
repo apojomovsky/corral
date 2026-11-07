@@ -646,7 +646,7 @@ class BrokenPolicyIsolationTest(unittest.TestCase):
         none = project_named("none")
         fake = FakeTracker()
         out = io.StringIO()
-        gated, problems, _requested, _calls, _limited = drive._gate_all(
+        gated, problems, _requested, pulls_calls, pulls_limited = drive._gate_all(
             store.items(),
             [good, bad, none],
             out,
@@ -680,6 +680,9 @@ class BrokenPolicyIsolationTest(unittest.TestCase):
             [f"project none: {eligibility.no_entry_line('none')}"],
         )
         self.assertEqual([row.project for row in gated], ["good"])
+        self.assertIn(("pulls_index", "app", 5), fake.calls)
+        self.assertEqual(pulls_calls, 1)
+        self.assertFalse(pulls_limited)
 
 
 class PolicyLoadOnceTest(unittest.TestCase):
