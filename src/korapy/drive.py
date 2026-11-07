@@ -91,6 +91,34 @@ settings.register(
     check=reviewrecord.check_threshold,
 )
 
+
+def _positive_calls(value):
+    """One configured pulls budget for the settings layer.
+
+    Takes the parsed value; anything but a positive integer raises
+    ValueError, so the settings layer reports the failure naming the
+    file and key. Zero would silently refuse every start, so it is a
+    configuration error, not a quiet disable.
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"must be a positive integer, not {value!r}")
+    return value
+
+
+#: Default cap on the GitHub calls one pass spends listing open pull
+#: requests: one listing per repository, so a handful of repositories
+#: cost a handful of calls. Tickets past the cap fail closed.
+DEFAULT_PULLS_MAX_CALLS = 20
+
+settings.register(
+    "drive.pulls_max_calls",
+    int,
+    DEFAULT_PULLS_MAX_CALLS,
+    "max GitHub calls one pass spends listing open pull requests "
+    "(tickets past the cap fail closed)",
+    check=_positive_calls,
+)
+
 #: The lock file inside the state dir.
 LOCK_NAME = "drive.lock"
 
@@ -310,10 +338,10 @@ def gate(
     for every kind, so no worker, fix round or re-review starts on it.
     With no review map (`reviews` None) the check cannot run and the
     row gates as before. A fresh start on an
-    unclaimed row with an open linked pull (`row.pulls`, read once per
-    pass through the tracker when the rows were built) is refused: the
-    pull, not a new worker, carries the ticket. The row pulls are the
-    one linked-pull source the policies read too, so the two never
+    unclaimed row with an open linked pull (`row.pulls`, listed once
+    per repository when the rows were built) is refused: the pull, not
+    a new worker, carries the ticket. The row pulls are the one
+    linked-pull source the policies read too, so the two never
     disagree and the check costs no second lookup. A fix or
     resume behind a reviewer holder (from `agent_roles`, resolved to
     its registry entry by ticket through the one resolver, since a
@@ -1216,7 +1244,8 @@ def _store_labels(store, now):
     unreadable, like a missing row: the hold gate skips instead of
     passing a ticket whose pull labels it could not see. Linked pulls
     themselves never live in the store; the pass reads them through the
-    `pulls_for` seam, which queries the tracker, and the rows carry them.
+    `index_for` seam, which lists each repository once, and the rows
+    carry them.
     """
 
     def read(kind, repo, number):
@@ -1339,54 +1368,115 @@ def log_missing_reviews(out, finished, reviews, rows) -> int:
     return count
 
 
-def tracker_pulls_for(tracker_factory):
-    """A `pulls_for` seam over the pass's per-repo trackers.
+def pulls_index_for(tracker_factory):
+    """A per-repo pulls index over the pass's trackers.
 
-    Each call reads the ticket's linked pull requests through its
-    tracker's `linked_pulls` and keeps their numbers and states as
-    `LinkedPull` rows for the pass's row building. A repo with no
-    tracker reads as no linked pulls; a tracker failure propagates,
-    and the pass map marks the ticket unreadable instead of starting
-    blind.
+    Each call lists the repo's open pull requests once and files them
+    by linked ticket as `LinkedPull` rows for the pass's row building.
+    A repo with no tracker reads as no linked pulls; a tracker failure
+    propagates, and the pass map marks the repo's tickets unreadable
+    instead of starting blind.
     """
 
-    def pulls_for(repo, number):
+    def index_for(repo, budget):
         try:
             tracker = tracker_factory(repo)
         except KeyError:
-            return ()
-        return tuple(
-            LinkedPull(number=item.number, state=item.state)
-            for item in tracker.linked_pulls(repo, number)
-            if getattr(item, "kind", "pr") == "pr"
+            return {}, 0, True
+        found = tracker.pulls_index(repo, budget)
+        return (
+            {
+                number: tuple(
+                    LinkedPull(number=item.number, state=item.state)
+                    for item in pulls
+                    if getattr(item, "kind", "pr") == "pr"
+                )
+                for number, pulls in found.by_issue.items()
+            },
+            found.calls,
+            found.complete,
         )
 
-    return pulls_for
+    return index_for
 
 
-def linked_pulls_map(items, pulls_for, *, errors=None):
-    """{(repo, number): linked pulls} for these store items, one read each.
+def pulls_check_needed(row, *, live_keys, hold_label, kind="start") -> bool:
+    """Whether the pass must list pulls before deciding this row. Pure.
+
+    Only tickets the gate could still decide need the listing: an open,
+    internally owned ticket no human holds. Anything else skips before
+    the gate ever reads row pulls (closed, external, held, waiting on
+    a human, foreign-claimed), so listing for it would spend GitHub
+    calls no verdict uses. A live-claimed ticket needs the listing
+    only for `fix` and `resume`: those are the only kinds that reach
+    the pulls reads with a holder, while `start` and `review` skip on
+    the claim first. `live_keys` holds the (repo, number) pairs with a
+    live agent, and `kind` is the wanted request kind.
+    """
+    if row is None or row.state != "open" or row.external:
+        return False
+    labels = tuple(row.labels or ())
+    if hold.labels_held(labels, hold_label):
+        return False
+    if iface.NEEDS_DECISION in labels or "needs-triage" in labels:
+        return False
+    holder = row.agent or ""
+    if not holder:
+        return True
+    if (row.repo, row.number) in live_keys:
+        return kind in ("fix", "resume") and is_managed_agent(holder)
+    return is_managed_agent(holder)
+
+
+def linked_pulls_map(keys, index_for, *, max_calls, errors=None):
+    """{(repo, number): linked pulls} for these tickets, one listing per repo.
 
     The pass's one linked-pull source: the row builders (eligibility
     and gating) read from this map, so the policies and the gate see
-    the same pulls with no second lookup. An unreadable ticket maps to
-    None, and readers fail that ticket closed; a ticket the seam reads
-    as empty maps to (). When `errors` is given, the first error string
-    per unreadable ticket is recorded there, so the rows built from the
-    map can name the cause instead of reading every failure alike.
+    the same pulls with no second lookup. Each repo lists its open
+    pull requests once and every ticket looks itself up in that
+    listing; a ticket in no listing reads as carrying no pulls. An
+    unreadable repo maps its tickets to None, and readers fail those
+    tickets closed; a ticket the listing reads as empty maps to ().
+    When `errors` is given, the first error string per unreadable
+    ticket is recorded there, so the rows built from the map can name
+    the cause. `max_calls` caps the listing calls for the pass: repos
+    past the cap map to None with a "pulls lookup limited" cause.
+    Returns (found, calls, limited).
     """
-    found = {}
-    for item in items:
-        key = (item.repo, item.number)
-        if key in found:
+    by_repo: dict = {}
+    for key in dict.fromkeys(keys):
+        by_repo.setdefault(key[0], []).append(key[1])
+    found: dict = {}
+    calls = 0
+    limited = False
+    remaining = max(0, max_calls)
+    for repo in sorted(by_repo):
+
+        def refuse(cause):
+            for number in by_repo[repo]:
+                found[(repo, number)] = None
+                if errors is not None:
+                    errors.setdefault((repo, number), cause)
+
+        if remaining <= 0:
+            limited = True
+            refuse(f"pulls lookup limited at {max_calls} call(s)")
             continue
         try:
-            found[key] = tuple(pulls_for(item.repo, item.number) or ())
+            by_issue, used, complete = index_for(repo, remaining)
         except Exception as exc:
-            found[key] = None
-            if errors is not None:
-                errors.setdefault(key, str(exc) or type(exc).__name__)
-    return found
+            refuse(str(exc) or type(exc).__name__)
+            continue
+        calls += used
+        remaining -= used
+        if not complete:
+            limited = True
+            refuse(f"pulls lookup limited at {max_calls} call(s)")
+            continue
+        for number in by_repo[repo]:
+            found[(repo, number)] = tuple(by_issue.get(number, ()))
+    return found, calls, limited
 
 
 #: The proceeding kinds the summary counts after starts, in order.
@@ -1396,13 +1486,16 @@ SUMMARY_KINDS = ("resume", "fix", "review")
 PAST = {"resume": "resumed", "fix": "fixed", "review": "reviewed"}
 
 
-def render(rows, *, label, plan=True):
+def render(rows, *, label, plan=True, pulls_calls=0, pulls_limited=False):
     """The candidate table plus the summary line under `label`.
 
     Each row names its project, so two projects requesting the same
     ticket print distinguishable lines. The summary counts only
     proceeding `start` rows as starts; other proceeding kinds are named
-    separately, and skipped rows count toward no kind.
+    separately, and skipped rows count toward no kind. The summary
+    also names the GitHub calls the pulls lookup spent (`pulls
+    calls`), so a listing regression is visible at once, and flags a
+    lookup that hit its cap (`pulls lookup limited`).
     """
     lines = []
     for row in rows:
@@ -1416,6 +1509,9 @@ def render(rows, *, label, plan=True):
         count = sum(1 for row in proceeding if row.kind == kind)
         if count:
             summary += f", would {kind} {count}" if plan else f", {PAST[kind]} {count}"
+    summary += f", pulls calls {pulls_calls}"
+    if pulls_limited:
+        summary += ", pulls lookup limited"
     lines.append(summary)
     return "\n".join(lines) + "\n"
 
@@ -1549,38 +1645,52 @@ def _gate_all(
     agent_tickets=None,
     reviews=None,
     fix_threshold=None,
-    pulls_for=None,
+    index_for=None,
+    pulls_max_calls=None,
     driven,
 ):
     """Eligibility plus the section 3 gate order over every candidate.
 
-    Returns (gated_rows, problems, requested): one `Gated` per candidate in section
-    3 order, one error line per project whose policy or quota
-    settings failed, and the set of (repo, number) any project requested
-    this pass, which the stuck sweep reads for withdrawals. A project with no eligibility entry prints its
-    logbook line to `out`. `released` ({(repo, number): reviewer id}
-    freed this pass) simulates the post-release rows, so a plan over
-    still-claimed rows gates what the real pass would gate after the
-    release; `finished` carries the newest finished entry per ticket for
-    the reviewer and fix-round readiness; `agent_roles` ({agent id:
-    role} for visible entries), resolved through `agent_states` and
-    `agent_tickets` by ticket, feeds the gate's reviewer-holder skip,
-    so a plan matches the claiming pass. `reviews` ({(repo, number):
-    latest review record}) feeds the gate's fix-round threshold;
-    `fix_threshold` (None reads the `drive.fix_round_threshold` host
-    setting) is the lowest finding severity that still opens a fix
-    round; `pulls_for` (None builds rows with no pulls, which is what
-    `--plan` does: it never contacts the tracker) feeds the pass's one
-    linked-pull map, which the eligibility rows and the gate rows share,
-    so the policies and the gate read the same row pulls with no second
-    lookup. `driven` ({project name: tracker repos it drives}, through
-    the one `driven_repos` resolver; required, and an empty mapping
-    drives nothing) keeps each project on its own repositories: the
-    policy sees only rows for repos the project drives, a request for
-    any other repo is dropped, and rows no registered project drives
-    never enter the held-row loop either, so a foreign row is never a
-    candidate and never claimed. Each project with a dropped row
-    prints how many foreign rows it ignored. Nothing is written.
+    Returns (gated_rows, problems, requested, pulls_calls,
+    pulls_limited): one `Gated` per candidate in section 3 order, one
+    error line per project whose policy or quota settings failed, the
+    set of (repo, number) any project requested this pass (which the
+    stuck sweep reads for withdrawals), the GitHub calls the pulls
+    lookup spent, and whether it hit its cap. A project with no
+    eligibility entry prints its logbook line to `out`. `released`
+    ({(repo, number): reviewer id} freed this pass) simulates the
+    post-release rows, so a plan over still-claimed rows gates what
+    the real pass would gate after the release; `finished` carries the
+    newest finished entry per ticket for the reviewer and fix-round
+    readiness; `agent_roles` ({agent id: role} for visible entries),
+    resolved through `agent_states` and `agent_tickets` by ticket,
+    feeds the gate's reviewer-holder skip, so a plan matches the
+    claiming pass. `reviews` ({(repo, number): latest review record})
+    feeds the gate's fix-round threshold; `fix_threshold` (None reads
+    the `drive.fix_round_threshold` host setting) is the lowest finding
+    severity that still opens a fix round; `index_for` (None builds
+    rows with no pulls, which is what `--plan` does: it never contacts
+    the tracker) feeds the pass's one linked-pull map, which the
+    eligibility rows and the gate rows share, so the policies and the
+    gate read the same row pulls with no second lookup.
+    `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
+    setting) caps the listing calls for the pass. The map is built
+    lazily: a pulls-less eligibility run first finds which tickets any
+    project wants, then only the fetchable ones (open, unheld, and in
+    a repository the pass drives, with live-claimed tickets fetched
+    only for `fix` and `resume`) trigger one
+    listing per repository; with none to check the tracker is never
+    contacted. A pass that hits the cap
+    prints "pulls lookup limited" and refuses the unchecked starts,
+    failing closed like an unreadable listing. `driven` ({project
+    name: tracker repos it drives}, through the one `driven_repos`
+    resolver; required, and an empty mapping drives nothing) keeps
+    each project on its own repositories: the policy sees only rows
+    for repos the project drives, a request for any other repo is
+    dropped, and rows no registered project drives never enter the
+    held-row loop either, so a foreign row is never a candidate and
+    never claimed. Each project with a dropped row prints how many
+    foreign rows it ignored. Nothing is written.
     """
     if driven is None:
         driven = {}
@@ -1595,14 +1705,57 @@ def _gate_all(
     else:
         problems = []
     pull_errors: dict = {}
-    pulls_by_key = (
-        linked_pulls_map(items, pulls_for, errors=pull_errors) if pulls_for is not None else None
-    )
-    by_key = _released_rows(items, released, pulls_by_key=pulls_by_key, pulls_errors=pull_errors)
-    waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
+    pulls_by_key = None
+    pulls_calls = 0
+    pulls_limited = False
     union = set()
     for repos in driven.values():
         union |= set(repos)
+    if index_for is not None:
+        wanted: dict = {}
+        for project in registered:
+            try:
+                outcome = eligibility.for_project(project, items, now=now)
+            except eligibility.EligibilityError:
+                continue
+            if outcome.skipped is None:
+                for request in outcome.requests:
+                    wanted.setdefault((request.repo, request.number), set()).add(request.kind)
+        pre_by_key = _released_rows(items, released)
+        live_keys = {(repo, number) for _, repo, number in live_set}
+        fetch_keys = {
+            key
+            for key, kinds in wanted.items()
+            if key[0] in union
+            and any(
+                pulls_check_needed(
+                    pre_by_key.get(key),
+                    live_keys=live_keys,
+                    hold_label=hold_label,
+                    kind=kind,
+                )
+                for kind in kinds
+            )
+        }
+        if fetch_keys:
+            if pulls_max_calls is None:
+                try:
+                    pulls_max_calls = settings.load(root=None)["drive.pulls_max_calls"]
+                except settings.SettingsError as problem:
+                    problems.append(f"korapy drive: {problem}")
+                    pulls_max_calls = DEFAULT_PULLS_MAX_CALLS
+            pulls_by_key, pulls_calls, pulls_limited = linked_pulls_map(
+                fetch_keys, index_for, max_calls=pulls_max_calls, errors=pull_errors
+            )
+            if pulls_limited:
+                unchecked = sum(1 for key in fetch_keys if pulls_by_key.get(key) is None)
+                print(
+                    f"pulls lookup limited at {pulls_max_calls} call(s): "
+                    f"{unchecked} ticket(s) left unchecked, starts refused",
+                    file=out,
+                )
+    by_key = _released_rows(items, released, pulls_by_key=pulls_by_key, pulls_errors=pull_errors)
+    waits = {(item.repo, item.number): item.tracker_updated_at for item in items}
     candidates = []
     for project in registered:
         allowed = set(driven.get(project.name, ()))
@@ -1709,7 +1862,7 @@ def _gate_all(
         if verdict.code == admission.TOTAL_FULL:
             stop_starts = True
         gated_rows.append(verdict)
-    return gated_rows, problems, set(requested_keys)
+    return gated_rows, problems, set(requested_keys), pulls_calls, pulls_limited
 
 
 def _pass(
@@ -1734,7 +1887,6 @@ def _pass(
     live_units=None,
     repo_map=None,
     review_reader=None,
-    pulls_for=None,
     driven,
 ) -> int:
     """One read-only pass: join eligibility to store rows, gate, print.
@@ -1756,11 +1908,10 @@ def _pass(
     threshold sees no records, exactly as before. Both passes also
     log each unheld finished reviewer (outcome `ok`) with no record
     once, naming the ticket and the reviewer, before the table, so a
-    kept claim never logs a line the gate did not skip on. `pulls_for`
-    feeds the pass's one linked-pull map, which the eligibility rows
-    and the gate rows share; with none every row reads empty, which is
-    what `--plan` builds: it never contacts the tracker. `driven`
-    ({project name: tracker repos it drives}, through the one
+    kept claim never logs a line the gate did not skip on. The plan
+    never lists pull requests: every row reads empty pulls and the
+    summary counts zero pulls calls, so a dry run contacts no tracker.
+    `driven` ({project name: tracker repos it drives}, through the one
     `driven_repos` resolver; required, and an empty mapping drives
     nothing) keeps each project on its own repositories, and each
     project with a dropped row prints how many foreign rows it
@@ -1807,7 +1958,7 @@ def _pass(
         else None
     )
     released = reviewed_claims(authors, finished, live_units=plan_live)
-    gated_rows, problems, _ = _gate_all(
+    gated_rows, problems, _, pulls_calls, pulls_limited = _gate_all(
         items,
         registered,
         out,
@@ -1825,7 +1976,6 @@ def _pass(
         agent_states=agent_states,
         agent_tickets=agent_tickets,
         reviews=reviews,
-        pulls_for=pulls_for,
         driven=driven,
     )
     log_missing_reviews(out, finished, reviews, _released_rows(items, released))
@@ -1840,7 +1990,7 @@ def _pass(
         )
         for gated in gated_rows
     ]
-    out.write(render(table, label=label))
+    out.write(render(table, label=label, pulls_calls=pulls_calls, pulls_limited=pulls_limited))
     for problem in problems:
         print(problem, file=err)
     return USAGE if problems else OK
@@ -4491,7 +4641,8 @@ def _launching_pass(
     hub=None,
     repo_map=None,
     review_reader=None,
-    pulls_for=None,
+    index_for=None,
+    pulls_max_calls=None,
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
@@ -4552,7 +4703,13 @@ def _launching_pass(
     `quota_load_reader` builds the readers (None loads them the way
     the verb does); the refreshed ledger persists through the ledger
     lock only when the pass loaded it itself, never over an injected
-    one.
+    one. `index_for` (None builds rows with no pulls) feeds the pass's
+    one linked-pull map, shared by the eligibility and gate rows; the
+    map lists each fetchable ticket's repository once, and
+    `pulls_max_calls` (None reads the `drive.pulls_max_calls` host
+    setting) caps the listing calls. A capped pass prints "pulls
+    lookup limited" and refuses the unchecked starts; the summary line
+    counts the listing calls.
     """
     events: list[dict] = []
     released = 0
@@ -4770,7 +4927,7 @@ def _launching_pass(
         reviews = review_records_for(_items, read=review_reader, err=err)
     else:
         reviews = None
-    gated_rows, problems, eligible_keys = _gate_all(
+    gated_rows, problems, eligible_keys, pulls_calls, pulls_limited = _gate_all(
         _items,
         registered,
         out,
@@ -4788,7 +4945,8 @@ def _launching_pass(
         agent_states=agent_states,
         agent_tickets=agent_tickets,
         reviews=reviews,
-        pulls_for=pulls_for,
+        index_for=index_for,
+        pulls_max_calls=pulls_max_calls,
         driven=driven,
     )
     log_missing_reviews(out, finished, reviews, _released_rows(_items, freed))
@@ -4942,7 +5100,11 @@ def _launching_pass(
         )
         for gated in final_rows
     ]
-    out.write(render(table, label="pass", plan=False))
+    out.write(
+        render(
+            table, label="pass", plan=False, pulls_calls=pulls_calls, pulls_limited=pulls_limited
+        )
+    )
     for problem in problems:
         print(problem, file=err)
     if problems:
@@ -5003,7 +5165,8 @@ def run_pass(
     hub=None,
     repo_map=None,
     review_reader=None,
-    pulls_for=None,
+    index_for=None,
+    pulls_max_calls=None,
     driven,
     quota_refresh_after_s=None,
     quota_load_reader=None,
@@ -5063,10 +5226,13 @@ def run_pass(
     skips and the pass ends with exit 1. `review_reader`
     feeds the gate's fix-round threshold from the ticket session dirs
     (reads only, like the registry); with none the threshold sees no
-    records, exactly as before. `pulls_for` feeds the pass's one
-    linked-pull map, which the eligibility rows and the gate rows share;
-    with none every row reads empty, which is what `--plan` builds: it
-    never contacts the tracker. `quota_refresh_after_s`
+    records, exactly as before. `index_for` feeds the claiming pass's
+    one linked-pull map, which the eligibility rows and the gate rows
+    share; with none every row reads empty. `--plan` never takes it,
+    so a dry run contacts no tracker. `pulls_max_calls` caps the
+    listing calls (None reads the `drive.pulls_max_calls` host
+    setting); a capped pass prints "pulls lookup limited" and refuses
+    the unchecked starts. `quota_refresh_after_s`
     re-reads stale quota before gating in the non-plan pass only;
     `--plan` never takes it, so a dry run runs no reader.
     `quota_load_reader` builds those readers. `now` defaults to the wall
@@ -5116,7 +5282,6 @@ def run_pass(
             live_units=live_units,
             repo_map=repo_map,
             review_reader=review_reader,
-            pulls_for=pulls_for,
             driven=driven,
             **args,
         )
@@ -5150,7 +5315,8 @@ def run_pass(
                 hub=hub,
                 repo_map=repo_map,
                 review_reader=review_reader,
-                pulls_for=pulls_for,
+                index_for=index_for,
+                pulls_max_calls=pulls_max_calls,
                 driven=driven,
                 quota_refresh_after_s=quota_refresh_after_s,
                 quota_load_reader=quota_load_reader,
