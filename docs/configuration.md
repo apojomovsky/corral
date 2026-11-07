@@ -126,6 +126,7 @@ what it means. Do not edit this table by hand.
 | `agents.cap` | `1` | this project's ceiling of live agents on the host |
 | `agents.unit_prefix` | `'korapy-agent-'` | prefix of transient agent unit names |
 | `board.add_per_pass` | `20` | missing board issues added per repo per pass (default: 20; 0 or less adopts nothing) |
+| `board.drift_max_age_s` | `600` | seconds a card may stay out of step with its issue before the doctor fails the repo |
 | `board.hold_label` | `'hold'` | label that holds a ticket for a human |
 | `board.item_max_age_s` | `300` | seconds before a freshness-gated read re-reads a board row live |
 | `board.poll_pages` | `5` | board poll page cap per pass (default: small) |

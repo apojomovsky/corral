@@ -65,6 +65,7 @@ The rules the design rests on:
   `git fetch origin && git worktree add .worktrees/<n>-<slug> -b <type>/<n>-<slug> origin/master`.
   Remove the worktree after the PR merges.
 - **No force pushes.** Rewriting a branch that exists on the remote drops it for every other agent and clone, and the `pre-push` hook refuses it (deleting a remote branch too). If a rewrite is genuinely needed, get the maintainer's explicit go-ahead in your own session, then re-run with `KORAPY_FORCE_PUSH_APPROVED=1 git push --force-with-lease`.
+- **The pre-push hook still gates every push.** It runs the suite, then stamps the tree it passed. It skips the suite only on proof for the identical clean tree: its own stamp for that tree, or a fresh green-matrix proof from `make check` covering the same interpreters. Both proofs are cache state resolved through `paths`, never trusted across trees; a dirty tree, a stale, corrupt or foreign proof always runs the suite again. A failing suite still blocks the push.
 - **Never skip hooks.** Never pass `--no-verify`, and never set an env override that bypasses a hook. When a hook blocks you, use the decision protocol below.
 - **Merges.** Merge `origin/master` into your branch when master moves on. Never rebase a pushed branch. A maintainer merges PRs (squash).
 
@@ -130,3 +131,9 @@ Dispatched agents run headless. When the turn ends, the process exits, and any b
 - **External contributions are for maintainers.** An agent never merges, reviews, comments on, labels, closes or works on a PR or issue from outside the maintainers, or any fork PR. Tell a maintainer and stop.
 - **Secrets.** Tokens and account metadata (runtime logins, the GitHub token, provider API keys, korapy's API token) are read at call time and never stored or logged. The same goes for quota payloads beyond their usage numbers.
 - **Report only what you ran.** Every claim about a command's result comes from a command you actually ran. Never invent output.
+
+## Board stewardship
+
+The board is the maintainer's view of the work; a stale board is a defect, not a nuisance.
+
+No agent or coordinator leaves the board stale: the loop keeps every card in step with its issue, and a coordinator who dispatches work outside the loop makes that work visible to the board the moment it starts (a claim, or a registered agent) and never ends a session with drift.

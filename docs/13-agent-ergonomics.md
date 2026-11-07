@@ -256,16 +256,20 @@ serially, with every precondition reported as data. The forge-side
 half of landing; `push` stays the worktree-side half.
 
 Arguments: `REPO PR --head SHA [--method squash|merge] [--skip CHECK]
-[--json] [--plan]`. `REPO` is `owner/name`; `PR` the pull request
-number. `--head` is required: the exact head SHA the caller
-approved. `--method` is `squash` or `merge` and defaults to the
-`merge.method` project setting (`squash`); anything else is
-exit 4. `--skip` names only `checks`, with the same
+[--json] [--plan] [--wait] [--timeout SECS]`. `REPO` is `owner/name`;
+`PR` the pull request number. `--head` is required: the exact head
+SHA the caller approved. `--method` is `squash` or `merge` and
+defaults to the `merge.method` project setting (`squash`); anything
+else is exit 4. `--skip` names only `checks`, with the same
 recording rule as the gate (section 6); the default is no skips.
 Naming `lock`, `open`, `head`, `review` or `fork` is exit 4:
 those checks establish what is being merged, and skipping
 identity is not a policy choice (mirroring takeoff, section
-5.5).
+5.5). `--wait` polls the forge while the `checks` row is pending
+until it leaves pending, any row fails, or `--timeout` (default
+ten minutes) lands; a `--timeout` without `--wait` is exit 4.
+The wait never holds the per-repo lock: a real merge re-reads
+under the lock after the wait settles.
 
 JSON shape (`--json`): the precondition verdict plus the outcome:
 
@@ -283,7 +287,8 @@ Without `--json`, one line per check plus the outcome, in the
 `takeoff` text style (`merge <name>: <status> - <detail>`).
 
 Exit codes: 0 merged (under `--plan`: mergeable), 1 a
-precondition failed or the merge was refused, 2 the merge lock is
+precondition failed or is still pending (a `--wait` timeout still
+reports `pending`) or the merge was refused, 2 the merge lock is
 held by another merger, 3 the forge is unreachable, 4 usage or
 configuration error. Exit 2 reuses the public race meaning, so
 retry loops treat it like the drive lock.
@@ -455,10 +460,19 @@ PRs to the same repo never merge concurrently.
    inherited across a clean merge-up. A block or a missing record
    refuses. This is the same reader takeoff uses, so the merge
    gate and the takeoff gate cannot disagree.
-5. `checks`: the forge's check statuses on the head are green
-   (read from the fresh `pull_request()`, extended per section
-   8). `--skip checks` waives this row and records the skip; it
-   is the only waivable merge check (section 5.4).
+5. `checks`: the forge's check statuses on the head (the verdict
+   from the fresh `pull_request()`, per section 8). Three states:
+   `ok` when green, `pending` while still running (a wait, not a
+   failure: the detail says to wait and carries no fix advice), and
+   `fail` when red (fix the branch and update the PR). A `pending`
+   row blocks with exit 1 like a `fail`, but stays `pending` in the
+   document so a caller branching on the row waits instead of
+   fixing. `--skip checks` waives this row and records the skip;
+   it is the only waivable merge check (section 5.4). Any `fail`
+   beside a pending `checks` row wins at once: the verb never
+   waits out a refusal. The row reports the one checks
+   precondition, not a count of provider checks; a separate count
+   read only decorates the pending detail (section 8).
 6. `fork`: the PR is not from a fork. Fork merges refuse with
    exit 1; a maintainer merges those by hand (AGENTS.md: external
    contributions are for maintainers).
@@ -498,25 +512,37 @@ verb never:
 
 ## 8. The forge seam for merge
 
-`pull_request()` today returns no check statuses and no
-merge-commit SHA, but sections 5.4 and 7.2 read both. PROPOSED:
-extend `PullRequest` with two fields, read from the same fresh
-PR fetch, so the merge gate needs no second seam:
+`PullRequest` carries the merge verdict from the one fresh PR
+fetch, so the gate reads state, head, checks and merge SHA
+consistently:
 
 - `checks_state: str`: `"passing"`, `"failing"` or `"pending"`,
   summarizing the forge's check statuses on the head SHA;
+- `checks_pending: int`: how many checks on the head SHA are
+  still running. Fakes set it explicitly; the adapter leaves the
+  default and the verb reads the live count separately (below);
 - `merge_sha: str | None`: the merge commit SHA once the PR
   state is `merged`, else None. The verify step ties this SHA to
   the pinned head.
 
-Only the adapters know the provider shape (the GitHub adapter
-parses both from the same `gh api` PR fetch it already
-performs); everything else takes the `Forge` object. The
-alternative (a separate `checks()` seam method) is rejected: two
-reads can disagree about a moving PR, while one fresh read keeps
-state, head, checks and merge SHA consistent.
+The running count is a separate, optional read that can only
+decorate a pending row, never change a verdict:
 
-`forge.py` gains one more method (PROPOSED):
+- `pending_checks(repo, sha) -> int`: how many check runs on
+  `sha` are still running (one page of up to 100 runs; a head
+  with more runs reports a lower bound). The merge verb calls it
+  only when the verdict is pending (in `--wait`, once per poll),
+  and only on the merge paths: `review show --pr` never calls
+  it, so an unrelated verb pays no second read and a transient
+  count failure cannot fail it. A failed or unusable count read
+  on the merge path degrades to the count-less pending message
+  instead of an error; passing, failing, and skipped rows never
+  trigger it.
+
+Only the adapters know the provider shape; everything else takes
+the `Forge` object.
+
+`forge.py` gains one more method:
 
 ```python
 def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
@@ -616,6 +642,10 @@ while true; do
   jq -r '.checks[] | "\(.status) \(.name): \(.detail)"' merge.json; exit 1
 done
 ```
+
+A coordinator that would rather wait than poll appends `--wait`
+(`--timeout` bounds the wait): a pending checks row then settles
+in the verb instead of spinning the loop above.
 
 Retrying dispatch (plan first, then run; 75 and 2 retry later):
 

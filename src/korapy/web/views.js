@@ -1465,6 +1465,14 @@ export function renderBoardRows(payload, { limit, offset, nowMs }) {
   const count = document.getElementById("board-count");
   count.textContent = "";
   count.appendChild(document.createTextNode(first + "-" + last + " of " + total));
+  // The drift count rides the same reply as the rows: the board
+  // step's verdicts, the number the doctor reports for the repo.
+  const drifted = typeof info.drift === "number" ? info.drift : 0;
+  if (drifted > 0) {
+    count.appendChild(
+      document.createTextNode(" (" + drifted + " drifted: sweep the repo to fix)"),
+    );
+  }
   document.getElementById("board-prev").disabled = clampedOffset <= 0;
   document.getElementById("board-next").disabled = clampedOffset + page >= total;
 }

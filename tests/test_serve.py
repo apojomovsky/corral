@@ -1056,6 +1056,9 @@ class BoardView(ServeCase):
                 seen.append((repo, state, label))
                 return []
 
+            def drift_flags(self):
+                return []
+
             def __enter__(self):
                 return self
 
@@ -1115,6 +1118,9 @@ class BoardView(ServeCase):
 
                 def claim_of(self, repo, number):
                     return self.real.claim_of(repo, number)
+
+                def drift_flags(self):
+                    return self.real.drift_flags()
 
                 def __enter__(self):
                     self.real = board.open_store(path)
