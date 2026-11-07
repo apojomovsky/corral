@@ -154,8 +154,11 @@ class CmdRollupCase(RollupCliCase):
         )
         with open(design, encoding="utf-8") as handle:
             text = handle.read()
-        for doc in (heavycli.__doc__ or "", heavycli.cmd_rollup.__doc__ or "", text):
+        for doc in (heavycli.__doc__ or "", heavycli.cmd_rollup.__doc__ or ""):
             self.assertIn("atomically", doc)
+        start = text.index("### 3.5")
+        section = text[start:].split("\n## ", 1)[0]
+        self.assertIn("both writes are atomic", section)
 
     def test_empty_ledger_exits_zero_with_empty_keys(self):
         out, err = io.StringIO(), io.StringIO()
