@@ -34,7 +34,7 @@ from dataclasses import dataclass, replace
 
 from korapy import accounts, admission, board, disk, host_ledger, models, paths, profiles
 from korapy import projects, prompts, quota, quota_ledger, registry, resources, runtimes
-from korapy import settings, units, worktrees
+from korapy import pushenv, settings, units, worktrees
 from korapy.runtimes import muse
 from korapy.runtimes import tail as runtime_tail
 
@@ -488,10 +488,26 @@ def unproven(tgt, number, *, list_fn):
     return seen
 
 
-def _env(adapter, session, unit):
+def _env(adapter, session, unit, extra=None):
     env = dict(adapter.env(session))
     env[AGENT_ID_VAR] = unit
+    if extra:
+        env.update(extra)
     return env
+
+
+def _push_extra(tgt, *, git, ssh_probe=None, gh_login=None):
+    """The unit's extra push environment for the target's clone.
+
+    The one resolver (`pushenv.launch_env`) decides from the clone's
+    origin URL: the HTTPS fallback entries when SSH cannot work, {}
+    otherwise. A clone nothing can push raises LaunchError (exit 4)
+    naming both fixes, before the launch makes anything.
+    """
+    try:
+        return pushenv.launch_env(tgt.clone, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
+    except pushenv.PushRefused as err:
+        raise LaunchError(str(err)) from None
 
 
 def _model_chains(tgt, pool, ledger, now, chains):
@@ -767,6 +783,8 @@ def launch(
     tracker=None,
     controllers_read=None,
     pressure_fn=None,
+    ssh_probe=None,
+    gh_login=None,
 ):
     """Start a new agent for ticket `number`. Returns `(unit, workdir)`.
 
@@ -854,6 +872,10 @@ def launch(
         raise
     adapter = _adapter(selection.runtime)
     session_runtime = selection.runtime
+    # How this launch pushes is decided before the first lock: a clone
+    # nothing can push refuses here (exit 4), before any worktree, unit
+    # or registry entry exists for it.
+    push_extra = _push_extra(tgt, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
     _close_previous(tgt, number, list_fn)
 
     with units.spawn_lock():
@@ -943,7 +965,7 @@ def launch(
                         reviewer=reviewer,
                         session_id=session_id,
                     )
-                env = _env(adapter, session, unit)
+                env = _env(adapter, session, unit, extra=push_extra)
             except ValueError as err:
                 raise LaunchError(str(err)) from None
             argv = units.unit_argv(
@@ -1140,6 +1162,8 @@ def resume(
     store=None,
     tracker=None,
     controllers_read=None,
+    ssh_probe=None,
+    gh_login=None,
 ):
     """Resume ticket `number`'s newest session of `role` in a new unit.
 
@@ -1215,6 +1239,9 @@ def resume(
             f"#{number} of {tgt.repo} has no {adapter.name} session to resume for role {role!r}"
         )
     _close_previous(tgt, number, list_fn)
+    # Decided like at launch, before the first lock: a clone nothing
+    # can push refuses here (exit 4), before any worktree or unit exists.
+    push_extra = _push_extra(tgt, git=git, ssh_probe=ssh_probe, gh_login=gh_login)
 
     with units.spawn_lock():
         admit(
@@ -1320,7 +1347,7 @@ def resume(
                 max_time=runtimes.DEFAULT_MAX_TIME,
                 reviewer=(recorded == "reviewer"),
             )
-            env = _env(adapter, session, unit)
+            env = _env(adapter, session, unit, extra=push_extra)
         except ValueError as err:
             raise LaunchError(str(err)) from None
         argv = units.unit_argv(

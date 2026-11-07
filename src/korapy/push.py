@@ -15,6 +15,8 @@ connection the server already dropped. Two halves fix it:
 
 Seams: every git call goes through `run`, stamp reads/writes through
 `read_text`/`write_text`, so tests run with fakes and no network.
+`env` carries a per-launch HTTPS fallback (see `korapy.pushenv`); None
+pushes exactly as before.
 """
 
 import os
@@ -50,11 +52,12 @@ GIT_TIMEOUT_S = 300
 PUSH_TIMEOUT_S = 3600
 
 
-def default_run(argv, timeout=None):
+def default_run(argv, timeout=None, env=None):
     if timeout is None:
         timeout = PUSH_TIMEOUT_S if "push" in argv[3:4] else GIT_TIMEOUT_S
     try:
-        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        merged = {**os.environ, **env} if env is not None else None
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=merged)
     except (OSError, subprocess.SubprocessError) as exc:
         return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
@@ -69,20 +72,20 @@ def write_text(path, text):
         handle.write(text)
 
 
-def _git(cwd, args, run):
-    return run(["git", "-C", cwd, *args])
+def _git(cwd, args, run, env=None):
+    return run(["git", "-C", cwd, *args], env=env)
 
 
-def abs_git_dir(cwd, run=None):
+def abs_git_dir(cwd, run=None, env=None):
     """Absolute git dir of this checkout (per-worktree, never the common)."""
     run = run or default_run
-    proc = _git(cwd, ["rev-parse", "--absolute-git-dir"], run)
+    proc = _git(cwd, ["rev-parse", "--absolute-git-dir"], run, env)
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
 
 
-def hook_path(cwd, run=None):
+def hook_path(cwd, run=None, env=None):
     """The pre-push hook git runs here, honouring `core.hooksPath`.
 
     `--git-path` resolves the hooks dir the way git itself does: a
@@ -90,13 +93,15 @@ def hook_path(cwd, run=None):
     and with no setting it is the common git dir's `hooks/`.
     """
     run = run or default_run
-    proc = _git(cwd, ["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"], run)
+    proc = _git(
+        cwd, ["rev-parse", "--path-format=absolute", "--git-path", "hooks/pre-push"], run, env
+    )
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
 
 
-def hook_digest(cwd, run=None):
+def hook_digest(cwd, run=None, env=None):
     """Content id of the installed pre-push hook, via `git hash-object`.
 
     The hook hashes its own installed file the same way, so both sides
@@ -104,33 +109,33 @@ def hook_digest(cwd, run=None):
     the stamp then never hits and the suite always runs (safe default).
     """
     run = run or default_run
-    path = hook_path(cwd, run)
+    path = hook_path(cwd, run, env)
     if not path:
         return ""
-    proc = run(["git", "hash-object", path])
+    proc = run(["git", "hash-object", path], env=env)
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
 
 
-def tree_hash(cwd, run=None):
+def tree_hash(cwd, run=None, env=None):
     run = run or default_run
-    proc = _git(cwd, ["rev-parse", "HEAD^{tree}"], run)
+    proc = _git(cwd, ["rev-parse", "HEAD^{tree}"], run, env)
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
 
 
-def stamp_path(cwd, run=None):
-    directory = abs_git_dir(cwd, run)
+def stamp_path(cwd, run=None, env=None):
+    directory = abs_git_dir(cwd, run, env)
     if not directory:
         return ""
     return os.path.join(directory, STAMP_NAME)
 
 
-def read_stamp(cwd, run=None, read=None):
+def read_stamp(cwd, run=None, read=None, env=None):
     read = read or read_text
-    path = stamp_path(cwd, run)
+    path = stamp_path(cwd, run, env)
     if not path:
         return ""
     try:
@@ -139,12 +144,12 @@ def read_stamp(cwd, run=None, read=None):
         return ""
 
 
-def record_pass(cwd, run=None, write=None, tree=None, digest=None):
+def record_pass(cwd, run=None, write=None, tree=None, digest=None, env=None):
     """Stamp the tree the suite just passed. Returns True when written."""
     write = write or write_text
-    tree = tree if tree is not None else tree_hash(cwd, run)
-    digest = digest if digest is not None else hook_digest(cwd, run)
-    path = stamp_path(cwd, run)
+    tree = tree if tree is not None else tree_hash(cwd, run, env)
+    digest = digest if digest is not None else hook_digest(cwd, run, env)
+    path = stamp_path(cwd, run, env)
     if not tree or not digest or not path:
         return False
     try:
@@ -154,40 +159,40 @@ def record_pass(cwd, run=None, write=None, tree=None, digest=None):
     return True
 
 
-def stamp_valid(cwd, run=None, read=None, tree=None, digest=None):
+def stamp_valid(cwd, run=None, read=None, tree=None, digest=None, env=None):
     """True when the stamp covers this tree under this hook version."""
-    tree = tree if tree is not None else tree_hash(cwd, run)
-    digest = digest if digest is not None else hook_digest(cwd, run)
+    tree = tree if tree is not None else tree_hash(cwd, run, env)
+    digest = digest if digest is not None else hook_digest(cwd, run, env)
     if not tree or not digest:
         return False
-    return read_stamp(cwd, run, read) == f"{tree} {digest}"
+    return read_stamp(cwd, run, read, env) == f"{tree} {digest}"
 
 
-def suite_needed(cwd, run=None, read=None):
+def suite_needed(cwd, run=None, read=None, env=None):
     """The hook's skip decision: run the suite unless the stamp hits."""
-    return not stamp_valid(cwd, run, read)
+    return not stamp_valid(cwd, run, read, env)
 
 
-def current_branch(cwd, run=None):
+def current_branch(cwd, run=None, env=None):
     run = run or default_run
-    proc = _git(cwd, ["branch", "--show-current"], run)
+    proc = _git(cwd, ["branch", "--show-current"], run, env)
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
 
 
-def local_head(cwd, run=None):
+def local_head(cwd, run=None, env=None):
     run = run or default_run
-    proc = _git(cwd, ["rev-parse", "HEAD"], run)
+    proc = _git(cwd, ["rev-parse", "HEAD"], run, env)
     if proc.returncode != 0:
         return ""
     return (proc.stdout or "").strip()
 
 
-def remote_head(cwd, remote, branch, run=None):
+def remote_head(cwd, remote, branch, run=None, env=None):
     """(sha, proc) for the remote ref; sha is "" when missing or unreadable."""
     run = run or default_run
-    proc = _git(cwd, ["ls-remote", remote, f"refs/heads/{branch}"], run)
+    proc = _git(cwd, ["ls-remote", remote, f"refs/heads/{branch}"], run, env)
     if proc.returncode != 0:
         return "", proc
     for line in (proc.stdout or "").splitlines():
@@ -209,28 +214,28 @@ def hook_refused(push_proc):
     return "pre-push:" in combined
 
 
-def do_push(cwd, remote, branch, run):
-    return _git(cwd, ["push", remote, branch], run)
+def do_push(cwd, remote, branch, run, env=None):
+    return _git(cwd, ["push", remote, branch], run, env)
 
 
-def verified_push(cwd, remote="origin", branch=None, run=None, out=None):
+def verified_push(cwd, remote="origin", branch=None, run=None, out=None, env=None):
     """Push, verify the remote ref, retry once on mismatch. Returns exit code."""
     run = run or default_run
     emit = out or print
-    branch = branch or current_branch(cwd, run)
+    branch = branch or current_branch(cwd, run, env)
     if not branch:
         emit("korapy push: no current branch (detached HEAD); pass a branch name")
         return CONFIG
-    head = local_head(cwd, run)
+    head = local_head(cwd, run, env)
     if not head:
         emit("korapy push: cannot resolve HEAD")
         return CONFIG
 
     def verify():
-        sha, proc = remote_head(cwd, remote, branch, run)
+        sha, proc = remote_head(cwd, remote, branch, run, env)
         return sha, proc
 
-    first = do_push(cwd, remote, branch, run)
+    first = do_push(cwd, remote, branch, run, env)
     if first.returncode != 0:
         if hook_refused(first):
             emit((first.stderr or "").strip() or "korapy push: pre-push hook refused the push")
@@ -256,7 +261,7 @@ def verified_push(cwd, remote="origin", branch=None, run=None, out=None):
         f"{(sha[:12] if sha else '(missing)')}, HEAD is {head[:12]}; "
         "retrying once"
     )
-    second = do_push(cwd, remote, branch, run)
+    second = do_push(cwd, remote, branch, run, env)
     if second.returncode != 0 and looks_unreachable(
         (second.stdout or "") + "\n" + (second.stderr or "")
     ):
