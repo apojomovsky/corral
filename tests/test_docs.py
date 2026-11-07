@@ -259,14 +259,13 @@ class DispatchLoopDefaults(unittest.TestCase):
         ):
             with self.subTest(setting=key):
                 self.assertIn(f"`{key}`", flat)
-                windows = [
-                    flat[match.end() : match.end() + 120]
-                    for match in re.finditer(re.escape(f"`{key}`"), flat)
-                ]
-                self.assertTrue(
-                    any(self.POINTER in window for window in windows),
-                    f"{key} names no default pointer",
-                )
+                bare = []
+                for match in re.finditer(re.escape(f"`{key}`"), flat):
+                    window = flat[match.end() : match.end() + 120]
+                    if self.POINTER not in window:
+                        start = max(0, match.start() - 40)
+                        bare.append(flat[start : match.end() + 60].strip())
+                self.assertEqual(bare, [], f"{key} has mentions without the default pointer")
 
 
 class SnapshotSections(unittest.TestCase):
