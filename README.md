@@ -39,6 +39,9 @@ flowchart LR
   GitHub rate budget shared by every project.
 - Route around dead quota: per-launch model chains skip exhausted
   providers, so a funded project keeps running.
+- Push past a dead SSH agent: launches and `korapy push` rewrite SSH
+  addresses to HTTPS through the host `gh` login, and refuse with
+  exit 4 when neither path can push.
 - Keep the loop moving: drive syncs, claims, launches and mirrors on a
   timer, and proves nothing is lost before it deletes anything.
 - Gate every landing: review records, takeoff checks and one merger

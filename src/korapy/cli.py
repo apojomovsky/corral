@@ -162,9 +162,16 @@ def cmd_prose(args: argparse.Namespace) -> int:
 
 
 def cmd_push(args: argparse.Namespace) -> int:
-    from korapy import push
+    from korapy import push, pushenv, worktrees
 
-    return push.verified_push(os.getcwd(), remote=args.remote, branch=args.branch)
+    try:
+        extra = pushenv.launch_env(os.getcwd(), git=worktrees.git)
+    except pushenv.PushRefused as err:
+        print(f"korapy push: {err}", file=sys.stderr)
+        return USAGE
+    return push.verified_push(
+        os.getcwd(), remote=args.remote, branch=args.branch, env=extra or None
+    )
 
 
 def cmd_budget(args: argparse.Namespace) -> int:
