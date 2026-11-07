@@ -619,7 +619,10 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
     next launch creates it. A slice the manager never created
     (exit 0 with every limit unset, no fragment, inactive) reads as missing.
     A cleared budget applies nothing: stale limits stay until the operator
-    stops the slice by hand.
+    stops the slice by hand. A zero share applies nothing either, and no
+    launch ever reconciles it, so its fix names only the hand stop.
+    Mixed drift names the project a launch still reconciles and sends
+    the zero-share slice to a hand stop.
     """
     if state.host is None or state.limits_error is not None:
         return None
@@ -647,13 +650,20 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
             "",
         )
     expected = {units.HOST_SLICE: state.host}
+    zero_shares: set[str] = set()
+    owners: dict[str, str] = {}
     for name in sorted(state.shares):
         try:
             slice_name = units.project_slice(name)
         except units.UnitsError:
             continue
-        expected[slice_name] = resources.share_cap(limits, name, state.now)
+        share = resources.share_cap(limits, name, state.now)
+        expected[slice_name] = share
+        owners[slice_name] = name
+        if share is not None and share.cpu_m == 0 and share.memory_mb == 0:
+            zero_shares.add(slice_name)
     drifts: list[str] = []
+    drifted: list[str] = []
     matched = 0
     missing = 0
     for name in sorted(expected):
@@ -662,15 +672,39 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
             missing += 1
             continue
         matched += 1
-        drifts.extend(f"slice {name}: {drift}" for drift in slice_drift(expected[name], props))
+        found = slice_drift(expected[name], props)
+        if found:
+            drifted.append(name)
+        drifts.extend(f"slice {name}: {drift}" for drift in found)
     if drifts:
+        if drifted and all(name in zero_shares for name in drifted):
+            return ResourceRow(
+                "resources-slices",
+                "warn",
+                "; ".join(drifts) + "; no launch reconciles it",
+                "stop the slice by hand (a zero-share project applies nothing:"
+                " its launches are always refused)",
+            )
+        fix = (
+            "launch an agent of that project, then run `korapy doctor` again"
+            " (a cleared budget applies nothing: stop the slice by hand)"
+        )
+        if any(name in zero_shares for name in drifted):
+            runnable = sorted(
+                {owners[name] for name in drifted if name in owners and name not in zero_shares}
+            )
+            if runnable:
+                fix = (
+                    f"launch an agent of {', '.join(runnable)},"
+                    " then run `korapy doctor` again"
+                    " (a cleared budget applies nothing: stop the slice by hand;"
+                    " the zero-share slice needs a hand stop)"
+                )
         return ResourceRow(
             "resources-slices",
             "warn",
             "; ".join(drifts) + "; limits reconcile on the next launch of that project",
-            "launch an agent of that project, then run `korapy doctor` again"
-            " (a cleared budget or a ceiling-0 project applies nothing:"
-            " stop the slice by hand)",
+            fix,
         )
     if matched == 1:
         detail = "1 resource slice matches its budget"

@@ -291,7 +291,8 @@ Per-candidate gate order, cheapest first:
    the pass populated from one `Tracker.pulls_index` listing per
    repository; an unreadable read fails closed (skip, record
    "unreadable"), and so does a repository past the
-   `drive.pulls_max_calls` cap (skip, record "pulls lookup limited").
+   `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md))
+   cap (skip, record "pulls lookup limited").
    A `fix`, `resume`, or takeover `review` on a claimed row reads the same row pulls:
    unreadable pulls refuse it with the cause named, and a hold label
    on a linked pull hold-skips it. `--plan` builds rows with no pulls
@@ -744,10 +745,11 @@ the modules named.
     the file's reason and starts nothing; cap counts starts not
     resumes or plans and resets on date change; the pause file and
     the day counter live in the state dir, and the cap resolves
-    `drive.max_starts_per_day` through the single settings resolver.
+    `drive.max_starts_per_day` (default in [`configuration.md`](configuration.md))
+    through the single settings resolver.
 11. Timer unit, doctor checks and docs. Criteria: user timer installed
     and enabled by an explicit operator step; the installed unit
-    carries the `drive.period` cadence resolved through the single
-    settings resolver; doctor reports missing
+    carries the `drive.period` cadence (default in [`configuration.md`](configuration.md))
+    resolved through the single settings resolver; doctor reports missing
     timer, bad registration entries and unreadable policy modules;
     README commands row added if a verb ships.
