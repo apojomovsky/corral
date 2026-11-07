@@ -971,7 +971,10 @@ function headerLine(header) {
     typeof info.agents_stale === "number" && Number.isFinite(info.agents_stale)
       ? String(info.agents_stale) + " stale"
       : "stale not reported";
-  const finished = typeof info.agents_finished === "number" ? info.agents_finished : 0;
+  const finished =
+    typeof info.agents_finished === "number" && Number.isFinite(info.agents_finished)
+      ? info.agents_finished
+      : 0;
   const section = card("fleet", desc);
   section.setAttribute("class", "card strip");
   const line = document.createElement("p");
