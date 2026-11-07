@@ -21,6 +21,7 @@ class FakeGit:
     """
 
     def __init__(self, head="HEAD1", tree="TREE1", digest="DIGEST1", remote="OLD", branch="fix/x"):
+        self.envs = []
         self.head = head
         self.tree = tree
         self.digest = digest
@@ -40,7 +41,8 @@ class FakeGit:
             return argv[3:]
         return argv[1:]
 
-    def run(self, argv, timeout=300):
+    def run(self, argv, timeout=300, env=None):
+        self.envs.append(env)
         args = self._args(argv)
         if args == ["rev-parse", "--absolute-git-dir"]:
             return _proc(0, "/fake/.git\n")
@@ -146,6 +148,54 @@ class VerifiedPushTest(unittest.TestCase):
         self.assertEqual(git.pushes, 0)
 
 
+class PushEnvTest(unittest.TestCase):
+    ENV = {
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "url.https://github.com/.insteadOf",
+        "GIT_CONFIG_VALUE_0": "git@github.com:",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+
+    def test_the_push_env_reaches_every_git_call(self):
+        git = FakeGit()
+        code, _ = _push(git, env=self.ENV)
+        self.assertEqual(code, 0)
+        self.assertTrue(git.envs)
+        for seen in git.envs:
+            self.assertEqual(seen, self.ENV)
+
+    def test_no_env_means_no_extra_env_on_any_call(self):
+        git = FakeGit()
+        code, _ = _push(git)
+        self.assertEqual(code, 0)
+        self.assertTrue(git.envs)
+        for seen in git.envs:
+            self.assertIsNone(seen)
+
+    def test_default_run_merges_the_env_over_the_process_env(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            return push.subprocess.CompletedProcess(argv, 0, "", "")
+
+        with unittest.mock.patch.object(push.subprocess, "run", fake_run):
+            push.default_run(["git", "status"], env={"GIT_TERMINAL_PROMPT": "0"})
+        self.assertEqual(seen["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertIn("PATH", seen["env"])
+
+    def test_default_run_without_env_inherits_the_process_env(self):
+        seen = {}
+
+        def fake_run(argv, **kwargs):
+            seen.update(kwargs)
+            return push.subprocess.CompletedProcess(argv, 0, "", "")
+
+        with unittest.mock.patch.object(push.subprocess, "run", fake_run):
+            push.default_run(["git", "status"])
+        self.assertIsNone(seen["env"])
+
+
 class StampTest(unittest.TestCase):
     def test_stamp_hit_skips_suite(self):
         git = FakeGit()
@@ -216,7 +266,7 @@ class HookPathTest(unittest.TestCase):
         subprocess.run(["git", "init", "-q", tmp.name], check=True, env=self.env)
         self.root = os.path.realpath(tmp.name)
 
-    def run_git(self, argv, timeout=None):
+    def run_git(self, argv, timeout=None, env=None):
         return subprocess.run(argv, capture_output=True, text=True, env=self.env)
 
     def test_the_default_is_the_git_dir_hooks(self):

@@ -9,6 +9,8 @@ each `RepoRow` as a `Check`, so this module never imports `doctor`.
 
 from typing import NamedTuple
 
+from korapy import pushenv
+
 
 class RepoSite(NamedTuple):
     """One project the remote rows cover, with its readings as data.
@@ -32,6 +34,11 @@ class RepoSite(NamedTuple):
     cause: str | None = None
     tracker_repo: str | None = None
     canonical: str | None = None
+    #: How a launch would push to this origin: "ssh", "https" (the
+    #: fallback rewrites SSH GitHub addresses to HTTPS through the host
+    #: `gh` login) or "refuse" (neither path works). None means no
+    #: reading, and then the report carries no push row.
+    push: str | None = None
 
 
 class RepoRow(NamedTuple):
@@ -174,12 +181,58 @@ def _tracker_row(site: RepoSite) -> RepoRow | None:
     )
 
 
+def _push_row(site: RepoSite) -> RepoRow | None:
+    """The push-path row: how a launch would push to this origin.
+
+    No row without a reading, or without an origin (the remote row
+    already covers that). SSH reads ok; the HTTPS fallback reads ok
+    with a note; an unpushable origin fails naming both fixes.
+    """
+    if site.push is None or site.origin is None:
+        return None
+    name = f"push:{site.name}"
+    if site.push == "refuse":
+        return RepoRow(
+            name,
+            "fail",
+            f"{site.name}: neither SSH nor the host gh login can push to the origin remote",
+            "restore the SSH agent (or add a key usable without one),"
+            " or run `gh auth login`, then run `korapy doctor` again",
+        )
+    if site.push == "https":
+        return RepoRow(
+            name,
+            "ok",
+            f"{site.name}: no usable SSH agent, so pushes rewrite SSH GitHub"
+            " addresses to HTTPS through the host gh login",
+            "",
+        )
+    if site.push != "ssh":
+        return None
+    if pushenv.is_ssh_github_url(site.origin):
+        return RepoRow(
+            name,
+            "ok",
+            f"SSH to the remote works for {site.name}; pushes use it",
+            "",
+        )
+    return RepoRow(
+        name,
+        "ok",
+        f"the origin for {site.name} needs no SSH agent, so pushes work as configured",
+        "",
+    )
+
+
 def check_sites(sites) -> list[RepoRow]:
-    """One remote row plus one labels row per site, in order, then the tracker row when readable. Pure."""
+    """Remote, labels and push rows per site, in order, then the tracker row when readable."""
     rows = []
     for site in sites:
         rows.append(_remote_row(site))
         rows.append(_labels_row(site))
+        pushed = _push_row(site)
+        if pushed is not None:
+            rows.append(pushed)
         tracker = _tracker_row(site)
         if tracker is not None:
             rows.append(tracker)
