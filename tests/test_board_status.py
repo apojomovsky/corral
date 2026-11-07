@@ -487,6 +487,18 @@ class StatusStepTest(unittest.TestCase):
         self.sync_cards([card(7, status="Renamed")], reader=reader)
         self.assertEqual(reader.writes, [(REPO, 7, "opt-a")])
 
+    def test_non_string_current_status_reads_as_unknown(self):
+        reader = FakeStatusReader()
+        outcome = self.sync_cards(
+            [
+                card(7, extra={"board_status": ["Available"]}),
+                card(8, extra={"board_status": {"name": "Available"}}),
+            ],
+            reader=reader,
+        )
+        self.assertEqual(outcome.written, (f"{REPO}#7", f"{REPO}#8"))
+        self.assertEqual(reader.writes, [(REPO, 7, "opt-a"), (REPO, 8, "opt-a")])
+
     def test_pull_request_cards_are_skipped(self):
         reader = FakeStatusReader()
         outcome = self.sync_cards(
