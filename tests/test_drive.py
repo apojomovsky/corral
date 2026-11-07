@@ -621,6 +621,69 @@ class BrokenPolicyIsolationTest(unittest.TestCase):
         self.assertIn("missing_policy_xyz:eligible", named[0])
         self.assertIn("good app#7: start", out.getvalue())
 
+    def test_a_pulls_seam_loads_the_good_policy_once_and_reports_the_rest(self):
+        from korapy import eligibility
+
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        counter = os.path.join(self.tmp.name, "imports.log")
+        good_path = os.path.join(self.policies, "good.py")
+        with open(good_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "\n".join(
+                    [
+                        f"with open({counter!r}, 'a', encoding='utf-8') as _h:",
+                        "    _h.write('imported\\n')",
+                        "def eligible(rows, *, now):",
+                        "    from korapy.eligibility import StartRequest",
+                        "    return [StartRequest('app', 7, 'start')]",
+                        "",
+                    ]
+                )
+            )
+        good = project_named("good", good_path + ":eligible")
+        bad = project_named("bad", "missing_policy_xyz:eligible")
+        none = project_named("none")
+        fake = FakeTracker()
+        out = io.StringIO()
+        gated, problems, _requested, pulls_calls, pulls_limited = drive._gate_all(
+            store.items(),
+            [good, bad, none],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={
+                name: drive.QuotaSource(chains={}, stale_after=10**12)
+                for name in ("good", "bad", "none")
+            },
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            fix_threshold="high",
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            pulls_max_calls=5,
+            driven={
+                "good": frozenset({"app"}),
+                "bad": frozenset({"app"}),
+                "none": frozenset(),
+            },
+        )
+        with open(counter, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "imported\n")
+        self.assertEqual(len(problems), 1)
+        self.assertIn("bad", problems[0])
+        self.assertIn("missing_policy_xyz:eligible", problems[0])
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [f"project none: {eligibility.no_entry_line('none')}"],
+        )
+        self.assertEqual([row.project for row in gated], ["good"])
+        self.assertIn(("pulls_index", "app", 5), fake.calls)
+        self.assertEqual(pulls_calls, 1)
+        self.assertFalse(pulls_limited)
+
 
 class PolicyLoadOnceTest(unittest.TestCase):
     """Each resolving policy imports once per pass, not once per loop."""
