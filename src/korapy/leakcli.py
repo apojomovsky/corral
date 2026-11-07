@@ -155,6 +155,24 @@ def guard_terms(ops_root):
     )
 
 
+def guard_terms_from_table(table, ops_root, *, project_name=None):
+    """The private terms guarding `ops_root`, from one pre-read table.
+
+    The `takeoff` gate calls this with the project table its repo state
+    already parsed, so the gate reads the file once; the host and home
+    seams stay here, so both gates guard the same terms. `SettingsError`
+    propagates; each gate reports it in its own way.
+    """
+    return leakguard.terms_from_table(
+        table,
+        ops_root,
+        host=_hostname(),
+        home=_homedir(),
+        ops_name=os.path.basename(os.path.abspath(ops_root)) if ops_root else "",
+        project_name=project_name,
+    )
+
+
 def _as_json(findings):
     return {
         "schema_version": SCHEMA_VERSION,

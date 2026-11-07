@@ -648,6 +648,16 @@ def private(root):
     return resolve(project=read_project(root), env={}, project_name=project_path).private
 
 
+def private_from_table(table, project_name):
+    """The ``[private]`` terms from one pre-read project table.
+
+    `table` is the `read_project` result the caller already holds, so a
+    gate that parsed the file once never reads it again for the leak
+    terms; `project_name` names the file in errors, as in `private`.
+    Shape and regex errors are SettingsError (exit 4)."""
+    return resolve(project=dict(table or {}), env={}, project_name=project_name).private
+
+
 def find_root(start):
     """The nearest directory at or above `start` holding korapy.toml, else None."""
     here = os.path.abspath(start)

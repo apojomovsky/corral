@@ -3,6 +3,7 @@
 import os
 import tempfile
 import unittest
+import unittest.mock
 
 from korapy import leakguard, settings
 
@@ -191,6 +192,45 @@ class GuardTest(unittest.TestCase):
 
     def test_clean_text_passes(self):
         self.assertEqual(leakguard.guard_text("ordinary work", terms(TERM)), [])
+
+
+class TermsFromTableTest(unittest.TestCase):
+    def test_terms_from_the_table_match_a_fresh_read_without_reading_the_file(self):
+        table = {"private": {"terms": ["Acme Client"], "patterns": ["acme-[0-9]+"]}}
+        with tempfile.TemporaryDirectory(prefix="korapy-leak-") as ops:
+            project_name = os.path.join(ops, "korapy.toml")
+            with open(project_name, "w", encoding="utf-8") as handle:
+                handle.write('[private]\nterms = ["Acme Client"]\npatterns = ["acme-[0-9]+"]\n')
+            expected = leakguard.terms(ops, host="host-1", home="/users/someone", ops_name="ops")
+
+            def no_read(path):
+                raise AssertionError("the terms must come from the table, not the file")
+
+            with unittest.mock.patch.object(settings, "_load", side_effect=no_read):
+                found = leakguard.terms_from_table(
+                    table,
+                    ops,
+                    host="host-1",
+                    home="/users/someone",
+                    ops_name="ops",
+                    project_name=project_name,
+                )
+        self.assertEqual(
+            [(term.kind, term.text, term.source) for term in found],
+            [(term.kind, term.text, term.source) for term in expected],
+        )
+
+    def test_a_bad_pattern_from_the_table_is_a_configuration_error(self):
+        table = {"private": {"patterns": ["acme-([0-9]+"]}}
+        with self.assertRaisesRegex(settings.SettingsError, r"acme-\(\[0-9\]\+"):
+            leakguard.terms_from_table(
+                table,
+                "/tmp/ops",
+                host="host-1",
+                home="/users/someone",
+                ops_name="ops",
+                project_name="korapy.toml",
+            )
 
 
 class PrivateSettingsTest(unittest.TestCase):

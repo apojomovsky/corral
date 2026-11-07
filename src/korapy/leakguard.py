@@ -75,6 +75,27 @@ def terms(ops_root, *, host, home, ops_name):
     only the clone-independent built-ins (host and home) apply.
     """
     configured = settings.private(ops_root)
+    return _with_builtins(configured, ops_root, host=host, home=home, ops_name=ops_name)
+
+
+def terms_from_table(table, ops_root, *, host, home, ops_name, project_name=None):
+    """The configured terms plus the built-ins, from one pre-read table.
+
+    `table` is the `read_project` result the caller already holds, so a
+    gate that parsed the file once never reads it again for the leak
+    terms; `project_name` names the file in errors. With no table the
+    configured terms are empty and only the clone-independent built-ins
+    (host and home) apply.
+    """
+    name = project_name or (
+        os.path.join(ops_root, settings.PROJECT_FILE) if ops_root else settings.PROJECT_FILE
+    )
+    configured = settings.private_from_table(table or {}, name)
+    return _with_builtins(configured, ops_root, host=host, home=home, ops_name=ops_name)
+
+
+def _with_builtins(configured, ops_root, *, host, home, ops_name):
+    """Configured terms plus the built-ins korapy always adds."""
     found = [Term("term", text, CONFIG_SOURCE) for text in configured.terms]
     found.extend(Term("pattern", text, CONFIG_SOURCE) for text in configured.patterns)
     candidates = [
