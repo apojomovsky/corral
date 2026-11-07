@@ -106,7 +106,10 @@ repo. Two projects sharing a short entry name keep their own tracker
 repos: the scoping reads each root's own entries, never the
 first-winner pass map. A launch-path check refuses the pass with exit
 4 naming the repository if a foreign row ever reaches a claim, in
-case a future caller bypasses the filter.
+case a future caller bypasses the filter. The review-record lookup
+reads only rows in a driven repository too, so a foreign row prints
+no error line: the pass reports the ignored foreign rows once, per
+project.
 
 The function is pure by contract: no tracker, forge, `gh`, network,
 clock or settings access inside. Korapy supplies everything as
@@ -653,7 +656,7 @@ is tested through the seam its production code already injects:
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
-| Own repositories: with rows for two repos and two projects, each project's plan lists only its own repo, a foreign row is never claimed, the launch-path refusal exits 4 naming the repo, and a project sharing a short name with another keeps its own rows | temp `Store`, temp ops roots, stub policies, threaded `driven` sets |
+| Own repositories: with rows for two repos and two projects, each project's plan lists only its own repo, a foreign row is never claimed, the launch-path refusal exits 4 naming the repo, a foreign row never reaches the review-record lookup (a broken owned record still reports its line), and a project sharing a short name with another keeps its own rows | temp `Store`, temp ops roots, stub policies, threaded `driven` sets, recording review reader |
 | Finished worker keeps its claim until the reviewer takes over; `start` and `review` on a finished holder proceed as a takeover | temp `Store`, fake registry with a `done` entry, recording launcher, author==reviewer refusal case |
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |

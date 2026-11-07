@@ -36,6 +36,7 @@ Five rules bind every verb:
 | `korapy takeoff [--body FILE] [--test] [--skip NAME] [--plan] [--json] [--ops DIR] [PATH]` | Run the project-level gate over a worktree and report one row per check. `--skip NAME` waives one policy check and records the skip. | `--plan`: resolves each check without running the configured commands. |
 | `korapy merge REPO NUMBER --pr N --head SHA [--forge-repo OWNER/NAME] [--method METHOD] [--skip CHECK] [--plan] [--json]` | Merge one PR after proving it mergeable, one merger per repo. `--head` pins the approved head; only `checks` can be skipped. | `--plan`: reports every row and the lock state without taking the lock or merging. |
 | `korapy drive [--plan]` | Run one dispatch pass over the board store. | `--plan`: prints the candidate table and changes nothing. |
+| `korapy board sweep [REPO] [--plan]` | Bring every card back in step with its issue, to completion. | `--plan`: lists each card, the issue state and the move; changes nothing. |
 | `korapy push [BRANCH] [--remote REMOTE]` | Push the branch, verify the remote ref, retry once on a dead connection. | None: pushing is the worktree-side half of landing. |
 | `korapy heavy run [--timeout SECS] [--role NAME] [--bypass REASON] [--plan] [--json] CMD` | Queue one heavy command in the lane and run it in a transient scope with CPU and memory limits, releasing the slot on exit. `--bypass REASON` runs now, skipping the queue inside the same scope limits, and records the reason in the lane journal. Past the wait deadline the waiter leaves with 75. | `--plan`: reports the verdict without queueing or running. |
 | `korapy heavy status [--json]` | The lane's holders, waiters and learned costs; an empty lane is an empty list. | Itself: it writes nothing. |
@@ -107,3 +108,17 @@ while true; do
   jq -r '.checks[] | "\(.status) \(.name): \(.detail)"' merge.json; exit 1
 done
 ```
+
+## Board stewardship
+
+The board is the maintainer's view of the work; a stale board is a
+defect, not a nuisance.
+
+No agent or coordinator leaves the board stale: the loop keeps every card in step with its issue, and a coordinator who dispatches work outside the loop makes that work visible to the board the moment it starts (a claim, or a registered agent) and never ends a session with drift.
+
+## Heartbeat
+
+On every heartbeat, in the ops root:
+
+1. Run `korapy board sweep --plan`; no output means the board is in step.
+2. If it lists moves, run the loop (or `korapy board sweep --apply`) before ending the session.

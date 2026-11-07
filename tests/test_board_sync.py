@@ -450,5 +450,15 @@ class ExtendedAuditTest(BoardCase):
         self.assertEqual(self.board_cursor(), tracker.format_cursor(T0 - 100))
 
 
+class AdoptSeamTest(BoardCase):
+    def test_reader_without_an_adopt_seam_reports_refused_instead_of_crashing(self):
+        reader = FakeBoardReader([reading(repo=REPO, number=1, updated_at=T0)])
+        result = self.poll(reader, uncapped=True)
+        self.assertEqual(result.adopted, ())
+        self.assertEqual(len(result.refused), 1)
+        self.assertIn(REPO, result.refused[0])
+        self.assertIn("adopt", result.refused[0])
+
+
 if __name__ == "__main__":
     unittest.main()

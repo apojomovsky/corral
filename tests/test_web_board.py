@@ -166,6 +166,41 @@ class BoardContract(ServeCase):
             self.assertIsInstance(claim["claimed_at"], (int, float))
 
 
+class BoardDrift(ServeCase):
+    def payload(self, drifted=()):
+        with tempfile.TemporaryDirectory(prefix="korapy-serve-board-drift-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            stored_board_with_text(path, {"number": 3}, {"number": 7})
+            store = board.open_store(path)
+            try:
+                for number in drifted:
+                    store.note_drift("app", number, now=T0)
+            finally:
+                store.close()
+            opener = lambda: board.open_store(path)  # noqa: E731 - test seam
+            server, _ = self.start_server(FakeBuilder(healthy_doc()), board_open=opener)
+            status, _, raw = self.fetch(server, "GET", "/v1/board?body=0")
+            self.assertEqual(status, 200)
+            return json.loads(raw)
+
+    def test_clean_board_reports_zero_drift(self):
+        payload = self.payload()
+        self.assertEqual(payload["drift"], 0)
+        for row in payload["board"]:
+            self.assertIs(row["drift"], False)
+
+    def test_flagged_cards_are_marked_and_counted(self):
+        payload = self.payload(drifted=(7,))
+        self.assertEqual(payload["drift"], 1)
+        by_number = {row["number"]: row for row in payload["board"]}
+        self.assertIs(by_number[7]["drift"], True)
+        self.assertIs(by_number[3]["drift"], False)
+
+    def test_views_render_the_drift_count(self):
+        views = web_bytes("views.js").decode("utf-8")
+        self.assertIn("drift", views)
+
+
 class WebBoardSources(unittest.TestCase):
     def test_board_api_entry_points_exist(self):
         api = web_bytes("api.js").decode("utf-8")

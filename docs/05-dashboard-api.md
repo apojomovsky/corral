@@ -55,7 +55,12 @@ the snapshot only summarizes:
 - `GET /v1/board?repo=&state=&label=&max_age=&limit=&offset=&body=`: board store rows
   oldest first, each with its confidence (`confirmed`, `pending`,
   `dirty`), `fetched_at`, claim holder (agent, host, epoch,
-  claimed_at) when held, and queued agent/status overlays. Listing
+  claimed_at) when held, a `drift` flag per row, and queued
+  agent/status overlays. The `drift` flag marks the cards the board
+  step recorded as out of step with their issues, the same verdicts
+  `korapy doctor` counts in its `board-drift` rows; the reply carries
+  their count as `drift` beside `total` (over the filtered rows,
+  before paging), so the board view shows the doctor's number. Listing
   goes through `Store.items` (which takes no `max_age` and reports no
   freshness); freshness is computed in exactly one place in the serve
   layer by calling `Store.item(repo, number, now=..., max_age=...)`
