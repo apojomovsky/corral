@@ -2709,7 +2709,11 @@ def reviewed_claims(authors, finished, live_units=None) -> dict:
         if ticket in live:
             continue
         newest = (finished or {}).get(ticket)
-        if newest is not None and newest[0] == agent and newest[1] == "reviewer":
+        if (
+            newest is not None
+            and _finished_agent(newest) == agent
+            and _finished_role(newest) == "reviewer"
+        ):
             found[ticket] = agent
     return found
 
@@ -2851,13 +2855,12 @@ def resolve_finished(finished_for, released, *, agent_states=None, agent_tickets
     """
 
     def carried(prior):
-        role = prior[1] if len(prior) > 1 else None
-        return role, _finished_outcome(prior)
+        return _finished_role(prior), _finished_outcome(prior)
 
     resolved = {}
     for ticket, prior in (finished_for or {}).items():
         role, outcome = carried(prior)
-        resolved[ticket] = (prior[0], role, outcome)
+        resolved[ticket] = (_finished_agent(prior), role, outcome)
     for ticket, agent in (released or {}).items():
         role, outcome = None, None
         prior = resolved.get(ticket)

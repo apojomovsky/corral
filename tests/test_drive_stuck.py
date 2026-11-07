@@ -238,6 +238,11 @@ class ReviewedClaimsTest(unittest.TestCase):
             {("app", 7): AGENT},
         )
 
+    def test_short_finished_entries_read_as_unreviewed(self):
+        authors = {("app", 7): AGENT}
+        for newest in ((), (AGENT,)):
+            self.assertEqual(drive.reviewed_claims(authors, {("app", 7): newest}), {})
+
 
 class ReleaseReviewedTest(unittest.TestCase):
     def setUp(self):

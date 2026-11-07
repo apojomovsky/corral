@@ -243,6 +243,16 @@ class ResolveFinishedTest(unittest.TestCase):
         )
         self.assertEqual(resolved, {("app", 7): (HOLDER, None, None)})
 
+    def test_short_cross_pass_entries_read_as_unreviewed(self):
+        self.assertEqual(
+            drive.resolve_finished({("app", 7): ()}, {}),
+            {("app", 7): (None, None, None)},
+        )
+        self.assertEqual(
+            drive.resolve_finished({("app", 7): (WORKER,)}, {}),
+            {("app", 7): (WORKER, None, None)},
+        )
+
 
 class FixModeTest(unittest.TestCase):
     def test_a_live_registry_entry_resumes(self):
