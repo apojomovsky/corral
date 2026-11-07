@@ -294,10 +294,12 @@ configuration error. Exit 2 reuses the public race meaning, so
 retry loops treat it like the drive lock.
 
 State read: one fresh forge PR read (state, head SHA, check
-statuses, fork flag), the review record via `mergeup.find_record`
-(the same reader takeoff uses, so both gates agree), and the
-per-repo merge lock. No local worktree state: the merge runs
-forge-side, so a coordinator needs no clone.
+statuses, fork flag), the head-pinned check-runs read for the
+pending count (section 8), the review record via
+`mergeup.find_record` (the same reader takeoff uses, so both
+gates agree), and the per-repo merge lock. No local worktree
+state: the merge runs forge-side, so a coordinator needs no
+clone.
 
 Read-only twin: `--plan`. It reports every precondition row and
 the lock state (`free` or `held`) without taking the lock and
@@ -512,9 +514,16 @@ verb never:
 
 ## 8. The forge seam for merge
 
-`PullRequest` carries the merge verdict from the one fresh PR
-fetch, so the gate reads state, head, checks and merge SHA
-consistently:
+The merge verdict comes from two reads. The first is the fresh
+PR fetch, which carries state, head SHA, the checks verdict, the
+fork flag and the merge SHA, so the gate reads those
+consistently. The second is the head-pinned check-runs fetch,
+which carries only the running count. The head can move between
+the two reads, so the count can describe a different head than
+the verdict: that is why the count only decorates a pending row
+and never changes a verdict.
+
+`PullRequest` carries the verdict from the PR fetch:
 
 - `checks_state: str`: `"passing"`, `"failing"` or `"pending"`,
   summarizing the forge's check statuses on the head SHA;
@@ -530,14 +539,18 @@ decorate a pending row, never change a verdict:
 
 - `pending_checks(repo, sha) -> int`: how many check runs on
   `sha` are still running (one page of up to 100 runs; a head
-  with more runs reports a lower bound). The merge verb calls it
-  only when the verdict is pending (in `--wait`, once per poll),
-  and only on the merge paths: `review show --pr` never calls
-  it, so an unrelated verb pays no second read and a transient
-  count failure cannot fail it. A failed or unusable count read
-  on the merge path degrades to the count-less pending message
-  instead of an error; passing, failing, and skipped rows never
-  trigger it.
+  with more runs reports a lower bound). The adapter answers it
+  from the head-pinned check-runs fetch for the head SHA the PR
+  read reported. The merge verb calls it only when the verdict
+  is pending (in `--wait`, once per poll), and only on the merge
+  paths: `review show --pr` never calls it, so an unrelated verb
+  pays no second read and a transient count failure cannot fail
+  it. A failed or unusable count read on the merge path degrades
+  to the count-less pending message instead of an error;
+  passing, failing, and skipped rows never trigger it. A stale
+  count (the head moved between the two reads) still only
+  decorates the pending detail, so it can neither settle a wait
+  nor fail a gate.
 
 Only the adapters know the provider shape; everything else takes
 the `Forge` object.
