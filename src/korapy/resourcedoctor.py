@@ -669,7 +669,8 @@ def _check_slices(state: ResourceReadings) -> ResourceRow | None:
             "warn",
             "; ".join(drifts) + "; limits reconcile on the next launch of that project",
             "launch an agent of that project, then run `korapy doctor` again"
-            " (a cleared budget applies nothing: stop the slice by hand)",
+            " (a cleared budget or a ceiling-0 project applies nothing:"
+            " stop the slice by hand)",
         )
     if matched == 1:
         detail = "1 resource slice matches its budget"
