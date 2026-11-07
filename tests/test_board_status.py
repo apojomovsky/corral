@@ -681,8 +681,8 @@ class DriveStatusTest(unittest.TestCase):
     def test_sync_all_runs_the_status_step(self):
         self.seed(7)
         reader = BoardStepReader([card(7, state="closed", status="Available")])
-        seen, errors, store_errors, refused, adopt_errors, status_errors = self.drive.sync_all(
-            self.store, lambda repo: reader, operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            self.drive.sync_all(self.store, lambda repo: reader, operators=["alice"], now=T0)
         )
         self.assertEqual(reader.writes, [(REPO, 7, "opt-d")])
         self.assertEqual(status_errors, [])
@@ -698,8 +698,8 @@ class DriveStatusTest(unittest.TestCase):
             [card(7, state="closed", status="Available")],
             write_errors={(REPO, 7): iface.TrackerError("locked")},
         )
-        seen, errors, store_errors, refused, adopt_errors, status_errors = self.drive.sync_all(
-            self.store, lambda repo: reader, operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            self.drive.sync_all(self.store, lambda repo: reader, operators=["alice"], now=T0)
         )
         self.assertEqual(reader.writes, [(REPO, 7, "opt-d")])
         self.assertEqual(len(status_errors), 1)
@@ -857,8 +857,8 @@ class RealTrackerStatusTest(unittest.TestCase):
         self.script_mutation(run)
         run.add_rest(self.FEED_PATH, [])
         tracker = self.backed_tracker(run)
-        seen, errors, store_errors, refused, adopt_errors, status_errors = drive.sync_all(
-            self.store, lambda repo: tracker, operators=["alice"], now=T0
+        seen, errors, store_errors, refused, adopt_errors, status_errors, adopted, written = (
+            drive.sync_all(self.store, lambda repo: tracker, operators=["alice"], now=T0)
         )
         self.assertEqual(errors, [])
         self.assertEqual(status_errors, [])
@@ -869,3 +869,164 @@ class RealTrackerStatusTest(unittest.TestCase):
         found = run.graphql_variables(self.WRITE_MARKER)
         self.assertEqual(len(found), 1)
         self.assertEqual(found[0]["option"], "opt-r")
+
+
+class RecordingReader(BoardStepReader):
+    """A pass double with an adopt cap and stateful adds for recording tests."""
+
+    board_adopt_limit = 20
+
+    def __init__(self, items, *, added=(), resume=None, **kw):
+        super().__init__(items, **kw)
+        self._added = list(added)
+        self._added_done = set()
+        self._resume = resume
+
+    def poll(self, found_schema, *, after=None, max_pages=5):
+        return list(self._items), self._resume
+
+    def adopt_missing(self, project_id, repo, present, *, limit, now):
+        self.adopt_calls.append((project_id, repo, set(present), limit))
+        if limit is not None and limit <= 0:
+            return iface.BoardAdopt((), (), (), None)
+        present_numbers = {number for key_repo, number in present if key_repo == repo}
+        added = []
+        for name in self._added:
+            key_repo, _, number = name.rpartition("#")
+            if (
+                key_repo != repo
+                or not number.isdigit()
+                or int(number) in present_numbers
+                or name in self._added_done
+            ):
+                continue
+            added.append(name)
+            self._added_done.add(name)
+            if limit is not None and len(added) >= limit:
+                break
+        return iface.BoardAdopt(tuple(added), (), (), None)
+
+
+class DriftRecordingTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-board-recording-")
+        self.addCleanup(self.tmp.cleanup)
+        self.store = board.open_store(os.path.join(self.tmp.name, "board.sqlite"))
+        self.addCleanup(self.store.close)
+
+    def seed(self, number, state="open"):
+        self.store.upsert_item(
+            board.Item(
+                repo=REPO,
+                number=number,
+                title="Title",
+                body="Body",
+                state=state,
+                author="alice",
+                url="https://example.com/acme/app",
+                tracker_updated_at=T0 - 100,
+            ),
+            operators=["alice"],
+            now=T0 - 100,
+        )
+
+    def run_board_step(self, reader, *, uncapped=False):
+        return sync.sync_board_repo(
+            self.store,
+            reader,
+            schema(),
+            REPO,
+            operators=["alice"],
+            now=T0,
+            max_pages=5,
+            uncapped=uncapped,
+        )
+
+    def test_written_card_clears_its_flag(self):
+        self.seed(7, state="closed")
+        result = self.run_board_step(RecordingReader([card(7, state="closed", status="Available")]))
+        self.assertEqual(result.status_written, (f"{REPO}#7",))
+        self.assertEqual(self.store.drift_flags(), [])
+
+    def test_deferred_card_stays_flagged_until_a_later_pass_writes_it(self):
+        self.seed(7, state="closed")
+        self.seed(9, state="closed")
+        reader = RecordingReader(
+            [
+                card(7, state="closed", status="Available", updated_at=T0 - 100),
+                card(9, state="closed", status="Available", updated_at=T0 - 100),
+            ],
+            limit=1,
+        )
+        first = self.run_board_step(reader)
+        self.assertEqual(len(first.status_written), 1)
+        self.assertEqual(self.store.drift_flags(), [(REPO, 9, T0 - 100)])
+        second = self.run_board_step(reader)
+        self.assertEqual(len(second.status_written), 1)
+        self.assertEqual(
+            set(first.status_written) | set(second.status_written), {f"{REPO}#7", f"{REPO}#9"}
+        )
+        self.assertEqual(self.store.drift_flags(), [])
+
+    def test_uncapped_run_writes_everything_despite_no_caps(self):
+        self.seed(7, state="closed")
+        self.seed(9, state="closed")
+        reader = RecordingReader(
+            [
+                card(7, state="closed", status="Available"),
+                card(9, state="closed", status="Available"),
+            ]
+        )
+        reader.board_status_limit = None
+        result = self.run_board_step(reader, uncapped=True)
+        self.assertEqual(len(result.status_written), 2)
+        self.assertEqual(self.store.drift_flags(), [])
+
+    def test_missing_open_issue_is_flagged_and_the_add_is_named(self):
+        self.seed(7)
+        self.seed(8)
+        reader = RecordingReader([card(7, status="Available")], added=[f"{REPO}#8"])
+        result = self.run_board_step(reader)
+        self.assertEqual(result.adopted, (f"{REPO}#8",))
+        self.assertEqual(self.store.drift_flags(), [(REPO, 8, T0 - 100)])
+
+    def test_truncated_poll_leaves_missing_verdicts_alone(self):
+        self.seed(7)
+        self.seed(8)
+        self.store.note_drift(REPO, 8, now=T0 - 10)
+        reader = RecordingReader([card(7, status="Available")], resume="TOKEN")
+        result = self.run_board_step(reader)
+        self.assertEqual(result.adopted, ())
+        self.assertEqual(self.store.drift_flags(), [(REPO, 8, T0 - 10)])
+
+    def test_complete_poll_clears_gone_verdicts(self):
+        self.seed(7)
+        self.seed(9, state="closed")
+        self.store.note_drift(REPO, 9, now=T0 - 10)
+        self.run_board_step(RecordingReader([card(7, status="Available")]))
+        self.assertEqual(self.store.drift_flags(), [])
+
+    def test_manual_move_is_not_drift(self):
+        self.seed(7)
+        self.store.claim(REPO, 7, "bob", "host-1", now=T0 - 100)
+        self.store.record_status_set(REPO, 7, "opt-c", "claimed", now=T0 - 100)
+        result = self.run_board_step(RecordingReader([card(7, status="Available")]))
+        self.assertEqual(result.status_written, ())
+        self.assertEqual(self.store.drift_flags(), [])
+
+    def test_unmapped_project_records_nothing(self):
+        self.seed(7, state="closed")
+        result = self.run_board_step(
+            RecordingReader([card(7, state="closed", status="Available")], ids={})
+        )
+        self.assertEqual(result.status_written, ())
+        self.assertEqual(self.store.drift_flags(), [])
+
+    def test_disabled_caps_still_record_mapped_drift(self):
+        self.seed(7, state="closed")
+        reader = RecordingReader(
+            [card(7, state="closed", status="Available", updated_at=T0 - 100)], limit=0
+        )
+        result = self.run_board_step(reader)
+        self.assertEqual(result.status_written, ())
+        self.assertEqual(self.store.drift_flags(), [(REPO, 7, T0 - 100)])

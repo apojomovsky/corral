@@ -11,6 +11,7 @@ error. No GitHub, no network, no service control in this module.
 
 import argparse
 import json
+import math
 import os
 import shutil
 import socket
@@ -400,6 +401,18 @@ def _all_failed(doc):
     return all(is_error_section(doc.get(section)) for section in ERROR_SECTIONS)
 
 
+def _finite_count(value):
+    """`value` when it is a finite number, else 0.
+
+    A hand-crafted document can carry NaN or infinity where the real
+    producer only ever writes ints; the dashboard reads those as 0, so
+    the human view does the same instead of printing `nan`.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return value if math.isfinite(value) else 0
+
+
 def _show(doc):
     """The human view: one short table per section, agents first."""
     agents = doc.get("agents")
@@ -408,7 +421,7 @@ def _show(doc):
         print(
             f"agents: {header.get('agents_live', 0)} live,"
             f" {header.get('agents_stale', 0)} stale,"
-            f" {header.get('agents_finished', 0)} finished"
+            f" {_finite_count(header.get('agents_finished', 0))} finished"
         )
         for row in agents:
             if row["repo"] is None:

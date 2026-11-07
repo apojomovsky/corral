@@ -131,3 +131,9 @@ Dispatched agents run headless. When the turn ends, the process exits, and any b
 - **External contributions are for maintainers.** An agent never merges, reviews, comments on, labels, closes or works on a PR or issue from outside the maintainers, or any fork PR. Tell a maintainer and stop.
 - **Secrets.** Tokens and account metadata (runtime logins, the GitHub token, provider API keys, korapy's API token) are read at call time and never stored or logged. The same goes for quota payloads beyond their usage numbers.
 - **Report only what you ran.** Every claim about a command's result comes from a command you actually ran. Never invent output.
+
+## Board stewardship
+
+The board is the maintainer's view of the work; a stale board is a defect, not a nuisance.
+
+No agent or coordinator leaves the board stale: the loop keeps every card in step with its issue, and a coordinator who dispatches work outside the loop makes that work visible to the board the moment it starts (a claim, or a registered agent) and never ends a session with drift.

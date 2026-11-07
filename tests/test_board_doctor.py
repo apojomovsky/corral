@@ -11,6 +11,7 @@ or a real subprocess.
 import os
 import tempfile
 import unittest
+from typing import Any
 
 from korapy import board as store
 from korapy import boarddoctor, doctor
@@ -97,7 +98,7 @@ def tempdir():
     return tempfile.mkdtemp(prefix="korapy-boarddoctor-")
 
 
-def check(sites, *, snap=None, refs=(), fetch=None, store_dir=None, board_items=None):
+def check(sites, *, snap=None, refs=(), fetch=None, store_dir=None, board_items=None, now=None):
     """``check_sites`` with fakes: snapshot ``snap``, membership ``refs``."""
     if fetch is None:
         fetch = fetch_snapshot(snap)
@@ -109,13 +110,32 @@ def check(sites, *, snap=None, refs=(), fetch=None, store_dir=None, board_items=
         fetch=fetch,
         open_store=lambda: open_temp_store(directory),
         board_items=board_items,
+        now=now,
     )
 
 
-def site(**over):
-    base = {"repo": REPO, "variant": "board", "board": config()}
-    base.update(over)
-    return boarddoctor.BoardSite(**base)
+def flag_drift(directory, *entries, repo=REPO, since=NOW):
+    """Drift verdicts in a temp store: ``entries`` are numbers or ``(number, since)``."""
+    handle = open_temp_store(directory)
+    try:
+        for entry in entries:
+            number, at = entry if isinstance(entry, tuple) else (entry, since)
+            handle.note_drift(repo, number, now=at)
+    finally:
+        handle.close()
+
+
+_UNSET: Any = object()
+
+
+def site(repo=REPO, variant="board", board=_UNSET, drift_max_age_s=None):
+    table = config() if board is _UNSET else board
+    return boarddoctor.BoardSite(
+        repo=repo,
+        variant=variant,
+        board=table,
+        drift_max_age_s=drift_max_age_s,
+    )
 
 
 def open_temp_store(directory):
@@ -657,6 +677,153 @@ class MissingFromBoard(unittest.TestCase):
         (row,) = check([site()], board_items=board_items)
         self.assertEqual(row.status, "fail")
         self.assertIn("cannot list the board's items", row.detail)
+
+
+class DriftRowTest(unittest.TestCase):
+    def drift_row(self, rows):
+        found = [row for row in rows if row.name == f"board-drift:{REPO}"]
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_no_verdicts_reads_ok_after_the_board_row(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        rows = check([site(drift_max_age_s=600)], store_dir=directory, refs=[(REPO, 7)], now=NOW)
+        self.assertEqual([row.name for row in rows], [f"board:{REPO}", f"board-drift:{REPO}"])
+        row = self.drift_row(rows)
+        self.assertEqual(row.status, "ok")
+        self.assertIn("no board drift", row.detail)
+
+    def test_young_drift_warns_naming_the_number_and_the_sweep(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        flag_drift(directory, (7, NOW - 60))
+        (row,) = [
+            row
+            for row in check(
+                [site(drift_max_age_s=600)], store_dir=directory, refs=[(REPO, 7)], now=NOW
+            )
+            if row.name == f"board-drift:{REPO}"
+        ]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("1 card drifted", row.detail)
+        self.assertIn("#7", row.detail)
+        self.assertIn("1m ago", row.detail)
+        self.assertIn(f"korapy board sweep {REPO} --apply", row.fix)
+
+    def test_drift_older_than_the_max_age_fails(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        flag_drift(directory, (7, NOW - 601))
+        row = self.drift_row(
+            check([site(drift_max_age_s=600)], store_dir=directory, refs=[(REPO, 7)], now=NOW)
+        )
+        self.assertEqual(row.status, "fail")
+        self.assertIn("10m ago", row.detail)
+
+    def test_drift_at_exactly_the_max_age_still_warns(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        flag_drift(directory, (7, NOW - 600))
+        row = self.drift_row(
+            check([site(drift_max_age_s=600)], store_dir=directory, refs=[(REPO, 7)], now=NOW)
+        )
+        self.assertEqual(row.status, "warn")
+
+    def test_many_flags_name_the_first_few_then_count_the_rest(self):
+        directory = tempdir()
+        stored_numbers(directory, *range(1, 9))
+        flag_drift(directory, *range(1, 9))
+        row = self.drift_row(
+            check(
+                [site(drift_max_age_s=600)],
+                store_dir=directory,
+                refs=[(REPO, number) for number in range(1, 9)],
+                now=NOW,
+            )
+        )
+        self.assertEqual(row.status, "warn")
+        self.assertIn("8 cards drifted", row.detail)
+        self.assertIn("(#1, #2, #3, #4, #5 and 3 more", row.detail)
+
+    def test_other_repos_flags_are_not_counted(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        flag_drift(directory, 9, repo="example/other")
+        row = self.drift_row(
+            check([site(drift_max_age_s=600)], store_dir=directory, refs=[(REPO, 7)], now=NOW)
+        )
+        self.assertEqual(row.status, "ok")
+
+    def test_a_site_without_a_max_age_gets_no_drift_row(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        flag_drift(directory, (7, NOW - 3600))
+        (row,) = check([site()], store_dir=directory, refs=[(REPO, 7)], now=NOW)
+        self.assertEqual(row.name, f"board:{REPO}")
+
+    def test_a_labels_site_gets_no_drift_row(self):
+        directory = tempdir()
+        stored_numbers(directory, 7)
+        flag_drift(directory, (7, NOW - 3600))
+        rows = check(
+            [site(variant="labels", drift_max_age_s=None)],
+            store_dir=directory,
+            refs=[(REPO, 7)],
+            now=NOW,
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertNotIn("drift", rows[0].name)
+
+    def test_an_unreadable_verdict_table_fails_closed(self):
+        class BrokenDriftStore(store.Store):
+            def drift_flags(self):
+                raise store.StoreError("test verdicts unreadable")
+
+        def open_broken():
+            inner = open_temp_store(tempdir())
+            return BrokenDriftStore(inner._conn)
+
+        rows = boarddoctor.check_sites(
+            [site(drift_max_age_s=600)],
+            fetch=fetch_snapshot(),
+            open_store=open_broken,
+            board_items=items_on((REPO, 7)),
+            now=NOW,
+        )
+        row = self.drift_row(rows)
+        self.assertEqual(row.status, "fail")
+        self.assertIn("cannot read the board drift verdicts", row.detail)
+
+    def test_sites_carry_the_repo_drift_max_age(self):
+        root = tempdir()
+        config_dir = tempdir()
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\n'
+                '[repo.tracker]\nrepo = "example/demo"\nvariant = "board"\n'
+                '[repo.board]\nproject_owner = "example"\nproject_number = 3\n'
+            )
+        sites, error = boarddoctor.sites_from_settings(root, env={"KORAPY_CONFIG": config_dir})
+        self.assertIsNone(error)
+        self.assertEqual(len(sites), 1)
+        self.assertEqual(sites[0].drift_max_age_s, 600)
+
+    def test_sites_honor_a_configured_drift_max_age(self):
+        root = tempdir()
+        config_dir = tempdir()
+        with open(os.path.join(root, "korapy.toml"), "w", encoding="utf-8") as handle:
+            handle.write(
+                '[[repo]]\nname = "app"\n'
+                '[repo.tracker]\nrepo = "example/demo"\nvariant = "board"\n'
+                '[repo.board]\nproject_owner = "example"\nproject_number = 3\n'
+            )
+        sites, error = boarddoctor.sites_from_settings(
+            root,
+            env={"KORAPY_CONFIG": config_dir, "KORAPY_BOARD_DRIFT_MAX_AGE_S": "900"},
+        )
+        self.assertIsNone(error)
+        self.assertEqual(sites[0].drift_max_age_s, 900)
 
 
 class OptionValidation(unittest.TestCase):

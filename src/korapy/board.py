@@ -46,7 +46,7 @@ from korapy import paths
 
 #: Schema version stamped as ``PRAGMA user_version``. A database with a
 #: newer or unknown version fails closed instead of migrating.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 #: The store file inside the state dir.
 DB_NAME = "board.sqlite"
@@ -91,7 +91,7 @@ class RenameRefused(Exception):
 
 
 #: Every table keyed by tracker repo: the rename verb moves all of them.
-RENAME_TABLES = ("items", "claims", "outbox", "cursors", "status_sets")
+RENAME_TABLES = ("items", "claims", "outbox", "cursors", "status_sets", "drift")
 
 
 @dataclass
@@ -200,6 +200,18 @@ _STATUS_SETS_DDL = """
         PRIMARY KEY(repo, number))
 """
 
+#: The board-drift verdicts the board step records: one row per card
+#: out of step with its issue, with the time it was first seen that
+#: way. The doctor and the dashboard read this table; only the board
+#: step writes it, reconciling every poll. Created by a fresh database
+#: and by the v3 to v4 migration alike: one definition.
+_DRIFT_DDL = """
+    CREATE TABLE IF NOT EXISTS drift(
+        repo TEXT NOT NULL, number INTEGER NOT NULL,
+        since REAL NOT NULL,
+        PRIMARY KEY(repo, number))
+"""
+
 
 def _migrate(conn):
     """Create the schema forward from an empty database, in one place."""
@@ -239,6 +251,7 @@ def _migrate(conn):
     )
     conn.execute(_CURSORS_DDL)
     conn.execute(_STATUS_SETS_DDL)
+    conn.execute(_DRIFT_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -251,6 +264,12 @@ def _migrate_1_to_2(conn):
 def _migrate_2_to_3(conn):
     """Forward a version-2 database: add the last-set Status table."""
     conn.execute(_STATUS_SETS_DDL)
+    conn.execute("PRAGMA user_version=3")
+
+
+def _migrate_3_to_4(conn):
+    """Forward a version-3 database: add the board-drift verdicts table."""
+    conn.execute(_DRIFT_DDL)
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 
@@ -524,6 +543,37 @@ class Store:
             " set_at=excluded.set_at",
             (repo, number, option_id, derived, now),
         )
+
+    def note_drift(self, repo, number, *, now):
+        """Flag (``repo``, ``number``) as out of step with its issue.
+
+        The first sighting wins: a card that stays drifted keeps its
+        original ``since``, so the doctor's age counts the whole drift,
+        not the last poll. Only the board step calls this, reconciling
+        every poll; the doctor and the dashboard only read.
+        """
+        self._conn.execute(
+            "INSERT INTO drift(repo, number, since) VALUES(?, ?, ?)"
+            " ON CONFLICT(repo, number) DO NOTHING",
+            (repo, number, now),
+        )
+
+    def clear_drift(self, repo, number):
+        """Clear the drift flag on (``repo``, ``number``), if any."""
+        self._conn.execute("DELETE FROM drift WHERE repo=? AND number=?", (repo, number))
+
+    def drift_flags(self):
+        """Every drift verdict as ``(repo, number, since)``, ordered by repo and number.
+
+        Read-only: the doctor counts one repo's rows against its age
+        setting, and the dashboard sums the whole table.
+        """
+        return [
+            (row[0], row[1], row[2])
+            for row in self._conn.execute(
+                "SELECT repo, number, since FROM drift ORDER BY repo ASC, number ASC"
+            ).fetchall()
+        ]
 
     def queued_writes(self, limit=None):
         """Queued outbox rows, oldest first, at most ``limit``."""
@@ -1028,9 +1078,14 @@ def open_store(path=None):
             with _txn(conn):
                 _migrate_1_to_2(conn)
                 _migrate_2_to_3(conn)
+                _migrate_3_to_4(conn)
         elif version == 2:
             with _txn(conn):
                 _migrate_2_to_3(conn)
+                _migrate_3_to_4(conn)
+        elif version == 3:
+            with _txn(conn):
+                _migrate_3_to_4(conn)
         elif version != SCHEMA_VERSION:
             raise StoreError(
                 f"board store {target} has schema version {version},"

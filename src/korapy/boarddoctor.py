@@ -1,4 +1,4 @@
-"""Doctor board checks: schema, option ids, flip refusal, parity.
+"""Doctor board checks: schema, option ids, flip refusal, parity, drift.
 
 One read-only check per repo in board mode, per docs/07-board-fields.md
 section 5 and docs/11-board-standard.md section 5. The board must
@@ -6,21 +6,25 @@ resolve, every mapped field and every mapped option id must exist, and
 no queued writes may predate a variant flip. The parity report compares
 label-derived and board-derived concepts per stored item and renders
 stable text (sorted by repo and number), so a one-time run after a
-board edit or a variant flip reports exactly what differs.
+board edit or a variant flip reports exactly what differs. The drift
+row counts the verdicts the board step recorded per repo and fails the
+ones out of step longer than the repo's ``board.drift_max_age_s``.
 
 Pure core plus three injected seams: ``fetch`` resolves one board
 config to its live snapshot (raw fields, title, owner boards, raising
 ``TrackerError`` when it does not), ``board_items`` lists the
 ``(repo, number)`` pairs on the board for the missing-from-board row,
-and ``open_store`` opens the board store the parity rows and the outbox
-counts are read from. Tests inject fakes at all three; production wires
-the GraphQL board reader and the real store in ``doctor.production_env``.
+and ``open_store`` opens the board store the parity rows, the outbox
+counts and the drift verdicts are read from. Tests inject fakes at all
+three; production wires the GraphQL board reader and the real store in
+``doctor.production_env``.
 """
 
+import time
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
-from korapy import board, boardstatus, paths, settings
+from korapy import board, boardstatus, paths, quotacli, settings
 from korapy import tracker as iface
 from korapy.github import gh
 
@@ -31,6 +35,9 @@ class BoardSite(NamedTuple):
     repo: str  # "owner/name" the adapter talks to (or the entry name)
     variant: str  # "labels" | "board"
     board: settings.BoardConfig | None  # the resolved [board] table
+    #: Seconds a card may stay out of step before the drift row fails.
+    #: None disables the drift row for the site.
+    drift_max_age_s: int | None = None
 
 
 class BoardRow(NamedTuple):
@@ -298,6 +305,39 @@ def missing_finding(repo: str, missing: Sequence[int]) -> FieldFinding:
     return FieldFinding(detail=detail, severity="fail", fix="run `korapy github setup --populate`")
 
 
+def drift_row(site: BoardSite, flags: Sequence[tuple], *, now: float) -> BoardRow:
+    """One ``board-drift`` row over the board step's recorded verdicts. Pure.
+
+    ``flags`` are the ``(repo, number, since)`` verdicts for this repo,
+    oldest first. No verdicts reads ok; verdicts all younger than the
+    site's ``drift_max_age_s`` warn; a verdict out of step longer than
+    that fails, the standing rule that no session ends with a stale
+    board. The detail names the count, the first few issue numbers and
+    the oldest drift; the fix sweeps the repo.
+    """
+    name = f"board-drift:{site.repo}"
+    assert site.drift_max_age_s is not None
+    if not flags:
+        return BoardRow(name, "ok", f"{site.repo}: no board drift recorded", "")
+    numbers = [number for _, number, _ in flags]
+    shown = ", ".join(f"#{number}" for number in numbers[:_SHOWN_MISSING])
+    rest = len(numbers) - _SHOWN_MISSING
+    tail = f" and {rest} more" if rest > 0 else ""
+    oldest = max(now - since for _, _, since in flags)
+    if len(numbers) == 1:
+        detail = f"{site.repo}: 1 card drifted (#{numbers[0]}"
+    else:
+        detail = f"{site.repo}: {len(numbers)} cards drifted ({shown}{tail}"
+    detail += f"; oldest drift {quotacli.format_age(oldest)})"
+    status = "fail" if oldest > site.drift_max_age_s else "warn"
+    return BoardRow(
+        name,
+        status,
+        detail,
+        f"run `korapy board sweep {site.repo} --apply`",
+    )
+
+
 def _board_address(board_config: settings.BoardConfig) -> str:
     """The configured board as ``owner number N`` or ``owner id ID``."""
     if board_config.project_number is not None:
@@ -482,12 +522,45 @@ def _check_site(site: BoardSite, *, store: board.Store, fetch, board_items) -> B
     )
 
 
+def _drift_rows(
+    sites: Sequence[BoardSite], store: board.Store, *, now: float
+) -> dict[str, BoardRow]:
+    """One ``board-drift`` row per drift-enabled board site, keyed by repo.
+
+    Reads the verdicts the board step recorded; a repo with no
+    ``drift_max_age_s`` gets no row. A verdict table the read cannot
+    parse fails that repo's row closed instead of reporting on partial
+    knowledge.
+    """
+    rows: dict[str, BoardRow] = {}
+    for site in sites:
+        if site.drift_max_age_s is None:
+            continue
+        try:
+            flags = [
+                (repo, number, since)
+                for repo, number, since in store.drift_flags()
+                if repo == site.repo
+            ]
+        except Exception as err:
+            rows[site.repo] = BoardRow(
+                f"board-drift:{site.repo}",
+                "fail",
+                f"{site.repo}: cannot read the board drift verdicts: {err}",
+                "make the state dir usable, then run `korapy doctor` again",
+            )
+            continue
+        rows[site.repo] = drift_row(site, flags, now=now)
+    return rows
+
+
 def check_sites(
     sites: Sequence[BoardSite],
     *,
     fetch: Callable[[settings.BoardConfig], object] | None = None,
     open_store: Callable[[], board.Store] | None = None,
     board_items: Callable[[settings.BoardConfig], object] | None = None,
+    now: float | None = None,
 ) -> list[BoardRow]:
     """One row per board-mode repo, plus one warn per provisioned labels repo.
 
@@ -495,9 +568,13 @@ def check_sites(
     their warn-only row from config alone, with no `fetch` and no store
     call; a labels repo without a table still gets no row. Board-mode
     sites with no seams fail closed instead of reaching the real pacer
-    or a real subprocess. The store opens once for all board sites and
-    closes before returning.
+    or a real subprocess. A drift-enabled board site (one carrying a
+    ``drift_max_age_s``) also gets its ``board-drift`` row right after
+    its board row, read from the same store opening. The store opens
+    once for all board sites and closes before returning. ``now`` is
+    the clock drift ages read against (the current time when omitted).
     """
+    moment = time.time() if now is None else now
     kinds = []
     for site in sites:
         if site.variant == "board":
@@ -508,6 +585,7 @@ def check_sites(
         return []
     board_sites = [site for kind, site in kinds if kind == "board"]
     board_rows: list[BoardRow] = []
+    drift_rows: dict[str, BoardRow] = {}
     if board_sites:
         if fetch is None or open_store is None:
             board_rows = [
@@ -538,6 +616,7 @@ def check_sites(
                         _check_site(site, store=store, fetch=fetch, board_items=board_items)
                         for site in board_sites
                     ]
+                    drift_rows = _drift_rows(board_sites, store, now=moment)
                 finally:
                     store.close()
     positions = [index for index, (kind, _) in enumerate(kinds) if kind == "board"]
@@ -548,6 +627,8 @@ def check_sites(
             rows.append(_labels_table_row(site))
         elif index in placed:
             rows.append(placed[index])
+            if site.repo in drift_rows:
+                rows.append(drift_rows[site.repo])
     return rows
 
 
@@ -559,8 +640,10 @@ def sites_from_settings(
     Every repo with ``tracker.variant`` set to ``board`` becomes a
     site, plus every labels repo whose resolved `[repo.board]` table is
     not `None` (answered warn-only from config, with no board fetch). A
-    labels repo with no table still gets no doctor row. Reads plain
-    files, never the network.
+    labels repo with no table still gets no doctor row. Board sites
+    carry the repo's ``board.drift_max_age_s`` for the drift row;
+    labels sites carry none and get no drift row. Reads plain files,
+    never the network.
     """
     try:
         names = settings.repo_names(root)
@@ -576,5 +659,12 @@ def sites_from_settings(
             continue
         repo = str(loaded["tracker.repo"] or name)
         variant = str(loaded["tracker.variant"])
-        sites.append(BoardSite(repo=repo, variant=variant, board=loaded.board))
+        sites.append(
+            BoardSite(
+                repo=repo,
+                variant=variant,
+                board=loaded.board,
+                drift_max_age_s=(loaded["board.drift_max_age_s"] if variant == "board" else None),
+            )
+        )
     return sites, None
