@@ -185,8 +185,10 @@ def _board_step(store, tracker, tracker_repo, *, operators, now):
     the poll cannot apply is already a line in the board result, not a
     raise. A complete poll also adopts the tracker's missing issues
     through the same reader; failed adds ride along as adopt lines
-    without failing the sync. Anything else (a programming error, any
-    other store failure) propagates.
+    without failing the sync. The same step also syncs the Status
+    column every pass, at most `board.status_per_pass` writes per repo.
+    Anything else (a programming error, any other store failure)
+    propagates.
     """
     try:
         schema = tracker.board_schema()
