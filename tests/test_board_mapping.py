@@ -12,6 +12,7 @@ import os
 import tempfile
 import tomllib
 import unittest
+from typing import Any
 from contextlib import redirect_stdout
 from unittest import mock
 
@@ -86,7 +87,7 @@ def standard_provision(spec, **over):
 
 def board_config(**over):
     """A ``BoardConfig`` with an addressed board and blank columns."""
-    table = {
+    table: dict[str, Any] = {
         "project_owner": "example",
         "project_number": 3,
         "project_id": None,
