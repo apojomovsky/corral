@@ -72,9 +72,45 @@ def terms(ops_root, *, host, home, ops_name):
     The built-ins are the ops repository's own directory name, the absolute
     ops root path, the machine host name and the user's home directory path;
     they come in through arguments so tests inject fakes. With no ops root
-    only the clone-independent built-ins (host and home) apply.
+    only the clone-independent built-ins (host and home) apply. A thin
+    wrapper over `terms_from_table`: the table form holds the only
+    configured-terms resolution.
     """
-    configured = settings.private(ops_root)
+    if not ops_root:
+        return terms_from_table(
+            {},
+            None,
+            host=host,
+            home=home,
+            ops_name=ops_name,
+            project_name=settings.PROJECT_FILE,
+        )
+    return terms_from_table(
+        settings.read_project(ops_root),
+        ops_root,
+        host=host,
+        home=home,
+        ops_name=ops_name,
+        project_name=os.path.join(ops_root, settings.PROJECT_FILE),
+    )
+
+
+def terms_from_table(table, ops_root, *, host, home, ops_name, project_name):
+    """The configured terms plus the built-ins, from one pre-read table.
+
+    `table` is the `read_project` result the caller already holds, so a
+    gate that parsed the file once never reads it again for the leak
+    terms; `project_name` names the file in errors and is required, so
+    every error names the file the caller parsed. With no table the
+    configured terms are empty and only the clone-independent built-ins
+    (host and home) apply.
+    """
+    configured = settings.private_from_table(table or {}, project_name)
+    return _with_builtins(configured, ops_root, host=host, home=home, ops_name=ops_name)
+
+
+def _with_builtins(configured, ops_root, *, host, home, ops_name):
+    """Configured terms plus the built-ins korapy always adds."""
     found = [Term("term", text, CONFIG_SOURCE) for text in configured.terms]
     found.extend(Term("pattern", text, CONFIG_SOURCE) for text in configured.patterns)
     candidates = [
