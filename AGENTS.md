@@ -65,6 +65,7 @@ The rules the design rests on:
   `git fetch origin && git worktree add .worktrees/<n>-<slug> -b <type>/<n>-<slug> origin/master`.
   Remove the worktree after the PR merges.
 - **No force pushes.** Rewriting a branch that exists on the remote drops it for every other agent and clone, and the `pre-push` hook refuses it (deleting a remote branch too). If a rewrite is genuinely needed, get the maintainer's explicit go-ahead in your own session, then re-run with `KORAPY_FORCE_PUSH_APPROVED=1 git push --force-with-lease`.
+- **The pre-push hook still gates every push.** It runs the suite, then stamps the tree it passed. It skips the suite only on proof for the identical clean tree: its own stamp for that tree, or a fresh green-matrix proof from `make check` covering the same interpreters. Both proofs are cache state resolved through `paths`, never trusted across trees; a dirty tree, a stale, corrupt or foreign proof always runs the suite again. A failing suite still blocks the push.
 - **Never skip hooks.** Never pass `--no-verify`, and never set an env override that bypasses a hook. When a hook blocks you, use the decision protocol below.
 - **Merges.** Merge `origin/master` into your branch when master moves on. Never rebase a pushed branch. A maintainer merges PRs (squash).
 

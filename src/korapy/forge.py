@@ -60,6 +60,10 @@ class PullRequest(NamedTuple):
     labels: tuple[str, ...]
     checks_state: str  # "passing" | "failing" | "pending" on the head SHA
     merge_sha: str | None  # the merge commit once merged, else None
+    # How many checks on the head SHA are still running. Fakes set it
+    # explicitly; the adapter leaves the default and reports the live
+    # count through `pending_checks` instead.
+    checks_pending: int = 0
 
 
 class Forge(Protocol):
@@ -114,6 +118,13 @@ class Forge(Protocol):
         """One pull request, fetched fresh. Raises ``ForgeError`` when
         the forge is unreachable, the answer is unusable, or the PR is
         missing."""
+        ...
+
+    def pending_checks(self, repo: str, sha: str) -> int:
+        """How many checks on ``sha`` are still running. Raises
+        ``ForgeError`` when the forge is unreachable or answers
+        something unusable. A separate, optional read: it only
+        decorates a pending checks row and never changes the verdict."""
         ...
 
     def pr_index(self, repo: str) -> dict[str, str]:

@@ -1260,6 +1260,22 @@ def _store_labels(store, now):
     return read
 
 
+def _driven_union(driven) -> set:
+    """Every tracker repo some registered project drives. Pure.
+
+    The one union over the pass's `driven` map (each entry through
+    the one `driven_repos` resolver): candidate selection counts a row
+    foreign against it, and both passes read review records only for
+    rows inside it, so a row outside every project's repositories
+    never reaches the review-record lookup. None (nothing drives
+    anything) reads as the empty set.
+    """
+    union = set()
+    for repos in (driven or {}).values():
+        union |= set(repos)
+    return union
+
+
 def review_records_for(items, *, read, err):
     """{(repo, number): latest review record} for rows with one on file.
 
@@ -1271,7 +1287,9 @@ def review_records_for(items, *, read, err):
     line on `err` naming the key, never a silent gap: an empty result
     means no records, not swallowed exceptions. The pass builds this
     map once from its rows and the gate reads it, so the record files
-    are listed once per pass, not once per candidate.
+    are listed once per pass, not once per candidate. Callers pass
+    only rows in a repository the pass drives, so a foreign row never
+    reaches `read`.
     """
     found = {}
     for item in items or ():
@@ -1709,9 +1727,7 @@ def _gate_all(
     pulls_by_key = None
     pulls_calls = 0
     pulls_limited = False
-    union = set()
-    for repos in driven.values():
-        union |= set(repos)
+    union = _driven_union(driven)
     if index_for is not None:
         wanted: dict = {}
         for project in registered:
@@ -1906,7 +1922,9 @@ def _pass(
     short-to-tracker map, threaded to the admission live set.
     `review_reader` feeds the gate's fix-round threshold from the
     session dirs (reads only, like the registry); with none the
-    threshold sees no records, exactly as before. Both passes also
+    threshold sees no records, exactly as before. Only rows in a
+    repository the pass drives are read, so a foreign row never
+    reaches the lookup and prints no error line. Both passes also
     log each unheld finished reviewer (outcome `ok`) with no record
     once, naming the ticket and the reviewer, before the table, so a
     kept claim never logs a line the gate did not skip on. The plan
@@ -1953,8 +1971,13 @@ def _pass(
     finished = resolve_finished(
         finished_for, authors, agent_states=agent_states, agent_tickets=agent_tickets
     )
+    union = _driven_union(driven)
     reviews = (
-        review_records_for(items, read=review_reader, err=err)
+        review_records_for(
+            [item for item in items if item.repo in union],
+            read=review_reader,
+            err=err,
+        )
         if review_reader is not None
         else None
     )
@@ -4956,7 +4979,12 @@ def _launching_pass(
             print(f"korapy drive: cannot read the store: {problem}", file=err)
             return finish(USAGE)
     if review_reader is not None:
-        reviews = review_records_for(_items, read=review_reader, err=err)
+        union = _driven_union(driven)
+        reviews = review_records_for(
+            [item for item in _items if item.repo in union],
+            read=review_reader,
+            err=err,
+        )
     else:
         reviews = None
     gated_rows, problems, eligible_keys, pulls_calls, pulls_limited = _gate_all(
@@ -5258,7 +5286,9 @@ def run_pass(
     skips and the pass ends with exit 1. `review_reader`
     feeds the gate's fix-round threshold from the ticket session dirs
     (reads only, like the registry); with none the threshold sees no
-    records, exactly as before. `index_for` feeds the claiming pass's
+    records, exactly as before. Only rows in a repository the pass
+    drives are read, so a foreign row never reaches the lookup and
+    prints no error line. `index_for` feeds the claiming pass's
     one linked-pull map, which the eligibility rows and the gate rows
     share; with none every row reads empty. `--plan` never takes it,
     so a dry run contacts no tracker. `pulls_max_calls` caps the
