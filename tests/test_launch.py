@@ -319,15 +319,16 @@ class BudgetWiringTest(OpsCase):
             handle.write(text)
 
     def register_web(self, share="weight = 1\n"):
+        self.register_project("web", "korapy-agent-", os.path.realpath(self.root), share=share)
+
+    def register_project(self, name, prefix, root, ceiling=None, share="weight = 1\n"):
         directory = os.path.join(os.environ["KORAPY_CONFIG"], "projects.d")
         os.makedirs(directory, exist_ok=True)
-        with open(os.path.join(directory, "web.toml"), "w", encoding="utf-8") as handle:
-            handle.write(
-                'name = "web"\nunit_prefix = "korapy-agent-"\nroot = "'
-                + os.path.realpath(self.root)
-                + '"\n\n[resources]\n'
-                + share
-            )
+        text = f'name = "{name}"\nunit_prefix = "{prefix}"\nroot = "{root}"\n'
+        if ceiling is not None:
+            text += f"ceiling = {ceiling}\n"
+        with open(os.path.join(directory, f"{name}.toml"), "w", encoding="utf-8") as handle:
+            handle.write(text + "\n[resources]\n" + share)
 
     def admit(self, number=5, **kwargs):
         kwargs.setdefault("list_fn", self.system.list_fn)
@@ -365,6 +366,41 @@ class BudgetWiringTest(OpsCase):
         self.assertEqual(self.system.started, [])
         self.assertFalse(os.path.exists(self.session("lib", 5)))
         self.assertEqual(self.worktrees_of("lib"), [])
+
+    def test_a_ceiling_zero_project_reserves_no_budget(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 3000\nmemory_mb = 8000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.register_web()
+        self.register_project(
+            "shadow", "korapy-shadow-", os.path.join(self.tmp, "shadow-ops"), ceiling=0
+        )
+        decided = self.admit()
+        assert decided.share is not None
+        self.assertEqual(
+            (decided.share.cpu_m, decided.share.memory_mb, decided.share.pids),
+            (3000, 8000, 4096),
+        )
+
+    def test_a_ceiling_raised_from_0_to_1_re_splits_on_the_next_launch(self):
+        self.host_config(
+            "[resources.host]\ncpu_m = 3000\nmemory_mb = 8000\npids = 4096\n"
+            "[resources.role.worker]\ncpu_m = 1000\nmemory_mb = 2048\n"
+        )
+        self.register_web()
+        shadow_root = os.path.join(self.tmp, "shadow-ops")
+        self.register_project("shadow", "korapy-shadow-", shadow_root, ceiling=0)
+        paused = self.admit()
+        assert paused.share is not None
+        self.assertEqual(paused.share.cpu_m, 3000)
+        self.register_project("shadow", "korapy-shadow-", shadow_root, ceiling=1)
+        resumed = self.admit()
+        assert resumed.share is not None
+        self.assertEqual(
+            (resumed.share.cpu_m, resumed.share.memory_mb, resumed.share.pids),
+            (1500, 4000, 2048),
+        )
 
     def test_disk_pressure_wins_over_the_budget(self):
         self.host_config(
