@@ -623,6 +623,7 @@ means. The diagnostic commands only read; `mirror` and `sync` write.
 | A claim looks stuck | `korapy drive --plan` | The next live pass releases dead claims itself and prints whom it released, keeping the epoch. In hub mode, `korapy hub release REPO N` force-releases one ticket now. |
 | The host looks overloaded | `korapy snapshot` | The `pressure` line and the `resources` charges say whether load, memory or the budget is the ceiling. `korapy disk` adds the reclaim plan, largest first. Launches refused by either read exit 75. |
 | GitHub rate limits | `korapy gh-calls --since 1h` | Per-caller and per-minute totals with throttled calls and query shapes. `korapy mirror` exits 3 when a rate limit stops the pass with nothing sent; `korapy sync` exits 3 when the tracker is unreachable. |
+| Pushes fail from an agent, or commits never reach the remote | `korapy doctor` | The `push:` row per project: ok means SSH works, ok with a note means the HTTPS fallback is in use (the SSH agent is unusable, so SSH GitHub addresses are rewritten to HTTPS through the host `gh` login), fail means neither path works. A fail names both fixes: restore the SSH agent (or add a key usable without one), or run `gh auth login`. A launch or `korapy push` with neither path refuses with exit 4 instead of starting work that cannot land. |
 
 ```sh
 korapy drive --plan

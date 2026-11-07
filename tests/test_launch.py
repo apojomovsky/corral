@@ -1131,6 +1131,81 @@ class LaunchTest(OpsCase):
         self.assertEqual(self.system.units["korapy-agent-my-repo-5"], "active")
 
 
+class PushEnvTest(OpsCase):
+    """The push path a launch gets: SSH, the HTTPS fallback, or a refusal.
+
+    The clone's origin reads as an SSH GitHub address through a git seam
+    that answers only that read and runs the real git for everything else,
+    so worktree creation still fetches the local origin. Fakes only.
+    """
+
+    SSH_ORIGIN = "git@github.com:acme/lib.git"
+
+    def ssh_git(self):
+        from korapy import worktrees
+
+        def git(args, cwd):
+            if list(args) == ["remote", "get-url", "origin"]:
+                return subprocess.CompletedProcess(["git", *args], 0, self.SSH_ORIGIN + "\n", "")
+            return worktrees.git(args, cwd)
+
+        return git
+
+    def start(self, number=5, role=None, **kwargs):
+        kwargs.setdefault("ssh_probe", lambda: False)
+        kwargs.setdefault("gh_login", lambda: True)
+        return launch.launch(
+            self.target("lib"),
+            number,
+            "do the thing",
+            title="feat: add the thing",
+            role=role,
+            list_fn=self.system.list_fn,
+            run=self.system.run,
+            usage=roomy,
+            host_ledger_fn=self.system.host_ledger_fn,
+            git=self.ssh_git(),
+            **kwargs,
+        )
+
+    def setenv(self, argv):
+        found = {}
+        for item in argv:
+            if item.startswith("--setenv="):
+                key, _, value = item[len("--setenv=") :].partition("=")
+                found[key] = value
+        return found
+
+    def test_the_fallback_env_reaches_the_unit(self):
+        unit, _ = self.start()
+        env = self.setenv(self.system.started[-1])
+        self.assertEqual(env["KORAPY_AGENT_ID"], unit)
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
+        self.assertEqual(env["GIT_CONFIG_KEY_0"], "url.https://github.com/.insteadOf")
+        self.assertEqual(env["GIT_CONFIG_VALUE_0"], "git@github.com:")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_the_reviewer_launch_gets_the_same_env(self):
+        with mock.patch.object(runtimes, "get", return_value=FakeAdapter()):
+            _, _ = self.start(number=6, role="reviewer")
+        env = self.setenv(self.system.started[-1])
+        self.assertEqual(env["GIT_CONFIG_COUNT"], "4")
+        self.assertEqual(env["GIT_TERMINAL_PROMPT"], "0")
+
+    def test_a_healthy_agent_gets_no_push_env(self):
+        self.start(ssh_probe=lambda: True)
+        env = self.setenv(self.system.started[-1])
+        self.assertNotIn("GIT_CONFIG_COUNT", env)
+
+    def test_neither_path_refuses_before_anything_starts(self):
+        with self.assertRaises(launch.LaunchError) as ctx:
+            self.start(gh_login=lambda: False)
+        self.assertEqual(ctx.exception.exit_code, 4)
+        self.assertIn("agent", str(ctx.exception))
+        self.assertIn("gh auth login", str(ctx.exception))
+        self.assertEqual(self.system.started, [])
+
+
 class MuseSessionTest(OpsCase):
     """A muse launch records one uuid; the resume reuses it. Fakes only."""
 
