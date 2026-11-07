@@ -191,10 +191,38 @@ class RepositoryAddress(unittest.TestCase):
         self.assertIn(self.clone_line, install)
 
     def test_the_owner_path_appears_only_in_the_allowed_forms(self):
-        rest = self.text
-        for allowed in (self.badge_image, self.badge_link, self.clone_line):
-            rest = rest.replace(allowed, "")
-        self.assertNotIn("github.com/", rest)
+        cases = (
+            (
+                "allowed forms only",
+                f"{self.badge_image}\n{self.badge_link}\n{self.clone_line}\n",
+                True,
+            ),
+            (
+                "bare login in prose",
+                f"{self.clone_line}\nThanks to {self.owner} for the reviews.\n",
+                False,
+            ),
+            (
+                "differently cased login in prose",
+                f"{self.clone_line}\nThanks to {self.owner.upper()} for the reviews.\n",
+                False,
+            ),
+            (
+                "another repository URL",
+                "See https://github.com/someone/else for details.\n",
+                False,
+            ),
+            ("the readme itself", self.text, True),
+        )
+        for name, text, expected_clean in cases:
+            with self.subTest(case=name):
+                rest = text
+                for allowed in (self.badge_image, self.badge_link, self.clone_line):
+                    rest = rest.replace(allowed, "")
+                is_clean = "github.com/" not in rest and not _contains_login(
+                    rest.encode("utf-8"), self.owner
+                )
+                self.assertEqual(is_clean, expected_clean)
 
     def test_the_owner_login_stays_out_of_the_rest_of_the_tree(self):
         offenders = [
