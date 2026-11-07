@@ -228,61 +228,69 @@ class WrappedBindingGuardTest(unittest.TestCase):
     time exactly like a second direct statement. Function, lambda and
     class bodies open a new scope and stay out of the walk, as do
     comprehension targets (a walrus inside one still binds outside).
-    Each new bypass gets a CASES entry, never a new branch: the walk is
-    generic, so one entry is the whole proof.
+    Each new bypass gets a CASES entry carrying the doubled name, never
+    a new branch: the walk is generic, so one entry is the whole proof.
     """
 
     CASES = [
-        ("if", "if cond:\n    _DUP = 1\nelse:\n    _DUP = 2\n"),
-        ("try", "try:\n    _DUP = 1\nexcept OSError:\n    _DUP = 2\n"),
-        ("finally", "try:\n    pass\nfinally:\n    _DUP = 1\n_DUP = 2\n"),
-        ("for body", "for item in items:\n    _DUP = item\n_DUP = None\n"),
-        ("for target", "for _DUP in items:\n    pass\n_DUP = None\n"),
-        ("with body", 'with open(path) as handle:\n    _DUP = handle.read()\n_DUP = ""\n'),
-        ("with target", 'with open(path) as _DUP:\n    pass\n_DUP = ""\n'),
+        ("if", "if cond:\n    _DUP = 1\nelse:\n    _DUP = 2\n", "_DUP"),
+        ("try", "try:\n    _DUP = 1\nexcept OSError:\n    _DUP = 2\n", "_DUP"),
+        ("finally", "try:\n    pass\nfinally:\n    _DUP = 1\n_DUP = 2\n", "_DUP"),
+        ("for body", "for item in items:\n    _DUP = item\n_DUP = None\n", "_DUP"),
+        ("for target", "for _DUP in items:\n    pass\n_DUP = None\n", "_DUP"),
+        ("with body", 'with open(path) as handle:\n    _DUP = handle.read()\n_DUP = ""\n', "_DUP"),
+        ("with target", 'with open(path) as _DUP:\n    pass\n_DUP = ""\n', "_DUP"),
         (
             "match body",
             'match cmd:\n    case "run":\n        _DUP = 1\n    case _:\n        _DUP = 2\n',
+            "_DUP",
         ),
         (
             "match capture",
             "match cmd:\n    case [first, *_DUP]:\n        pass\n_DUP = []\n",
+            "_DUP",
         ),
         (
             "match as capture",
             "match cmd:\n    case _DUP:\n        pass\n_DUP = 1\n",
+            "_DUP",
         ),
         (
             "match star capture",
             "match cmd:\n    case [*_DUP]:\n        pass\n_DUP = []\n",
+            "_DUP",
         ),
         (
             "match mapping rest",
             "match cmd:\n    case {**_DUP}:\n        pass\n_DUP = {}\n",
+            "_DUP",
         ),
         (
             "nested",
             "if ready:\n    for item in items:\n        _DUP = item\nelse:\n    _DUP = None\n",
+            "_DUP",
         ),
-        ("while", "while cond:\n    _DUP = next(source)\n_DUP = None\n"),
-        ("except as", "try:\n    pass\nexcept OSError as _DUP:\n    pass\n_DUP = None\n"),
-        ("walrus in condition", "if (_DUP := load()):\n    pass\n_DUP = None\n"),
-        ("walrus in iterable", "for item in (_DUP := load()):\n    pass\n_DUP = None\n"),
+        ("while", "while cond:\n    _DUP = next(source)\n_DUP = None\n", "_DUP"),
+        ("except as", "try:\n    pass\nexcept OSError as _DUP:\n    pass\n_DUP = None\n", "_DUP"),
+        ("walrus in condition", "if (_DUP := load()):\n    pass\n_DUP = None\n", "_DUP"),
+        ("walrus in iterable", "for item in (_DUP := load()):\n    pass\n_DUP = None\n", "_DUP"),
         (
             "match-case guard",
             "match cmd:\n    case _ if (_DUP := check()):\n        pass\n_DUP = None\n",
+            "_DUP",
         ),
-        ("bare walrus", "(_DUP := load())\n_DUP = None\n"),
-        ("assert walrus", "assert (_DUP := check())\n_DUP = None\n"),
-        ("augmented value", "_TOTAL = 0\n_TOTAL += (_DUP := 1)\n_DUP = 2\n"),
-        ("decorator", "@(_DUP := deco)\ndef handle():\n    pass\n_DUP = None\n"),
-        ("default", "def handle(arg=(_DUP := load())):\n    pass\n_DUP = None\n"),
-        ("class base", "class Thing((_DUP := Base)):\n    pass\n_DUP = None\n"),
+        ("bare walrus", "(_DUP := load())\n_DUP = None\n", "_DUP"),
+        ("assert walrus", "assert (_DUP := check())\n_DUP = None\n", "_DUP"),
+        ("augmented value", "_TOTAL = 0\n_TOTAL += (_DUP := 1)\n_DUP = 2\n", "_DUP"),
+        ("decorator", "@(_DUP := deco)\ndef handle():\n    pass\n_DUP = None\n", "_DUP"),
+        ("default", "def handle(arg=(_DUP := load())):\n    pass\n_DUP = None\n", "_DUP"),
+        ("class base", "class Thing((_DUP := Base)):\n    pass\n_DUP = None\n", "_DUP"),
         (
             "walrus in comprehension",
             "[(_DUP := render(item)) for item in items]\n_DUP = None\n",
+            "_DUP",
         ),
-        ("annotated assignment rebinds", "X: int = 1\nX = 2\n"),
+        ("annotated assignment rebinds", "X: int = 1\nX = 2\n", "X"),
     ]
 
     CLEAN_CASES = [
@@ -301,11 +309,12 @@ class WrappedBindingGuardTest(unittest.TestCase):
     ]
 
     def test_each_wrapper_reports_both_bindings(self):
-        for label, source in self.CASES:
+        for label, source, expected in self.CASES:
             with self.subTest(wrapper=label):
                 names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
                 doubled = {name for name in names if names.count(name) == 2}
-                self.assertEqual(len(doubled), 1)
+                self.assertEqual(doubled, {expected})
+                self.assertEqual(names.count(expected), 2)
 
     def test_clean_cases_bind_no_name_twice(self):
         with tempfile.TemporaryDirectory(prefix="korapy-guard-clean-") as directory:
