@@ -614,9 +614,27 @@ class SliceDrift(unittest.TestCase):
         row = by_name(resourcedoctor.check(state))["resources-slices"]
         self.assertEqual(row.status, "warn")
         self.assertIn("korapy-web.slice", row.detail)
-        self.assertIn("ceiling-0", row.fix)
+        self.assertIn("no launch reconciles it", row.detail)
+        self.assertNotIn("reconcile on the next launch", row.detail)
+        self.assertIn("zero-share", row.fix)
         self.assertIn("stop the slice by hand", row.fix)
         self.assertNotIn("launch an agent", row.fix)
+
+    def test_mixed_drift_names_the_reconcilable_project(self):
+        state = readings(
+            shares={"web": R.Share(weight=1.0), "shadow": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("16777216000", "8000000"),
+                "korapy-web.slice": props("8589934592", "8000000"),
+                "korapy-shadow.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("korapy-shadow.slice", row.detail)
+        self.assertIn("launch an agent of web", row.fix)
+        self.assertIn("hand stop", row.fix)
 
 
 class ParseShow(unittest.TestCase):

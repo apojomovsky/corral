@@ -222,7 +222,7 @@ zero in the split, so the host budget divides among the projects that
 can start agents. No slice is created for it: the count gate refuses
 its launches first, so no launch ever reaches the slice setup, and raising
 the ceiling re-splits on the next launch. A slice left over from before
-the project was paused carries no limits (stop it by hand if `doctor`
+the project was paused is owed no limits (stop it by hand if `doctor`
 warns). An outside fleet declares its own load
 with one JSON file per claim in the `foreign-claims.d/` directory
 beside the host ledger; claims expire after `resources.gone_s`
