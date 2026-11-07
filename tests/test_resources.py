@@ -652,6 +652,71 @@ class ShareCap(unittest.TestCase):
             R.share_cap(R.Limits(host=bad.host, gone_s=-1.0), "web", NOW)
 
 
+def zeroed(**overrides):
+    """The resolver output for a project that reserves nothing: no weight, no floor."""
+    share = {
+        "weight": 0,
+        "cpu_floor_m": 0,
+        "memory_floor_mb": 0,
+        "pids_floor": 0,
+        "cpu_ceiling_m": None,
+        "memory_ceiling_mb": None,
+        "pids_ceiling": None,
+    }
+    share.update(overrides)
+    return share
+
+
+class ZeroShareSplit(unittest.TestCase):
+    """The split with one zeroed project: the other keeps the whole budget.
+
+    A ceiling-0 project takes no weighted share and no floor: the
+    derivation divides the host budget among the projects that can
+    start agents, and the zeroed project's own cap is zero.
+    """
+
+    def table(self, projects):
+        return limits(host=(3000, 8000, 512), projects=projects)
+
+    def test_a_two_project_split_gives_the_other_the_whole_budget(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        cap = R.share_cap(host, "web", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (3000, 8000, 512))
+
+    def test_the_zeroed_project_caps_at_zero(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        cap = R.share_cap(host, "shadow", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (0, 0, 0))
+
+    def test_a_floored_split_still_gives_the_other_the_whole_budget(self):
+        host = self.table(
+            {
+                "web": {"weight": 1, "cpu_floor_m": 500, "memory_floor_mb": 1024},
+                "shadow": zeroed(),
+            }
+        )
+        joined = R.join(
+            host, {name: host.projects[name] for name in host.projects}, (), where="here"
+        )
+        cap = R.share_cap(joined, "web", NOW)
+        assert cap is not None
+        self.assertEqual((cap.cpu_m, cap.memory_mb, cap.pids), (3000, 8000, 512))
+
+    def test_the_other_project_may_fill_the_whole_budget(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        verdict = R.admit(
+            req("web"), charged((2000, 5000, 100), {"web": (2000, 5000, 100)}), host, NOW
+        )
+        self.assertEqual((verdict.allowed, verdict.code), (True, "ok"))
+
+    def test_a_launch_under_a_zero_share_is_refused(self):
+        host = self.table({"web": {"weight": 1}, "shadow": zeroed()})
+        verdict = R.admit(req("shadow"), charged(), host, NOW)
+        self.assertFalse(verdict.allowed)
+
+
 class Codes(unittest.TestCase):
     def test_codes_are_stable_strings(self):
         self.assertEqual(

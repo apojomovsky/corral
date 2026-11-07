@@ -591,6 +591,32 @@ class SliceDrift(unittest.TestCase):
         )
         self.assertEqual(by_name(resourcedoctor.check(state))["resources-slices"].status, "ok")
 
+    def test_a_zero_share_slice_without_limits_is_ok(self):
+        state = readings(
+            shares={"web": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("16777216000", "8000000"),
+                "korapy-web.slice": resourcedoctor.parse_show(
+                    "MemoryMax=infinity\nCPUQuotaPerSecUSec=infinity\n"
+                ),
+            },
+        )
+        self.assertEqual(by_name(resourcedoctor.check(state))["resources-slices"].status, "ok")
+
+    def test_stale_limits_on_a_zero_share_slice_warn(self):
+        state = readings(
+            shares={"web": R.Share(weight=0)},
+            slices={
+                "korapy.slice": props("16777216000", "8000000"),
+                "korapy-web.slice": props("16777216000", "8000000"),
+            },
+        )
+        row = by_name(resourcedoctor.check(state))["resources-slices"]
+        self.assertEqual(row.status, "warn")
+        self.assertIn("korapy-web.slice", row.detail)
+        self.assertIn("ceiling-0", row.fix)
+        self.assertIn("stop the slice by hand", row.fix)
+
 
 class ParseShow(unittest.TestCase):
     def test_parses_key_value_lines(self):
