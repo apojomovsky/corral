@@ -143,15 +143,35 @@ def find_ops_root(cwd, flag=None):
 def guard_terms(ops_root):
     """The private terms guarding `ops_root`, for every gate that needs them.
 
-    One definition shared by `leakcheck` and `takeoff`: the host and home
-    seams stay here, so both gates guard the same terms. `SettingsError`
-    propagates; each gate reports it in its own way.
+    One definition shared by `leakcheck` and `takeoff`: a thin wrapper
+    over `guard_terms_from_table`, so both gates guard the same terms.
+    `SettingsError` propagates; each gate reports it in its own way.
     """
-    return leakguard.terms(
+    if not ops_root:
+        return guard_terms_from_table({}, None, project_name=settings.PROJECT_FILE)
+    return guard_terms_from_table(
+        settings.read_project(ops_root),
+        ops_root,
+        project_name=os.path.join(ops_root, settings.PROJECT_FILE),
+    )
+
+
+def guard_terms_from_table(table, ops_root, *, project_name):
+    """The private terms guarding `ops_root`, from one pre-read table.
+
+    The `takeoff` gate calls this with the project table its repo state
+    already parsed, so the gate reads the file once; the host and home
+    seams stay here, so both gates guard the same terms. `project_name`
+    is required, so errors name the file the caller parsed.
+    `SettingsError` propagates; each gate reports it in its own way.
+    """
+    return leakguard.terms_from_table(
+        table,
         ops_root,
         host=_hostname(),
         home=_homedir(),
         ops_name=os.path.basename(os.path.abspath(ops_root)) if ops_root else "",
+        project_name=project_name,
     )
 
 
