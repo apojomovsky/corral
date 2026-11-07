@@ -82,6 +82,20 @@ review state as data. `StartRequest` names `repo`, `number` and `kind`
 (`start`, `resume`, `review`, `fix`) and may carry a project-local
 weight used only to order within that project.
 
+The policy module lives in the project's own ops root, beside
+`korapy.toml`: the registration above loads `blue_policy.py` from
+`/srv/ops/blue_ops`, with no installation and no host service
+environment to edit. A dotted module imports with that root first on
+the import search path, restored before the pass moves on (also on
+failure); when the same module name exists both in the ops root and
+elsewhere, the ops root's copy wins, and the loaded file is recorded
+on the policy. `korapy doctor` verifies every registration's entry
+resolves; the `drive-projects` row fails naming the project, the
+module and the reason when one does not, and names the file each
+resolving entry loaded from when all do. Cached modules from another
+project's root never leak across: each load resolves against its own
+root even when two projects name the same module.
+
 A policy only sees its own project's repositories. The board store is
 shared per host and keyed by tracker repository, so one project's rows
 sit next to another's; before the policy runs, the pass hides every
@@ -122,9 +136,12 @@ Why not the alternatives:
 Open question settled here: the design doc's `Project.wants()` sketch
 takes no arguments. It becomes `eligible(rows, *, now)` as above; a
 project with no `eligibility` entry registers no candidates and the
-drive skips it with a logbook line. Loading failures are configuration
-errors (exit 4) naming the project and entry point, reported once per
-pass, and they block only that project.
+drive skips it with a logbook line. An entry that does not import, or
+an answer that is not a list of `StartRequest` rows, skips that
+project for the pass with one error line naming the project, the
+module and the reason; every other project's pass still runs, and the
+pass exits 4. `korapy doctor` reports the import failures in its
+`drive-projects` row.
 
 Ready-made policy: most projects need no policy code. The
 `korapy.policies` module ships `basic(rows, *, now)`, which a
@@ -137,6 +154,35 @@ request, claimed or not: in-flight rows stay requested so the loop
 never withdraws them by omission. Weight is the board priority rank,
 highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
+
+A project with its own board rules writes a small policy instead. A
+board whose Status column gates the work, for example, keeps a module
+like this in its ops root:
+
+```python
+# <ops root>/lead_policy.py: start tickets whose board Status reads Ready
+from korapy.eligibility import StartRequest
+
+READY = "Ready"
+
+
+def eligible(rows, *, now):
+    return [
+        StartRequest(repo=row.repo, number=row.number, kind="start")
+        for row in rows
+        if row.extra.get("board_status") == READY
+    ]
+```
+
+registered as one line:
+
+```toml
+eligibility = "lead_policy:eligible"
+```
+
+Board columns (`Status`, `Priority`, `Area`, `Pool`, `Blocked by`)
+arrive on each row's `extra` map; labels, state and linked pulls ride
+along as row fields, so the same shape filters on any of them.
 
 The store carries no linked pulls (pull-request rows are never ticket
 rows, and the sync drops them), so the pass lists each fetchable

@@ -557,6 +557,25 @@ class ReaderPath(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn(missing, errors[0][2])
 
+
+class PublicPathHelper(unittest.TestCase):
+    def test_the_reader_path_helper_has_a_public_spelling(self):
+        self.assertIs(accounts.with_reader_path, accounts._with_reader_path)
+
+    def test_the_public_helper_prepends_and_restores(self):
+        marker = os.path.join(tempfile.mkdtemp(prefix="korapy-path-"), "readers")
+        before = list(sys.path)
+        with accounts.with_reader_path([marker]):
+            self.assertEqual(sys.path[0], marker)
+        self.assertEqual(list(sys.path), before)
+
+    def test_the_public_helper_restores_on_failure(self):
+        before = list(sys.path)
+        with self.assertRaises(RuntimeError):
+            with accounts.with_reader_path(["/nonexistent-korapy-readers"]):
+                raise RuntimeError("boom")
+        self.assertEqual(list(sys.path), before)
+
     def test_only_accounts_touches_sys_path(self):
         root = os.path.join(os.path.dirname(__file__), "..", "src", "korapy")
         offenders = []

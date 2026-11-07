@@ -59,7 +59,9 @@ def top_level_bindings(tree):
     names around them are visited: decorators, defaults, annotations,
     bases and keywords. Comprehension loop targets stay out for the
     same reason. An augmented assignment never binds on its own, so
-    ``X += 1`` after ``X = 1`` is not a second binding.
+    ``X += 1`` after ``X = 1`` is not a second binding. A bare
+    annotation with no value binds nothing, so ``X: Config`` followed
+    by ``X = load()`` is a single binding.
     """
     found = []
 
@@ -95,6 +97,13 @@ def top_level_bindings(tree):
                     bind(alias.asname or alias.name, node.lineno)
             return
         elif isinstance(node, ast.AugAssign):
+            visit(node.value, in_comprehension)
+            return
+        elif isinstance(node, ast.AnnAssign):
+            visit(node.annotation, in_comprehension)
+            if node.value is None:
+                return
+            visit(node.target, in_comprehension)
             visit(node.value, in_comprehension)
             return
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -240,6 +249,18 @@ class WrappedBindingGuardTest(unittest.TestCase):
             "match cmd:\n    case [first, *_DUP]:\n        pass\n_DUP = []\n",
         ),
         (
+            "match as capture",
+            "match cmd:\n    case _DUP:\n        pass\n_DUP = 1\n",
+        ),
+        (
+            "match star capture",
+            "match cmd:\n    case [*_DUP]:\n        pass\n_DUP = []\n",
+        ),
+        (
+            "match mapping rest",
+            "match cmd:\n    case {**_DUP}:\n        pass\n_DUP = {}\n",
+        ),
+        (
             "nested",
             "if ready:\n    for item in items:\n        _DUP = item\nelse:\n    _DUP = None\n",
         ),
@@ -264,6 +285,10 @@ class WrappedBindingGuardTest(unittest.TestCase):
     ]
 
     CLEAN_CASES = [
+        (
+            "bare annotation binds nothing",
+            "X: Config\nX = load()\n",
+        ),
         ("except as bound once", "try:\n    pass\nexcept OSError as _DUP:\n    print(_DUP)\n"),
         ("walrus bound once", "if (_DUP := load()):\n    print(_DUP)\n"),
         ("augassign is not a rebinding", "_TOTAL = 0\nif cond:\n    _TOTAL += 2\n"),
