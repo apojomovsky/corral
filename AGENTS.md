@@ -20,6 +20,8 @@ korapy is public. Nothing in it identifies a person, a host or an account, and t
 
 Use generic stand-ins: `example.com`, `suite@korapy.invalid`, `~/.config/korapy/`, "a project", `host-1`. The only named person in the repository is the copyright holder in `LICENSE`; everything else stays generic. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
 
+One exception: the repository's own owner and name may appear in the README's CI status badge and clone URL, and nowhere else. An account that is not the repository owner never appears.
+
 ## Layout
 
 | Path | What |

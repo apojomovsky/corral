@@ -8,7 +8,7 @@ korapy runs fleets of headless coding agents on Linux hosts. It claims
 tickets from a board, launches one agent per ticket under a shared
 budget, and lands the work through review and merge.
 
-<!-- CI badge goes here once the owner path is approved, one line, same row as the badges below. -->
+[![CI](https://github.com/apojomovsky/korapy/actions/workflows/ci.yml/badge.svg)](https://github.com/apojomovsky/korapy/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml) [![Linux only](https://img.shields.io/badge/platform-linux-lightgrey.svg)](docs/00-design.md) [![No runtime dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](pyproject.toml) [![Status: alpha](https://img.shields.io/badge/status-alpha-orange.svg)](#status)
 
 ## What it does
@@ -48,6 +48,12 @@ flowchart LR
   the same tracker and forge interfaces.
 
 ## Requirements and install
+
+Clone the repository:
+
+```bash
+git clone https://github.com/apojomovsky/korapy
+```
 
 You need [uv](https://docs.astral.sh/uv/). Everything else is checked,
 with install commands, by korapy itself:
