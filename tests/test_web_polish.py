@@ -53,6 +53,20 @@ class UnknownCounts(unittest.TestCase):
         self.assertIn("not reported", function_body(web_text("views.js"), "headerLine"))
 
 
+class FinishedGuard(unittest.TestCase):
+    """Ticket 569: a non-finite finished count hides the toggle, never renders."""
+
+    def test_finished_count_is_finite_guarded(self):
+        body = function_body(web_text("views.js"), "headerLine")
+        self.assertIn("Number.isFinite(info.agents_finished)", body)
+
+    def test_finished_has_no_bare_typeof_default(self):
+        self.assertNotIn(
+            'typeof info.agents_finished === "number" ? info.agents_finished : 0',
+            web_text("views.js"),
+        )
+
+
 class CapacityGuards(unittest.TestCase):
     """Point 3: capacity guards numbers and a non-array pending."""
 
