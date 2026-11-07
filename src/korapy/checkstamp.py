@@ -36,6 +36,11 @@ STAMP_NAME = "korapy-check-stamp"
 #: may have moved on (a flaky test, a rebuilt interpreter). One day.
 STAMP_MAX_AGE_S = 24 * 3600
 
+#: The interpreters the matrix stamps: the same set `make check` runs.
+#: Mirrors the Makefile's `PYTHONS` (pinned by an agreement test) for
+#: readers, like the pre-push hook, that cannot query make at gate time.
+MATRIX_PYTHONS = ("3.11", "3.14")
+
 
 def stamp_path(env=None):
     """The stamp file: `STAMP_NAME` under the cache dir, resolved here only."""

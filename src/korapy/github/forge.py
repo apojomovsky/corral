@@ -82,6 +82,31 @@ def _checks_state(payload, number):
     raise _shape(f"PR {number} has an unusable checks state {raw!r}")
 
 
+def _pending_checks(payload, label):
+    """How many check runs on the head SHA are still running.
+
+    A run counts while its `status` is anything but `completed`
+    (`queued` or `in_progress`): strictly newer or older provider
+    words still read as running, never as done. Anything but a list
+    of objects with a string `status` is an unusable answer
+    (``ForgeError``), never a zero guess: a missing count would
+    report a live wait as settled.
+    """
+    if not isinstance(payload, dict):
+        raise _shape(f"check runs on {label} are not an object")
+    runs = payload.get("check_runs")
+    if not isinstance(runs, list):
+        raise _shape(f"check runs on {label} are not a list")
+    pending = 0
+    for run in runs:
+        status = run.get("status") if isinstance(run, dict) else None
+        if not isinstance(status, str):
+            raise _shape(f"check run on {label} has no status")
+        if status != "completed":
+            pending += 1
+    return pending
+
+
 def _merge_sha(payload, number, state):
     """The merge commit SHA once merged, else ``None``.
 
@@ -333,6 +358,31 @@ class GithubForge:
         except Exception as err:
             raise forge.ForgeError(f"unusable answer for PR {number}: {err}") from err
         return _parse_pull(payload, number)
+
+    def pending_checks(self, repo: str, sha: str) -> int:
+        """How many check runs on ``sha`` are still running.
+
+        A separate, optional read: the merge verb calls it only to
+        decorate a pending checks row, never to change the verdict. A
+        run counts while its ``status`` is anything but ``completed``.
+        The read takes one page of up to 100 runs; a head with more
+        runs reports a lower bound, never a guess beyond the page.
+        """
+        if not _REPO.fullmatch(repo or ""):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        try:
+            head = _sha(sha, "head sha")
+        except forge.ForgeError:
+            raise
+        try:
+            payload = json.loads(
+                self._get(f"repos/{repo}/commits/{head}/check-runs?per_page={PER_PAGE}")
+            )
+        except forge.ForgeError:
+            raise
+        except Exception as err:
+            raise forge.ForgeError(f"unusable check runs on {head}: {err}") from err
+        return _pending_checks(payload, head)
 
     def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:
         """Merge PR ``number`` pinned to ``head_sha`` with ``method``.

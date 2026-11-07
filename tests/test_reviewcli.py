@@ -211,6 +211,19 @@ class ShowTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(json.loads(out)["verdict"], "approve")
 
+    def test_show_makes_no_check_runs_read(self):
+        from korapy.github import forge as ghforge
+        from tests.test_forge import FakeRun, pr_payload
+
+        head = self.rev("HEAD")
+        payload = pr_payload(number=PR)
+        payload["head"]["sha"] = head
+        payload["base"]["sha"] = self.master_base
+        run = FakeRun({f"repos/{FORGE_REPO}/pulls/{PR}": payload})
+        code, _, _ = self.show(self.args(), ghforge.GithubForge(run))
+        self.assertEqual(code, 0)
+        self.assertEqual(run.calls, [["api", f"repos/{FORGE_REPO}/pulls/{PR}"]])
+
 
 if __name__ == "__main__":
     unittest.main()
