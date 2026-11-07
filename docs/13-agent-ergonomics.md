@@ -460,8 +460,8 @@ PRs to the same repo never merge concurrently.
    inherited across a clean merge-up. A block or a missing record
    refuses. This is the same reader takeoff uses, so the merge
    gate and the takeoff gate cannot disagree.
-5. `checks`: the forge's check statuses on the head (read from the
-   fresh `pull_request()`, extended per section 8). Three states:
+5. `checks`: the forge's check statuses on the head (the verdict
+   from the fresh `pull_request()`, per section 8). Three states:
    `ok` when green, `pending` while still running (a wait, not a
    failure: the detail says to wait and carries no fix advice), and
    `fail` when red (fix the branch and update the PR). A `pending`
@@ -470,10 +470,9 @@ PRs to the same repo never merge concurrently.
    fixing. `--skip checks` waives this row and records the skip;
    it is the only waivable merge check (section 5.4). Any `fail`
    beside a pending `checks` row wins at once: the verb never
-   waits out a refusal. The forge summary carries no per-check
-   breakdown (one fresh read keeps state, head, checks and merge
-   SHA consistent per section 8), so the row reports the one
-   checks precondition, not a count of provider checks.
+   waits out a refusal. The row reports the one checks
+   precondition, not a count of provider checks; a separate count
+   read only decorates the pending detail (section 8).
 6. `fork`: the PR is not from a fork. Fork merges refuse with
    exit 1; a maintainer merges those by hand (AGENTS.md: external
    contributions are for maintainers).
@@ -513,30 +512,37 @@ verb never:
 
 ## 8. The forge seam for merge
 
-`pull_request()` today returns no check statuses and no
-merge-commit SHA, but sections 5.4 and 7.2 read both. PROPOSED:
-extend `PullRequest` with two fields, read from the same fresh
-PR fetch, so the merge gate needs no second seam:
+`PullRequest` carries the merge verdict from the one fresh PR
+fetch, so the gate reads state, head, checks and merge SHA
+consistently:
 
 - `checks_state: str`: `"passing"`, `"failing"` or `"pending"`,
   summarizing the forge's check statuses on the head SHA;
 - `checks_pending: int`: how many checks on the head SHA are
-  still running, read from the provider's check-runs for that
-  SHA right after the PR fetch;
+  still running. Fakes set it explicitly; the adapter leaves the
+  default and the verb reads the live count separately (below);
 - `merge_sha: str | None`: the merge commit SHA once the PR
   state is `merged`, else None. The verify step ties this SHA to
-  the pinned head. The merge verdict still comes from the one PR
-  read; the count only decorates the pending row, so a slow
-  second read can never flip a decision.
+  the pinned head.
 
-Only the adapters know the provider shape (the GitHub adapter
-parses both from the same `gh api` PR fetch it already
-performs); everything else takes the `Forge` object. The
-alternative (a separate `checks()` seam method) is rejected: two
-reads can disagree about a moving PR, while one fresh read keeps
-state, head, checks and merge SHA consistent.
+The running count is a separate, optional read that can only
+decorate a pending row, never change a verdict:
 
-`forge.py` gains one more method (PROPOSED):
+- `pending_checks(repo, sha) -> int`: how many check runs on
+  `sha` are still running (one page of up to 100 runs; a head
+  with more runs reports a lower bound). The merge verb calls it
+  only when the verdict is pending (in `--wait`, once per poll),
+  and only on the merge paths: `review show --pr` never calls
+  it, so an unrelated verb pays no second read and a transient
+  count failure cannot fail it. A failed or unusable count read
+  on the merge path degrades to the count-less pending message
+  instead of an error; passing, failing, and skipped rows never
+  trigger it.
+
+Only the adapters know the provider shape; everything else takes
+the `Forge` object.
+
+`forge.py` gains one more method:
 
 ```python
 def merge(self, repo: str, number: int, *, head_sha: str, method: str) -> str:

@@ -53,6 +53,7 @@ class FakeForge:
         self.pulls = {(pr.repo, pr.number): pr for pr in pulls}
         self.index = dict(index or {})
         self.requested = []
+        self.pending_requested = []
         self.user = user
         self.repos = dict(repos or {})
         self.fail = set(fail)
@@ -66,6 +67,27 @@ class FakeForge:
             return self.pulls[(repo, number)]
         except KeyError:
             raise forge.ForgeError(f"no such PR: {repo}#{number}") from None
+
+    def pending_checks(self, repo, sha):
+        """The canned running-check count for the PR at ``sha``.
+
+        Derived from the stored pull requests so merge tests can set
+        the count through ``make_pr(checks_pending=...)`` without a
+        second seam. ``fail={"pending_checks"}`` raises instead, so
+        the merge core can prove it degrades to the count-less message.
+        """
+        self.pending_requested.append((repo, sha))
+        self._fail("pending_checks")
+        if not ghforge.is_repo_name(repo):
+            raise forge.ForgeError(f"unusable forge repo {repo!r}")
+        ghforge._sha(sha, "head sha")
+        for (stored_repo, _), pr in self.pulls.items():
+            if stored_repo == repo and pr.head_sha == sha:
+                count = pr.checks_pending
+                if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+                    raise forge.ForgeError(f"unusable pending count for {sha}")
+                return count
+        return 0
 
     def merge(self, repo, number, *, head_sha, method):
         """Merge a canned PR, refusing like the adapter does.
@@ -205,15 +227,8 @@ class FakeRun:
 
 
 class PullRequestTest(unittest.TestCase):
-    def fetch(self, payload, number=7, repo="acme/lib", runs=None):
-        if runs is None:
-            runs = checks_payload()
-        run = FakeRun(
-            {
-                f"repos/{repo}/pulls/{number}": payload,
-                checks_path(payload["head"]["sha"], repo): runs,
-            }
-        )
+    def fetch(self, payload, number=7, repo="acme/lib"):
+        run = FakeRun({f"repos/{repo}/pulls/{number}": payload})
         return ghforge.GithubForge(run).pull_request(repo, number), run
 
     def test_open_pr_same_repo(self):
@@ -236,10 +251,7 @@ class PullRequestTest(unittest.TestCase):
                 merge_sha=None,
             ),
         )
-        self.assertEqual(
-            run.calls,
-            [["api", "repos/acme/lib/pulls/7"], ["api", checks_path()]],
-        )
+        self.assertEqual(run.calls, [["api", "repos/acme/lib/pulls/7"]])
 
     def test_fork_pr_counts_as_fork(self):
         payload = pr_payload()
@@ -317,12 +329,7 @@ class PullRequestTest(unittest.TestCase):
 
 class ChecksStateTest(unittest.TestCase):
     def state_of(self, payload):
-        run = FakeRun(
-            {
-                "repos/acme/lib/pulls/7": payload,
-                checks_path(payload["head"]["sha"]): checks_payload(),
-            }
-        )
+        run = FakeRun({"repos/acme/lib/pulls/7": payload})
         return ghforge.GithubForge(run).pull_request("acme/lib", 7).checks_state
 
     def test_clean_is_passing(self):
@@ -364,36 +371,38 @@ def checks_payload(*statuses):
 
 
 def checks_path(head_sha=HEAD_SHA, repo="acme/lib"):
-    return f"repos/{repo}/commits/{head_sha}/check-runs"
+    return f"repos/{repo}/commits/{head_sha}/check-runs?per_page={ghforge.PER_PAGE}"
 
 
 class ChecksPendingTest(unittest.TestCase):
-    """The forge reports how many checks are still running on the head SHA."""
+    """The forge reports how many checks are still running on the head SHA.
 
-    def fetch(self, payload, runs, number=7, repo="acme/lib"):
-        run = FakeRun(
-            {
-                f"repos/{repo}/pulls/{number}": payload,
-                checks_path(payload["head"]["sha"], repo): runs,
-            }
-        )
-        return ghforge.GithubForge(run).pull_request(repo, number), run
+    A separate, optional read: it only decorates a pending checks row
+    and never changes the verdict. The read takes one page of up to
+    100 runs; a head with more runs reports a lower bound.
+    """
+
+    def fetch(self, runs, head_sha=HEAD_SHA, repo="acme/lib"):
+        run = FakeRun({checks_path(head_sha, repo): runs})
+        return ghforge.GithubForge(run).pending_checks(repo, head_sha), run
 
     def test_running_check_runs_count_as_pending(self):
-        pr, run = self.fetch(pr_payload(), checks_payload("in_progress", "queued", "completed"))
-        self.assertEqual(pr.checks_pending, 2)
-        self.assertEqual(
-            run.calls[1],
-            ["api", checks_path()],
-        )
+        count, run = self.fetch(checks_payload("in_progress", "queued", "completed"))
+        self.assertEqual(count, 2)
+        self.assertEqual(run.calls, [["api", checks_path()]])
 
     def test_no_check_runs_is_zero_pending(self):
-        pr, _ = self.fetch(pr_payload(), checks_payload())
-        self.assertEqual(pr.checks_pending, 0)
+        count, _ = self.fetch(checks_payload())
+        self.assertEqual(count, 0)
 
     def test_completed_runs_never_count(self):
-        pr, _ = self.fetch(pr_payload(), checks_payload("completed", "completed"))
-        self.assertEqual(pr.checks_pending, 0)
+        count, _ = self.fetch(checks_payload("completed", "completed"))
+        self.assertEqual(count, 0)
+
+    def test_one_page_of_runs_is_the_count(self):
+        count, run = self.fetch(checks_payload("in_progress", "completed"))
+        self.assertEqual(count, 1)
+        self.assertIn(f"per_page={ghforge.PER_PAGE}", run.calls[0][1])
 
     def test_malformed_check_runs_are_forge_error(self):
         bad = [
@@ -408,29 +417,34 @@ class ChecksPendingTest(unittest.TestCase):
         ]
         for runs in bad:
             with self.subTest(runs=runs):
-                run = FakeRun(
-                    {
-                        "repos/acme/lib/pulls/7": pr_payload(),
-                        checks_path(): runs,
-                    }
-                )
+                run = FakeRun({checks_path(): runs})
                 with self.assertRaises(forge.ForgeError):
-                    ghforge.GithubForge(run).pull_request("acme/lib", 7)
+                    ghforge.GithubForge(run).pending_checks("acme/lib", HEAD_SHA)
 
     def test_missing_check_runs_read_is_forge_error(self):
-        run = FakeRun({"repos/acme/lib/pulls/7": pr_payload()})
+        run = FakeRun({})
         with self.assertRaises(forge.ForgeError):
-            ghforge.GithubForge(run).pull_request("acme/lib", 7)
+            ghforge.GithubForge(run).pending_checks("acme/lib", HEAD_SHA)
+
+    def test_bad_shapes_never_beyond_validation(self):
+        run = FakeRun({})
+        adapter = ghforge.GithubForge(run)
+        with self.assertRaises(forge.ForgeError):
+            adapter.pending_checks("not-a-repo", HEAD_SHA)
+        with self.assertRaises(forge.ForgeError):
+            adapter.pending_checks("acme/lib", "short")
+        self.assertEqual(run.calls, [])
+
+    def test_pull_request_makes_no_check_runs_read(self):
+        run = FakeRun({"repos/acme/lib/pulls/7": pr_payload()})
+        pr = ghforge.GithubForge(run).pull_request("acme/lib", 7)
+        self.assertEqual(pr.checks_pending, 0)
+        self.assertEqual(run.calls, [["api", "repos/acme/lib/pulls/7"]])
 
 
 class MergeShaTest(unittest.TestCase):
     def sha_of(self, payload):
-        run = FakeRun(
-            {
-                "repos/acme/lib/pulls/7": payload,
-                checks_path(payload["head"]["sha"]): checks_payload(),
-            }
-        )
+        run = FakeRun({"repos/acme/lib/pulls/7": payload})
         return ghforge.GithubForge(run).pull_request("acme/lib", 7).merge_sha
 
     def test_open_pr_has_no_merge_sha(self):
@@ -488,10 +502,6 @@ class MergeRun:
 
 
 class MergeSeamTest(unittest.TestCase):
-    def runs(self):
-        """The check-runs read each `pull_request` performs after the PR read."""
-        return checks_payload()
-
     def merged_pr(self, sha=MERGE_SHA):
         return pr_payload(
             state="closed",
@@ -508,11 +518,11 @@ class MergeSeamTest(unittest.TestCase):
 
     def test_squash_merge_pins_the_head_and_returns_the_verified_sha(self):
         put = {"merged": True, "sha": MERGE_SHA, "message": "Pull Request successfully merged."}
-        run = MergeRun([pr_payload(), self.runs(), self.merged_pr(), self.runs()], put)
+        run = MergeRun([pr_payload(), self.merged_pr()], put)
         sha = ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
         self.assertEqual(sha, MERGE_SHA)
         self.assertEqual(
-            run.calls[2],
+            run.calls[1],
             [
                 "api",
                 "-X",
@@ -526,24 +536,24 @@ class MergeSeamTest(unittest.TestCase):
         )
 
     def test_merged_pr_refuses_without_merging(self):
-        run = MergeRun([self.merged_pr(), self.runs()], None)
+        run = MergeRun([self.merged_pr()], None)
         with self.assertRaises(forge.ForgeRefused):
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
-        self.assertEqual(len(run.calls), 2)
+        self.assertEqual(len(run.calls), 1)
 
     def test_closed_pr_refuses_without_merging(self):
-        run = MergeRun([pr_payload(state="closed"), self.runs()], None)
+        run = MergeRun([pr_payload(state="closed")], None)
         with self.assertRaises(forge.ForgeRefused):
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
-        self.assertEqual(len(run.calls), 2)
+        self.assertEqual(len(run.calls), 1)
 
     def test_moved_head_refuses_without_merging(self):
         payload = pr_payload()
         payload["head"]["sha"] = OTHER_SHA
-        run = MergeRun([payload, self.runs()], None)
+        run = MergeRun([payload], None)
         with self.assertRaises(forge.ForgeRefused):
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
-        self.assertEqual(len(run.calls), 2)
+        self.assertEqual(len(run.calls), 1)
 
     def test_missing_pr_is_forge_error(self):
         run = MergeRun([RuntimeError("gh exited 1")], None)
@@ -567,7 +577,7 @@ class MergeSeamTest(unittest.TestCase):
         self.assertEqual(run.calls, [])
 
     def test_runner_failure_during_merge_is_forge_error(self):
-        run = MergeRun([pr_payload(), self.runs()], RuntimeError("connection refused"))
+        run = MergeRun([pr_payload()], RuntimeError("connection refused"))
         with self.assertRaises(forge.ForgeError):
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
 
@@ -577,7 +587,7 @@ class MergeSeamTest(unittest.TestCase):
             "gh: Head branch was modified. Review and try the merge again. (HTTP 409)",
         ):
             with self.subTest(message=message):
-                run = MergeRun([pr_payload(), self.runs()], RuntimeError(message))
+                run = MergeRun([pr_payload()], RuntimeError(message))
                 with self.assertRaises(forge.ForgeRefused):
                     ghforge.GithubForge(run).merge(
                         "acme/lib", 7, head_sha=HEAD_SHA, method="squash"
@@ -592,7 +602,7 @@ class MergeSeamTest(unittest.TestCase):
             "failed to connect to 127.0.0.1 port 4050: Connection refused",
         ):
             with self.subTest(message=message):
-                run = MergeRun([pr_payload(), self.runs()], RuntimeError(message))
+                run = MergeRun([pr_payload()], RuntimeError(message))
                 with self.assertRaises(forge.ForgeError) as ctx:
                     ghforge.GithubForge(run).merge(
                         "acme/lib", 7, head_sha=HEAD_SHA, method="squash"
@@ -602,7 +612,7 @@ class MergeSeamTest(unittest.TestCase):
     def test_unaccepted_merge_answer_is_forge_error(self):
         for put in ({"merged": False, "sha": MERGE_SHA}, {"merged": True, "sha": "short"}):
             with self.subTest(put=put):
-                run = MergeRun([pr_payload(), self.runs()], put)
+                run = MergeRun([pr_payload()], put)
                 with self.assertRaises(forge.ForgeError):
                     ghforge.GithubForge(run).merge(
                         "acme/lib", 7, head_sha=HEAD_SHA, method="squash"
@@ -613,7 +623,7 @@ class MergeSeamTest(unittest.TestCase):
         cases = [pr_payload(), self.merged_pr(sha=OTHER_SHA)]
         for verify in cases:
             with self.subTest(verify=verify):
-                run = MergeRun([pr_payload(), self.runs(), verify, self.runs()], put)
+                run = MergeRun([pr_payload(), verify], put)
                 with self.assertRaises(forge.ForgeError):
                     ghforge.GithubForge(run).merge(
                         "acme/lib", 7, head_sha=HEAD_SHA, method="squash"
@@ -621,13 +631,13 @@ class MergeSeamTest(unittest.TestCase):
 
     def test_merge_commit_sends_the_method_and_checks_the_parents(self):
         run = MergeRun(
-            [pr_payload(), self.runs(), self.merged_pr(), self.runs(), self.commit()],
+            [pr_payload(), self.merged_pr(), self.commit()],
             self.merge_put(),
         )
         sha = ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="merge")
         self.assertEqual(sha, MERGE_SHA)
         self.assertEqual(
-            run.calls[2],
+            run.calls[1],
             [
                 "api",
                 "-X",
@@ -639,20 +649,18 @@ class MergeSeamTest(unittest.TestCase):
                 f"sha={HEAD_SHA}",
             ],
         )
-        self.assertEqual(run.calls[5], ["api", f"repos/acme/lib/commits/{MERGE_SHA}"])
+        self.assertEqual(run.calls[3], ["api", f"repos/acme/lib/commits/{MERGE_SHA}"])
 
     def test_squash_merge_never_reads_the_merge_commit(self):
-        run = MergeRun([pr_payload(), self.runs(), self.merged_pr(), self.runs()], self.merge_put())
+        run = MergeRun([pr_payload(), self.merged_pr()], self.merge_put())
         ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="squash")
-        self.assertEqual(len(run.calls), 5)
+        self.assertEqual(len(run.calls), 3)
 
     def test_merge_commit_without_the_head_parent_is_unverified(self):
         run = MergeRun(
             [
                 pr_payload(),
-                self.runs(),
                 self.merged_pr(),
-                self.runs(),
                 self.commit(parents=(BASE_SHA, OTHER_SHA)),
             ],
             self.merge_put(),
@@ -660,7 +668,7 @@ class MergeSeamTest(unittest.TestCase):
         with self.assertRaises(forge.ForgeError) as ctx:
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="merge")
         self.assertNotIsInstance(ctx.exception, forge.ForgeRefused)
-        self.assertEqual(len(run.calls), 6)
+        self.assertEqual(len(run.calls), 4)
 
     def test_merge_commit_malformed_commit_is_forge_error(self):
         bad = [
@@ -675,21 +683,19 @@ class MergeSeamTest(unittest.TestCase):
         for payload in bad:
             with self.subTest(payload=payload):
                 run = MergeRun(
-                    [pr_payload(), self.runs(), self.merged_pr(), self.runs(), payload],
+                    [pr_payload(), self.merged_pr(), payload],
                     self.merge_put(),
                 )
                 with self.assertRaises(forge.ForgeError) as ctx:
                     ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="merge")
                 self.assertNotIsInstance(ctx.exception, forge.ForgeRefused)
-                self.assertEqual(len(run.calls), 6)
+                self.assertEqual(len(run.calls), 4)
 
     def test_merge_commit_fetch_failure_is_forge_error(self):
         run = MergeRun(
             [
                 pr_payload(),
-                self.runs(),
                 self.merged_pr(),
-                self.runs(),
                 RuntimeError("connection refused"),
             ],
             self.merge_put(),
@@ -697,7 +703,7 @@ class MergeSeamTest(unittest.TestCase):
         with self.assertRaises(forge.ForgeError) as ctx:
             ghforge.GithubForge(run).merge("acme/lib", 7, head_sha=HEAD_SHA, method="merge")
         self.assertNotIsInstance(ctx.exception, forge.ForgeRefused)
-        self.assertEqual(len(run.calls), 6)
+        self.assertEqual(len(run.calls), 4)
 
 
 class FakeForgeMergeTest(unittest.TestCase):

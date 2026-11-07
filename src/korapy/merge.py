@@ -335,8 +335,14 @@ def _evaluate(
     skip_set: frozenset[str],
     cwd: str,
     lock_detail: str,
+    pending: int | None = None,
 ) -> list[Check]:
-    """Every precondition row for a fresh PR read, in gate order."""
+    """Every precondition row for a fresh PR read, in gate order.
+
+    `pending` decorates a pending checks row only: the running count
+    from the separate `pending_checks` read, or `None` when that read
+    failed or never ran. It never changes the verdict.
+    """
     checks = [Check("lock", OK_S, lock_detail)]
     if pr.state == iface.OPEN:
         checks.append(Check("open", OK_S, "the PR is open"))
@@ -359,14 +365,11 @@ def _evaluate(
     elif pr.checks_state == "passing":
         checks.append(Check("checks", OK_S, "the checks are passing"))
     elif pr.checks_state == "pending":
-        checks.append(
-            Check(
-                "checks",
-                PENDING,
-                f"the checks are pending ({pr.checks_pending} still running): "
-                "wait for them to finish",
-            )
-        )
+        if pending:
+            detail = f"the checks are pending ({pending} still running): wait for them to finish"
+        else:
+            detail = "the checks are pending: waiting for the forge to report check results"
+        checks.append(Check("checks", PENDING, detail))
     else:
         checks.append(
             Check(
@@ -430,6 +433,45 @@ def _resolve_timeout(timeout) -> float:
     return seconds
 
 
+def _pending_count(forge, repo: str, sha: str) -> int | None:
+    """The running check count for a pending head, or `None` when unknown.
+
+    The separate `pending_checks` read only decorates the pending row:
+    a failed or unusable count degrades to the count-less pending
+    message instead of an error, so a slow second read can never flip
+    the verdict or fail the verb.
+    """
+    try:
+        count = forge.pending_checks(repo, sha)
+    except iface.ForgeError:
+        return None
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    return count
+
+
+def _read_and_evaluate(
+    forge,
+    ticket_repo: str,
+    ticket_number: int,
+    repo: str,
+    number: int,
+    head: str,
+    skip_set: frozenset[str],
+    cwd: str,
+    lock_detail: str,
+) -> list[Check]:
+    """One PR read plus its rows, fetching the pending count only then.
+
+    The count read runs only when the verdict is pending; passing,
+    failing, and skipped rows never trigger it, and other verbs that
+    read the PR never pay for it.
+    """
+    pr = forge.pull_request(repo, number)
+    pending = _pending_count(forge, repo, pr.head_sha) if pr.checks_state == "pending" else None
+    return _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail, pending)
+
+
 def _poll_until_settled(
     ticket_repo: str,
     ticket_number: int,
@@ -452,8 +494,9 @@ def _poll_until_settled(
     No lock is taken and nothing merges: the caller merges (or reports
     `--plan`) from the returned evaluation. A `fail` anywhere wins at
     once, even beside a pending checks row; a timeout returns the
-    pending evaluation. Forge outages raise through the seam, never
-    swallowed into a verdict.
+    pending evaluation. PR-read outages raise through the seam, never
+    swallowed into a verdict; a failed pending-count read degrades to
+    the count-less pending message.
     """
     start = clock()
     while True:
@@ -461,8 +504,9 @@ def _poll_until_settled(
             lock_detail = "the merge lock is free"
         else:
             lock_detail = held_detail
-        pr = forge.pull_request(repo, number)
-        checks = _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail)
+        checks = _read_and_evaluate(
+            forge, ticket_repo, ticket_number, repo, number, head, skip_set, cwd, lock_detail
+        )
         if _status(checks, "checks") != PENDING or _failed(checks):
             return checks
         if clock() - start >= timeout:
@@ -554,12 +598,13 @@ def run_merge(
             )
         else:
             free = _lock_free(path)
-            pr = forge.pull_request(repo, number)
             if free:
                 lock_detail = "the merge lock is free"
             else:
                 lock_detail = "the merge lock is held by another merger (informational: --plan never takes the lock)"
-            checks = _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail)
+            checks = _read_and_evaluate(
+                forge, ticket_repo, ticket_number, repo, number, head, skip_set, cwd, lock_detail
+            )
         return Result(checks, sorted(skip_set), False, None, OK if not _blocked(checks) else NO)
     if wait:
         checks = _poll_until_settled(
@@ -582,9 +627,16 @@ def run_merge(
             return Result(checks, sorted(skip_set), False, None, NO)
     try:
         with _locked(path):
-            pr = forge.pull_request(repo, number)
-            checks = _evaluate(
-                ticket_repo, ticket_number, pr, head, skip_set, cwd, "the merge lock is free"
+            checks = _read_and_evaluate(
+                forge,
+                ticket_repo,
+                ticket_number,
+                repo,
+                number,
+                head,
+                skip_set,
+                cwd,
+                "the merge lock is free",
             )
             if _blocked(checks):
                 return Result(checks, sorted(skip_set), False, None, NO)
@@ -596,9 +648,16 @@ def run_merge(
                 # row still green is the method the forge or the
                 # repository settings do not allow: the `method` row
                 # names the setting, and appears in no other case.
-                pr = forge.pull_request(repo, number)
-                checks = _evaluate(
-                    ticket_repo, ticket_number, pr, head, skip_set, cwd, "the merge lock is free"
+                checks = _read_and_evaluate(
+                    forge,
+                    ticket_repo,
+                    ticket_number,
+                    repo,
+                    number,
+                    head,
+                    skip_set,
+                    cwd,
+                    "the merge lock is free",
                 )
                 if not _blocked(checks):
                     checks.append(

@@ -101,9 +101,6 @@ def cmd_merge(args: argparse.Namespace, forge=None) -> int:
         _err(f"korapy merge: {err}")
         return USAGE
     adapter = forge if forge is not None else _production_forge()
-    if args.timeout is not None and not args.wait:
-        _err("korapy merge --timeout needs --wait: it bounds how long --wait polls")
-        return USAGE
     try:
         result = merge.run_merge(
             ticket_repo,

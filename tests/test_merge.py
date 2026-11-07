@@ -71,13 +71,32 @@ class SequenceForge(FakeForge):
     def __init__(self, reads):
         self.reads = list(reads)
         self.requested = []
+        self.pending_requested = []
         self.calls = []
+        self._last = None
 
     def pull_request(self, repo, number):
         self.requested.append((repo, number))
         if len(self.reads) > 1:
-            return self.reads.pop(0)
-        return self.reads[0]
+            self._last = self.reads.pop(0)
+            return self._last
+        self._last = self.reads[0]
+        return self._last
+
+    def pending_checks(self, repo, sha):
+        self.pending_requested.append((repo, sha))
+        source = self._last
+        if source is None:
+            source = self.reads[0]
+        if source.head_sha != sha:
+            for pr in self.reads:
+                if pr.head_sha == sha:
+                    source = pr
+                    break
+        count = source.checks_pending
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise forge.ForgeError(f"unusable pending count for {sha}")
+        return count
 
     def merge(self, repo, number, *, head_sha, method):
         from korapy.github import forge as ghforge
@@ -659,6 +678,83 @@ class PendingWaitTest(MergeCase):
         self.assertFalse(result.merged)
         self.assertEqual(fake.calls, [])
         self.assertEqual(len(sleeps), 10)
+
+    def test_pending_with_no_count_waits_for_the_forge_report(self):
+        result = self.do_merge(self.fake(checks_state="pending", checks_pending=0), plan=True)
+        self.assertEqual(result.exit_code, 1)
+        row = self.row(result, "checks")
+        self.assertEqual(row.status, "pending")
+        self.assertNotIn("still running", row.detail)
+        self.assertIn("waiting for the forge to report check results", row.detail)
+        self.assertNotIn("fix the branch", row.detail)
+        self.assertFalse(result.merged)
+
+    def test_failing_count_read_degrades_to_a_count_less_pending(self):
+        fake = FakeForge(
+            pulls=[
+                make_pr(
+                    repo=FORGE_REPO,
+                    number=PR,
+                    base_sha=self.base,
+                    head_sha=self.head,
+                    checks_state="pending",
+                    checks_pending=2,
+                )
+            ],
+            fail={"pending_checks"},
+        )
+        result = self.do_merge(fake, plan=True)
+        self.assertEqual(result.exit_code, 1)
+        row = self.row(result, "checks")
+        self.assertEqual(row.status, "pending")
+        self.assertNotIn("still running", row.detail)
+        self.assertIn("waiting for the forge to report check results", row.detail)
+        self.assertNotIn("fix the branch", row.detail)
+        self.assertFalse(result.merged)
+
+    def test_plan_with_wait_settles_without_merging_or_locking(self):
+        fake = SequenceForge([self.pr("pending", 2), self.pr("passing")])
+        self.hold_lock()
+        now_fn, sleep_fn, sleeps = self.clock()
+        with mock.patch.object(merge, "_flock", side_effect=AssertionError("plan takes no lock")):
+            result = merge.run_merge(
+                REPO,
+                TICKET,
+                FORGE_REPO,
+                PR,
+                head_sha=self.head,
+                forge=fake,
+                cwd=self.dir,
+                plan=True,
+                wait=True,
+                timeout=100,
+                poll_s=10,
+                now_fn=now_fn,
+                sleep_fn=sleep_fn,
+            )
+        self.assertEqual(result.exit_code, 0)
+        self.assertFalse(result.merged)
+        self.assertIsNone(result.merge_sha)
+        for check in result.checks:
+            self.assertEqual(check.status, "ok", check.name)
+        self.assertIn("never takes the lock", self.row(result, "lock").detail)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(sleeps, [10])
+
+    def test_settled_rows_make_no_pending_count_read(self):
+        fake = self.fake(checks_state="passing")
+        result = self.do_merge(fake, plan=True)
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(fake.pending_requested, [])
+        failing = self.fake(checks_state="failing")
+        result = self.do_merge(failing, plan=True)
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(failing.pending_requested, [])
+
+    def test_timeout_without_wait_is_usage_at_the_core(self):
+        with self.assertRaises(merge.MergeError) as caught:
+            self.do_merge(self.fake(), timeout=60)
+        self.assertIn("--wait", str(caught.exception))
 
     def test_wait_default_timeout_is_ten_minutes(self):
         self.assertEqual(merge.DEFAULT_WAIT_TIMEOUT_S, 600)
