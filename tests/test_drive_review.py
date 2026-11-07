@@ -1466,6 +1466,7 @@ class ClaimRaceTest(unittest.TestCase):
             "now": NOW,
             "stale_after": 3600.0,
             "restarts_path": self.budget,
+            "driven": {gated.project: frozenset({gated.repo})},
         }
         values.update(over)
         launcher = values["launcher"]

@@ -82,6 +82,18 @@ review state as data. `StartRequest` names `repo`, `number` and `kind`
 (`start`, `resume`, `review`, `fix`) and may carry a project-local
 weight used only to order within that project.
 
+A policy only sees its own project's repositories. The board store is
+shared per host and keyed by tracker repository, so one project's rows
+sit next to another's; before the policy runs, the pass hides every
+row whose tracker repo is not one of the project's own `[[repo]]`
+entries (tracker spelling, through the one `driven_repos` resolver
+the rest of the pass reads), and drops any request naming such a
+repo. Two projects sharing a short entry name keep their own tracker
+repos: the scoping reads each root's own entries, never the
+first-winner pass map. A launch-path check refuses the pass with exit
+4 naming the repository if a foreign row ever reaches a claim, in
+case a future caller bypasses the filter.
+
 The function is pure by contract: no tracker, forge, `gh`, network,
 clock or settings access inside. Korapy supplies everything as
 arguments, including `now`. That keeps project policy testable with
@@ -127,20 +139,30 @@ highest first, with unknown priorities lowest; ties keep row order for
 the drive loop to break.
 
 The store carries no linked pulls (pull-request rows are never ticket
-rows, and the sync drops them), so the pass reads each ticket's linked
-pulls through the tracker (`Tracker.linked_pulls`, implemented once by
-each adapter) once per pass and the rows a policy sees arrive with
-`pulls` populated: `basic`'s own pull filter refuses a ticket with an
-open linked pull, and the shared gate reads the same row pulls (section
-3), so the two never disagree and no second lookup runs. `--plan`
-builds rows with `pulls` empty: it never contacts the tracker. Which
-findings reopen work is the gate's call too: it grades the ticket's
-latest review record against the fix-round threshold, so a policy only
-decides to ask, never whether the asking succeeds (section 5).
+rows, and the sync drops them), so the pass lists each fetchable
+ticket's repository once through the tracker (`Tracker.pulls_index`,
+implemented once by each adapter: one paged open-pulls listing per
+repository, filed by linked ticket) and the rows a policy sees arrive
+with `pulls` populated: only tickets some project wants and the gate
+could still decide trigger a listing (open, unheld, and in a
+repository the pass drives, with live-claimed tickets fetched only
+for `fix` and `resume`; anything else never fetches, and
+with none to check the tracker is never contacted). `basic`'s own pull filter refuses a
+ticket with an open linked pull, and the shared gate reads the same row
+pulls (section 3), so the two never disagree and no second lookup runs.
+The `drive.pulls_max_calls` setting (default 20) caps the listing calls
+per pass: repositories past the cap leave their tickets unreadable, and
+the gate refuses those starts, failing closed like an unreadable
+listing. `--plan` builds rows with `pulls` empty: it never contacts the
+tracker. Which findings reopen work is the gate's call too: it grades
+the ticket's latest review record against the fix-round threshold, so a
+policy only decides to ask, never whether the asking succeeds
+(section 5).
 
 ## 3. Ordering and fairness; caps, quota and hold; what exit 75 does
 
-Each pass builds one candidate list: every project's requests,
+Each pass builds one candidate list: every project's requests
+(scoped to the repositories that project drives, per section 2),
 annotated with board facts (priority, `tracker_updated_at` for wait
 time, current agent and unit liveness). Global order is:
 
@@ -194,7 +216,7 @@ Per-candidate gate order, cheapest first:
    - Claimed row plus `review`: skip while the worker still holds
      the claim. The review is scheduled on a later pass, after the
      worker finishes and the takeover above schedules it.
-3. Review threshold and linked pulls, both on unclaimed rows only.
+3. Review threshold (unclaimed rows) and linked pulls.
    The pass reads the ticket's latest review record once per pass
    from the session dirs and grades it here: an approving verdict
    (`approve` or `approve-with-findings`) whose findings all sit
@@ -218,10 +240,16 @@ Per-candidate gate order, cheapest first:
    `start` (including a `fix` or `resume` reclassified as one) on an
    unclaimed row with an open linked pull request skips, since the
    pull carries the ticket. The linked pulls come from the row, which
-   the pass populated from `Tracker.linked_pulls` with one tracker
-   call per ticket per pass; an unreadable read fails closed (skip,
-   record "unreadable"). `--plan` builds rows with no pulls and skips
-   this check: it never contacts the tracker.
+   the pass populated from one `Tracker.pulls_index` listing per
+   repository; an unreadable read fails closed (skip, record
+   "unreadable"), and so does a repository past the
+   `drive.pulls_max_calls` cap (skip, record "pulls lookup limited").
+   A `fix` or `resume` on a claimed row reads the same row pulls:
+   unreadable pulls refuse it with the cause named, and a hold label
+   on a linked pull hold-skips it. `--plan` builds rows with no pulls
+   and skips this check: it never
+   contacts the tracker. The summary line counts the listing calls
+   (`pulls calls`), so a regression is visible at once.
 4. Hold: `hold.reason` over the ticket and linked PR labels.
    Unreadable labels fail closed (skip, record "unreadable").
    `needs-decision` label also skips: a ticket waiting on a human is
@@ -517,7 +545,9 @@ with section errors on failure, per its contract.
 the whole gate order but never syncs and writes nothing: no tracker
 calls, no claims, no outbox rows, no starts, no mirror, no journal. It prints one row per candidate with the
 verdict and the reason in the same words the logbook would use, plus a
-summary (would start N, blocked per gate). Exit 0 on a completed plan,
+summary (would start N, blocked per gate). Each project with a dropped
+row also prints how many foreign rows it ignored (section 2). Exit 0
+on a completed plan,
 4 when the store could not be read or on configuration errors
 (`board.StoreError` already means 4; there is no exit 3 path because
 `--plan` never contacts the tracker). `--plan`
@@ -538,10 +568,11 @@ never takes the drive lock.
   are not starts and are unaffected.
 - Never started: external items, non-open tickets, held tickets
   (including unreadable labels, fail closed), tickets or linked PRs
-  carrying the hold label, tickets carrying `needs-decision`, and
-  tickets whose eligibility the project withdrew this pass. The loop
-  checks these on every pass, not only at first claim: a label added
-  mid-flight stops the next resume.
+  carrying the hold label, tickets carrying `needs-decision`,
+  tickets whose eligibility the project withdrew this pass, and
+  tickets whose repository the project does not drive (section 2).
+  The loop checks these on every pass, not only at first claim: a
+  label added mid-flight stops the next resume.
 - No deletion: the loop stops units (via the injected stop seam, which
   has no default) and releases claims. It never removes worktrees,
   branches, sessions, images or caches. Cleanup stays with the hygiene
@@ -576,6 +607,7 @@ is tested through the seam its production code already injects:
 | Outbox drain, supersede, external and closed drops, rate-limit halt | fake `Tracker.write`, temp `Store` |
 | Claim race: second claimer gets exit 2 path and moves on | temp `Store`, two agent ids |
 | Claim routing: `start` on a claimed row skips, `resume`/`fix` on a managed holder proceeds, foreign holder skips, unclaimed `resume` reclassifies | temp `Store`, fake registry entries |
+| Own repositories: with rows for two repos and two projects, each project's plan lists only its own repo, a foreign row is never claimed, the launch-path refusal exits 4 naming the repo, and a project sharing a short name with another keeps its own rows | temp `Store`, temp ops roots, stub policies, threaded `driven` sets |
 | Finished worker keeps its claim until the reviewer takes over; `start` and `review` on a finished holder proceed as a takeover | temp `Store`, fake registry with a `done` entry, recording launcher, author==reviewer refusal case |
 | Finished holders are never restarted; withdrawn or held finished rows still release, live units never release | temp `Store`, fake registry states and unit list, fake stop seam |
 | Reviewer-held finished rows release for a fix round; live units keep their claims | temp `Store`, fake registry with a `done` reviewer entry, live-unit fixture |

@@ -658,6 +658,7 @@ class HubStuckWiringTest(unittest.TestCase):
             "stop_unit": FakeStop(),
             "restarter": FakeLauncher(),
             "stuck_project": lambda repo, number: "blue",
+            "driven": {"blue": frozenset({"app"})},
         }
         values.update(fields)
         code = drive_pass(
@@ -784,12 +785,12 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         self.ops = os.path.join(self.tmp.name, "ops")
         os.makedirs(os.path.join(self.config, "projects.d"))
         os.makedirs(self.ops)
-        store = stored(os.path.join(self.state, "board.sqlite"), [("app", 7, "open")])
+        store = stored(os.path.join(self.state, "board.sqlite"), [("acme/app", 7, "open")])
         store.close()
         with open(os.path.join(self.ops, "korapy.toml"), "w", encoding="utf-8") as handle:
-            handle.write("")
+            handle.write('[[repo]]\nname = "app"\ntracker.repo = "acme/app"\n')
         with open(os.path.join(self.ops, "policy.py"), "w", encoding="utf-8") as handle:
-            handle.write(policy_source([("app", 7, "start")]))
+            handle.write(policy_source([("acme/app", 7, "start")]))
         with open(
             os.path.join(self.config, "projects.d", "blue.toml"), "w", encoding="utf-8"
         ) as handle:
@@ -854,7 +855,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         with mock.patch.object(drivehub.hubmod, "HubClient", BombClient):
             code, logged, errors = self.run_plan()
         self.assertEqual(code, 0)
-        self.assertIn("app#7", logged)
+        self.assertIn("acme/app#7", logged)
         self.assertEqual(errors, "")
 
     def test_plan_with_hub_configured_makes_zero_hub_calls(self):
@@ -871,7 +872,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         with mock.patch.object(drivehub.hubmod, "HubClient", FakeHubClient):
             code, logged, errors = self.run_plan()
         self.assertEqual(code, 0)
-        self.assertIn("app#7", logged)
+        self.assertIn("acme/app#7", logged)
         self.assertEqual(errors, "")
         self.assertEqual(FakeHubClient.built, [])
 
@@ -895,7 +896,33 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         self.assertIn("plan treats finished rows as released", errors)
         self.assertEqual(seen.get("live_units"), frozenset())
         self.assertTrue(seen.get("plan"))
-        self.assertIn("app#7", logged)
+        self.assertIn("acme/app#7", logged)
+
+    def test_plan_hands_a_non_none_driven_to_run_pass(self):
+        seen = {}
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return 0
+
+        with mock.patch.object(drive, "run_pass", side_effect=spy):
+            code, _logged, _errors = self.run_plan()
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(seen.get("driven"))
+        self.assertEqual(seen["driven"], {"blue": frozenset({"acme/app"})})
+
+    def test_claiming_pass_hands_a_non_none_driven_to_run_pass(self):
+        seen = {}
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return 0
+
+        with mock.patch.object(drive, "run_pass", side_effect=spy):
+            code, _logged, _errors = self.run_non_plan()
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(seen.get("driven"))
+        self.assertEqual(seen["driven"], {"blue": frozenset({"acme/app"})})
 
     def test_non_plan_with_unusable_token_path_is_a_usage_error(self):
         with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
@@ -948,7 +975,7 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         with open(os.path.join(self.config, "config.toml"), "w", encoding="utf-8") as handle:
             handle.write(f'[hub]\nurl = "{url}"\nhost_id = "{host_id}"\n')
         fake_tracker = FakeTracker(
-            [reading(repo="app", number=7, author="operator", updated_at=1900.0)]
+            [reading(repo="acme/app", number=7, author="operator", updated_at=1900.0)]
         )
         launcher = FakeLauncher()
 
@@ -960,11 +987,11 @@ class CmdDriveHubBuildTest(unittest.TestCase):
                 super().__init__(host_id=hub_host_id)
                 RecordingHub.built.append((url, hub_host_id, token_path))
                 RecordingHub.instance = self
-                self.receipts[("app", 7)] = 5
+                self.receipts[("acme/app", 7)] = 5
 
         entry = trackers.RepoTracker(
             name="app",
-            tracker_repo="app",
+            tracker_repo="acme/app",
             operators=["operator"],
             variant="labels",
             tracker=fake_tracker,
@@ -982,9 +1009,11 @@ class CmdDriveHubBuildTest(unittest.TestCase):
             mock.patch.object(drivehub.hubmod, "HubClient", RecordingHub),
             mock.patch.object(drivehub, "HubMode", RecordingMode),
             mock.patch.object(
-                drive, "production_operators", return_value=({"app": ["operator"]}, None)
+                drive, "production_operators", return_value=({"acme/app": ["operator"]}, None)
             ),
-            mock.patch.object(trackers, "production_trackers", return_value=({"app": entry}, None)),
+            mock.patch.object(
+                trackers, "production_trackers", return_value=({"acme/app": entry}, None)
+            ),
             mock.patch.object(drive, "production_launcher", return_value=launcher),
             mock.patch.object(drive, "production_stopper", return_value=FakeStop()),
             mock.patch.object(drive.sys, "stdout", out),
@@ -1006,16 +1035,16 @@ class CmdDriveHubBuildTest(unittest.TestCase):
         agent = proposes[0][3]
         store = board.open_store(os.path.join(self.state, "board.sqlite"))
         try:
-            found = store.claim_of("app", 7)
+            found = store.claim_of("acme/app", 7)
         finally:
             store.close()
         assert found is not None
         self.assertEqual((found.agent, found.epoch), (agent, 5))
         self.assertEqual(len(launcher.calls), 1)
-        self.assertEqual(launcher.calls[0][1:4], ("app", 7, "start"))
+        self.assertEqual(launcher.calls[0][1:4], ("acme/app", 7, "start"))
         self.assertEqual(
             [call for call in fake_tracker.calls if call[0] == "write"],
-            [("write", "app", 7, "agent", agent)],
+            [("write", "acme/app", 7, "agent", agent)],
         )
 
     def test_non_plan_with_hub_url_but_no_host_id_is_a_usage_error(self):

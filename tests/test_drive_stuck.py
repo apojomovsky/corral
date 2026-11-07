@@ -554,6 +554,7 @@ class RestartPassTest(unittest.TestCase):
             stop_unit=stop,
             restarter=launcher,
             restarts_path=self.budget,
+            driven={"blue": frozenset({"app"})},
         )
         self.assertEqual(code, 0)
         self.assertEqual(stop.calls, [])
@@ -2147,6 +2148,7 @@ class StuckErrorBranchTest(unittest.TestCase):
             "tracker_factory": None,
             "restarts_path": self.budget,
             "read_labels": lambda kind, repo, number: [],
+            "driven": {"blue": frozenset({"app"})},
         }
         values.update(over)
         stop, launcher = values["stop_unit"], values["restarter"]
@@ -2762,6 +2764,7 @@ class RestartEligibilityTest(unittest.TestCase):
             "read_labels": lambda kind, repo, number: [],
             "hold_label": "hold",
             "requested": {("app", 7)},
+            "driven": {"blue": frozenset({"app"})},
         }
         values.update(over)
         stop, launcher = values["stop_unit"], values["restarter"]

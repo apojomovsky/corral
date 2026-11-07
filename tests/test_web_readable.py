@@ -11,7 +11,7 @@ import copy
 import unittest
 from importlib import resources
 
-from korapy import snapshot
+from korapy import drive, snapshot
 from tests.test_serve import DRIVE, ServeCase
 from tests.test_snapshot import (
     HOST,
@@ -112,6 +112,14 @@ class QuotaAge(unittest.TestCase):
         self.assertIn("older than its freshness bound counts as stale", views)
         self.assertIn("korapy quota refresh", views)
 
+    def test_quota_card_renders_the_snapshot_stale_reason(self):
+        # The card renders the snapshot's stale_reason field as-is;
+        # the words come from the server helper, never a second
+        # derivation in the page.
+        views = web_text("views.js")
+        self.assertIn("stale_reason", views)
+        self.assertIn("quotaProvider", views)
+
     def test_window_reset_reads_as_local_time_with_countdown(self):
         # The reset line is composed, not pasted: the local clock plus
         # the countdown, so the suite pins the composition itself.
@@ -180,8 +188,12 @@ class DriveSection(unittest.TestCase):
         self.assertIn("finished cleanly", fmt)
 
     def test_pause_help_names_the_pause_file(self):
+        # The card renders the snapshot's pause_file, which the drive
+        # section reports from drive.PAUSE_NAME (pinned in
+        # test_web_polish.py), so the page never carries its own copy.
         views = web_text("views.js")
-        self.assertIn("drive.pause", views)
+        self.assertIn("pause_file", views)
+        self.assertTrue(drive.PAUSE_NAME)
 
 
 class SectionHelp(unittest.TestCase):

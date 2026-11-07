@@ -103,6 +103,74 @@ def select_value(fid, name, oid, oname):
     }
 
 
+def date_value(date="2026-11-01"):
+    """A date value as GraphQL returns it: no field fragment selected."""
+    return {"__typename": "ProjectV2ItemFieldDateValue", "date": date}
+
+
+def number_value(number=3.5):
+    return {"__typename": "ProjectV2ItemFieldNumberValue", "number": number}
+
+
+def iteration_value(title="Sprint 4"):
+    return {
+        "__typename": "ProjectV2ItemFieldIterationValue",
+        "title": title,
+        "startDate": "2026-11-01",
+        "duration": 14,
+    }
+
+
+def label_value(name="bug"):
+    return {
+        "__typename": "ProjectV2ItemFieldLabelValue",
+        "labels": {"nodes": [{"name": name}]},
+    }
+
+
+def user_value(login="contributor"):
+    return {
+        "__typename": "ProjectV2ItemFieldUserValue",
+        "users": {"nodes": [{"login": login}]},
+    }
+
+
+def milestone_field_value(title="M1"):
+    return {
+        "__typename": "ProjectV2ItemFieldMilestoneValue",
+        "milestone": {"title": title},
+    }
+
+
+def pull_request_field_value(number=9):
+    return {
+        "__typename": "ProjectV2ItemFieldPullRequestValue",
+        "pullRequests": {"nodes": [{"number": number}]},
+    }
+
+
+def unmapped_values():
+    """One value per kind korapy does not read, in GraphQL's bare shape."""
+    return [
+        date_value(),
+        number_value(),
+        iteration_value(),
+        label_value(),
+        user_value(),
+        milestone_field_value(),
+        pull_request_field_value(),
+    ]
+
+
+def date_value_on_mapped_field():
+    """A date value carrying a mapped field id: still skipped, not read."""
+    return {
+        "__typename": "ProjectV2ItemFieldDateValue",
+        "date": "2026-11-01",
+        "field": {"__typename": "ProjectV2Field", "id": "F_agent", "name": "Agent"},
+    }
+
+
 def item_node(number, repo="example/demo", updated=T1, values=(), typename="Issue"):
     if typename == "DraftIssue":
         content = {"__typename": "DraftIssue", "title": "An idea"}
@@ -754,6 +822,131 @@ class PollItemsTest(unittest.TestCase):
             row, _ = db.item("example/demo", 7, now=found.updated_at)
         self.assertEqual(row.extra["priority"], "urgent")
         self.assertEqual(row.extra["blocked_by"], ["example/demo#1"])
+
+
+class UnmappedKindsTest(unittest.TestCase):
+    def setUp(self):
+        self.fields = full_schema_fields()
+
+    def poll_one(self, run, values, number=7, **issue_over):
+        rest_issue(run, number, **issue_over)
+        run.script("BoardSchemaByNumber", [schema_payload(*self.fields)])
+        run.script("BoardItems", [items_payload([item_node(number, values=values)])])
+        reader = reader_for(run)
+        found, _ = reader.poll(reader.schema(), max_pages=10)
+        self.assertEqual(len(found), 1)
+        return found[0]
+
+    def test_mixed_mapped_and_unmapped_reads_only_mapped(self):
+        run = BoardFakeRun()
+        found = self.poll_one(
+            run,
+            [
+                text_value("F_agent", "Agent", "agent-1"),
+                select_value("F_prio", "Priority", "opt-p0-id", "P0"),
+                *unmapped_values(),
+            ],
+        )
+        self.assertEqual(found.agent, "agent-1")
+        self.assertEqual(found.extra["priority"], "urgent")
+        self.assertEqual({k for k in found.extra if k != "milestone"}, {"priority"})
+
+    def test_date_value_on_a_mapped_field_id_is_skipped(self):
+        run = BoardFakeRun()
+        found = self.poll_one(run, [date_value_on_mapped_field()])
+        self.assertEqual(found.agent, "")
+
+    def test_unrelated_kinds_only_read_as_no_values(self):
+        run = BoardFakeRun()
+        found = self.poll_one(run, unmapped_values())
+        self.assertEqual(found.agent, "")
+        self.assertEqual(found.status, "")
+        self.assertEqual({k for k in found.extra if k != "milestone"}, set())
+
+    def test_malformed_values_of_mapped_kinds_still_fail_closed(self):
+        field = {"__typename": "ProjectV2SingleSelectField", "id": "F_prio", "name": "Priority"}
+        bad_entries = [
+            "nope",
+            {"__typename": "ProjectV2ItemFieldTextValue", "text": "x"},
+            {
+                "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                "optionId": 123,
+                "name": "P0",
+                "field": field,
+            },
+            {
+                "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                "optionId": "opt-p0-id",
+                "name": 123,
+                "field": field,
+            },
+            {
+                "__typename": "ProjectV2ItemFieldSingleSelectValue",
+                "text": "P0",
+                "field": field,
+            },
+        ]
+        for entry in bad_entries:
+            with self.subTest(entry=entry):
+                run = BoardFakeRun()
+                rest_issue(run, 7)
+                run.script("BoardSchemaByNumber", [schema_payload(*self.fields)])
+                run.script("BoardItems", [items_payload([item_node(7, values=[entry])])])
+                reader = reader_for(run)
+                with self.assertRaises(iface.TrackerError):
+                    reader.poll(reader.schema(), max_pages=10)
+
+    def test_user_owned_board_fixture_reads_mapped_values_only(self):
+        run = BoardFakeRun()
+        rest_issue(run, 7)
+        rest_issue(run, 10)
+        rest_issue(run, 11)
+        payload = item_payload(9, pull_request={})
+        run.add_rest("repos/example/demo/issues/9", payload)
+        run.add_rest("repos/example/demo/pulls/9", pull_payload(9, fork=True))
+        unset_status = {
+            "__typename": "ProjectV2ItemFieldSingleSelectValue",
+            "field": {"__typename": "ProjectV2SingleSelectField", "id": "F_wf", "name": "Status"},
+        }
+        nodes = [
+            item_node(
+                7,
+                values=[
+                    text_value("F_agent", "Agent", "agent-1"),
+                    select_value("F_prio", "Priority", "opt-p1-id", "P1"),
+                    date_value("2026-11-15"),
+                ],
+            ),
+            item_node(
+                9,
+                typename="PullRequest",
+                values=[
+                    select_value("F_wf", "Status", "opt-s1", "In progress"),
+                    milestone_field_value("M2"),
+                ],
+            ),
+            item_node(10, values=[unset_status]),
+            item_node(
+                11,
+                values=[
+                    date_value("2026-12-01"),
+                    text_value("F_blocked", "Blocked by", "example/demo#1"),
+                ],
+            ),
+        ]
+        run.script("BoardSchemaByNumber", [schema_payload(*self.fields)])
+        run.script("BoardItems", [items_payload(nodes)])
+        reader = reader_for(run)
+        found, _ = reader.poll(reader.schema(), max_pages=10)
+        self.assertEqual([item.number for item in found], [7, 9, 10, 11])
+        by_number = {item.number: item for item in found}
+        self.assertEqual(by_number[7].agent, "agent-1")
+        self.assertEqual(by_number[7].extra["priority"], "high")
+        self.assertEqual(by_number[9].extra["board_status"], "In progress")
+        self.assertTrue(by_number[9].from_fork)
+        self.assertEqual(by_number[10].agent, "")
+        self.assertNotIn("board_status", by_number[10].extra)
+        self.assertEqual(by_number[11].extra["blocked_by"], ["example/demo#1"])
 
 
 class MilestoneOfTest(unittest.TestCase):

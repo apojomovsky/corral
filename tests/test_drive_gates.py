@@ -9,13 +9,14 @@ host read, so nothing reaches the network, subprocesses or real dirs.
 import inspect
 import io
 import os
+from dataclasses import replace
 import tempfile
 import unittest
 from unittest import mock
 
 from korapy import accounts, admission, board, drive, eligibility, policies, projects, registry
 from korapy.eligibility import LinkedPull, StartRequest, TicketRow
-from tests.test_drive import policy_source, stored
+from tests.test_drive import driven_for, policy_source, stored
 from tests.test_eligibility import item as board_item
 from tests.test_tracker import FakeTracker, reading
 
@@ -660,6 +661,7 @@ class PassWiringTest(unittest.TestCase):
             "gone_s": 3600.0,
         }
         values.update(fields)
+        values.setdefault("driven", driven_for(found, store))
         code = drive.run_pass(**values)
         return code, out.getvalue(), err.getvalue()
 
@@ -862,6 +864,7 @@ class PassWiringTest(unittest.TestCase):
                 now=2000.0,
                 projects_fn=lambda: [self.project("blue", entry)],
                 live=frozenset(),
+                driven={"blue": frozenset({"app"})},
             )
         self.assertEqual(code, 0)
         self.assertEqual(err.getvalue(), "")
@@ -926,41 +929,192 @@ class OpenPullGateTest(unittest.TestCase):
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("unreadable", gated.reason)
 
+    def test_an_unreadable_pull_lookup_refuses_a_review(self):
+        gated = gate(
+            entry(kind="review", row_=row(pulls=None)),
+            finished={("app", 7): ("drive-w-1", "worker")},
+        )
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_fix(self):
+        gated = gate(entry(kind="fix", row_=row(agent="drive-host-1-x", pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_refuses_a_resume(self):
+        gated = gate(entry(kind="resume", row_=row(agent="drive-host-1-x", pulls=None)))
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+
+    def test_an_unreadable_pull_lookup_names_the_cause(self):
+        candidate = entry(
+            row_=replace(row(pulls=None), pulls_error="tracker down"),
+        )
+        gated = gate(candidate)
+        self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
+        self.assertIn("unreadable", gated.reason)
+        self.assertIn("tracker down", gated.reason)
+
     def test_no_linked_pulls_means_a_fresh_start(self):
         gated = gate(entry(row_=row(pulls=())))
         self.assertEqual((gated.verdict, gated.kind, gated.code), ("start", "start", ""))
 
 
-class LinkedPullsMapTest(unittest.TestCase):
-    """One tracker read per ticket feeds every row in the pass."""
+class PullsIndexMapTest(unittest.TestCase):
+    """One listing per repo feeds every ticket in the pass."""
 
-    def test_each_ticket_reads_once_through_the_tracker(self):
+    def test_many_tickets_share_a_single_repo_listing(self):
         fake = FakeTracker()
-        fake.linked[("app", 7)] = [reading("app", 9, kind="pr", state="open")]
-        fake.linked[("app", 8)] = []
-        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
-        found = drive.linked_pulls_map([board_item(number=7), board_item(number=8)], pulls_for)
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state="open")]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        keys = [("app", 7), ("app", 8), ("app", 9)]
+        found, calls, limited = drive.linked_pulls_map(keys, index_for, max_calls=20)
         self.assertEqual([pull.number for pull in found[("app", 7)]], [9])
         self.assertEqual([pull.state for pull in found[("app", 7)]], ["open"])
         self.assertEqual(found[("app", 8)], ())
+        self.assertEqual(found[("app", 9)], ())
+        self.assertEqual(calls, 1)
+        self.assertFalse(limited)
+        self.assertEqual(fake.calls, [("pulls_index", "app", 20)])
+
+    def test_each_repo_lists_once(self):
+        fake = FakeTracker()
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7), ("api", 2)], index_for, max_calls=20
+        )
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(found[("api", 2)], ())
+        self.assertEqual(calls, 2)
+        self.assertFalse(limited)
         self.assertEqual(
-            fake.calls,
-            [("linked_pulls", "app", 7), ("linked_pulls", "app", 8)],
+            sorted(call[1] for call in fake.calls if call[0] == "pulls_index"),
+            ["api", "app"],
         )
 
-    def test_an_unreadable_ticket_maps_to_none(self):
+    def test_an_unreadable_repo_maps_its_tickets_to_none(self):
         fake = FakeTracker()
-        fake.linked_errors[("app", 7)] = "tracker down"
-        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
-        found = drive.linked_pulls_map([board_item()], pulls_for)
+        fake.index_errors["app"] = "tracker down"
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7)], index_for, max_calls=20, errors=errors
+        )
         self.assertIsNone(found[("app", 7)])
+        self.assertEqual(errors[("app", 7)], "tracker down")
+        self.assertFalse(limited)
+
+    def test_a_readable_repo_records_no_error(self):
+        fake = FakeTracker()
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7)], index_for, max_calls=20, errors=errors
+        )
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(errors, {})
+        self.assertFalse(limited)
 
     def test_non_pull_links_never_reach_the_row(self):
         fake = FakeTracker()
-        fake.linked[("app", 7)] = [reading("app", 9, kind="issue", state="open")]
-        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
-        found = drive.linked_pulls_map([board_item()], pulls_for)
+        fake.index["app"] = {7: [reading("app", 9, kind="issue", state="open")]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
         self.assertEqual(found[("app", 7)], ())
+
+    def test_a_repo_without_a_tracker_reads_as_no_pulls(self):
+        def missing(repo):
+            raise KeyError(repo)
+
+        index_for = drive.pulls_index_for(missing)
+        found, calls, limited = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        self.assertEqual(found[("app", 7)], ())
+        self.assertEqual(calls, 0)
+        self.assertFalse(limited)
+
+    def test_an_exhausted_budget_refuses_the_remaining_repos(self):
+        fake = FakeTracker()
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7), ("api", 2)], index_for, max_calls=1, errors=errors
+        )
+        self.assertEqual(calls, 1)
+        self.assertTrue(limited)
+        refused = [key for key in (("app", 7), ("api", 2)) if found[key] is None]
+        self.assertEqual(len(refused), 1)
+        for key in refused:
+            self.assertIn("pulls lookup limited", errors[key])
+
+    def test_an_incomplete_listing_refuses_its_repo(self):
+        fake = FakeTracker()
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state="open")]}
+        fake.index_truncated.add("app")
+        index_for = drive.pulls_index_for(lambda repo: fake)
+        errors: dict = {}
+        found, calls, limited = drive.linked_pulls_map(
+            [("app", 7)], index_for, max_calls=20, errors=errors
+        )
+        self.assertIsNone(found[("app", 7)])
+        self.assertIn("pulls lookup limited", errors[("app", 7)])
+        self.assertTrue(limited)
+
+
+class PullsCheckNeededTest(unittest.TestCase):
+    """Only tickets a check could still start trigger a listing."""
+
+    def check(self, item, live=(), hold_label="hold", kind="start"):
+        rows = eligibility.rows_from_items([item])
+        live_keys = {(repo, number) for _, repo, number in live}
+        return drive.pulls_check_needed(
+            rows[0], live_keys=live_keys, hold_label=hold_label, kind=kind
+        )
+
+    def test_an_open_unclaimed_ticket_needs_the_check(self):
+        self.assertTrue(self.check(board_item()))
+
+    def test_a_closed_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(state="closed")))
+
+    def test_an_externally_owned_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(external=True)))
+
+    def test_a_held_ticket_needs_no_check(self):
+        self.assertFalse(self.check(board_item(labels=["hold"])))
+
+    def test_a_ticket_waiting_on_a_human_needs_no_check(self):
+        self.assertFalse(self.check(board_item(labels=["needs-decision"])))
+        self.assertFalse(self.check(board_item(labels=["needs-triage"])))
+
+    def test_a_ticket_claimed_by_a_live_managed_agent_needs_the_check(self):
+        item = board_item(agent="drive-host-1-abc-7")
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)]))
+
+    def test_a_live_managed_claim_needs_the_check_for_start_and_review(self):
+        item = board_item(agent="drive-host-1-abc-7")
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="start"))
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="review"))
+
+    def test_a_live_managed_claim_needs_the_check_for_fix_and_resume(self):
+        item = board_item(agent="drive-host-1-abc-7")
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="fix"))
+        self.assertTrue(self.check(item, live=[("blue", "app", 7)], kind="resume"))
+
+    def test_a_live_foreign_claim_needs_no_check_for_fix(self):
+        item = board_item(agent="human-1")
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="fix"))
+
+    def test_a_live_foreign_claim_needs_no_check_for_start_or_review(self):
+        item = board_item(agent="human-1")
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="start"))
+        self.assertFalse(self.check(item, live=[("blue", "app", 7)], kind="review"))
+
+    def test_a_managed_claim_without_a_live_agent_still_needs_the_check(self):
+        self.assertTrue(self.check(board_item(agent="drive-host-1-abc-7")))
+
+    def test_a_foreign_claim_needs_no_check(self):
+        self.assertFalse(self.check(board_item(agent="human-1")))
 
 
 class LinkedPullAgreementTest(unittest.TestCase):
@@ -972,12 +1126,11 @@ class LinkedPullAgreementTest(unittest.TestCase):
 
     def tracked_rows(self, state="open"):
         fake = FakeTracker()
-        fake.linked[("app", 7)] = [reading("app", 9, kind="pr", state=state)]
-        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        fake.index["app"] = {7: [reading("app", 9, kind="pr", state=state)]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
         items = [board_item()]
-        rows = eligibility.rows_from_items(
-            items, pulls_by_key=drive.linked_pulls_map(items, pulls_for)
-        )
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        rows = eligibility.rows_from_items(items, pulls_by_key=found)
         return fake, rows
 
     def test_an_open_linked_pull_is_not_startable_by_policy_or_gate(self):
@@ -987,23 +1140,24 @@ class LinkedPullAgreementTest(unittest.TestCase):
         self.assertEqual((gated.verdict, gated.code), ("skip", "row"))
         self.assertIn("pull #9 is open", gated.reason)
 
-    def test_policy_and_gate_share_a_single_tracker_read(self):
+    def test_policy_and_gate_share_a_single_repo_listing(self):
         fake, rows = self.tracked_rows()
         policies.basic(rows, now=1000.0)
         gate(entry(row_=rows[0]))
-        self.assertEqual(fake.calls, [("linked_pulls", "app", 7)])
+        self.assertEqual(len(fake.calls), 1)
+        self.assertEqual(fake.calls[0][0], "pulls_index")
 
     def test_the_gate_takes_no_pull_seam(self):
         self.assertNotIn("pulls_for", inspect.signature(drive.gate).parameters)
+        self.assertNotIn("index_for", inspect.signature(drive.gate).parameters)
 
     def test_a_hold_label_on_a_linked_pull_names_the_pull(self):
         fake = FakeTracker()
-        fake.linked[("app", 7)] = [reading("app", 12, kind="pr", state="closed")]
-        pulls_for = drive.tracker_pulls_for(lambda repo: fake)
+        fake.index["app"] = {7: [reading("app", 12, kind="pr", state="closed")]}
+        index_for = drive.pulls_index_for(lambda repo: fake)
         items = [board_item()]
-        (built,) = eligibility.rows_from_items(
-            items, pulls_by_key=drive.linked_pulls_map(items, pulls_for)
-        )
+        found, _, _ = drive.linked_pulls_map([("app", 7)], index_for, max_calls=20)
+        (built,) = eligibility.rows_from_items(items, pulls_by_key=found)
         gated = gate(
             entry(row_=built),
             read_labels=labels_for({("issue", "app", 7): [], ("pr", "app", 12): ["hold"]}),

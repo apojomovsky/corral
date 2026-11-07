@@ -20,6 +20,8 @@ korapy is public. Nothing in it identifies a person, a host or an account, and t
 
 Use generic stand-ins: `example.com`, `suite@korapy.invalid`, `~/.config/korapy/`, "a project", `host-1`. The only named person in the repository is the copyright holder in `LICENSE`; everything else stays generic. A commit that slips is not fixed by a later commit; tell the maintainer before you push.
 
+One exception: the repository's own owner and name may appear in the README's CI status badge and clone URL, and nowhere else. An account that is not the repository owner never appears.
+
 ## Layout
 
 | Path | What |
@@ -79,7 +81,7 @@ The rules the design rests on:
    - it is covered by tests in the same PR.
 
    File everything else as an issue with `needs-triage` and a priority label. A deferral is an issue, not a paragraph in a PR body.
-4. **Takeoff:** `make pre-pr-check PR_BODY=<file>`, plus `TEST=1` for the full suite, and `make check`. Fix what they report.
+4. **Takeoff:** `make check`, then `make pre-pr-check PR_BODY=<file> TEST=1`. Fix what they report. When `make check` just passed on the same tree, `pre-pr-check` reuses that proof instead of running the suite again; with no fresh proof it runs the suite as before.
 5. **Open the PR** once, ready for review (never a draft). `Closes #N` comes first in the body (`Refs #N` for a partial win). The body says what changed and why, then `## Review`, which records:
    - the reviewer id;
    - the question asked;
@@ -95,7 +97,7 @@ The rules the design rests on:
 
 `priority:urgent` is the maintainers' alone.
 
-**README freshness.** When a change alters user-visible surface (CLI verbs or flags, install steps, config files, exit codes, `system-deps.toml`), update `README.md` in the same PR. If no README change is needed, say why in `## Review`. The README is the front door: what it is, install, a quickstart, links. Details go in `docs/`.
+**Docs freshness.** When a change alters user-visible surface (CLI verbs or flags, install steps, config files, exit codes, `system-deps.toml`), update the reference in the same PR: `docs/commands.md` for verbs, flags and exit codes, `docs/configuration.md` for settings, the install section of `docs/guide.md` for install steps and host programs. The README changes only when the pitch, the install or the quickstart changes; if none of those needs it, say why in `## Review`. The README is the front door: what it is, install, a quickstart, links. Details go in `docs/`.
 
 ## Approval gates
 

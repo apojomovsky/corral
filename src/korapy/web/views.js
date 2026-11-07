@@ -139,11 +139,13 @@ function errorCard(title, desc, body, todo) {
   return section;
 }
 
-// One labelled field with its help text: the label names the fact,
-// the value states it, the help says what it means.
+// One labelled field: the label names the fact, the value states
+// it, the help rides as a tooltip so the numbers lead. The help
+// stays in the source for the suite to pin, never as visible prose.
 function field(label, value, help) {
   const wrap = document.createElement("div");
   wrap.setAttribute("class", "field");
+  wrap.setAttribute("title", String(help));
   wrap.appendChild(el("dt", label));
   const shown = document.createElement("dd");
   if (typeof value === "string") {
@@ -152,7 +154,6 @@ function field(label, value, help) {
     shown.appendChild(value);
   }
   wrap.appendChild(shown);
-  wrap.appendChild(el("dd", String(help), { class: "help" }));
   const list = document.createElement("dl");
   list.setAttribute("class", "fields");
   list.appendChild(wrap);
@@ -178,6 +179,8 @@ function meter(frac, word, label) {
   const svg = document.createElementNS(SVG_NS, "svg");
   svg.setAttribute("width", String(BAR_WIDTH));
   svg.setAttribute("height", String(BAR_HEIGHT));
+  svg.setAttribute("viewBox", "0 0 " + String(BAR_WIDTH) + " " + String(BAR_HEIGHT));
+  svg.setAttribute("preserveAspectRatio", "none");
   svg.setAttribute("role", "img");
   svg.setAttribute("aria-label", label + " " + String(pct) + "%, " + state);
   const back = document.createElementNS(SVG_NS, "rect");
@@ -243,12 +246,21 @@ function quotaWindow(id, window, info, nowMs) {
 
 // One provider: its state in words, its reading's age, then one row
 // per window. A stale provider keeps its last numbers on screen under
-// a stale meter, never a zero bar.
+// a stale meter, never a zero bar. The stale reason renders the
+// snapshot's stale_reason field as-is; the words come from the server.
 function quotaProvider(name, info, nowMs) {
   const group = document.createElement("div");
+  group.setAttribute("class", info.stale ? "provider stale" : "provider");
+  if (info.stale) {
+    group.appendChild(el("span", "stale", { class: "badge stale" }));
+  }
   group.appendChild(el("h3", String(name)));
   const line = document.createElement("p");
-  line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + formatQuotaRead(info, nowMs))));
+  let read = formatQuotaRead(info, nowMs);
+  if (info.stale && typeof info.stale_reason === "string" && info.stale_reason !== "") {
+    read += ": " + info.stale_reason;
+  }
+  line.appendChild(document.createTextNode(cleanText(String(info.state) + ", " + read)));
   group.appendChild(line);
   if (typeof info.error === "string" && info.error !== "") {
     group.appendChild(el("p", "reader error: " + info.error));
@@ -353,10 +365,12 @@ function pressureText(pressure) {
 
 // One resource dimension: a labelled bar of charged against the host
 // budget, with both units spelled out. Without a budget there is no
-// bar, only the charged number and the reason.
+// bar, only the charged number and the reason. The help rides as a
+// tooltip so the numbers lead.
 function resourceDim(labelText, abbrTitle, valueText, frac, help) {
   const wrap = document.createElement("div");
   wrap.setAttribute("class", "field");
+  wrap.setAttribute("title", String(help));
   const term = document.createElement("dt");
   if (abbrTitle) {
     term.appendChild(el("abbr", labelText, { title: abbrTitle }));
@@ -373,7 +387,6 @@ function resourceDim(labelText, abbrTitle, valueText, frac, help) {
     shown.appendChild(barRow);
   }
   wrap.appendChild(shown);
-  wrap.appendChild(el("dd", help, { class: "help" }));
   const list = document.createElement("dl");
   list.setAttribute("class", "fields");
   list.appendChild(wrap);
@@ -491,32 +504,50 @@ function capacityCard(capacity) {
   }
   const section = card("capacity", desc);
   const info = capacity && typeof capacity === "object" ? capacity : {};
+  const live =
+    typeof info.live === "number" && Number.isFinite(info.live)
+      ? String(info.live)
+      : "not reported";
+  const totalCap =
+    typeof info.total_cap === "number" && Number.isFinite(info.total_cap)
+      ? String(info.total_cap)
+      : "not reported";
+  const repoCap =
+    typeof info.repo_cap !== "number" || !Number.isFinite(info.repo_cap)
+      ? "not reported"
+      : info.repo_cap === 0
+        ? "none"
+        : String(info.repo_cap) + " agents";
   section.appendChild(
     field(
       "Total capacity",
-      String(info.live) + " of " + String(info.total_cap) + " tickets live",
+      live + " of " + totalCap + " tickets live",
       "How many agents the host admits in total.",
     ),
   );
   section.appendChild(
     field(
       "Per-repo cap",
-      info.repo_cap === 0 ? "none" : String(info.repo_cap) + " agents",
+      repoCap,
       "How many agents one repo may hold. None means no per-repo limit.",
     ),
   );
   section.appendChild(
     field(
       "Live now",
-      String(info.live) + " tickets",
+      live === "not reported" ? "not reported" : live + " tickets",
       "Tickets with a live agent right now: one ticket holds one slot.",
     ),
   );
-  const pending = Array.isArray(info.pending) ? info.pending : [];
+  const pending = Array.isArray(info.pending) ? info.pending : null;
   section.appendChild(
     field(
       "Pending",
-      pending.length === 0 ? "none" : pending.map((name) => String(name)).join(", "),
+      pending === null
+        ? "not reported"
+        : pending.length === 0
+          ? "none"
+          : pending.map((name) => String(name)).join(", "),
       "Launches waiting for a slot. The host does not track a queue yet.",
     ),
   );
@@ -601,11 +632,17 @@ function driveCard(drive, nowMs) {
       typeof info.pause_reason === "string" && info.pause_reason !== ""
         ? info.pause_reason
         : "no reason recorded";
+    const pauseFile =
+      typeof info.pause_file === "string" && info.pause_file !== ""
+        ? info.pause_file
+        : "the drive pause file";
     section.appendChild(
       field(
         "Status",
         "paused: " + reason,
-        "The loop starts nothing while paused. It resumes when the drive.pause file is removed from the state dir.",
+        "The loop starts nothing while paused. It resumes when the " +
+          pauseFile +
+          " is removed from the state dir.",
       ),
     );
   } else {
@@ -919,24 +956,30 @@ function headerLine(header) {
   const desc = "Agents on this host right now. Finished entries are history, not agents.";
   if (isErrorSection(header)) {
     return errorCard(
-      "agents",
+      "fleet",
       desc,
       header,
       "The agent registry could not be read, so no counts can be shown. Check the host with korapy doctor.",
     );
   }
   const info = header && typeof header === "object" ? header : {};
-  const live = typeof info.agents_live === "number" ? info.agents_live : 0;
-  const stale = typeof info.agents_stale === "number" ? info.agents_stale : 0;
+  const live =
+    typeof info.agents_live === "number" && Number.isFinite(info.agents_live)
+      ? String(info.agents_live) + " live"
+      : "live not reported";
+  const stale =
+    typeof info.agents_stale === "number" && Number.isFinite(info.agents_stale)
+      ? String(info.agents_stale) + " stale"
+      : "stale not reported";
   const finished = typeof info.agents_finished === "number" ? info.agents_finished : 0;
-  const section = card("agents", desc);
+  const section = card("fleet", desc);
   section.setAttribute("class", "card strip");
   const line = document.createElement("p");
   line.setAttribute("class", "headline");
   const count = document.createElement("strong");
-  count.textContent = cleanText(String(live) + " live");
+  count.textContent = cleanText(live);
   line.appendChild(count);
-  line.appendChild(document.createTextNode(cleanText(", " + String(stale) + " stale")));
+  line.appendChild(document.createTextNode(cleanText(", " + stale)));
   section.appendChild(line);
   if (finished > 0) {
     const box = document.createElement("details");

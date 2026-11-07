@@ -133,6 +133,20 @@ class TrackerItem(NamedTuple):
     extra: dict | None = None  # board concepts; normalized to {} on read
 
 
+class PullsIndex(NamedTuple):
+    """One repo's open pull requests, keyed by linked ticket number.
+
+    ``by_issue`` maps each linked ticket to its open pull requests,
+    oldest first; ``calls`` counts the listing calls the index cost;
+    ``complete`` is False when the caller's budget stopped the listing
+    early, leaving a partial index the caller must fail closed on.
+    """
+
+    by_issue: dict[int, list[TrackerItem]]
+    calls: int
+    complete: bool
+
+
 class Tracker(Protocol):
     """Tickets and their change feed, provider-neutral."""
 
@@ -155,16 +169,20 @@ class Tracker(Protocol):
         """Every item, for a full resync."""
         ...
 
-    def linked_pulls(self, repo: str, number: int) -> list[TrackerItem]:
-        """Every open pull request linked to the ticket.
+    def pulls_index(self, repo: str, max_calls: int) -> PullsIndex:
+        """The open pull requests on ``repo``, keyed by linked ticket.
 
-        A pull request links to a ticket when it references it the way
-        the adapter reads as closing or relating it (on GitHub: a
-        close keyword or `Refs` line naming the ticket in the title or
-        body, outside fenced code). Only open pull requests are
-        returned, oldest first. A failed call raises `TrackerError`; a
-        rate-limit answer raises `TrackerRateLimited` with the seconds
-        to wait.
+        One paged listing, not one read per ticket: a pull request
+        links to a ticket when it references it the way the adapter
+        reads as closing or relating it (on GitHub: a close keyword
+        or `Refs` line naming the ticket in the title or body, outside
+        fenced code). ``by_issue`` maps each linked ticket number to
+        its open pull requests, oldest first; ``calls`` counts the
+        listing calls the index cost; ``complete`` is False when
+        ``max_calls`` stopped the listing early, in which case the
+        index is partial and callers fail closed. A failed call raises
+        `TrackerError`; a rate-limit answer raises `TrackerRateLimited`
+        with the seconds to wait.
         """
         ...
 
@@ -369,6 +387,23 @@ class BoardPopulate(NamedTuple):
     added: tuple[str, ...]
     kept: tuple[str, ...]
     refused: tuple[str, ...]
+
+
+class BoardAdopt(NamedTuple):
+    """The adopt-missing outcome for one board pass: added, kept, refused.
+
+    The pass adds open and recently closed issues missing from the
+    board, up to its cap, through the one shared adder; each entry of
+    ``refused`` is a fix line for one issue the pass could not add,
+    retried on the next pass. ``stopped`` carries the rate limit that
+    halted the run as ``(message, retry_after)``, or ``None`` when the
+    run finished; the rest carries to the next pass.
+    """
+
+    added: tuple[str, ...]
+    kept: tuple[str, ...]
+    refused: tuple[str, ...]
+    stopped: tuple[str, float] | None
 
 
 def render_provision(repo: str, provision: BoardProvision) -> str:

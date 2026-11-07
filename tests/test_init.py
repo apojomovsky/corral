@@ -286,6 +286,7 @@ TAIL = """# Defaults: uncomment to override.
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
+# board.add_per_pass = 20  # missing board issues added per repo per pass (default: 20; 0 or less adopts nothing)
 # board.hold_label = "hold"  # label that holds a ticket for a human
 # board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
 # board.poll_pages = 5  # board poll page cap per pass (default: small)
@@ -307,6 +308,7 @@ TAIL = """# Defaults: uncomment to override.
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -330,6 +332,7 @@ TAIL = """# Defaults: uncomment to override.
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
+# quota.refresh_after_s = 900  # seconds after a read before the drive pass refreshes it
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
 #
 # [registry]
@@ -423,6 +426,7 @@ commits.conventional = false
 # agents.unit_prefix = "korapy-agent-"  # prefix of transient agent unit names
 #
 # [board]
+# board.add_per_pass = 20  # missing board issues added per repo per pass (default: 20; 0 or less adopts nothing)
 # board.hold_label = "hold"  # label that holds a ticket for a human
 # board.item_max_age_s = 300  # seconds before a freshness-gated read re-reads a board row live
 # board.poll_pages = 5  # board poll page cap per pass (default: small)
@@ -443,6 +447,7 @@ commits.conventional = false
 # drive.fix_round_threshold = "normal"  # lowest review finding severity that still opens a fix round (high, normal or low): an approving review below it is merge-ready
 # drive.max_starts_per_day = 50  # real starts one dispatch pass may launch per calendar day (plans never count)
 # drive.period = "*:0/5"  # systemd OnCalendar cadence at which the installed timer wakes a pass
+# drive.pulls_max_calls = 20  # max GitHub calls one pass spends listing open pull requests (tickets past the cap fail closed)
 #
 # [git]
 # git.branch = "{type}/{issue}-{slug}"  # branch name template
@@ -465,6 +470,7 @@ commits.conventional = false
 #
 # [quota]
 # quota.low_pct = 90  # usage percent at which a provider reads low
+# quota.refresh_after_s = 900  # seconds after a read before the drive pass refreshes it
 # quota.unknown_blocks = false  # an unknown provider blocks its roles instead of passing them
 #
 # [registry]

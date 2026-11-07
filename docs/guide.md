@@ -168,8 +168,12 @@ What you should see from `korapy quota` before any provider exists is
 one line: `no providers`. `refresh` runs the readers and records
 readings or failures. `mark` blocks a provider until the given epoch
 seconds (default: now plus the cooldown); `unmark` releases it early.
-A dead reader shows in `korapy quota` and the doctor but does not stop
-the fleet.
+Every reading prints its age, and a stale one says why: `never ran`,
+`reader failed`, or `too old`. A dead reader shows in `korapy quota`
+and the doctor but does not stop the fleet. The dispatch pass
+refreshes readings older than the `quota.refresh_after_s` setting
+(default 900 seconds) by itself, recording failures the same way the
+verb does, so admission and the dashboard keep seeing a fresh ledger.
 
 Then the host budget. With no `[resources.host]` table nothing is
 enforced: launches set no slice properties and the doctor warns, as in
@@ -461,7 +465,11 @@ korapy mirror --limit N
 `sync` feeds the board store from the tracker's change feed
 (`--resync` rebuilds from the full listing, `--audit N` re-reads the N
 rows verified least recently, `--push` mirrors the outbox after). A
-board repo runs the feed step and then the board step. Exit 1 when
+board repo runs the feed step and then the board step. A complete
+board step also adds the tracker's missing open and recently closed
+issues to the board, up to `board.add_per_pass` per repo per pass; a failed add
+is logged with the issue number and retried on the next pass, and a
+rate limit stops the adopt with the rest left for the next pass. Exit 1 when
 nothing changed or the only failures are refused reads, 3 when the
 tracker is unreachable, 4 when stored rows are corrupt and nothing
 synced. `mirror` pushes queued writes oldest first; exit 0 when a
@@ -562,16 +570,11 @@ the verb, point the clone's origin remote at the new URL and set
 `tracker.repo` to the new name, then remove the pause file and
 re-run `korapy doctor`.
 
-Exit codes are a public interface; scripts branch on them:
-
-| Code | Meaning |
-| --- | --- |
-| 0 | Success (under `--plan`: the plan holds) |
-| 1 | Nothing to do, or a gate said no |
-| 2 | Race lost or already running: retry later |
-| 3 | GitHub, systemd or a host unreachable |
-| 4 | Configuration or usage error |
-| 75 | No free slot (try later) |
+Exit codes are a public interface; scripts branch on them. The full
+table lives in [`commands.md`](commands.md): 0 is success (under
+`--plan`: the plan holds), 1 means nothing to do or a gate said no, 2
+means a lost race, 3 an unreachable host, 4 a usage error, and 75
+means no free slot, so try later.
 
 An empty event queue is not a failure: `coord events` prints an empty
 list and exits 0. Scripts that need an exit code use `coord wait` in a
