@@ -283,6 +283,46 @@ def limits(found: list[Project], *, total_cap: int, repo_cap: int) -> admission.
     return built
 
 
+def _effective_cap(project: Project, total_cap: int) -> int | None:
+    """The slots `project` may still take: its ceiling clamped to the host total.
+
+    The same clamp `limits` applies for the count gate, so the budget
+    split and the count admission agree on who can start agents. None
+    (uncapped) reads as the whole total.
+    """
+    if project.ceiling is None:
+        return total_cap
+    return min(project.ceiling, total_cap)
+
+
+def budget_shares(found: list[Project], *, total_cap: int) -> dict[str, dict]:
+    """The resource shares for the host budget split, keyed by project name.
+
+    The one resolver for which projects share the budget: the budget
+    derivation, the slice reconciliation and the doctor row all read it,
+    so the can-this-project-launch rule lives in exactly one place.
+
+    A project whose effective cap is 0 (a ceiling of 0, or a host total
+    of 0) can start no agent, so it reserves nothing: its weight and
+    floors read as zero, and a floor on it is ignored. Its name stays in
+    the table with its configured ceilings, so its own share caps at
+    zero and raising the ceiling restores its old share on the next
+    launch. Every other project passes its `[resources]` table through
+    unchanged.
+    """
+    shares = {}
+    for project in found:
+        table = dict(project.resources or {})
+        if _effective_cap(project, total_cap) == 0:
+            table["weight"] = 0
+            for key in _RESOURCE_FLOORS.values():
+                table[key] = 0
+            for key in _RESOURCE_CEILINGS.values():
+                table.setdefault(key, None)
+        shares[project.name] = table
+    return shares
+
+
 def check_and_sources(
     config_dir: str | None = None,
 ) -> tuple[list[str], list[tuple[str, str, str | None]]]:

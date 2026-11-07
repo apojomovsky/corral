@@ -299,7 +299,9 @@ def _ensure_slices(decided, run):
     """Create the host slice then the project slice with their limits, in order.
 
     Nothing is created when no host budget is configured. An existing
-    slice reads as created; parents always precede their children.
+    slice reads as created; parents always precede their children. A
+    zero share (a ceiling-0 project reserves nothing) starts the slice
+    with no limits.
     """
     if decided.host is None:
         return
@@ -397,7 +399,7 @@ def admit(
     now = None
     where = os.path.join(paths.config_dir(), settings.HOST_CONFIG_NAME)
     if base.host is not None:
-        shares = {entry.name: (entry.resources or {}) for entry in registered}
+        shares = projects.budget_shares(registered, total_cap=tgt.resolved["admission.total_cap"])
         limits = resources.join(base, shares, ledger.get("foreign", []), where=where)
         now = (now_fn or time.time)()
         _require_role_price(tgt, role, where)
