@@ -184,6 +184,11 @@ class Env(NamedTuple):
     #: or the exception reading it raised. None means the caller has no
     #: reading, and then the report carries no quota row.
     quota_view: Mapping[str, object] | Exception | None = None
+    #: Every resolving eligibility entry as (project, entry, source
+    #: file), gathered once by production. None means the caller has no
+    #: reading, and then the ok row stays generic; a bad entry is
+    #: already a failing row through `project_problems`.
+    project_policies: Sequence[tuple[str, str, str | None]] | None = None
 
 
 def _check_deps(results: Sequence[deps.Result], error: str | None = None) -> list[Check]:
@@ -323,26 +328,45 @@ def _check_drive_timer(state: str | None) -> list[Check]:
     ]
 
 
-def _check_drive_projects(problems: Sequence[str] | None) -> list[Check]:
+def _check_drive_projects(
+    problems: Sequence[str] | None,
+    policies: Sequence[tuple[str, str, str | None]] | None = None,
+) -> list[Check]:
     """The registry row: no row without a reading, one fail row joining
-    every bad registration and every unreadable policy entry."""
+    every bad registration and every unreadable policy entry, else one
+    ok row naming the file each resolving entry loaded from."""
     if problems is None:
         return []
-    if not problems:
+    if problems:
+        return [
+            Check(
+                "drive-projects",
+                "fail",
+                "; ".join(problems),
+                "fix the named registration file or policy entry, then run `korapy doctor` again",
+            )
+        ]
+    if policies:
+        joined = "; ".join(
+            f"project {name}: {entry!r} loaded from {source}"
+            if source
+            else f"project {name}: {entry!r} loaded"
+            for name, entry, source in policies
+        )
         return [
             Check(
                 "drive-projects",
                 "ok",
-                "every registration loads and every policy entry resolves",
+                f"every registration loads and every policy entry resolves: {joined}",
                 "",
             )
         ]
     return [
         Check(
             "drive-projects",
-            "fail",
-            "; ".join(problems),
-            "fix the named registration file or policy entry, then run `korapy doctor` again",
+            "ok",
+            "every registration loads and every policy entry resolves",
+            "",
         )
     ]
 
@@ -857,7 +881,7 @@ def run_checks(env: Env) -> list[Check]:
         _check_linger(env.user, env.run),
         _check_manager(env.unit_prefix, env.list_fn),
         *_check_drive_timer(env.timer_state),
-        *_check_drive_projects(env.project_problems),
+        *_check_drive_projects(env.project_problems, env.project_policies),
         *_check_readers(env.reader_errors),
         *check_quota(env.quota_view),
         _check_registry(env.registry_rows, env.registry_error),
@@ -1552,14 +1576,42 @@ def load_resource_readings(
     )
 
 
+def load_project_report() -> tuple[list[str], list[tuple[str, str, str | None]] | None]:
+    """Registry problems plus every resolving policy entry, in one pass.
+
+    Returns (problems, sources): `sources` holds one (project, entry,
+    source file) per resolving entry, or None when the registry cannot
+    even be listed. Each policy module imports once here, so a policy's
+    top-level code runs once per report, not once per answer. A
+    gathering failure is one problem and no sources, never a
+    traceback. The one loader for the live report; the two readers
+    below are thin views over it.
+    """
+    try:
+        problems, sources = projects.check_and_sources()
+    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
+        return [str(err)], None
+    return problems, list(sources)
+
+
 def load_project_problems() -> list[str]:
     """The registry problems for the live report: bad files and policy
     entries that do not resolve. A gathering failure is one problem
-    naming it, never a traceback."""
-    try:
-        return list(projects.check())
-    except (projects.ProjectsError, paths.PathError, settings.SettingsError, OSError) as err:
-        return [str(err)]
+    naming it, never a traceback. One view over `load_project_report`,
+    so reading problems never re-imports a policy module."""
+    problems, _ = load_project_report()
+    return problems
+
+
+def load_project_policies() -> list[tuple[str, str, str | None]] | None:
+    """Every resolving eligibility entry for the live report, as
+    (project, entry, source file). Empty when nothing resolves: then
+    the ok row stays generic and any failure already reads through
+    `load_project_problems`. Entries that do not resolve are skipped
+    here and reported there. One view over `load_project_report`, so
+    reading sources never re-imports a policy module."""
+    _, sources = load_project_report()
+    return sources
 
 
 def load_profile_state(resolved, settings_error: str | None) -> ProfileState:
@@ -1853,7 +1905,7 @@ def production_env() -> Env:
         tracker_factory=production_tracker_factory,
         push_probe=push_probe,
     )
-    project_problems = load_project_problems()
+    project_problems, project_policies = load_project_report()
     timer_state = load_timer_state()
     hub_url = _production_hub_url(resolved)
     hub_token = read_hub_token() if hub_url else None
@@ -1885,6 +1937,7 @@ def production_env() -> Env:
         board_error=board_error,
         repo_sites=repo_sites,
         project_problems=project_problems,
+        project_policies=project_policies,
         timer_state=timer_state,
         hub_url=hub_url or None,
         hub_auth=hub_auth,

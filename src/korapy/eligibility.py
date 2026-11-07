@@ -14,9 +14,15 @@ world is a configuration error in that project, never a new seam.
 
 The entry is either a dotted ``module:function`` name or a
 ``path/to/policy.py:function`` file path. Korapy's callers pass the
-project's registered ops root as `base`, so a relative file path
+project's registered ops root as `base`: a relative file path
 resolves against that root rather than the process working directory,
-and the same entry loads from a shell and under a unit.
+and a dotted module imports with that root first on the import search
+path, so a policy file sitting beside `korapy.toml` needs no
+installation and the same entry loads from a shell and under a unit.
+The previous search path is restored before returning, also on
+failure. When the same module name exists both in the ops root and
+elsewhere, the ops root's copy wins; `LoadedPolicy.source` records
+which file was loaded.
 A project without the entry registers no candidates; loading failures
 are configuration errors (exit 4) naming the project and the entry,
 blocking only that project.
@@ -31,7 +37,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
-from korapy import board
+from korapy import accounts, board
 
 #: The request kinds a policy may return (section 2 of `04-dispatch-loop.md`).
 KINDS = ("start", "resume", "review", "fix")
@@ -158,8 +164,129 @@ def rows_from_items(
     return rows
 
 
-def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[..., Any]:
-    """The callable an entry names, dotted or file path. Never called here."""
+def _module_files(module: Any) -> list[str]:
+    """The files a cached module loaded from: its file plus package dirs."""
+    files = []
+    file = getattr(module, "__file__", None)
+    if isinstance(file, str) and file:
+        files.append(file)
+    try:
+        locations = list(getattr(module, "__path__", None) or [])
+    except TypeError:
+        locations = []
+    files.extend(entry for entry in locations if isinstance(entry, str) and entry)
+    return files
+
+
+def _under_root(path: str, root: str) -> bool:
+    """Whether `path` is the root itself or something inside it."""
+    real = os.path.realpath(path)
+    return real == root or real.startswith(root + os.sep)
+
+
+def _root_provides(root: str, name: str) -> bool:
+    """Whether the ops root holds the top-level package or module `name`.
+
+    A bare directory counts: a namespace package (no `__init__.py`)
+    is still a copy the root provides, so it evicts a cached copy
+    like a regular one instead of silently keeping it.
+    """
+    package = os.path.join(root, *name.split("."))
+    return (
+        os.path.isfile(package + ".py")
+        or os.path.isfile(os.path.join(package, "__init__.py"))
+        or os.path.isdir(package)
+    )
+
+
+def _import_dotted(head: str, *, entry: str, project: str, base: str | None = None) -> Any:
+    """The module `head` names, with the ops root first when `base` is given.
+
+    The import runs through the shared import-path helper accounts uses
+    for readers, so prepending and restoring happen in exactly one
+    place. Prepending (never appending) keeps an ops-root copy winning
+    over an installed copy of the same name. The module cache does not
+    consult that path, so with an ops root the cached entries for the
+    module (and an ancestor package the root provides) whose files live
+    elsewhere are set aside before importing and put back afterwards:
+    one project's policy cannot leak into the next project's load, and
+    a name imported earlier still resolves to the ops root's copy.
+    When the root provides the name but the import still resolves
+    elsewhere (a regular package always beats the root's namespace
+    copy, whatever the path order), that is a configuration error
+    naming the project and the entry, never a quiet wrong policy.
+    """
+    dirs = [base] if base else []
+    with accounts.with_reader_path(dirs):
+        if not base:
+            try:
+                return importlib.import_module(head)
+            except Exception as err:
+                raise EligibilityError(
+                    f"project {project}: eligibility {entry!r} does not import: {err}"
+                ) from None
+        root = os.path.realpath(base)
+        saved: dict[str, Any] = {}
+        stashed = [
+            head,
+            *[".".join(head.split(".")[:depth]) for depth in range(1, len(head.split(".")))],
+        ]
+        for key in [name for name in stashed if name in sys.modules]:
+            if key != head and not _root_provides(root, key):
+                continue
+            module = sys.modules[key]
+            files = _module_files(module)
+            if files and all(not _under_root(found, root) for found in files):
+                saved[key] = module
+                del sys.modules[key]
+        for key in [
+            name for name in list(sys.modules) if name.startswith(head + ".") and name not in saved
+        ]:
+            module = sys.modules[key]
+            files = _module_files(module)
+            if files and all(not _under_root(found, root) for found in files):
+                saved[key] = module
+                del sys.modules[key]
+        before = set(sys.modules)
+        try:
+            module = importlib.import_module(head)
+            loaded = _module_files(module)
+            if _root_provides(root, head) and (
+                not loaded or all(not _under_root(found, root) for found in loaded)
+            ):
+                shown = loaded[0] if loaded else "an unknown file"
+                raise EligibilityError(
+                    f"project {project}: eligibility {entry!r} loaded from {shown} "
+                    f"instead of the ops root {root}"
+                )
+            return module
+        except EligibilityError:
+            raise
+        except Exception as err:
+            raise EligibilityError(
+                f"project {project}: eligibility {entry!r} does not import: {err}"
+            ) from None
+        finally:
+            for key in [
+                name
+                for name in list(sys.modules)
+                if (name == head or name.startswith(head + ".") or head.startswith(name + "."))
+                and name not in before
+                and name not in saved
+            ]:
+                sys.modules.pop(key, None)
+            sys.modules.update(saved)
+
+
+def _resolve(
+    entry: str, *, project: str, base: str | None = None
+) -> tuple[Callable[..., Any], str | None]:
+    """The callable an entry names plus the file its module loaded from.
+
+    Dotted or file path; never called here. `source` is the module
+    file (None when the module reports none), so a shadowed name shows
+    which copy won.
+    """
     head, sep, attrs = entry.partition(":")
     if not sep or not head or not attrs:
         raise EligibilityError(
@@ -167,14 +294,12 @@ def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[.
             "module:function or path/to/policy.py:function"
         )
     if "/" in head or os.sep in head or head.endswith(".py"):
-        target: Any = _load_file(head, entry=entry, project=project, base=base)
+        module, source = _load_file(head, entry=entry, project=project, base=base)
+        target: Any = module
     else:
-        try:
-            target = importlib.import_module(head)
-        except Exception as err:
-            raise EligibilityError(
-                f"project {project}: eligibility {entry!r} does not import: {err}"
-            ) from None
+        module = _import_dotted(head, entry=entry, project=project, base=base)
+        source = getattr(module, "__file__", None)
+        target = module
     for attr in attrs.split("."):
         try:
             target = getattr(target, attr)
@@ -184,14 +309,15 @@ def _resolve(entry: str, *, project: str, base: str | None = None) -> Callable[.
             ) from None
     if not callable(target):
         raise EligibilityError(f"project {project}: eligibility {entry!r} is not callable")
-    return target
+    return target, source
 
 
-def _load_file(path: str, *, entry: str, project: str, base: str | None = None) -> Any:
-    """The module at `path`, imported under a name derived from the path.
+def _load_file(path: str, *, entry: str, project: str, base: str | None = None) -> tuple[Any, str]:
+    """The module at `path` plus the absolute file it loaded from.
 
     A relative `path` resolves against `base`, the project's registered
     ops root; without a base it stays relative to the working directory.
+    The module imports under a name derived from the path.
     """
     if base is not None and not os.path.isabs(path):
         path = os.path.join(base, path)
@@ -209,7 +335,7 @@ def _load_file(path: str, *, entry: str, project: str, base: str | None = None) 
         raise EligibilityError(
             f"project {project}: eligibility {entry!r} does not import: {err}"
         ) from None
-    return module
+    return module, os.path.abspath(path)
 
 
 @dataclass(frozen=True)
@@ -219,11 +345,14 @@ class LoadedPolicy:
     `eligible(rows, *, now)` is the pure call: it runs the entry over
     the rows and returns the validated requests heaviest first. A bad
     answer is an EligibilityError naming the project and the entry.
+    `source` is the file the entry's module loaded from (None when the
+    module reports none), so a shadowed name shows which copy won.
     """
 
     project: str
     entry: str
     func: Callable[..., Any] = field(compare=False)
+    source: str | None = None
 
     def eligible(self, rows: Sequence[TicketRow], *, now: float) -> list[StartRequest]:
         try:
@@ -283,13 +412,16 @@ def load_policy(entry: str, *, project: str, base: str | None = None) -> LoadedP
     calls the entry function; the module's own top-level code runs on
     import, which is the in-process trust boundary for policy code.
 
-    `base` is the project's registered ops root, against which a
-    relative file path resolves. Raises EligibilityError (exit 4)
-    naming the project and the entry.
+    `base` is the project's registered ops root: a relative file path
+    resolves against it, and a dotted module imports with it first on
+    the import search path (restored before returning, also on
+    failure), so the ops root's copy wins over an installed one.
+    `source` on the returned policy records which file the module
+    loaded from. Raises EligibilityError (exit 4) naming the project
+    and the entry.
     """
-    return LoadedPolicy(
-        project=project, entry=entry, func=_resolve(entry, project=project, base=base)
-    )
+    func, source = _resolve(entry, project=project, base=base)
+    return LoadedPolicy(project=project, entry=entry, func=func, source=source)
 
 
 def check_entry(entry: str, *, project: str, base: str | None = None) -> str | None:
