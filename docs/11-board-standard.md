@@ -924,8 +924,9 @@ Decision: the same board step also sets the `Status` column from the
 issue's state, so a project board keeps itself current. The project
 names its option ids in `[repo.board]` (`status_available`,
 `status_claimed`, `status_review`, `status_done`); option ids live in
-the file, display names stay comments, and the pass never matches a
-name in code. A project that maps none of them keeps today's
+the file, display names stay comments, and the pass matches the live
+display name through the schema's option ids against the configured
+ones. A project that maps none of them keeps today's
 read-only behavior; a partial map syncs only what it names.
 
 Derived state, in order: a closed issue means done; an open linked
