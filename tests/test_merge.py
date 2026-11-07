@@ -629,6 +629,7 @@ class PendingWaitTest(MergeCase):
         self.assertFalse(result.merged)
         self.assertEqual(sleeps, [])
         self.assertEqual(len(fake.requested), 1)
+        self.assertEqual(fake.pending_requested, [])
 
     def test_wait_with_an_already_failing_row_returns_after_one_read(self):
         fake = SequenceForge([self.pr("failing")])

@@ -468,7 +468,10 @@ def _read_and_evaluate(
     read the PR never pay for it.
     """
     pr = forge.pull_request(repo, number)
-    pending = _pending_count(forge, repo, pr.head_sha) if pr.checks_state == "pending" else None
+    if pr.checks_state == "pending" and "checks" not in skip_set:
+        pending = _pending_count(forge, repo, pr.head_sha)
+    else:
+        pending = None
     return _evaluate(ticket_repo, ticket_number, pr, head, skip_set, cwd, lock_detail, pending)
 
 
