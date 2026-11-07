@@ -282,6 +282,7 @@ class WrappedBindingGuardTest(unittest.TestCase):
             "walrus in comprehension",
             "[(_DUP := render(item)) for item in items]\n_DUP = None\n",
         ),
+        ("annotated assignment rebinds", "X: int = 1\nX = 2\n"),
     ]
 
     CLEAN_CASES = [
@@ -303,7 +304,8 @@ class WrappedBindingGuardTest(unittest.TestCase):
         for label, source in self.CASES:
             with self.subTest(wrapper=label):
                 names = [name for name, _, _ in top_level_bindings(ast.parse(source))]
-                self.assertEqual(names.count("_DUP"), 2)
+                doubled = {name for name in names if names.count(name) == 2}
+                self.assertEqual(len(doubled), 1)
 
     def test_clean_cases_bind_no_name_twice(self):
         with tempfile.TemporaryDirectory(prefix="korapy-guard-clean-") as directory:
