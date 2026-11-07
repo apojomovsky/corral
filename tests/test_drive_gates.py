@@ -1090,6 +1090,9 @@ class PullsCheckNeededTest(unittest.TestCase):
     def test_a_foreign_claim_needs_no_check(self):
         self.assertFalse(self.check(board_item(agent="human-1")))
 
+    def test_a_wanted_key_with_no_row_needs_no_check(self):
+        self.assertFalse(drive.pulls_check_needed(None, hold_label="hold"))
+
 
 class LinkedPullAgreementTest(unittest.TestCase):
     """Policy and gate read the one tracker-sourced row pulls.
