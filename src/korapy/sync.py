@@ -302,6 +302,53 @@ def _resolve_status_pulls(reader, repo, *, max_calls):
     )
 
 
+class StatusPulls(NamedTuple):
+    """The Status step's setup plus its resolved pulls, from `status_pulls`.
+
+    ``setup`` is the step's activation triple (None when the project is
+    unmapped), ``pulls`` the issue numbers holding an open linked pull
+    (None when the listing is unknown), ``pulls_error`` why it is
+    unknown, and ``rate_limited`` the rate-limit error when the listing
+    was limited: the caller halts or notes it, and ``pulls`` stays
+    unknown either way.
+    """
+
+    setup: tuple | None
+    pulls: set[int] | None
+    pulls_error: str
+    rate_limited: iface.TrackerRateLimited | None
+
+
+def status_pulls(reader, schema, repo, cards, *, pulls_max_calls, uncapped=False):
+    """``StatusPulls`` for one repo: the setup gate plus one pulls listing.
+
+    The one resolver the pass and the sweep plan share: the setup gate
+    first, so an unmapped project resolves without contacting the
+    tracker; then one ``pulls_index`` listing when an open ticket needs
+    pulls, capped by ``pulls_max_calls`` (None reads the host setting).
+    A closed-only poll lists nothing, the way the pass already skips
+    it. A limited listing resolves to unknown pulls with the rate-limit
+    error carried for the caller; any other listing failure resolves to
+    unknown pulls with its line.
+    """
+    setup = _status_setup(reader, schema, uncapped=uncapped)
+    if setup is None:
+        return StatusPulls(None, set(), "", None)
+    if not any(
+        getattr(card, "kind", "issue") == "issue" and card.state != "closed" for card in cards
+    ):
+        return StatusPulls(setup, set(), "", None)
+    try:
+        pulls, pulls_error = _resolve_status_pulls(
+            reader, repo, max_calls=_pulls_budget(pulls_max_calls)
+        )
+    except iface.TrackerRateLimited as err:
+        return StatusPulls(setup, None, "", err)
+    except iface.TrackerError as err:
+        return StatusPulls(setup, None, str(err), None)
+    return StatusPulls(setup, pulls, pulls_error, None)
+
+
 def sync_board_status(
     store, reader, schema, repo, cards, *, now, pulls=None, pulls_error="", uncapped=False
 ) -> StatusOutcome:
@@ -380,39 +427,33 @@ def sync_board_status(
 def _sync_board_status(store, reader, schema, repo, cards, *, now, pulls_max_calls, uncapped=False):
     """The Status step with its pulls resolved once for the repo.
 
-    Skips the listing when the step cannot write or no open ticket
-    needs pulls, so unmapped projects and closed-only polls never
-    contact the tracker. A rate-limited listing halts the step with
-    the outage line; an unreadable or capped one rests the open cards
-    with the cause while closed cards still derive Done. Returns the
-    outcome with the resolved pulls, so the drift recording reads the
-    same listing instead of resolving it twice; a halted listing
-    resolves to unknown, and the recording rests the open cards too.
+    Resolves through `status_pulls`, the accessor the sweep plan
+    shares: an unmapped project or a closed-only poll lists nothing,
+    so neither contacts the tracker. A rate-limited listing halts the
+    step with the outage line; an unreadable or capped one rests the
+    open cards with the cause while closed cards still derive Done.
+    Returns the outcome with the resolved pulls, so the drift recording
+    reads the same listing instead of resolving it twice; a halted
+    listing resolves to unknown, and the recording rests the open cards
+    too.
     """
-    pulls: set[int] | None = set()
-    pulls_error = ""
-    if _status_setup(reader, schema, uncapped=uncapped) is not None and any(
-        getattr(card, "kind", "issue") == "issue" and card.state != "closed" for card in cards
-    ):
-        try:
-            pulls, pulls_error = _resolve_status_pulls(
-                reader, repo, max_calls=_pulls_budget(pulls_max_calls)
-            )
-        except iface.TrackerRateLimited as err:
-            return (
-                StatusOutcome(
-                    (),
-                    (
-                        f"{repo}: board status rate limited, retry after {err.retry_after:g}s"
-                        f" ({err}); the rest carries to the next pass",
-                    ),
-                    (),
+    resolved = status_pulls(
+        reader, schema, repo, cards, pulls_max_calls=pulls_max_calls, uncapped=uncapped
+    )
+    limited = resolved.rate_limited
+    if limited is not None:
+        return (
+            StatusOutcome(
+                (),
+                (
+                    f"{repo}: board status rate limited, retry after {limited.retry_after:g}s"
+                    f" ({limited}); the rest carries to the next pass",
                 ),
-                None,
-                "",
-            )
-        except iface.TrackerError as err:
-            pulls, pulls_error = None, str(err)
+                (),
+            ),
+            None,
+            "",
+        )
     return (
         sync_board_status(
             store,
@@ -421,12 +462,12 @@ def _sync_board_status(store, reader, schema, repo, cards, *, now, pulls_max_cal
             repo,
             cards,
             now=now,
-            pulls=pulls,
-            pulls_error=pulls_error,
+            pulls=resolved.pulls,
+            pulls_error=resolved.pulls_error,
             uncapped=uncapped,
         ),
-        pulls,
-        pulls_error,
+        resolved.pulls,
+        resolved.pulls_error,
     )
 
 
