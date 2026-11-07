@@ -398,6 +398,8 @@ def sync_board_status(
         derived = boardstatus.derive(card.state, has_open_pull, claimed)
         extra = card.extra if isinstance(card.extra, dict) else {}
         current_name = extra.get("board_status") or ""
+        if not isinstance(current_name, str):
+            current_name = ""
         current = by_name.get(current_name) if current_name else ""
         record = store.status_set_of(card.repo, card.number)
         action, payload = boardstatus.decide(current, record, derived, ids)
