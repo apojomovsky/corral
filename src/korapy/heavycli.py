@@ -12,9 +12,9 @@ scope limits, and records the reason in the lane journal; a bare
 `takeoff` is reserved for the module call). `status` shows holders,
 waiters, learned costs and the last few recent rows. `rollup` regenerates the portable per-key cost summary from
 the raw run ledger: stdout always carries the JSON document, the
-default file at `heavy.rollup_path()` is refreshed with the same
-bytes, and `--out PATH` additionally writes them for the operator to
-commit. Exit codes follow the public table: 0 ok, 1 nothing to do
+default file at `heavy.rollup_path()` is refreshed atomically with
+the same bytes, and `--out PATH` additionally writes them atomically
+wherever the operator points it to commit. Exit codes follow the public table: 0 ok, 1 nothing to do
 (or a wait that would block, for `--plan`), 3 the scope could not be
 created, 4 usage or configuration, 75 no slot.
 """
@@ -400,8 +400,10 @@ def cmd_rollup(args, *, state_dir=None, now=None):
     """Run the verb. The ledger lives in the state dir; tests pass fakes.
 
     Standard output always carries the JSON document, and the default
-    file at ``heavy.rollup_path()`` is refreshed with the same bytes;
-    ``--out`` additionally writes them wherever the operator points it.
+    file at ``heavy.rollup_path()`` is refreshed atomically with the
+    same bytes; ``--out`` additionally writes them atomically wherever
+    the operator points it. Both writes go through
+    ``paths.atomic_write_text``.
     """
     from korapy import heavy, paths
 

@@ -193,10 +193,9 @@ ticket's repository once through the tracker (`Tracker.pulls_index`,
 implemented once by each adapter: one paged open-pulls listing per
 repository, filed by linked ticket) and the rows a policy sees arrive
 with `pulls` populated: only tickets some project wants and the gate
-could still decide trigger a listing (open, unheld, and in a
-repository the pass drives, with live-claimed tickets fetched only
-for `fix` and `resume`; anything else never fetches, and
-with none to check the tracker is never contacted). `basic`'s own pull filter refuses a
+could still decide trigger a listing (open, unheld or managed-held
+rows in a repository the pass drives; anything else never fetches,
+and with none to check the tracker is never contacted). `basic`'s own pull filter refuses a
 ticket with an open linked pull, and the shared gate reads the same row
 pulls (section 3), so the two never disagree and no second lookup runs.
 The `drive.pulls_max_calls` setting (default 20) caps the listing calls
@@ -293,7 +292,7 @@ Per-candidate gate order, cheapest first:
    repository; an unreadable read fails closed (skip, record
    "unreadable"), and so does a repository past the
    `drive.pulls_max_calls` cap (skip, record "pulls lookup limited").
-   A `fix` or `resume` on a claimed row reads the same row pulls:
+   A `fix`, `resume`, or takeover `review` on a claimed row reads the same row pulls:
    unreadable pulls refuse it with the cause named, and a hold label
    on a linked pull hold-skips it. `--plan` builds rows with no pulls
    and skips this check: it never

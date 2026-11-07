@@ -146,6 +146,17 @@ class ParserCase(RollupCliCase):
 
 
 class CmdRollupCase(RollupCliCase):
+    def test_rollup_docstrings_agree_both_writes_are_atomic(self):
+        design = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "docs",
+            "14-heavy-lane.md",
+        )
+        with open(design, encoding="utf-8") as handle:
+            text = handle.read()
+        for doc in (heavycli.__doc__ or "", heavycli.cmd_rollup.__doc__ or "", text):
+            self.assertIn("atomically", doc)
+
     def test_empty_ledger_exits_zero_with_empty_keys(self):
         out, err = io.StringIO(), io.StringIO()
         with redirect_stdout(out), redirect_stderr(err):
