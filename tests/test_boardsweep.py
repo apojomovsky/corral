@@ -325,6 +325,59 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual([(move.number, move.kind) for move in moves], [(7, "add")])
         self.assertEqual(self.store.drift_flags(), [(REPO, 7, T0)])
 
+    def test_since_seeds_from_the_cards_last_change(self):
+        self.seed(7, state="closed")
+        old = T0 - 3600
+        moves, _ = boardsweep.reconcile(
+            self.store,
+            REPO,
+            cards=[card(7, state="closed", status="Available", updated_at=old)],
+            open_cards=boardsweep.store_cards(self.store.items(repo=REPO, state="open")),
+            present={(REPO, 7)},
+            names=dict(NAMES),
+            ids=dict(IDS),
+            pulls=set(),
+            now=T0,
+            complete=True,
+            status_active=True,
+            adopt_active=True,
+        )
+        self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0].age_s, 3600)
+        self.assertEqual(self.store.drift_flags(), [(REPO, 7, old)])
+
+    def test_missing_since_seeds_from_the_stored_row(self):
+        self.store.upsert_item(
+            board.Item(
+                repo=REPO,
+                number=7,
+                title="Title",
+                body="Body",
+                state="open",
+                author="alice",
+                url="https://example.com/x",
+                tracker_updated_at=T0 - 3600,
+            ),
+            operators=["alice"],
+            now=T0 - 3600,
+        )
+        moves, _ = boardsweep.reconcile(
+            self.store,
+            REPO,
+            cards=[],
+            open_cards=boardsweep.store_cards(self.store.items(repo=REPO, state="open")),
+            present=set(),
+            names=dict(NAMES),
+            ids=dict(IDS),
+            pulls=set(),
+            now=T0,
+            complete=True,
+            status_active=False,
+            adopt_active=True,
+        )
+        self.assertEqual([(move.number, move.kind) for move in moves], [(7, "add")])
+        self.assertEqual(self.store.drift_flags(), [(REPO, 7, T0 - 3600)])
+
     def test_inactive_status_step_clears_present_flags_on_complete(self):
         self.seed(7, state="closed")
         self.store.note_drift(REPO, 7, now=T0 - 10)

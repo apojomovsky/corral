@@ -3,10 +3,11 @@
 Runs the board step's own Status sync and missing-issue adopt to
 completion, without the per-pass caps: ``--plan`` (the default) lists
 each card, the issue state and the move, and changes nothing;
-``--apply`` writes. REPO names ``[[repo]]`` entries (or their tracker
-spelling); with none, every board entry is swept. Exit codes: 0
-nothing to do or applied, 1 drift found in plan (or only refused
-reads on apply), 3 tracker unreachable, 4 usage or configuration
+``--apply`` writes under the drive lock. REPO names ``[[repo]]``
+entries (or their tracker spelling); with none, every board entry is
+swept. Exit codes: 0 nothing to do or applied, 1 drift found in plan
+(or only refused reads on apply), 2 the drive lock is held
+(``--apply`` only), 3 tracker unreachable, 4 usage or configuration
 error.
 """
 
@@ -22,7 +23,13 @@ from korapy import tracker as iface
 from korapy import trackers
 from korapy import syncli
 
-OK, NOTHING, UNREACHABLE, USAGE = 0, 1, 3, 4
+OK, NOTHING, RACE, UNREACHABLE, USAGE = 0, 1, 2, 3, 4
+
+#: Bound on ``--apply`` rounds for one repo: every round fixes at
+#: least one card, so a tracker whose adds never appear in the next
+#: poll would loop forever without it. Leftovers are reported as
+#: lines; the count is generous because real drift is small.
+MAX_APPLY_ROUNDS = 50
 
 
 def _err(text, err):
@@ -149,7 +156,9 @@ def _plan_repo(entry, entry_tracker, *, store, now, pulls_max_calls):
     return tuple(moves) + tuple(missing), tuple(notes), "", ""
 
 
-def _apply_repo(entry, entry_tracker, *, store, out, err, now, pulls_max_calls):
+def _apply_repo(
+    entry, entry_tracker, *, store, out, err, now, pulls_max_calls, max_rounds=MAX_APPLY_ROUNDS
+):
     """Sweep one repo to completion. Returns ``(applied, problem)``.
 
     Runs the board step uncapped until a round fixes nothing: the
@@ -157,7 +166,10 @@ def _apply_repo(entry, entry_tracker, *, store, out, err, now, pulls_max_calls):
     proves the repo clean. ``applied`` counts the cards fixed;
     ``problem`` is ``"outage"``, ``"refused"``, ``"failed"`` (only
     per-card failures, retried next pass) or ``""`` after the printed
-    lines.
+    lines. At most ``max_rounds`` rounds run: a tracker whose adds
+    never appear in the next poll makes every round look like
+    progress, so the cap stops the sweep and the leftover moves are
+    reported as lines instead of hammering the tracker.
     """
     repo = entry.tracker_repo
     try:
@@ -172,7 +184,7 @@ def _apply_repo(entry, entry_tracker, *, store, out, err, now, pulls_max_calls):
     problem = ""
     failed = False
     seen_lines: set = set()
-    while True:
+    for _ in range(max(1, max_rounds)):
         # NOTE: row failures land in the result lines, never raise; a
         # store error here escapes to sweep_root, which counts usage.
         result = sync.sync_board_repo(
@@ -209,6 +221,17 @@ def _apply_repo(entry, entry_tracker, *, store, out, err, now, pulls_max_calls):
             break
         if not result.adopted and not result.status_written:
             break
+    else:
+        leftover, notes, blocked, _ = _plan_repo(
+            entry, entry_tracker, store=store, now=now, pulls_max_calls=pulls_max_calls
+        )
+        if blocked:
+            _err(blocked, err)
+        for move in leftover:
+            _err(boardsweep.format_move(move), err)
+        for note in notes:
+            _err(note, err)
+        _err(f"{repo}: sweep stopped after {max_rounds} rounds with drift remaining", err)
     if not problem and failed:
         problem = "failed"
     return applied, problem
@@ -227,19 +250,85 @@ def sweep_root(
     plan,
     pulls_max_calls=None,
     git=None,
+    lock,
+    lock_path,
 ) -> int:
     """Sweep every named board entry. All seams injected; exit codes follow the module docstring.
 
     ``entry_factory`` maps an entry name to its plain-data
     ``SetupEntry`` (``ValueError`` names the entry's usage error),
     ``tracker_factory`` builds its board tracker, and ``open_store``
-    opens the board store once for the whole run. Every named entry is
-    attempted, in entry order; a per-entry failure of any kind is
-    recorded while the loop continues with the next entry. A usage
-    error anywhere exits 4; an outage with nothing applied exits 3;
-    only per-card failures with nothing applied, a refused read with
-    nothing applied, or drift in plan mode exits 1.
+    opens the board store once for the whole run. ``lock`` is the
+    drive-lock seam (``drive.drive_lock``, taking ``lock_path`` from
+    the one resolver ``drive.lock_path``), required for ``--apply``:
+    the whole apply pass runs under it, so a timer drive pass running
+    the board step cannot adopt and write against the same partial
+    view; a held lock refuses with exit 2 naming the holder, and a
+    missing lock fails closed with exit 4 instead of writing
+    unguarded. The plan stays lock-free and never touches the seam.
+    Every named entry is attempted, in entry order; a per-entry
+    failure of any kind is recorded while the loop continues with the
+    next entry. A usage error anywhere exits 4; an outage with nothing
+    applied exits 3; only per-card failures with nothing applied, a
+    refused read with nothing applied, or drift in plan mode exits 1.
     """
+    if plan:
+        return _sweep_body(
+            root,
+            names,
+            entry_factory=entry_factory,
+            tracker_factory=tracker_factory,
+            open_store=open_store,
+            out=out,
+            err=err,
+            now=now,
+            plan=plan,
+            pulls_max_calls=pulls_max_calls,
+            git=git,
+        )
+    if lock is None:
+        _err("cannot sweep without the drive lock: refusing unguarded", err)
+        return USAGE
+    from korapy import drive
+
+    try:
+        with lock(lock_path):
+            return _sweep_body(
+                root,
+                names,
+                entry_factory=entry_factory,
+                tracker_factory=tracker_factory,
+                open_store=open_store,
+                out=out,
+                err=err,
+                now=now,
+                plan=plan,
+                pulls_max_calls=pulls_max_calls,
+                git=git,
+            )
+    except drive.LockHeld as held:
+        _err(str(held), err)
+        return RACE
+    except drive.LockError as problem:
+        _err(str(problem), err)
+        return USAGE
+
+
+def _sweep_body(
+    root,
+    names,
+    *,
+    entry_factory,
+    tracker_factory,
+    open_store,
+    out,
+    err,
+    now,
+    plan,
+    pulls_max_calls=None,
+    git=None,
+) -> int:
+    """The resolve, sweep and report behind `sweep_root`: runs unlocked."""
     selected, problem = _resolve_names(root, names, git=git)
     if problem is not None:
         _err(problem, err)
@@ -321,6 +410,8 @@ def sweep_root(
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
+    from korapy import drive
+
     root = settings.find_root(os.getcwd())
     if root is None:
         _err("no korapy.toml above here", sys.stderr)
@@ -336,6 +427,8 @@ def cmd_sweep(args: argparse.Namespace) -> int:
         now=time.time(),
         plan=not args.apply,
         git=syncli._git,
+        lock=drive.drive_lock,
+        lock_path=drive.lock_path(),
     )
 
 

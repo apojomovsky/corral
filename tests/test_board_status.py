@@ -953,14 +953,14 @@ class DriftRecordingTest(unittest.TestCase):
         self.seed(9, state="closed")
         reader = RecordingReader(
             [
-                card(7, state="closed", status="Available"),
-                card(9, state="closed", status="Available"),
+                card(7, state="closed", status="Available", updated_at=T0 - 100),
+                card(9, state="closed", status="Available", updated_at=T0 - 100),
             ],
             limit=1,
         )
         first = self.run_board_step(reader)
         self.assertEqual(len(first.status_written), 1)
-        self.assertEqual(self.store.drift_flags(), [(REPO, 9, T0)])
+        self.assertEqual(self.store.drift_flags(), [(REPO, 9, T0 - 100)])
         second = self.run_board_step(reader)
         self.assertEqual(len(second.status_written), 1)
         self.assertEqual(
@@ -988,7 +988,7 @@ class DriftRecordingTest(unittest.TestCase):
         reader = RecordingReader([card(7, status="Available")], added=[f"{REPO}#8"])
         result = self.run_board_step(reader)
         self.assertEqual(result.adopted, (f"{REPO}#8",))
-        self.assertEqual(self.store.drift_flags(), [(REPO, 8, T0)])
+        self.assertEqual(self.store.drift_flags(), [(REPO, 8, T0 - 100)])
 
     def test_truncated_poll_leaves_missing_verdicts_alone(self):
         self.seed(7)
@@ -1024,7 +1024,9 @@ class DriftRecordingTest(unittest.TestCase):
 
     def test_disabled_caps_still_record_mapped_drift(self):
         self.seed(7, state="closed")
-        reader = RecordingReader([card(7, state="closed", status="Available")], limit=0)
+        reader = RecordingReader(
+            [card(7, state="closed", status="Available", updated_at=T0 - 100)], limit=0
+        )
         result = self.run_board_step(reader)
         self.assertEqual(result.status_written, ())
-        self.assertEqual(self.store.drift_flags(), [(REPO, 7, T0)])
+        self.assertEqual(self.store.drift_flags(), [(REPO, 7, T0 - 100)])

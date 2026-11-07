@@ -6,6 +6,7 @@ a scripted board tracker plus a real board store on a scratch file,
 no ``gh``, no network, no real state dir.
 """
 
+import contextlib
 import io
 import os
 import tempfile
@@ -143,6 +144,54 @@ class FakeBoardTracker:
         return iface.BoardAdopt(tuple(added), (), tuple(self.refused), self.stopped)
 
 
+class OpenLock:
+    """A free drive lock: the default seam for sweep tests not about locking."""
+
+    def __init__(self):
+        self.paths = []
+
+    def __call__(self, path):
+        self.paths.append(path)
+        return contextlib.nullcontext()
+
+
+class WatchingBoardTracker(FakeBoardTracker):
+    """Records whether the drive lock was held while the poll ran."""
+
+    def __init__(self, items, *, lock, seen, **over):
+        super().__init__(items, **over)
+        self._lock = lock
+        self._seen = seen
+
+    def poll(self, found_schema, *, after=None, max_pages=5):
+        self._seen["held"] = self._lock.held
+        return super().poll(found_schema, after=after, max_pages=max_pages)
+
+
+class NoAdoptTracker(FakeBoardTracker):
+    """A board tracker with no adopt seam: missing issues are refused."""
+
+    adopt_missing = None  # type: ignore[assignment]
+
+
+class NeverAppearingTracker(FakeBoardTracker):
+    """An adopt that never lands: every round looks like progress.
+
+    The poll never shows the adopted issue, so the sweep would loop
+    forever without the round cap.
+    """
+
+    def poll(self, found_schema, *, after=None, max_pages=5):
+        return [], None
+
+    def adopt_missing(self, project_id, repo, present, *, limit, now):
+        self.adopt_calls.append((project_id, repo, set(present), limit))
+        return iface.BoardAdopt((f"{repo}#8",), (), (), None)
+
+
+_DEFAULT_LOCK = object()
+
+
 def entry(name="app", tracker_repo=REPO, variant="board"):
     return SetupEntry(
         name=name,
@@ -193,7 +242,16 @@ class SweepCase(unittest.TestCase):
         finally:
             store.close()
 
-    def sweep(self, entries, trackers, *, plan=True, names=None):
+    def sweep(
+        self,
+        entries,
+        trackers,
+        *,
+        plan=True,
+        names=None,
+        lock=_DEFAULT_LOCK,
+        lock_path="/state/drive.lock",
+    ):
         table = {candidate.name: tracker for candidate, tracker in zip(entries, trackers)}
 
         def entry_factory(name):
@@ -202,6 +260,8 @@ class SweepCase(unittest.TestCase):
                     return candidate
             raise ValueError(f"unknown repo {name!r}")
 
+        if lock is _DEFAULT_LOCK:
+            lock = OpenLock()
         return boardcli.sweep_root(
             self.tmp.name,
             names if names is not None else [entry.name for entry in entries],
@@ -212,6 +272,8 @@ class SweepCase(unittest.TestCase):
             err=self.err,
             now=T0,
             plan=plan,
+            lock=lock,
+            lock_path=lock_path,
         )
 
 
@@ -279,6 +341,8 @@ class PlanTest(SweepCase):
             now=T0,
             plan=True,
             git=None,
+            lock=None,
+            lock_path="/state/drive.lock",
         )
         self.assertEqual(code, 4)
 
@@ -355,6 +419,80 @@ class ApplyTest(SweepCase):
         code = self.sweep([entry()], [tracker], plan=False)
         self.assertEqual(code, 1)
         self.assertIn(REPO, self.err.getvalue())
+
+
+class SweepLockTest(SweepCase):
+    def test_apply_with_a_held_lock_exits_two_and_writes_nothing(self):
+        from tests.test_reponame import HeldLock
+
+        self.seed(7, state="closed")
+        tracker = FakeBoardTracker([card(7, state="closed", status="Available")])
+        code = self.sweep([entry()], [tracker], plan=False, lock=HeldLock())
+        self.assertEqual(code, 2)
+        self.assertIn("another drive pass", self.err.getvalue())
+        self.assertIn("/state/drive.lock", self.err.getvalue())
+        self.assertEqual(tracker.writes, [])
+        self.assertEqual(tracker.adopt_calls, [])
+
+    def test_apply_without_a_lock_fails_closed(self):
+        self.seed(7, state="closed")
+        tracker = FakeBoardTracker([card(7, state="closed", status="Available")])
+        code = self.sweep([entry()], [tracker], plan=False, lock=None)
+        self.assertEqual(code, 4)
+        self.assertIn("lock", self.err.getvalue())
+        self.assertEqual(tracker.writes, [])
+        self.assertEqual(tracker.adopt_calls, [])
+
+    def test_plan_never_takes_the_lock(self):
+        from tests.test_reponame import HeldLock
+
+        held = HeldLock()
+        self.seed(7, state="closed")
+        code = self.sweep(
+            [entry()],
+            [FakeBoardTracker([card(7, state="closed", status="Available")])],
+            plan=True,
+            lock=held,
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(held.calls, [])
+
+    def test_apply_writes_run_under_the_lock(self):
+        from tests.test_reponame import RecordingLock
+
+        rec = RecordingLock()
+        seen = {}
+        watching = WatchingBoardTracker(
+            [card(7, state="closed", status="Available")], lock=rec, seen=seen
+        )
+        self.seed(7, state="closed")
+        code = self.sweep([entry()], [watching], plan=False, lock=rec)
+        self.assertEqual(code, 0)
+        self.assertTrue(seen.get("held"))
+        self.assertEqual(rec.paths, ["/state/drive.lock"])
+
+
+class SweepAdoptSeamTest(SweepCase):
+    def test_apply_without_an_adopt_seam_reports_refused(self):
+        self.seed(8)
+        tracker = NoAdoptTracker([card(7, status="Available")])
+        code = self.sweep([entry()], [tracker], plan=False)
+        self.assertEqual(code, 1)
+        self.assertIn("adopt", self.err.getvalue())
+
+
+class SweepCapTest(SweepCase):
+    def test_adds_that_never_appear_stop_at_the_round_cap(self):
+        self.seed(8)
+        tracker = NeverAppearingTracker([])
+        code = self.sweep([entry()], [tracker], plan=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(tracker.adopt_calls), boardcli.MAX_APPLY_ROUNDS)
+        self.assertIn(f"{REPO}#8: state open, add to board", self.err.getvalue())
+        self.assertIn("rounds", self.err.getvalue())
+
+    def test_the_round_cap_is_generous(self):
+        self.assertGreaterEqual(boardcli.MAX_APPLY_ROUNDS, 20)
 
 
 if __name__ == "__main__":

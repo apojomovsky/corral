@@ -189,7 +189,8 @@ def reconcile(
     cards when the status step is inactive (an unmapped project cannot
     drift). A failed poll never reaches here, so nothing is recorded
     on partial knowledge. The first sighting wins: a card that stays
-    drifted keeps its original ``since``.
+    drifted keeps its original ``since``, seeded from the card's last
+    change, so the recorded age agrees with the plan's drift age.
     """
     claims = set()
     records = {}
@@ -214,7 +215,7 @@ def reconcile(
         flagged = {(move.repo, move.number) for move in found}
         for card in cards:
             if (card.repo, card.number) in flagged:
-                store.note_drift(card.repo, card.number, now=now)
+                store.note_drift(card.repo, card.number, now=min(now, card.updated_at))
             else:
                 store.clear_drift(card.repo, card.number)
     elif complete:
@@ -223,7 +224,7 @@ def reconcile(
     if adopt_active and complete:
         for move in missing_moves(open_cards, present=present, now=now):
             moves.append(move)
-            store.note_drift(move.repo, move.number, now=now)
+            store.note_drift(move.repo, move.number, now=now - move.age_s)
     if complete:
         seen = {(card.repo, card.number) for card in cards}
         still_open = {(card.repo, card.number) for card in open_cards}

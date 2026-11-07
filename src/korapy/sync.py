@@ -199,16 +199,21 @@ def _adopt_after_poll(reader, schema, repo, found, *, page_after, resume, now, u
     and adding cannot duplicate. A reader without an adopt cap
     (``board_adopt_limit``) skips the adopt, unless the sweep runs
     uncapped: then the cap reads as unlimited and every missing issue
-    is adopted in one run.
+    is adopted in one run. A reader with no adopt seam at all reports
+    one refused line instead of crashing, so the sweep names the repo
+    it cannot fix.
     """
     limit = None if uncapped else getattr(reader, "board_adopt_limit", None)
     if limit is None and not uncapped:
         return (), (), (), ()
     if resume is not None or page_after is not None:
         return (), (), (), ()
+    adopt = getattr(reader, "adopt_missing", None)
+    if adopt is None:
+        return (), (), (f"{repo}: the board reader has no adopt seam",), ()
     present = {(item.repo, item.number) for item in found}
     try:
-        adopted = reader.adopt_missing(schema.project_id, repo, present, limit=limit, now=now)
+        adopted = adopt(schema.project_id, repo, present, limit=limit, now=now)
     except iface.TrackerRejected as err:
         return (), (), (f"{repo}: {err}",), ()
     except iface.TrackerError as err:
