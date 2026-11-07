@@ -374,13 +374,14 @@ def _check_worktree(toplevel, main_clone, root_setting, base_sha, default_branch
     return Check("worktree", OK, "", ""), branch, int(match.group("number"))
 
 
-def _leak_terms(ops_root, table, project_name=None):
+def _leak_terms(ops_root, table, project_name):
     """The private terms guarding `ops_root`, from the one parsed table.
 
     `table` is the project table `_repo_state` already parsed, so the
     gate never reads the file a second time; a concurrent edit landing
-    between the two reads cannot produce a mixed view. Usable before any
-    check runs.
+    between the two reads cannot produce a mixed view. `project_name`
+    is required, so errors name the file `_repo_state` parsed. Usable
+    before any check runs.
     """
     try:
         return leakcli.guard_terms_from_table(table, ops_root, project_name=project_name)

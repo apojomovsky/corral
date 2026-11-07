@@ -588,6 +588,28 @@ class TakeoffCase(unittest.TestCase):
             with self.assertRaises(takeoff.TakeoffError):
                 self.gate()
 
+    def test_takeoff_and_leakcheck_guard_the_same_terms(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[private]\n"
+            'terms = ["Alpine Schema"]\n'
+        )
+        table = settings.read_project(self.ops)
+        project_name = os.path.join(self.ops, "korapy.toml")
+        guarded = takeoff._leak_terms(self.ops, table, project_name)
+        self.assertEqual(
+            [(term.kind, term.text, term.source) for term in guarded],
+            [(term.kind, term.text, term.source) for term in leakcli.guard_terms(self.ops)],
+        )
+
+    def test_leak_terms_need_a_project_name(self):
+        with self.assertRaises(TypeError):
+            takeoff._leak_terms(self.ops, {})  # ty: ignore[missing-argument]
+
     def test_scrubbed_commit_message_hides_the_term(self):
         term = "Alpine Schema"
         self.write_ops(

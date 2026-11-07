@@ -232,6 +232,20 @@ class TermsFromTableTest(unittest.TestCase):
                 project_name="korapy.toml",
             )
 
+    def test_project_name_is_required(self):
+        table = {"private": {"terms": ["Acme Client"]}}
+        with self.assertRaises(TypeError):
+            leakguard.terms_from_table(  # ty: ignore[missing-argument]
+                table, "/tmp/ops", host="host-1", home="/users/someone", ops_name="ops"
+            )
+
+    def test_terms_without_a_root_match_the_empty_table_form(self):
+        kwargs = {"host": "host-1.example.com", "home": "/users/someone", "ops_name": ""}
+        self.assertEqual(
+            leakguard.terms(None, **kwargs),
+            leakguard.terms_from_table({}, None, project_name=settings.PROJECT_FILE, **kwargs),
+        )
+
 
 class PrivateSettingsTest(unittest.TestCase):
     def resolve(self, **kw):
@@ -273,6 +287,20 @@ class PrivateSettingsTest(unittest.TestCase):
             self.resolve(
                 project={"repo": [{"name": "app", "private": {"patterns": ["acme-[0-9]+"]}}]}
             )
+
+    def test_private_matches_the_from_table_form(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-leak-") as ops:
+            project_name = os.path.join(ops, "korapy.toml")
+            with open(project_name, "w", encoding="utf-8") as handle:
+                handle.write('[private]\nterms = ["Acme Client"]\npatterns = ["acme-[0-9]+"]\n')
+            self.assertEqual(
+                settings.private(ops),
+                settings.private_from_table(settings.read_project(ops), project_name),
+            )
+
+    def test_private_without_a_root_is_empty(self):
+        self.assertEqual(settings.private(None), settings.Private(terms=[], patterns=[]))
+        self.assertEqual(settings.private(""), settings.Private(terms=[], patterns=[]))
 
 
 if __name__ == "__main__":

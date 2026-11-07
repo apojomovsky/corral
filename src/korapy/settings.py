@@ -641,11 +641,13 @@ def private(root):
 
     Empty when there is no root or no file. Shape and regex errors are
     SettingsError (exit 4). The host config is never read: private terms
-    live on the ops side only, so only the ops root's file counts."""
+    live on the ops side only, so only the ops root's file counts. A
+    thin wrapper over `private_from_table`: the table form holds the
+    only ``[private]`` resolution."""
     if not root:
         return Private(terms=[], patterns=[])
     project_path = os.path.join(root, PROJECT_FILE)
-    return resolve(project=read_project(root), env={}, project_name=project_path).private
+    return private_from_table(read_project(root), project_path)
 
 
 def private_from_table(table, project_name):
