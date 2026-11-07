@@ -355,6 +355,12 @@ class BudgetSharesTest(unittest.TestCase):
                 },
             ),
             (
+                "a ceiling of 0 with no resources table reserves nothing",
+                [self.project("shadow", ceiling=0)],
+                4,
+                {"shadow": dict(nothing)},
+            ),
+            (
                 "zero slots exclude an uncapped project",
                 [self.project("web", resources={"weight": 1})],
                 0,

@@ -616,6 +616,7 @@ class SliceDrift(unittest.TestCase):
         self.assertIn("korapy-web.slice", row.detail)
         self.assertIn("ceiling-0", row.fix)
         self.assertIn("stop the slice by hand", row.fix)
+        self.assertNotIn("launch an agent", row.fix)
 
 
 class ParseShow(unittest.TestCase):
