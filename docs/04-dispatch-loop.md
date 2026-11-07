@@ -28,11 +28,11 @@ loop deletes (section 7: the loop deletes nothing).
 ## 1. Process model: a timer running a one-shot pass
 
 Decision: no daemon. `korapy drive` runs one pass and exits. A
-`systemd --user` timer wakes it every `drive.period` (default 5
-minutes). The timer unit ships with korapy and is enabled by the
-operator; installing or enabling host units needs a maintainer's
-go-ahead per AGENTS.md, so the implementation ticket files that as a
-separate step.
+`systemd --user` timer wakes it every `drive.period`
+(default in [`configuration.md`](configuration.md)). The timer unit
+ships with korapy and is enabled by the operator; installing or
+enabling host units needs a maintainer's go-ahead per AGENTS.md, so
+the implementation ticket files that as a separate step.
 
 Why not a long-lived daemon:
 
@@ -198,7 +198,7 @@ rows in a repository the pass drives; anything else never fetches,
 and with none to check the tracker is never contacted). `basic`'s own pull filter refuses a
 ticket with an open linked pull, and the shared gate reads the same row
 pulls (section 3), so the two never disagree and no second lookup runs.
-The `drive.pulls_max_calls` setting (default 20) caps the listing calls
+The `drive.pulls_max_calls` setting (default in [`configuration.md`](configuration.md)) caps the listing calls
 per pass: repositories past the cap leave their tickets unreadable, and
 the gate refuses those starts, failing closed like an unreadable
 listing. `--plan` builds rows with `pulls` empty: it never contacts the
@@ -268,7 +268,7 @@ Per-candidate gate order, cheapest first:
    The pass reads the ticket's latest review record once per pass
    from the session dirs and grades it here: an approving verdict
    (`approve` or `approve-with-findings`) whose findings all sit
-   below the `drive.fix_round_threshold` setting (default `normal`)
+   below the `drive.fix_round_threshold` setting (default in [`configuration.md`](configuration.md))
    is merge-ready, so a fix, resume, review or start requested on it
    skips instead of launching. A `block` verdict, or any finding at
    or above the threshold, opens exactly one fix round through the
@@ -425,8 +425,7 @@ States and who moves them:
   is nothing to compare a row against. No `author` field is added to
   `TicketRow` because scheduling never needs it.
 - Changes requested: the review record's findings decide. A finding
-  at or above the `drive.fix_round_threshold` setting (default
-  `normal`), or a `block` verdict, schedules a fix round as `resume`
+  at or above the `drive.fix_round_threshold` setting (default in [`configuration.md`](configuration.md)), or a `block` verdict, schedules a fix round as `resume`
   when the worker's unit or registry entry is still usable, else a
   fresh `fix` start on the same ticket and branch. Fix rounds count
   against the restart budget below.
@@ -609,7 +608,7 @@ never takes the drive lock.
   setting roundtrip: an operator creates or deletes one file. A
   `drive.enabled` setting is deliberately not added: two switches would
   disagree, and one fact lives in one place.
-- Per-day start cap: `drive.max_starts_per_day` (default 50) with a
+- Per-day start cap: `drive.max_starts_per_day` (default in [`configuration.md`](configuration.md)) with a
   date-keyed counter in the state dir, incremented only by real starts
   (`--plan` excluded, restarts included). At the cap the pass ends
   with exit 1 and a logbook line; resumes of already-running agents

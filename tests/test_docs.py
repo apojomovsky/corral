@@ -16,6 +16,7 @@ from korapy import cli, settings, snapshot, takeoff
 
 COMMANDS = Path(__file__).resolve().parent.parent / "docs" / "commands.md"
 CONFIGURATION = Path(__file__).resolve().parent.parent / "docs" / "configuration.md"
+DISPATCH_LOOP = Path(__file__).resolve().parent.parent / "docs" / "04-dispatch-loop.md"
 README = Path(__file__).resolve().parent.parent / "README.md"
 
 SPAN_RE = re.compile(r"`([^`]*)`")
@@ -225,6 +226,47 @@ class DriveRowDefaults(unittest.TestCase):
         refresh_default = settings.REGISTRY["quota.refresh_after_s"].default
         self.assertIn(f"(default `{fix_default}`)", row)
         self.assertIn(f"(default {refresh_default} seconds)", row)
+
+
+class DispatchLoopDefaults(unittest.TestCase):
+    """`docs/04-dispatch-loop.md` states no registry default by value.
+
+    The defaults live in one place, the generated table in
+    `docs/configuration.md`. The dispatch-loop doc names its settings
+    and points there, so a registry change cannot leave the two
+    disagreeing the way a hand-copied value would.
+    """
+
+    POINTER = "(default in [`configuration.md`](configuration.md))"
+
+    def test_every_default_parenthetical_is_the_pointer(self):
+        text = DISPATCH_LOOP.read_text(encoding="utf-8")
+        strays = []
+        for match in re.finditer(r"\(default", text):
+            tail = text[match.start() : match.start() + len(self.POINTER)]
+            if tail != self.POINTER:
+                line = text.count("\n", 0, match.start()) + 1
+                strays.append(f"line {line}: {text[match.start() :].splitlines()[0]}")
+        self.assertEqual(strays, [])
+
+    def test_each_named_setting_still_points_at_the_table(self):
+        flat = DISPATCH_LOOP.read_text(encoding="utf-8").replace("\n", " ")
+        for key in (
+            "drive.fix_round_threshold",
+            "drive.max_starts_per_day",
+            "drive.period",
+            "drive.pulls_max_calls",
+        ):
+            with self.subTest(setting=key):
+                self.assertIn(f"`{key}`", flat)
+                windows = [
+                    flat[match.end() : match.end() + 120]
+                    for match in re.finditer(re.escape(f"`{key}`"), flat)
+                ]
+                self.assertTrue(
+                    any(self.POINTER in window for window in windows),
+                    f"{key} names no default pointer",
+                )
 
 
 class SnapshotSections(unittest.TestCase):
