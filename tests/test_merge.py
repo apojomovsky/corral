@@ -605,6 +605,55 @@ class PendingWaitTest(MergeCase):
         self.assertEqual(sleeps, [])
         self.assertEqual(len(fake.requested), 1)
 
+    def test_wait_with_skipped_checks_returns_after_one_read(self):
+        fake = SequenceForge([self.pr("pending", 2)])
+        now_fn, sleep_fn, sleeps = self.clock()
+        result = merge.run_merge(
+            REPO,
+            TICKET,
+            FORGE_REPO,
+            PR,
+            head_sha=self.head,
+            forge=fake,
+            cwd=self.dir,
+            plan=True,
+            skips=["checks"],
+            wait=True,
+            timeout=100,
+            poll_s=10,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(self.row(result, "checks").status, "skipped")
+        self.assertFalse(result.merged)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(fake.requested), 1)
+
+    def test_wait_with_an_already_failing_row_returns_after_one_read(self):
+        fake = SequenceForge([self.pr("failing")])
+        now_fn, sleep_fn, sleeps = self.clock()
+        result = merge.run_merge(
+            REPO,
+            TICKET,
+            FORGE_REPO,
+            PR,
+            head_sha=self.head,
+            forge=fake,
+            cwd=self.dir,
+            plan=True,
+            wait=True,
+            timeout=100,
+            poll_s=10,
+            now_fn=now_fn,
+            sleep_fn=sleep_fn,
+        )
+        self.assertEqual(result.exit_code, 1)
+        self.assertEqual(self.row(result, "checks").status, "fail")
+        self.assertFalse(result.merged)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(fake.requested), 1)
+
     def test_wait_polls_until_passing_then_merges(self):
         fake = SequenceForge([self.pr("pending", 2), self.pr("pending", 1), self.pr("passing")])
         now_fn, sleep_fn, sleeps = self.clock()

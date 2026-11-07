@@ -581,10 +581,34 @@ class TakeoffCase(unittest.TestCase):
 
     def test_leak_term_errors_are_usage_errors(self):
         with mock.patch.object(
-            leakcli, "guard_terms", side_effect=settings.SettingsError("bad pattern")
+            leakcli,
+            "guard_terms_from_table",
+            side_effect=settings.SettingsError("bad pattern"),
         ):
             with self.assertRaises(takeoff.TakeoffError):
                 self.gate()
+
+    def test_takeoff_and_leakcheck_guard_the_same_terms(self):
+        self.write_ops(
+            "[[repo]]\n"
+            f'name = "{REPO}"\n'
+            f'clone.path = "{self.main}"\n'
+            f'clone.default_branch = "{MAIN}"\n'
+            'checks.test = "make test"\n'
+            "[private]\n"
+            'terms = ["Alpine Schema"]\n'
+        )
+        table = settings.read_project(self.ops)
+        project_name = os.path.join(self.ops, "korapy.toml")
+        guarded = takeoff._leak_terms(self.ops, table, project_name)
+        self.assertEqual(
+            [(term.kind, term.text, term.source) for term in guarded],
+            [(term.kind, term.text, term.source) for term in leakcli.guard_terms(self.ops)],
+        )
+
+    def test_leak_terms_need_a_project_name(self):
+        with self.assertRaises(TypeError):
+            takeoff._leak_terms(self.ops, {})  # ty: ignore[missing-argument]
 
     def test_scrubbed_commit_message_hides_the_term(self):
         term = "Alpine Schema"
@@ -696,10 +720,9 @@ class TakeoffCase(unittest.TestCase):
         ):
             result = self.gate()
         project_path = os.path.join(self.ops, "korapy.toml")
-        # One parse feeds the covering match, the tracker map and the
-        # resolved settings; the private terms read the file again
-        # through their own seam (see the leak tests).
-        self.assertEqual(reads.count(project_path), 2)
+        # One parse feeds the covering match, the tracker map, the
+        # resolved settings and the private terms.
+        self.assertEqual(reads.count(project_path), 1)
         self.assertEqual(seen, ["acme/myrepo"])
         self.assertEqual(self.status(result, "review"), "ok")
         self.assertEqual(result.exit_code, 0)
@@ -770,10 +793,11 @@ class TakeoffCase(unittest.TestCase):
             state = takeoff._repo_state(self.ops, self.main, no_git)
         project_path = os.path.join(self.ops, "korapy.toml")
         self.assertEqual(reads.count(project_path), 1)
-        short_map, ticket_repo, short, matched, resolved = state
+        short_map, ticket_repo, short, matched, resolved, table = state
         self.assertEqual(short_map, {REPO: "acme/myrepo"})
         self.assertEqual((ticket_repo, short, matched), ("acme/myrepo", REPO, True))
         self.assertEqual(resolved["checks.test"], "make test")
+        self.assertEqual(table["repo"][0]["name"], REPO)
 
     def test_repo_state_map_is_fail_soft_when_no_tracker_spelling_resolves(self):
         reads = []
@@ -790,16 +814,17 @@ class TakeoffCase(unittest.TestCase):
             state = takeoff._repo_state(self.ops, self.main, bad_git)
         project_path = os.path.join(self.ops, "korapy.toml")
         self.assertEqual(reads.count(project_path), 1)
-        short_map, ticket_repo, short, matched, resolved = state
+        short_map, ticket_repo, short, matched, resolved, _table = state
         self.assertEqual(short_map, {})
         self.assertEqual((ticket_repo, short, matched), (REPO, REPO, True))
         self.assertEqual(resolved["checks.test"], "make test")
 
     def test_repo_state_without_an_ops_root_falls_back_to_the_clone_name(self):
-        short_map, ticket_repo, short, matched, resolved = takeoff._repo_state(
+        short_map, ticket_repo, short, matched, _resolved, table = takeoff._repo_state(
             None, self.main, self.run_cmd
         )
         self.assertEqual((short_map, ticket_repo, short, matched), ({}, "main", None, False))
+        self.assertEqual(table, {})
 
     def test_repo_state_matches_a_relative_clone_path_from_a_foreign_directory(self):
         tmp = tempfile.TemporaryDirectory(prefix="korapy-takeoff-relative-")
@@ -823,9 +848,10 @@ class TakeoffCase(unittest.TestCase):
             state = takeoff._repo_state(ops, os.path.realpath(clone), self.run_cmd)
         finally:
             os.chdir(previous)
-        short_map, ticket_repo, short, matched, _resolved = state
+        short_map, ticket_repo, short, matched, _resolved, table = state
         self.assertEqual(short_map, {"app": "acme/app"})
         self.assertEqual((ticket_repo, short, matched), ("acme/app", "app", True))
+        self.assertEqual(table["repo"][0]["name"], "app")
 
     def test_takeoff_commands_run_through_the_seam(self):
         self.write_ops(

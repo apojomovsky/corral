@@ -212,13 +212,15 @@ def _commit_rules():
 
 
 def _repo_state(ops_root, main_clone, git):
-    """`(short_map, ticket_repo, short, matched, resolved)`: one parse of the project file.
+    """`(short_map, ticket_repo, short, matched, resolved, table)`: one parse of the project file.
 
     Reads the ops root's `korapy.toml` (and the host config) exactly
     once and derives the covering `[[repo]]` match and the
     short-to-tracker map from that single parse, then resolves the
     matched entry's settings from the same in-memory tables, so a
-    concurrent edit between reads cannot produce a mixed view. The map
+    concurrent edit between reads cannot produce a mixed view. The
+    caller also derives the leak terms from the returned table, so the
+    whole gate shares the one parse. The map
     is fail-soft like `syncli.short_to_tracker`: entries no tracker
     spelling translates read as no entries, so short names keep
     resolving. A matched entry the map cannot translate keeps its entry
@@ -239,7 +241,7 @@ def _repo_state(ops_root, main_clone, git):
             resolved = settings.load(root=None)
         except settings.SettingsError as err:
             raise TakeoffError(str(err)) from None
-        return {}, os.path.basename(main_clone), None, False, resolved
+        return {}, os.path.basename(main_clone), None, False, resolved, {}
     try:
         table = settings.read_project(ops_root)
         host = settings.read_host()
@@ -279,7 +281,7 @@ def _repo_state(ops_root, main_clone, git):
             )
     except settings.SettingsError as err:
         raise TakeoffError(str(err)) from None
-    return short_map, ticket_repo, short, matched, resolved
+    return short_map, ticket_repo, short, matched, resolved, table
 
 
 def _check_base(branch, cwd, ls_remote):
@@ -372,10 +374,17 @@ def _check_worktree(toplevel, main_clone, root_setting, base_sha, default_branch
     return Check("worktree", OK, "", ""), branch, int(match.group("number"))
 
 
-def _leak_terms(ops_root):
-    """The private terms guarding `ops_root`, usable before any check runs."""
+def _leak_terms(ops_root, table, project_name):
+    """The private terms guarding `ops_root`, from the one parsed table.
+
+    `table` is the project table `_repo_state` already parsed, so the
+    gate never reads the file a second time; a concurrent edit landing
+    between the two reads cannot produce a mixed view. `project_name`
+    is required, so errors name the file `_repo_state` parsed. Usable
+    before any check runs.
+    """
     try:
-        return leakcli.guard_terms(ops_root)
+        return leakcli.guard_terms_from_table(table, ops_root, project_name=project_name)
     except settings.SettingsError as err:
         raise TakeoffError(str(err)) from None
 
@@ -733,7 +742,9 @@ def run_takeoff(
     except (leakcli.CollectError, settings.SettingsError) as err:
         raise TakeoffError(str(err)) from None
     main_clone = os.path.realpath(gitenv.worktree_main_checkout(toplevel) or toplevel)
-    short_map, ticket_repo, short, matched, resolved = _repo_state(ops_root, main_clone, _git)
+    short_map, ticket_repo, short, matched, resolved, table = _repo_state(
+        ops_root, main_clone, _git
+    )
     try:
         record_repo = reviewrecord.local_repo(ticket_repo, short_map)
     except ValueError as err:
@@ -753,7 +764,10 @@ def run_takeoff(
     )
     checks.append(worktree_check)
     rules = _commit_rules()
-    found_terms = _leak_terms(ops_root)
+    project_name = (
+        os.path.join(ops_root, settings.PROJECT_FILE) if ops_root else settings.PROJECT_FILE
+    )
+    found_terms = _leak_terms(ops_root, table, project_name)
 
     def scrub(detail):
         return _scrub(detail, found_terms)
@@ -797,11 +811,8 @@ def run_takeoff(
     timeout_s = resolved["checks.timeout_s"]
     if isinstance(timeout_s, bool) or not isinstance(timeout_s, int) or timeout_s <= 0:
         raise TakeoffError("checks.timeout_s must be a positive number of seconds")
-    project_where = (
-        os.path.join(ops_root, settings.PROJECT_FILE) if ops_root else settings.PROJECT_FILE
-    )
     try:
-        heavy_cfg = heavy.check_table(resolved.heavy, project_where)
+        heavy_cfg = heavy.check_table(resolved.heavy, project_name)
     except settings.SettingsError as err:
         raise TakeoffError(str(err)) from None
     budget = None

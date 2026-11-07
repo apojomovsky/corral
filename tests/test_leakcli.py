@@ -270,5 +270,26 @@ class VerbTest(RepoCase):
         self.assertEqual(os.path.realpath(found), os.path.realpath(ops))
 
 
+class GuardTermsTest(RepoCase):
+    def test_guard_terms_match_the_from_table_form(self):
+        ops = self.make_ops('[private]\nterms = ["Acme Client"]\npatterns = ["acme-[0-9]+"]\n')
+        table = settings.read_project(ops)
+        project_name = os.path.join(ops, "korapy.toml")
+        self.assertEqual(
+            leakcli.guard_terms(ops),
+            leakcli.guard_terms_from_table(table, ops, project_name=project_name),
+        )
+
+    def test_guard_terms_without_a_root_match_the_empty_table_form(self):
+        self.assertEqual(
+            leakcli.guard_terms(None),
+            leakcli.guard_terms_from_table({}, None, project_name=settings.PROJECT_FILE),
+        )
+
+    def test_project_name_is_required(self):
+        with self.assertRaises(TypeError):
+            leakcli.guard_terms_from_table({}, None)  # ty: ignore[missing-argument]
+
+
 if __name__ == "__main__":
     unittest.main()

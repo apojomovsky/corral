@@ -11,8 +11,9 @@ import io
 import os
 import tempfile
 import unittest
+from unittest import mock
 
-from korapy import board, boardcli, boardstatus
+from korapy import board, boardcli, boardstatus, sync
 from korapy import tracker as iface
 from korapy.github.board import BoardSchema, FieldDef
 from korapy.trackers import SetupEntry
@@ -479,6 +480,66 @@ class SweepAdoptSeamTest(SweepCase):
         code = self.sweep([entry()], [tracker], plan=False)
         self.assertEqual(code, 1)
         self.assertIn("adopt", self.err.getvalue())
+
+
+class SharedPullsAccessorTest(SweepCase):
+    """The plan and the pass resolve Status pulls through one public accessor."""
+
+    def test_plan_and_pass_share_the_status_pulls_accessor(self):
+        tracker = FakeBoardTracker([card(7, status="Available")])
+        self.seed(7)
+        seen = []
+        real = sync.status_pulls
+
+        def spy(reader, field_schema, repo, cards, *, pulls_max_calls, uncapped=False):
+            seen.append((reader, repo, uncapped))
+            return real(
+                reader,
+                field_schema,
+                repo,
+                cards,
+                pulls_max_calls=pulls_max_calls,
+                uncapped=uncapped,
+            )
+
+        store = self.open_store()
+        try:
+            with mock.patch.object(sync, "status_pulls", side_effect=spy):
+                plan_code = self.sweep([entry()], [tracker], plan=True)
+                sync.sync_board_repo(
+                    store,
+                    tracker,
+                    schema(),
+                    REPO,
+                    operators=["alice"],
+                    now=T0,
+                    max_pages=5,
+                )
+        finally:
+            store.close()
+        self.assertEqual(plan_code, 0)
+        self.assertEqual(len(seen), 2)
+        self.assertIs(seen[0][0], tracker)
+        self.assertIs(seen[1][0], tracker)
+        self.assertTrue(seen[0][2])
+        self.assertFalse(seen[1][2])
+        self.assertEqual(len(tracker.pulls_calls), 2)
+
+    def test_plan_with_only_closed_cards_lists_no_pulls(self):
+        self.seed(7, state="closed")
+        tracker = FakeBoardTracker([card(7, state="closed", status="Available")])
+        code = self.sweep([entry()], [tracker], plan=True)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{REPO}#7: state closed, set Status to 'Done'", self.out.getvalue())
+        self.assertEqual(tracker.pulls_calls, [])
+
+    def test_plan_with_an_open_card_lists_pulls_once(self):
+        self.seed(7)
+        tracker = FakeBoardTracker([card(7, status="Available")], pulls={(REPO, 7): [object()]})
+        code = self.sweep([entry()], [tracker], plan=True)
+        self.assertEqual(code, 1)
+        self.assertIn(f"{REPO}#7: state open, set Status to 'In review'", self.out.getvalue())
+        self.assertEqual(len(tracker.pulls_calls), 1)
 
 
 class SweepCapTest(SweepCase):
