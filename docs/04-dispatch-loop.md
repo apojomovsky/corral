@@ -347,7 +347,7 @@ them beyond the prefix.
 Decision: the hash input never carries the raw hostname. The
 claim `agent` value is mirrored to the tracker as a label, so on a
 public tracker it would publish the deployment hostname. The host
-segment comes from the `drive.agent_host` setting, resolved once per
+segment comes from the `drive.agent_host` setting (default in [`configuration.md`](configuration.md)), resolved once per
 pass: a configured display name is used verbatim (with `/` replaced
 by `-`), and the default is a short stable hash of the hostname
 rather than the hostname itself. The id stays opaque and slash-free

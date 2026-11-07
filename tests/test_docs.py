@@ -252,6 +252,7 @@ class DispatchLoopDefaults(unittest.TestCase):
     def test_each_named_setting_still_points_at_the_table(self):
         flat = DISPATCH_LOOP.read_text(encoding="utf-8").replace("\n", " ")
         for key in (
+            "drive.agent_host",
             "drive.fix_round_threshold",
             "drive.max_starts_per_day",
             "drive.period",
