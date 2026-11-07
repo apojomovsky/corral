@@ -541,6 +541,31 @@ class SharedPullsAccessorTest(SweepCase):
         self.assertIn(f"{REPO}#7: state open, set Status to 'In review'", self.out.getvalue())
         self.assertEqual(len(tracker.pulls_calls), 1)
 
+    def test_plan_with_rate_limited_pulls_notes_and_lists_no_moves(self):
+        self.seed(7)
+        tracker = FakeBoardTracker(
+            [card(7, status="Available")],
+            pulls_error=iface.TrackerRateLimited("slow down", 45.0),
+        )
+        code = self.sweep([entry()], [tracker], plan=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.out.getvalue(),
+            f"{REPO}#7: board pulls rate limited, retry after 45s (slow down)\n",
+        )
+        self.assertEqual(len(tracker.pulls_calls), 1)
+
+    def test_plan_with_failing_pulls_notes_the_cause_and_lists_no_moves(self):
+        self.seed(7)
+        tracker = FakeBoardTracker(
+            [card(7, status="Available")],
+            pulls_error=iface.TrackerError("boom"),
+        )
+        code = self.sweep([entry()], [tracker], plan=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.out.getvalue(), f"{REPO}#7: boom\n")
+        self.assertEqual(len(tracker.pulls_calls), 1)
+
 
 class SweepCapTest(SweepCase):
     def test_adds_that_never_appear_stop_at_the_round_cap(self):
