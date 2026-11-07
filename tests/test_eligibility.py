@@ -1,9 +1,10 @@
 """Project eligibility: the per-project hook naming startable tickets.
 
 Tests use stub policy modules written to a temporary directory (loaded
-by dotted name through an added `sys.path` entry, or by file path) and
-fixture board items. No tracker, no network, no subprocess, no real
-state or config dir: the registry dir is a temporary `KORAPY_CONFIG`.
+by dotted name from the project's ops root, through an added `sys.path`
+entry, or by file path) and fixture board items. No tracker, no
+network, no subprocess, no real state or config dir: the registry dir
+is a temporary `KORAPY_CONFIG`.
 """
 
 import dataclasses
@@ -598,6 +599,22 @@ class RegistrationTest(unittest.TestCase):
         with mock.patch.object(sys, "path", [policy_dir, *sys.path]):
             self.assertEqual(projects.check(), [])
 
+    def test_check_resolves_a_dotted_entry_against_the_project_root(self):
+        ops_root = os.path.join(self.tmp, "ops")
+        os.makedirs(ops_root)
+        with open(os.path.join(ops_root, "ops_dotted_policy.py"), "w", encoding="utf-8") as handle:
+            handle.write("def eligible(rows, *, now):\n    return []\n")
+        self.write_project(
+            "blue",
+            'name = "blue"\nunit_prefix = "blue-agent"\n'
+            f'root = "{ops_root}"\n'
+            'eligibility = "ops_dotted_policy:eligible"\n',
+        )
+        try:
+            self.assertEqual(projects.check(), [])
+        finally:
+            sys.modules.pop("ops_dotted_policy", None)
+
     def test_check_resolves_a_relative_entry_against_the_project_root(self):
         ops_root = os.path.join(self.tmp, "ops")
         os.makedirs(os.path.join(ops_root, "policies"))
@@ -618,6 +635,117 @@ class RegistrationTest(unittest.TestCase):
             self.assertEqual(projects.check(), [])
         finally:
             os.chdir(old)
+
+
+OPS_POLICY_MODULE = """\
+def eligible(rows, *, now):
+    from korapy.eligibility import StartRequest
+
+    return [
+        StartRequest(repo=row.repo, number=row.number, kind="start") for row in rows
+    ]
+"""
+
+
+class OpsRootImportTest(unittest.TestCase):
+    """Dotted policies import from the project's ops root, restored after."""
+
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="korapy-elig-ops-"))
+        self.ops = os.path.join(self.tmp, "ops")
+        os.makedirs(self.ops)
+        for name in ("ops_blue_policy", "ops_shadow_policy", "ops_status_policy"):
+            self.addCleanup(sys.modules.pop, name, None)
+
+    def write_ops_module(self, name, text=OPS_POLICY_MODULE):
+        path = os.path.join(self.ops, name + ".py")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_dotted_entry_imports_from_the_ops_root_with_no_path_setup(self):
+        expected = self.write_ops_module("ops_blue_policy")
+        self.assertNotIn(self.ops, sys.path)
+        policy = eligibility.load_policy("ops_blue_policy:eligible", project="blue", base=self.ops)
+        self.assertEqual(policy.source, expected)
+        rows = eligibility.rows_from_items([item()])
+        requests = policy.eligible(rows, now=2000.0)
+        self.assertEqual([(request.repo, request.number) for request in requests], [("app", 7)])
+        self.assertNotIn(self.ops, sys.path)
+
+    def test_ops_root_copy_wins_over_an_installed_copy_and_is_reported(self):
+        installed = os.path.join(self.tmp, "installed")
+        os.makedirs(installed)
+        with open(os.path.join(installed, "ops_shadow_policy.py"), "w", encoding="utf-8") as handle:
+            handle.write('MARKER = "installed"\n' + OPS_POLICY_MODULE)
+        expected = self.write_ops_module(
+            "ops_shadow_policy", 'MARKER = "ops"\n' + OPS_POLICY_MODULE
+        )
+        with mock.patch.object(sys, "path", [installed, *sys.path]):
+            policy = eligibility.load_policy(
+                "ops_shadow_policy:eligible", project="blue", base=self.ops
+            )
+            module = sys.modules["ops_shadow_policy"]
+        self.assertEqual(module.MARKER, "ops")
+        self.assertEqual(policy.source, expected)
+        rows = eligibility.rows_from_items([item()])
+        requests = policy.eligible(rows, now=2000.0)
+        self.assertEqual([(request.repo, request.number) for request in requests], [("app", 7)])
+
+    def test_loading_restores_the_search_path_on_success_and_failure(self):
+        self.write_ops_module("ops_blue_policy")
+        before = list(sys.path)
+        eligibility.load_policy("ops_blue_policy:eligible", project="blue", base=self.ops)
+        self.assertEqual(list(sys.path), before)
+        with self.assertRaises(eligibility.EligibilityError):
+            eligibility.load_policy("ops_missing_xyz:eligible", project="blue", base=self.ops)
+        self.assertEqual(list(sys.path), before)
+
+    def test_ops_root_policy_can_filter_on_a_board_column(self):
+        self.write_ops_module(
+            "ops_status_policy",
+            "from korapy.eligibility import StartRequest\n"
+            'READY = "Ready"\n'
+            "def eligible(rows, *, now):\n"
+            "    return [\n"
+            '        StartRequest(repo=row.repo, number=row.number, kind="start")\n'
+            "        for row in rows\n"
+            '        if row.extra.get("board_status") == READY\n'
+            "    ]\n",
+        )
+        project = projects.Project(
+            name="blue",
+            unit_prefix="blue-agent-",
+            root=self.ops,
+            eligibility="ops_status_policy:eligible",
+        )
+        outcome = eligibility.for_project(
+            project,
+            [
+                item(number=7, extra={"board_status": "Ready"}),
+                item(number=9, extra={"board_status": "Todo"}),
+            ],
+            now=2000.0,
+        )
+        self.assertIsNone(outcome.skipped)
+        self.assertEqual(
+            [(request.repo, request.number) for request in outcome.requests], [("app", 7)]
+        )
+
+    def test_for_project_loads_a_dotted_entry_from_the_project_root(self):
+        self.write_ops_module("ops_blue_policy")
+        project = projects.Project(
+            name="blue",
+            unit_prefix="blue-agent-",
+            root=self.ops,
+            eligibility="ops_blue_policy:eligible",
+        )
+        outcome = eligibility.for_project(project, [item()], now=2000.0)
+        self.assertIsNone(outcome.skipped)
+        self.assertEqual(
+            [(request.repo, request.number) for request in outcome.requests], [("app", 7)]
+        )
+        self.assertNotIn(self.ops, sys.path)
 
 
 if __name__ == "__main__":

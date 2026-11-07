@@ -308,6 +308,43 @@ weighted by board priority. The same file carries the project's slot
 `floor` and `ceiling`: with the host total full, a project below its
 floor still starts, and a project at its ceiling does not.
 
+A project with its own board rules writes a small policy module in its
+own ops root, beside `korapy.toml`, and names it in the same one-line
+registration:
+
+```toml
+eligibility = "lead_policy:eligible"
+```
+
+The ops root is first on the import search path while the module
+imports, so the file needs no installation; when the same module name
+exists elsewhere, the ops root's copy wins. `korapy doctor` verifies
+the entry resolves. A board whose Status column gates the work, for
+example, starts only tickets whose Status reads Ready:
+
+```python
+# <ops root>/lead_policy.py
+from korapy.eligibility import StartRequest
+
+READY = "Ready"
+
+
+def eligible(rows, *, now):
+    return [
+        StartRequest(repo=row.repo, number=row.number, kind="start")
+        for row in rows
+        if row.extra.get("board_status") == READY
+    ]
+```
+
+Board columns (`Status`, `Priority`, `Area`, `Pool`, `Blocked by`)
+arrive on each row's `extra` map, so the same shape filters on any of
+them. A project whose entry does not import, or whose answer has the
+wrong shape, is skipped for the pass with an error line naming the
+project, the module and the reason; every other project still runs.
+The contract and the ready-made policy are in
+[`04-dispatch-loop.md`](04-dispatch-loop.md).
+
 Labels and the board come from one verb. It creates the missing board
 labels on the tracker (existing labels are left alone), provisions the
 board for board entries, and writes the `[repo.board]` mapping into
