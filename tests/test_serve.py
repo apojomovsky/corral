@@ -2415,6 +2415,10 @@ class TransitiveSeamClosure(unittest.TestCase):
                 "socket",
             ): "socket.gethostname names launch records; the tail read never shells out",
             ("korapy.netbind", "socket"): "address-family constants for the loopback bind",
+            (
+                "korapy.pushenv",
+                "subprocess",
+            ): "the ssh-agent probe other verbs call; reads inject fakes instead",
             ("korapy.registry", "socket"): "socket.gethostname tags live-agent rows; local only",
             ("korapy.serve", "socket"): "MSG_PEEK flag for the client-close probe; opens nothing",
             ("korapy.snapshot", "socket"): "socket.gethostname fills the fleet header; local only",
