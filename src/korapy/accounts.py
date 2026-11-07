@@ -182,7 +182,7 @@ def _load(path: str) -> tuple[list[Provider], list[str]]:
 
 
 @contextlib.contextmanager
-def _with_reader_path(dirs: list[str]):
+def with_reader_path(dirs: list[str]):
     """`dirs` prepended to `sys.path`, restored afterwards.
 
     The only place that touches `sys.path`: readers import while the
@@ -194,6 +194,11 @@ def _with_reader_path(dirs: list[str]):
         yield
     finally:
         sys.path[:] = saved
+
+
+#: The spelling this helper had before it went public; eligibility and
+#: older readers may still name it. Both names are the same object.
+_with_reader_path = with_reader_path
 
 
 def pool(config_dir: str | None = None) -> tuple[list[Provider], list[str]]:
@@ -245,7 +250,7 @@ def load_reader(
     loaded, the provider just did not answer.
     """
     dirs = reader_dirs if reader_dirs is not None else pool(config_dir)[1]
-    with _with_reader_path(dirs):
+    with with_reader_path(dirs):
         cls = _resolve(entry, "accounts")
         try:
             return cls()
@@ -266,7 +271,7 @@ def check(config_dir: str | None = None) -> list[str]:
     except AccountsError as err:
         return [str(err)]
     problems = []
-    with _with_reader_path(dirs):
+    with with_reader_path(dirs):
         for provider in found:
             where = f"{path} [[provider]] {provider.name!r}"
             try:
