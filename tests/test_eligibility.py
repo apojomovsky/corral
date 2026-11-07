@@ -446,9 +446,13 @@ class ForProjectTest(unittest.TestCase):
         project = projects.Project(name="blue", unit_prefix="blue-agent", root="/srv/ops/blue")
         outcome = eligibility.for_project(project, [item()], now=2000.0)
         self.assertEqual(outcome.requests, [])
-        assert outcome.skipped is not None
-        self.assertIn("blue", outcome.skipped)
-        self.assertIn("skipped", outcome.skipped)
+        self.assertEqual(outcome.skipped, "project blue has no eligibility entry: skipped")
+
+    def test_the_no_entry_line_names_the_project(self):
+        self.assertEqual(
+            eligibility.no_entry_line("blue"),
+            "project blue has no eligibility entry: skipped",
+        )
 
     def test_a_project_with_the_entry_returns_its_ordered_requests(self):
         project = projects.Project(

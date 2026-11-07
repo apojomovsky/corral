@@ -676,6 +676,39 @@ class PolicyLoadOnceTest(unittest.TestCase):
             self.assertEqual(handle.read(), "imported\n")
 
 
+class NoEntrySkipLineTest(unittest.TestCase):
+    """A project without an entry prints the shared eligibility skip line."""
+
+    def test_the_gate_prints_the_eligibility_no_entry_line(self):
+        from korapy import eligibility
+
+        project = project_named("blue")
+        out = io.StringIO()
+        gated, problems, _requested, _calls, _limited = drive._gate_all(
+            [],
+            [project],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            fix_threshold="high",
+            index_for=None,
+            pulls_max_calls=5,
+            driven={"blue": frozenset()},
+        )
+        self.assertEqual(gated, [])
+        self.assertEqual(problems, [])
+        self.assertEqual(
+            out.getvalue().splitlines(),
+            [f"project blue: {eligibility.no_entry_line('blue')}"],
+        )
+
+
 class PlanTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-")
