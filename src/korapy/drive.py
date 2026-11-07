@@ -1798,7 +1798,7 @@ def _gate_all(
         policy = policies.get(project.name)
         if policy is None:
             print(
-                f"project {project.name}: project {project.name} has no eligibility entry: skipped",
+                f"project {project.name}: {eligibility.no_entry_line(project.name)}",
                 file=out,
             )
             continue

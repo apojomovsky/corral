@@ -449,6 +449,15 @@ class Outcome(NamedTuple):
     skipped: str | None
 
 
+def no_entry_line(project_name: str) -> str:
+    """The logbook line for a project without an eligibility entry.
+
+    Both `for_project` and the drive pass render this line, so the
+    text lives here, in exactly one place.
+    """
+    return f"project {project_name} has no eligibility entry: skipped"
+
+
 def for_project(
     project: Any,
     items: Sequence[board.Item],
@@ -469,7 +478,7 @@ def for_project(
     on to the next one.
     """
     if not project.eligibility:
-        return Outcome([], f"project {project.name} has no eligibility entry: skipped")
+        return Outcome([], no_entry_line(project.name))
     policy = load_policy(project.eligibility, project=project.name, base=project.root)
     return Outcome(
         policy.eligible(
