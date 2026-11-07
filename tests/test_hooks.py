@@ -101,13 +101,20 @@ class PrePush(Repo):
         super().setUp()
         # The hook runs the suite of the repo it is pushed from; this scratch
         # repo has a one-test suite that passes, so only the force guard
-        # decides (an empty suite exits 5 on Python 3.12+).
+        # decides (an empty suite exits 5 on Python 3.12+). The suite is
+        # tracked, like in a real checkout: untracked files count as a
+        # dirty tree, which must run the suite.
         (self.repo / "tests").mkdir()
         (self.repo / "tests" / "__init__.py").write_text("")
         (self.repo / "tests" / "test_ok.py").write_text(
             "import unittest\n\nclass Ok(unittest.TestCase):\n"
             "    def test_ok(self):\n        pass\n"
         )
+        git(self.repo, "add", "tests", env=self.env)
+        # Byte-compiled suite output must not count as a dirty tree: real
+        # checkouts ignore it, so the scratch repo does too.
+        (self.repo / ".gitignore").write_text("__pycache__/\n")
+        git(self.repo, "add", ".gitignore", env=self.env)
         self.remote = Path(self.tmp.name) / "remote.git"
         subprocess.run(["git", "init", "-q", "--bare", str(self.remote)], check=True, env=self.env)
         git(self.repo, "remote", "add", "origin", str(self.remote), env=self.env)
@@ -157,6 +164,95 @@ class PrePush(Repo):
         r = git(self.repo, "push", "-q", "origin", ":master", env=self.env)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("refusing", r.stderr)
+
+
+class MatrixProof(PrePush):
+    """The pre-push hook reuses a fresh green-matrix proof for the same tree.
+
+    The hook resolves the proof the way the takeoff does: the matrix
+    stamp under the cache dir, for the identical tree, interpreter set
+    and a clean tree. Anything else runs the suite as before.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import time
+
+        from korapy import checkstamp
+
+        self.checkstamp = checkstamp
+        self.time = time
+        self.cache = Path(self.tmp.name) / "cache"
+        self.cache.mkdir(exist_ok=True)
+        src = Path(__file__).resolve().parent.parent / "src"
+        self.proof_env = dict(self.env, PYTHONPATH=str(src), KORAPY_CACHE=str(self.cache))
+
+    def write_stamp(self, tree=None, pythons="3.11 3.14", now=None):
+        if tree is None:
+            tree = git(self.repo, "rev-parse", "HEAD^{tree}", env=self.env).stdout.strip()
+        text = self.checkstamp.format_stamp(tree, pythons, self.time.time() if now is None else now)
+        (self.cache / self.checkstamp.STAMP_NAME).write_text(text, encoding="utf-8")
+
+    def push(self, *args):
+        return git(self.repo, "push", *args, env=self.proof_env)
+
+    def test_a_fresh_matrix_proof_for_a_new_tree_skips_the_suite(self):
+        self.commit("chore: three", name="h")
+        self.write_stamp()
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("green matrix", r.stdout + r.stderr)
+
+    def test_a_matrix_skip_leaves_the_own_stamp_on_the_older_tree(self):
+        self.commit("chore: three", name="h")
+        self.write_stamp()
+        self.assertEqual(self.push("origin", "master").returncode, 0)
+        stamp = (self.repo / ".git" / "korapy-pre-push-stamp").read_text(encoding="utf-8")
+        tree = git(self.repo, "rev-parse", "HEAD^{tree}", env=self.env).stdout.strip()
+        self.assertNotIn(tree, stamp)
+
+    def test_a_missing_matrix_proof_runs_the_suite(self):
+        self.commit("chore: three", name="h")
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
+        self.assertNotIn("suite already passed", r.stdout + r.stderr)
+
+    def test_a_dirty_tree_with_a_fresh_proof_runs_the_suite(self):
+        self.commit("chore: three", name="h")
+        self.write_stamp()
+        (self.repo / "loose").write_text("uncommitted")
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
+
+    def test_a_stale_matrix_proof_runs_the_suite(self):
+        self.commit("chore: three", name="h")
+        self.write_stamp(now=self.time.time() - self.checkstamp.STAMP_MAX_AGE_S - 1)
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
+
+    def test_a_matrix_proof_for_another_tree_runs_the_suite(self):
+        self.write_stamp()
+        self.commit("chore: three", name="h")
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
+
+    def test_a_corrupt_matrix_proof_runs_the_suite(self):
+        self.commit("chore: three", name="h")
+        (self.cache / self.checkstamp.STAMP_NAME).write_text("not-a-stamp\n", encoding="utf-8")
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
+
+    def test_a_matrix_proof_for_other_interpreters_runs_the_suite(self):
+        self.commit("chore: three", name="h")
+        self.write_stamp(pythons="3.11")
+        r = self.push("origin", "master")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("green matrix", r.stdout + r.stderr)
 
 
 class PackagedHooks(unittest.TestCase):

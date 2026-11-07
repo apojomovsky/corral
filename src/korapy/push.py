@@ -21,6 +21,9 @@ pushes exactly as before.
 
 import os
 import subprocess
+import time
+
+from korapy import checkstamp
 
 OK, FAILED, API, CONFIG = 0, 1, 3, 4
 
@@ -171,6 +174,70 @@ def stamp_valid(cwd, run=None, read=None, tree=None, digest=None, env=None):
 def suite_needed(cwd, run=None, read=None, env=None):
     """The hook's skip decision: run the suite unless the stamp hits."""
     return not stamp_valid(cwd, run, read, env)
+
+
+def working_dirty(cwd, run=None, env=None):
+    """True when the working tree has uncommitted changes.
+
+    An unreadable status reads as dirty: a tree the gate cannot see
+    never skips the suite (fail closed).
+    """
+    run = run or default_run
+    proc = _git(cwd, ["status", "--porcelain"], run, env)
+    if proc.returncode != 0:
+        return True
+    return bool((proc.stdout or "").strip())
+
+
+def proof_decision(own_text, own_expected, matrix_text, *, tree, pythons, now, dirty):
+    """One resolver for the hook's skip: both proofs in, one decision out.
+
+    `own_text` is the hook's own stamp file content ("" when missing),
+    `own_expected` the `<tree> <hook-digest>` line it must hold (""
+    when the tree or digest is unresolvable, which never hits);
+    `matrix_text` the green-matrix stamp text; `tree` the current
+    `HEAD^{tree}`, `pythons` the interpreters a reused proof must
+    cover, `now` epoch seconds, `dirty` whether the working tree has
+    uncommitted changes. Returns `(skip, reason)`: `skip` True only for
+    an own-stamp hit or a fresh matrix proof for the identical clean
+    tree; `reason` is "own-stamp" or "matrix-proof" for a skip, else
+    the miss word ("dirty-tree", or the checkstamp verdict) that tells
+    the hook to run the suite as before.
+    """
+    if dirty:
+        return False, "dirty-tree"
+    if own_expected and (own_text or "").strip() == own_expected:
+        return True, "own-stamp"
+    verdict = checkstamp.stamp_status(matrix_text, tree, pythons, now)
+    if verdict == "fresh":
+        return True, "matrix-proof"
+    return False, verdict
+
+
+def hook_decision(cwd=None, run=None, read=None, matrix_read=None, env=None, now=None):
+    """Gather the hook's real inputs and resolve the skip.
+
+    Called by the pre-push hook: the tree, hook digest, both stamp
+    texts, the dirt flag and the clock arrive from git, the stamp
+    files and the cache dir (resolved through `paths`, never trusted
+    across trees). Every input stays injectable, so tests run with
+    fakes. Returns `(skip, reason)` like `proof_decision`.
+    """
+    cwd = cwd or os.getcwd()
+    env = os.environ if env is None else env
+    now = time.time() if now is None else now
+    tree = tree_hash(cwd, run, env)
+    digest = hook_digest(cwd, run, env)
+    own_expected = f"{tree} {digest}" if tree and digest else ""
+    return proof_decision(
+        read_stamp(cwd, run, read, env),
+        own_expected,
+        checkstamp.read_stamp(env, matrix_read),
+        tree=tree,
+        pythons=checkstamp.MATRIX_PYTHONS,
+        now=now,
+        dirty=working_dirty(cwd, run, env),
+    )
 
 
 def current_branch(cwd, run=None, env=None):

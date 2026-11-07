@@ -36,6 +36,23 @@ if [ -n "$tree" ] && [ -n "$hook_sum" ] && [ -f "$stamp_file" ] \
     exit 0
 fi
 
+# Green-matrix proof: `make check` stamps the tree it passed on every
+# interpreter under the cache dir. When that proof is fresh for this
+# identical clean tree, the suite the hook would run is already
+# proven, so the push skips it the same way. Any miss (no proof, dirty
+# tree, stale, corrupt or foreign proof) falls through and runs the
+# suite below. src/korapy/push.py resolves both proofs through one
+# decision function; a hook that cannot reach it runs the suite.
+matrix_proof="$(uv run --locked --quiet python -c 'from korapy import push; skip, why = push.hook_decision(); print(("skip " if skip else "run ") + why)' 2>/dev/null)" || matrix_proof="run unavailable"
+if [ "$matrix_proof" = "skip own-stamp" ]; then
+    echo "pre-push: suite already passed for this tree, skipping"
+    exit 0
+fi
+if [ "$matrix_proof" = "skip matrix-proof" ]; then
+    echo "pre-push: reusing the green matrix proof for this tree, skipping the suite"
+    exit 0
+fi
+
 uv run --locked --quiet python -m unittest discover -t . -s tests >/dev/null 2>&1 || {
     echo "pre-push: test suite failed (make test)" >&2
     exit 2
