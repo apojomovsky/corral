@@ -495,6 +495,9 @@ class ResyncAdoptionTest(StoreCase):
     def test_the_reserved_namespaces_agree_with_the_loop(self):
         self.assertIn(drive.MANAGED_PREFIX, sync.RESERVED_AGENT_PREFIXES)
 
+    def test_the_pulls_budget_default_agrees_with_the_loop(self):
+        self.assertEqual(sync.DEFAULT_PULLS_MAX_CALLS, drive.DEFAULT_PULLS_MAX_CALLS)
+
 
 class UnreadableListingStore:
     """A store whose repo listing and rows cannot be read."""

@@ -937,7 +937,11 @@ per repo per pass (default `20`); the rest carries to the next pass,
 so a one-time catch-up of a stale board spreads itself across passes.
 A rate limit stops the step with the rest left for the next pass; a
 failed write is logged with the issue number and retried, and neither
-fails the sync.
+fails the sync. Open pulls resolve through one listing per repo per
+pass under the same `drive.pulls_max_calls` budget as the dispatch
+gate; an unreadable or capped listing leaves the open cards alone
+(closed cards still reach Done, which needs no pulls) until the next
+pass.
 
 A person's manual move wins until the derived state changes: korapy
 records the Status it last set per card in the board store, and a

@@ -245,7 +245,7 @@ def _migrate(conn):
 def _migrate_1_to_2(conn):
     """Forward a version-1 database: add the tracker cursor table."""
     conn.execute(_CURSORS_DDL)
-    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+    conn.execute("PRAGMA user_version=2")
 
 
 def _migrate_2_to_3(conn):
@@ -936,8 +936,10 @@ class Store:
 
         One transaction: items, claims (agent and epoch kept, so the
         fencing token survives the move), the outbox (queued, sent and
-        dropped rows alike, so settled history stays coherent) and the
-        sync cursors. An unknown ``old`` moves nothing and reports zero
+        dropped rows alike, so settled history stays coherent), the
+        sync cursors and the last-set Status records (``status_sets``,
+        so a later move is still seen as a person's). An unknown ``old``
+        moves nothing and reports zero
         counts, so a second run is a no-op (even with ``new`` holding
         the moved rows); an ``old`` that still holds rows while ``new``
         does too refuses with ``RenameRefused`` instead of merging two

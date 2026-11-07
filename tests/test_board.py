@@ -720,6 +720,20 @@ class OpenTest(unittest.TestCase):
             with self.assertRaises(board.StoreError):
                 board.open_store(path)
 
+    def test_each_migration_step_stamps_its_own_version(self):
+        with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
+            path = os.path.join(tmp, "board.sqlite")
+            conn = sqlite3.connect(path)
+            try:
+                board._migrate_1_to_2(conn)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                self.assertEqual(version, 2)
+                board._migrate_2_to_3(conn)
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                self.assertEqual(version, board.SCHEMA_VERSION)
+            finally:
+                conn.close()
+
     def test_version_2_migrates_forward_adding_status_sets(self):
         with tempfile.TemporaryDirectory(prefix="korapy-board-") as tmp:
             path = os.path.join(tmp, "board.sqlite")

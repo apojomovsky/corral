@@ -2026,14 +2026,18 @@ def production_operators(registered, git, *, resolved=None):
     return mapping, None
 
 
-def sync_all(store, tracker_factory, *, operators, now):
+def sync_all(store, tracker_factory, *, operators, now, pulls_max_calls=None):
     """Sync every repo with cached rows, each through its own tracker.
 
     ``tracker_factory`` maps a tracker repo to its tracker (labels or
     board, built by the one factory); board repos run the feed step then
     the board step, and a complete board poll also adopts the tracker's
     missing issues onto the board through the same reader, while every
-    poll also syncs the Status column from the derived state. Returns
+    poll also syncs the Status column from the derived state. Open
+    pulls for the Status step resolve once per repo through each
+    reader's ``pulls_index`` seam, capped by ``pulls_max_calls`` (None
+    reads the ``drive.pulls_max_calls`` host setting, the same budget
+    the gate's linked-pull map spends). Returns
     (seen, errors, store_errors, refused, adopt_errors, status_errors):
     the rows applied, one line per tracker/outage failure, one line per
     corrupt stored row, one line per refused read (a validation rejection
@@ -2108,6 +2112,7 @@ def sync_all(store, tracker_factory, *, operators, now):
             operators=ops,
             now=now,
             max_pages=tracker.board_poll_pages,
+            pulls_max_calls=pulls_max_calls,
         )
         seen += board_result.items_seen
         errors.extend(board_result.errors)
@@ -4753,7 +4758,9 @@ def _launching_pass(
             sync_refused,
             sync_adopt_errors,
             sync_status_errors,
-        ) = sync_all(store, tracker_factory, operators=operators, now=now)
+        ) = sync_all(
+            store, tracker_factory, operators=operators, now=now, pulls_max_calls=pulls_max_calls
+        )
     except board.StoreError as problem:
         print(f"korapy drive: {problem}", file=err)
         return finish(USAGE)
