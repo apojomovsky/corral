@@ -1419,21 +1419,19 @@ def pulls_index_for(tracker_factory):
     return index_for
 
 
-def pulls_check_needed(row, *, live_keys, hold_label, kind="start") -> bool:
+def pulls_check_needed(row, *, hold_label) -> bool:
     """Whether the pass must list pulls before deciding this row. Pure.
 
     Only tickets the gate could still decide need the listing: an open,
     internally owned ticket no human holds. Anything else skips before
     the gate ever reads row pulls (closed, external, held, waiting on
     a human, foreign-claimed), so listing for it would spend GitHub
-    calls no verdict uses. Any managed-held ticket needs the listing
-    for every kind: `fix` and `resume` proceed with the holder, while a
-    `start` or `review` on a live-claimed row whose finished worker
-    matches is reclassified to `review` (takeover) and then reads the
-    row pulls too. Without the listing that takeover would proceed
-    blind, missing an open linked pull or a tracker outage. `live_keys`
-    holds the (repo, number) pairs with a live agent, and `kind` is the
-    wanted request kind.
+    calls no verdict uses. Any managed-held ticket needs the listing:
+    `fix` and `resume` proceed with the holder, while a `start` or
+    `review` on a live-claimed row whose finished worker matches is
+    reclassified to `review` (takeover) and then reads the row pulls
+    too. Without the listing that takeover would proceed blind,
+    missing an open linked pull or a tracker outage.
     """
     if row is None or row.state != "open" or row.external:
         return False
@@ -1743,7 +1741,7 @@ def _gate_all(
         except eligibility.EligibilityError as problem:
             policy_errors[project.name] = problem
     if index_for is not None:
-        wanted: dict = {}
+        wanted: set = set()
         for project in registered:
             policy = policies.get(project.name)
             if policy is None:
@@ -1753,22 +1751,12 @@ def _gate_all(
             except eligibility.EligibilityError:
                 continue
             for request in requests:
-                wanted.setdefault((request.repo, request.number), set()).add(request.kind)
+                wanted.add((request.repo, request.number))
         pre_by_key = _released_rows(items, released)
-        live_keys = {(repo, number) for _, repo, number in live_set}
         fetch_keys = {
             key
-            for key, kinds in wanted.items()
-            if key[0] in union
-            and any(
-                pulls_check_needed(
-                    pre_by_key.get(key),
-                    live_keys=live_keys,
-                    hold_label=hold_label,
-                    kind=kind,
-                )
-                for kind in kinds
-            )
+            for key in wanted
+            if key[0] in union and pulls_check_needed(pre_by_key.get(key), hold_label=hold_label)
         }
         if fetch_keys:
             if pulls_max_calls is None:
