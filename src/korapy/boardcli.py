@@ -116,7 +116,9 @@ def _plan_repo(entry, entry_tracker, *, store, now, pulls_max_calls):
         return (), (), f"{repo}: {err}", "outage"
     # NOTE: the store reads below raise board.StoreError on corrupt
     # rows; sweep_root turns those into the repo's usage error.
-    setup = sync._status_setup(entry_tracker, schema, uncapped=True)
+    resolved = sync.status_pulls(
+        entry_tracker, schema, repo, cards, pulls_max_calls=pulls_max_calls, uncapped=True
+    )
     normed = boardsweep.poll_cards(cards)
     present = {(card.repo, card.number) for card in normed}
     claims = set()
@@ -128,21 +130,19 @@ def _plan_repo(entry, entry_tracker, *, store, now, pulls_max_calls):
         records[key] = store.status_set_of(card.repo, card.number)
     open_cards = boardsweep.store_cards(store.items(repo=repo, state="open"))
     missing = boardsweep.missing_moves(open_cards, present=present, now=now)
+    setup = resolved.setup
     if setup is None:
         return tuple(missing), (), "", ""
     names = boardstatus.option_names(setup[3].options)
     ids = dict(setup[2])
-    try:
-        pulls, pulls_error = sync._resolve_status_pulls(
-            entry_tracker, repo, max_calls=sync._pulls_budget(pulls_max_calls)
-        )
-    except iface.TrackerRateLimited as err:
+    limited = resolved.rate_limited
+    if limited is not None:
         pulls, pulls_error = (
             None,
-            (f"board pulls rate limited, retry after {err.retry_after:g}s ({err})"),
+            (f"board pulls rate limited, retry after {limited.retry_after:g}s ({limited})"),
         )
-    except iface.TrackerError as err:
-        pulls, pulls_error = None, str(err)
+    else:
+        pulls, pulls_error = resolved.pulls, resolved.pulls_error
     moves, notes = boardsweep.status_moves(
         normed,
         names=names,
