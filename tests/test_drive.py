@@ -510,11 +510,15 @@ class PullsLookupPassTest(unittest.TestCase):
         self.addCleanup(store.close)
         items = store.items()
         project = project_named("blue", entry="dummy:eligible")
-        outcome = eligibility.Outcome([eligibility.StartRequest("app", 7, "start")], None)
+        policy = eligibility.LoadedPolicy(
+            project="blue",
+            entry="dummy:eligible",
+            func=lambda rows, *, now: [eligibility.StartRequest("app", 7, "start")],
+        )
         fake = FakeTracker()
         out = io.StringIO()
         with (
-            mock.patch.object(eligibility, "for_project", return_value=outcome),
+            mock.patch.object(eligibility, "load_policy", return_value=policy),
             mock.patch.object(
                 drive.settings,
                 "load",
@@ -616,6 +620,60 @@ class BrokenPolicyIsolationTest(unittest.TestCase):
         self.assertEqual(len(named), 1)
         self.assertIn("missing_policy_xyz:eligible", named[0])
         self.assertIn("good app#7: start", out.getvalue())
+
+
+class PolicyLoadOnceTest(unittest.TestCase):
+    """Each resolving policy imports once per pass, not once per loop."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="korapy-drive-policy-once-")
+        self.addCleanup(self.tmp.cleanup)
+        self.db = os.path.join(self.tmp.name, "board.sqlite")
+        self.policies = os.path.join(self.tmp.name, "policies")
+        os.makedirs(self.policies)
+
+    def test_a_pass_with_a_pulls_lookup_imports_each_policy_once(self):
+        store = stored(self.db, [("app", 7, "open")])
+        self.addCleanup(store.close)
+        counter = os.path.join(self.tmp.name, "imports.log")
+        policy_path = os.path.join(self.policies, "blue.py")
+        with open(policy_path, "w", encoding="utf-8") as handle:
+            handle.write(
+                "\n".join(
+                    [
+                        f"with open({counter!r}, 'a', encoding='utf-8') as _h:",
+                        "    _h.write('imported\\n')",
+                        "def eligible(rows, *, now):",
+                        "    from korapy.eligibility import StartRequest",
+                        "    return [StartRequest('app', 7, 'start')]",
+                        "",
+                    ]
+                )
+            )
+        project = project_named("blue", policy_path + ":eligible")
+        fake = FakeTracker()
+        out = io.StringIO()
+        gated, problems, _requested, _calls, _limited = drive._gate_all(
+            store.items(),
+            [project],
+            out,
+            now=2000.0,
+            live_set=frozenset(),
+            limits=admission.Limits(total=4),
+            quota_for={"blue": drive.QuotaSource(chains={}, stale_after=10**12)},
+            pool=None,
+            ledger_data={},
+            read_labels=lambda kind, repo, number: [],
+            hold_label="hold",
+            fix_threshold="high",
+            index_for=drive.pulls_index_for(lambda repo: fake),
+            pulls_max_calls=5,
+            driven={"blue": frozenset({"app"})},
+        )
+        self.assertEqual(problems, [])
+        self.assertEqual(len(gated), 1)
+        with open(counter, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "imported\n")
 
 
 class PlanTest(unittest.TestCase):
